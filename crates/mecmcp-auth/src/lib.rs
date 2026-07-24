@@ -6,6 +6,8 @@
 
 pub mod token;
 pub mod scope;
+pub mod grant;
 
 pub use token::{TokenDigest, TokenError, TokenSecret};
 pub use scope::{MAX_SCOPE_NAMES, ScopeError, ScopeSet};
+pub use grant::{Grant, GrantError, NoAction, NoGrant};
