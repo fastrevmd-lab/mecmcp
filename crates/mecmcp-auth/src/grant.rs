@@ -37,7 +37,7 @@ pub trait Grant: Clone + std::fmt::Debug + Send + Sync + 'static {
 ///
 /// Permits no action and no subject, so a token carrying it can never be
 /// mistaken for one with write authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NoGrant;
 
 /// The uninhabited action set of [`NoGrant`].
