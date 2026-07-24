@@ -5,5 +5,7 @@
 //! means to any particular device family.
 
 pub mod token;
+pub mod scope;
 
 pub use token::{TokenDigest, TokenError, TokenSecret};
+pub use scope::{MAX_SCOPE_NAMES, ScopeError, ScopeSet};
