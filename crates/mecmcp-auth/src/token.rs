@@ -8,7 +8,6 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// Raw random bytes behind one token secret.
 const SECRET_BYTES: usize = 32;
 /// Length of 32 random bytes encoded as unpadded base64url.
-#[cfg(test)]
 const ENCODED_SECRET_BYTES: usize = 43;
 /// Prefix identifying the digest algorithm on disk.
 const DIGEST_PREFIX: &str = "sha256:";
@@ -40,6 +39,11 @@ impl TokenSecret {
         let mut random = [0_u8; SECRET_BYTES];
         getrandom::fill(&mut random).map_err(|_| TokenError::Random)?;
         let encoded = base64url_no_pad(&random);
+        debug_assert_eq!(
+            encoded.len(),
+            ENCODED_SECRET_BYTES,
+            "base64url encoding of {SECRET_BYTES} bytes must yield {ENCODED_SECRET_BYTES} chars"
+        );
         random.zeroize();
         let digest = TokenDigest::from_secret(&encoded);
         Ok((Self(encoded), digest))
