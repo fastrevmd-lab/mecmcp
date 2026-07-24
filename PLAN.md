@@ -106,11 +106,34 @@ phase starts.
 ### Phase 0 — Align the consumers *(prerequisite, no shared code)*
 
 `rustjunosmcp` moves to edition 2024 / MSRV 1.88 and adopts the workspace lint
-set. `unsafe_code = "forbid"` will fail on `-auth/src/token.rs`; that is the
-point — it is fixed in Phase 1. Adopt `deny.toml` in both.
+set. Adopt `deny.toml` in both.
 
-**Exit:** `cargo +1.88 clippy --workspace --all-targets` clean in both repos,
-with the known `unsafe` failure documented as Phase 1's first task.
+**Completed 2026-07-24** on branch `chore/phase0-edition-2024-lints`. Findings
+worth carrying forward:
+
+- `cargo fix --edition` produced **zero** source changes across 37k LOC, and all
+  987 tests passed unmodified. The tree was already edition-2024 clean.
+- `unsafe_code` landed as **`deny`, not `forbid`**. There are **four** unsafe
+  sites, not the one predicted: `token.rs` `write_volatile` and `file.rs`
+  `getuid` (removed in Phase 1), plus `token_cmd.rs` and the `http_reload` test
+  using `kill(SIGHUP)` (removed in Phase 3). `forbid` cannot be locally
+  overridden, so `deny` plus targeted `#[allow]`s naming the removing phase is
+  the only workable intermediate. Phase 1 and Phase 3 each delete their allows;
+  Phase 3 raises the lint to `forbid`.
+- `cargo-deny` needed two fixes to pass: allow `Zlib` (`foldhash`, transitive
+  via `hashbrown`) and pin `version` alongside `path` on the intra-workspace
+  dependencies, which cargo-deny reads as wildcards.
+- Adopting the lint set surfaced ~1,700 findings, of which the material subset
+  is **13** — the shipping-code `unwrap_used` hits. All 13 were reviewed and
+  every one is guarded by an earlier return or a loop invariant the lint cannot
+  see. 946 of the 959 are in tests. `missing_docs` and `unwrap_used` are
+  therefore set to `allow` and tracked in rustjunosmcp issue #193, rather than
+  left at `warn` where they would bury genuinely new warnings.
+
+**Exit (met):** `cargo clippy --workspace --all-targets --all-features -D warnings`
+clean in both repos, with `missing_docs` and `unwrap_used` explicitly deferred
+under issue #193 and every other lint active; `cargo deny check` reporting
+`advisories ok, bans ok, licenses ok, sources ok`; all 987 tests passing.
 
 ### Phase 1 — `mecmcp-auth` *(the proving spike)*
 
