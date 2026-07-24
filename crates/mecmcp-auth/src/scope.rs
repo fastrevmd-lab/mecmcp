@@ -187,4 +187,28 @@ mod tests {
             "a,b"
         );
     }
+
+    #[test]
+    fn wildcard_excludes_a_write_tool_named_by_a_heap_string() {
+        // Guards the contents-vs-pointer comparison in `allows_tool`: the tool
+        // name arrives from JSON at runtime, never as the same &'static str as
+        // the registry entry.
+        let from_the_wire = String::from("load_and_commit_") + "config";
+        assert!(!ScopeSet::Wildcard.allows_tool(&from_the_wire, WRITE_TOOLS));
+    }
+
+    #[test]
+    fn empty_allowlist_permits_no_tools() {
+        let scope = ScopeSet::Allowlist(vec![]);
+        assert!(!scope.allows_tool("get_junos_config", WRITE_TOOLS));
+        assert!(!scope.allows_tool("load_and_commit_config", WRITE_TOOLS));
+    }
+
+    #[test]
+    fn an_allowlist_of_exactly_max_scope_names_is_accepted() {
+        // The existing oversize test proves rejection at MAX+1; this proves the
+        // boundary itself is not off by one.
+        let names = (0..MAX_SCOPE_NAMES).map(|i| format!("d{i}")).collect();
+        assert!(ScopeSet::Allowlist(names).validate("devices").is_ok());
+    }
 }
