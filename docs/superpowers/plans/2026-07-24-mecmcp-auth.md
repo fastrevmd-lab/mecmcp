@@ -137,8 +137,11 @@ for the same reason.
 
 ```toml
 # rust-toolchain.toml
+# Pin the toolchain both consumers already use. MSRV 1.88 is the compatibility
+# floor declared in Cargo.toml, not the toolchain we build with.
 [toolchain]
-channel    = "1.88"
+channel    = "1.97.0"
+profile    = "minimal"
 components = ["rustfmt", "clippy"]
 ```
 
