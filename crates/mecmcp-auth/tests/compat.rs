@@ -118,3 +118,71 @@ fn a_junos_wildcard_tool_scope_still_excludes_write_tools() {
     assert!(wildcard.tools.allows_tool("get_junos_config", JUNOS_WRITE_TOOLS));
     assert!(!wildcard.tools.allows_tool("load_and_commit_config", JUNOS_WRITE_TOOLS));
 }
+
+#[test]
+fn writing_a_deployed_file_preserves_its_envelope_version() {
+    use mecmcp_auth::{KnownNames, NoGrant};
+
+    // Test with junos fixture (version 1)
+    {
+        let (_dir, path) = staged("junos-tokens.json");
+        let known = KnownNames {
+            devices: &["edge-fw".to_owned(), "core-fw".to_owned(), "dc-fw".to_owned()],
+            tools: &["get_junos_config", "execute_junos_command", "get_router_list"],
+        };
+
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "readonly-observer", None, None, &known)
+            .expect("set_scopes on junos fixture");
+
+        let body = std::fs::read_to_string(&path).expect("read junos file");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse junos");
+        assert_eq!(
+            parsed["version"], 1,
+            "junos fixture must preserve version 1"
+        );
+
+        // Strict envelope test: prove the originating server could still read it
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StrictEnvelope {
+            version: u32,
+            #[allow(dead_code)]
+            tokens: serde_json::Value,
+        }
+
+        let envelope: StrictEnvelope = serde_json::from_str(&body)
+            .expect("junos v1 file must parse under strict deny_unknown_fields envelope");
+        assert_eq!(envelope.version, 1);
+    }
+
+    // Test with panos fixture (version 2)
+    {
+        let (_dir, path) = staged("panos-tokens.json");
+        let known = KnownNames {
+            devices: &["panosvm".to_owned()],
+            tools: &["get_panos_config", "list_devices", "stage_panos_config"],
+        };
+
+        TokenStoreFile::<MutationGrant>::set_scopes(&path, "panos-operator", None, None, &known)
+            .expect("set_scopes on panos fixture");
+
+        let body = std::fs::read_to_string(&path).expect("read panos file");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse panos");
+        assert_eq!(
+            parsed["version"], 2,
+            "panos fixture must preserve version 2, not normalise to 1"
+        );
+
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StrictEnvelope {
+            version: u32,
+            #[allow(dead_code)]
+            tokens: serde_json::Value,
+        }
+
+        let envelope: StrictEnvelope = serde_json::from_str(&body)
+            .expect("panos v2 file must parse under strict deny_unknown_fields envelope");
+        assert_eq!(envelope.version, 2);
+    }
+}
