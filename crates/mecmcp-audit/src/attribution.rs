@@ -1,6 +1,27 @@
 //! Attribution: the principal, actor type, and optional agent identity behind an action.
 
+use std::fmt;
 use uuid::Uuid;
+
+/// Who is acting. The authenticated and unauthenticated cases are distinct
+/// variants rather than sentinel strings, so no token name can forge the
+/// unauthenticated case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Principal {
+    /// An authenticated bearer token, identified by its non-secret name.
+    Token(String),
+    /// The stdio / `--allow-no-auth` path, where no credential was presented.
+    Unauthenticated,
+}
+
+impl fmt::Display for Principal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Principal::Token(name) => write!(f, "{name}"),
+            Principal::Unauthenticated => write!(f, "stdio"),
+        }
+    }
+}
 
 /// The type of actor performing an action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,12 +47,12 @@ pub struct AgentIdentity {
 ///
 /// This type is constructed from a [`mecmcp_auth::CallerCtx`] at the top of
 /// a handler and carried through the audit and change-control paths. It is
-/// never serialized with secrets: `principal` is a token name (not the token
-/// itself), and the rest are metadata.
+/// never serialized with secrets: a `Principal::Token` carries only the token
+/// name (not the secret itself), and the rest are metadata.
 #[derive(Debug, Clone)]
 pub struct Attribution {
-    /// The authenticated principal. A token name today; an OIDC subject later.
-    pub principal: String,
+    /// The authenticated principal, or the unauthenticated stdio path.
+    pub principal: Principal,
     /// Whether the actor is a human or an agent.
     pub actor_type: ActorType,
     /// Agent identity, when `actor_type == Agent`.
@@ -48,14 +69,15 @@ impl Attribution {
     /// Build an attribution for a human caller from an authenticated context.
     ///
     /// Defaults to `ActorType::Human` with no agent identity. Call sites that
-    /// know they are serving an agent should construct `Attribution` explicitly
-    /// and set `actor_type = Agent` + the `agent` field.
+    /// know they are serving an agent should build an `Attribution` directly with
+    /// `actor_type = Agent` and pass it to `AuditScope::new`, rather than calling
+    /// this helper and mutating the result.
     pub fn from_caller<G>(ctx: &mecmcp_auth::CallerCtx<G>) -> Self
     where
         G: mecmcp_auth::Grant,
     {
         Self {
-            principal: ctx.token_name.clone(),
+            principal: Principal::Token(ctx.token_name.clone()),
             actor_type: ActorType::Human,
             agent: None,
             on_behalf_of: None,
@@ -66,10 +88,10 @@ impl Attribution {
 
     /// Build an attribution for the stdio / no-auth path.
     ///
-    /// The principal is `"stdio"` and the actor is assumed to be human.
+    /// The principal is `Principal::Unauthenticated` and the actor is assumed to be human.
     pub fn stdio() -> Self {
         Self {
-            principal: "stdio".into(),
+            principal: Principal::Unauthenticated,
             actor_type: ActorType::Human,
             agent: None,
             on_behalf_of: None,
@@ -98,7 +120,7 @@ mod tests {
     fn from_caller_defaults_to_human_no_agent() {
         let c = ctx("ci-token");
         let a = Attribution::from_caller(&c);
-        assert_eq!(a.principal, "ci-token");
+        assert_eq!(a.principal, Principal::Token("ci-token".into()));
         assert_eq!(a.actor_type, ActorType::Human);
         assert!(a.agent.is_none());
         assert!(a.on_behalf_of.is_none());
@@ -108,9 +130,15 @@ mod tests {
     #[test]
     fn stdio_attribution_is_usable() {
         let a = Attribution::stdio();
-        assert_eq!(a.principal, "stdio");
+        assert_eq!(a.principal, Principal::Unauthenticated);
         assert_eq!(a.actor_type, ActorType::Human);
         assert!(a.agent.is_none());
+    }
+
+    #[test]
+    fn principal_display_renders_wire_format() {
+        assert_eq!(Principal::Token("ci".into()).to_string(), "ci");
+        assert_eq!(Principal::Unauthenticated.to_string(), "stdio");
     }
 
     #[test]

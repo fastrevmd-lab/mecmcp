@@ -1,6 +1,6 @@
 //! RAII audit guard: emits exactly one `target="audit"` event on Drop.
 
-use crate::attribution::{ActorType, Attribution};
+use crate::attribution::{ActorType, Attribution, Principal};
 use crate::schema::{AuditOutcome, AuditValue, bounded_error};
 use std::fmt::Display;
 use std::time::Instant;
@@ -105,7 +105,7 @@ impl Drop for AuditScope {
         // `metadata` pass through redact::render above.
         let authorization = match &self.outcome {
             AuditOutcome::Denied { .. } => "denied",
-            _ if self.attribution.principal == "stdio" => "no_auth",
+            _ if matches!(self.attribution.principal, Principal::Unauthenticated) => "no_auth",
             _ => "allowed",
         };
         let (result, error_kind, error, reason) = match &self.outcome {
@@ -371,5 +371,24 @@ mod tests {
         // Agent fields should be present but empty when actor_type is human.
         assert!(out.contains("model_id="));
         assert!(out.contains("session_id="));
+    }
+
+    #[test]
+    fn a_token_named_stdio_is_still_recorded_as_authenticated() {
+        // The authorization field must derive from the Principal variant, not from
+        // the token's name. Nothing stops an operator minting a token called
+        // "stdio", and that must not let it masquerade as the no-auth path.
+        let out = run_with_capture(|| {
+            let mut a = AuditScope::from_caller(&ctx("stdio"), "commit_config", "commit", vec![]);
+            a.succeed();
+        });
+        assert!(
+            out.contains("authorization=allowed"),
+            "a token named 'stdio' must be recorded as authenticated, not no_auth: {out}"
+        );
+        assert!(
+            !out.contains("authorization=no_auth"),
+            "authorization must not be no_auth for an authenticated token: {out}"
+        );
     }
 }
