@@ -241,7 +241,7 @@ detection, database inventory, OIDC, `mecmcp-intent`, additional vendors.
 
 | Risk | Mitigation |
 |---|---|
-| Breaking a live deployment mid-extraction | Every phase ends deployed to the lab and verified; serde aliases for all renames; LXC 601 remains the documented rollback host |
+| Breaking a live deployment mid-extraction | Every phase ends deployed to the lab and verified; serde aliases for all renames; rollback is by reinstalling the previous release tarball on LXC 609. **Note:** the previously documented rollback host LXC 601 was retired and destroyed 2026-07-24, so the "swap the IP back to 601" path no longer exists — take a container snapshot of 609 before each phase's deploy instead |
 | Trait over-abstraction — a `DeviceTransaction` that fits neither vendor well | Phase 5 implements it for *both* vendors in the same phase; if the trait needs vendor-specific escape hatches, that is a finding, not a failure |
 | The generic `Grant` trait leaking vendor concepts into `mecmcp-auth` | The crate must not name XPath or Junos config paths anywhere; enforced by review and by the crate compiling with neither vendor as a dependency |
 | Extraction stalls half-done, leaving three implementations | Phases are ordered so each is independently valuable; stopping after any phase leaves both servers better than before |
