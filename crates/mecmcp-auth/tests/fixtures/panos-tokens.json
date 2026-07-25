@@ -1,0 +1,15 @@
+{
+  "tokens": [
+    {
+      "name": "panos-operator",
+      "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+      "devices": ["panosvm"],
+      "tools": ["get_panos_config", "list_devices", "stage_panos_config"],
+      "created_at_unix": 1783850400,
+      "mutation": {
+        "allowed_xpath_roots": ["/config/devices/entry/vsys/entry/rulebase"],
+        "actions": ["set", "delete"]
+      }
+    }
+  ]
+}

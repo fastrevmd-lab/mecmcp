@@ -37,13 +37,13 @@ Every phase inherits these. Copied verbatim into each per-phase plan.
   reason `rustjunosmcp`'s hand-rolled `write_volatile` secret zeroing must be
   replaced with `zeroize`.
 - **No breaking change to on-disk `tokens.json` or `devices.json`.** Live
-  deployments exist (LXC 609, `/etc/jmcp/tokens.json`). Field renames ship as
+  deployments exist (the deployment container, `/etc/jmcp/tokens.json`). Field renames ship as
   serde aliases; the old spelling keeps working and stays tested.
 - **No breaking change to the MCP tool surface** of either server. Tool names,
   input schemas, and output shapes are a public API.
-- **The deployed systemd override on LXC 609 must keep working** unchanged
+- **The deployed systemd override on the deployment container must keep working** unchanged
   through every phase: `0.0.0.0:30031`, `--allow-insecure-bind`,
-  `--allowed-host 192.168.1.194`, no `--inventory-readonly`.
+  `--allowed-host <server-lan-ip>`, no `--inventory-readonly`.
 - **Licence:** MIT, single. Every crate carries `license = "MIT"`.
 - **Naming:** product name `mecmcp` (lowercase, no dashes, per the mechub brand
   standard). Crate names take the `mecmcp-` prefix; Rust crate names keep
@@ -196,7 +196,7 @@ preflight becomes an additional layer in it. CLI, TLS, and token subcommands
 move to `mecmcp-runtime`. Largest mechanical diff, lowest conceptual risk.
 
 **Exit:** `rustpanosmcp` gains per-token session caps, per-token RPS limits, and
-`/metrics`; `rustjunosmcp` gains pre-dispatch scope preflight; the LXC 609
+`/metrics`; `rustjunosmcp` gains pre-dispatch scope preflight; the the deployment container
 systemd override still works verbatim.
 
 ### Phase 4 — `mecmcp-policy` + `mecmcp-inventory` + `mecmcp-device`
@@ -241,7 +241,7 @@ detection, database inventory, OIDC, `mecmcp-intent`, additional vendors.
 
 | Risk | Mitigation |
 |---|---|
-| Breaking a live deployment mid-extraction | Every phase ends deployed to the lab and verified; serde aliases for all renames; LXC 601 remains the documented rollback host |
+| Breaking a live deployment mid-extraction | Every phase ends deployed to the lab and verified; serde aliases for all renames; rollback is by reinstalling the previous release tarball on the deployment container. **Note:** the previously documented rollback host the former rollback container was retired and destroyed 2026-07-24, so the "swap the IP back to 601" path no longer exists — take a container snapshot of the deployment container before each phase's deploy instead |
 | Trait over-abstraction — a `DeviceTransaction` that fits neither vendor well | Phase 5 implements it for *both* vendors in the same phase; if the trait needs vendor-specific escape hatches, that is a finding, not a failure |
 | The generic `Grant` trait leaking vendor concepts into `mecmcp-auth` | The crate must not name XPath or Junos config paths anywhere; enforced by review and by the crate compiling with neither vendor as a dependency |
 | Extraction stalls half-done, leaving three implementations | Phases are ordered so each is independently valuable; stopping after any phase leaves both servers better than before |
@@ -257,5 +257,5 @@ Applies to every phase; a phase is not done until all four hold.
    not intentionally change behaviour.
 3. Both servers start against their existing production config files with no
    edits to those files.
-4. Lab deployment verified: `rustjunosmcp` on LXC 609 against the vSRX fleet,
+4. Lab deployment verified: `rustjunosmcp` on the deployment container against the vSRX fleet,
    `rustpanosmcp` against the PAN-OS 12.1.5 lab firewall.

@@ -1,0 +1,27 @@
+[package]
+name        = "mecmcp-auth"
+description = "Vendor-neutral bearer-token authentication and scopes for mechub MCP servers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arc-swap   = { workspace = true }
+chrono     = { workspace = true }
+getrandom  = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+sha2       = { workspace = true }
+subtle     = { workspace = true }
+tempfile   = { workspace = true }
+thiserror  = { workspace = true }
+zeroize    = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
