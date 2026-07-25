@@ -2,8 +2,11 @@
 
 use crate::entry::TokenEntry;
 use crate::grant::{Grant, NoGrant};
+use crate::scope::ScopeSet;
 use crate::store::{StoreError, TokenStore};
+use crate::token::TokenSecret;
 use arc_swap::ArcSwap;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,6 +59,18 @@ pub enum FileError {
 ))]
 struct TokenDocument<G: Grant> {
     tokens: Vec<TokenEntry<G>>,
+}
+
+/// The names a token's scopes are allowed to reference.
+///
+/// Both registries are supplied by the caller so this crate stays
+/// vendor-neutral: each consuming server has its own device inventory and its
+/// own tool surface.
+pub struct KnownNames<'a> {
+    /// Device names present in the caller's inventory.
+    pub devices: &'a [String],
+    /// Tool names the caller's server actually implements.
+    pub tools: &'a [&'a str],
 }
 
 /// A token file plus the store parsed from it, swappable on reload.
@@ -120,6 +135,176 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
             source,
         })
     }
+
+    /// Add one scoped token and return its one-time plaintext.
+    ///
+    /// # Errors
+    /// Returns [`FileError`] if the name already exists, if the scopes reference
+    /// unknown devices or tools, or on I/O or validation failure.
+    pub fn add(
+        path: &Path,
+        name: &str,
+        devices: ScopeSet,
+        tools: ScopeSet,
+        known: &KnownNames<'_>,
+    ) -> Result<TokenSecret, FileError> {
+        Self::add_with_options(path, name, devices, tools, None, None, known)
+    }
+
+    /// Add one token with optional expiry and grant.
+    ///
+    /// # Errors
+    /// Returns [`FileError`] if the name already exists, if the scopes reference
+    /// unknown devices or tools, or on I/O or validation failure.
+    pub fn add_with_options(
+        path: &Path,
+        name: &str,
+        devices: ScopeSet,
+        tools: ScopeSet,
+        expires_at: Option<DateTime<Utc>>,
+        grant: Option<G>,
+        known: &KnownNames<'_>,
+    ) -> Result<TokenSecret, FileError> {
+        use crate::token::TokenSecret;
+
+        let current = if path.exists() {
+            Self::read_store(path)?
+        } else {
+            TokenStore::default()
+        };
+
+        if current.entries().iter().any(|entry| entry.name == name) {
+            return Err(FileError::Store {
+                path: path.to_path_buf(),
+                source: StoreError::Duplicate(format!("token '{name}' already exists")),
+            });
+        }
+
+        let (secret, digest) = TokenSecret::mint().map_err(|error| FileError::Store {
+            path: path.to_path_buf(),
+            source: StoreError::Entry(crate::entry::EntryError::Invalid(error.to_string())),
+        })?;
+
+        let mut entries = current.entries().to_vec();
+        entries.push(TokenEntry {
+            name: name.to_owned(),
+            digest,
+            devices,
+            tools,
+            created_at: Utc::now(),
+            expires_at,
+            grant,
+        });
+
+        let updated = TokenStore::try_new(entries).map_err(|source| FileError::Store {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        validate_references(&updated, known).map_err(|error| FileError::Store {
+            path: path.to_path_buf(),
+            source: StoreError::Entry(crate::entry::EntryError::Invalid(error)),
+        })?;
+
+        write_atomic(path, updated.entries())?;
+        Ok(secret)
+    }
+
+    /// Atomically replace one token digest while preserving its scopes.
+    ///
+    /// # Errors
+    /// Returns [`FileError`] if the named token does not exist, or on I/O or
+    /// validation failure.
+    pub fn rotate(
+        path: &Path,
+        name: &str,
+        known: &KnownNames<'_>,
+    ) -> Result<TokenSecret, FileError> {
+        use crate::token::TokenSecret;
+
+        let current = Self::read_store(path)?;
+
+        if !current.entries().iter().any(|entry| entry.name == name) {
+            return Err(FileError::Store {
+                path: path.to_path_buf(),
+                source: StoreError::Entry(crate::entry::EntryError::Invalid(format!(
+                    "token '{name}' does not exist"
+                ))),
+            });
+        }
+
+        let (secret, new_digest) = TokenSecret::mint().map_err(|error| FileError::Store {
+            path: path.to_path_buf(),
+            source: StoreError::Entry(crate::entry::EntryError::Invalid(error.to_string())),
+        })?;
+
+        let created_at = Utc::now();
+        let entries: Vec<TokenEntry<G>> = current
+            .entries()
+            .iter()
+            .map(|entry| {
+                if entry.name == name {
+                    TokenEntry {
+                        name: entry.name.clone(),
+                        digest: new_digest.clone(),
+                        devices: entry.devices.clone(),
+                        tools: entry.tools.clone(),
+                        created_at,
+                        expires_at: entry.expires_at,
+                        grant: entry.grant.clone(),
+                    }
+                } else {
+                    entry.clone()
+                }
+            })
+            .collect();
+
+        let updated = TokenStore::try_new(entries).map_err(|source| FileError::Store {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        validate_references(&updated, known).map_err(|error| FileError::Store {
+            path: path.to_path_buf(),
+            source: StoreError::Entry(crate::entry::EntryError::Invalid(error)),
+        })?;
+
+        write_atomic(path, updated.entries())?;
+        Ok(secret)
+    }
+
+    /// Idempotently revoke one named token.
+    ///
+    /// # Errors
+    /// Returns [`FileError`] on I/O or validation failure. Returns `Ok(false)`
+    /// if the token was not present.
+    pub fn revoke(
+        path: &Path,
+        name: &str,
+        known: &KnownNames<'_>,
+    ) -> Result<bool, FileError> {
+        let current = Self::read_store(path)?;
+        let mut entries = current.entries().to_vec();
+        let before = entries.len();
+        entries.retain(|entry| entry.name != name);
+        let removed = before != entries.len();
+
+        if removed {
+            let updated = TokenStore::try_new(entries).map_err(|source| FileError::Store {
+                path: path.to_path_buf(),
+                source,
+            })?;
+
+            validate_references(&updated, known).map_err(|error| FileError::Store {
+                path: path.to_path_buf(),
+                source: StoreError::Entry(crate::entry::EntryError::Invalid(error)),
+            })?;
+
+            write_atomic(path, updated.entries())?;
+        }
+
+        Ok(removed)
+    }
 }
 
 /// Write entries to `path` atomically, via a same-directory temporary file.
@@ -172,6 +357,43 @@ pub fn write_atomic<G: Grant + serde::Serialize>(
         path: path.to_path_buf(),
         source: error.error,
     })?;
+    Ok(())
+}
+
+/// Validate device and tool references against the known registries.
+///
+/// Reference-validation is deliberately NOT run during [`TokenStoreFile::load`],
+/// only during the mutating operations that mint new scopes. Running it on
+/// every load would mean a device decommissioned from the inventory would stop
+/// every token in the file from loading and take authentication offline
+/// server-wide. Catching a typo when a token is minted is worth it; refusing to
+/// start because inventory drifted is not.
+fn validate_references<G: Grant>(
+    store: &TokenStore<G>,
+    known: &KnownNames<'_>,
+) -> Result<(), String> {
+    for entry in store.entries() {
+        if let ScopeSet::Allowlist(devices) = &entry.devices {
+            for device in devices {
+                if !known.devices.iter().any(|known| known == device) {
+                    return Err(format!(
+                        "token '{}' references unknown device '{device}'",
+                        entry.name
+                    ));
+                }
+            }
+        }
+        if let ScopeSet::Allowlist(tools) = &entry.tools {
+            for tool in tools {
+                if !known.tools.iter().any(|known| known == tool) {
+                    return Err(format!(
+                        "token '{}' references unknown tool '{tool}'",
+                        entry.name
+                    ));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -377,5 +599,310 @@ mod tests {
         write_atomic(&path, file.store().entries()).expect("write");
         let reloaded: TokenStoreFile = TokenStoreFile::load(&path).expect("reload");
         assert_eq!(reloaded.store().len(), 2);
+    }
+
+    fn known_devices() -> Vec<String> {
+        vec!["edge-fw".to_owned(), "core-fw".to_owned()]
+    }
+
+    #[test]
+    fn add_then_load_authenticates_the_minted_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: &known_devices(),
+            tools: &["get_junos_config"],
+        };
+
+        let secret = TokenStoreFile::<NoGrant>::add(
+            &path,
+            "lab",
+            ScopeSet::Allowlist(vec!["edge-fw".to_owned()]),
+            ScopeSet::Allowlist(vec!["get_junos_config".to_owned()]),
+            &known,
+        )
+        .expect("add");
+
+        let file: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load");
+        let store = file.store();
+        let entry = store.authenticate(secret.expose_secret()).expect("auth");
+        assert_eq!(entry.name, "lab");
+    }
+
+    #[test]
+    fn add_with_duplicate_name_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: &known_devices(),
+            tools: &["get_junos_config"],
+        };
+
+        TokenStoreFile::<NoGrant>::add(
+            &path,
+            "lab",
+            ScopeSet::Wildcard,
+            ScopeSet::Wildcard,
+            &known,
+        )
+        .expect("first add");
+
+        let result = TokenStoreFile::<NoGrant>::add(
+            &path,
+            "lab",
+            ScopeSet::Wildcard,
+            ScopeSet::Wildcard,
+            &known,
+        );
+
+        match result {
+            Err(err) => {
+                assert!(err.to_string().contains("lab"));
+                assert!(err.to_string().contains("already exists"));
+            }
+            Ok(_) => panic!("second add should fail"),
+        }
+    }
+
+    #[test]
+    fn add_naming_unknown_device_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: &known_devices(),
+            tools: &["get_junos_config"],
+        };
+
+        let result = TokenStoreFile::<NoGrant>::add(
+            &path,
+            "lab",
+            ScopeSet::Allowlist(vec!["missing-fw".to_owned()]),
+            ScopeSet::Wildcard,
+            &known,
+        );
+
+        match result {
+            Err(err) => {
+                assert!(err.to_string().contains("missing-fw"));
+                assert!(err.to_string().contains("unknown device"));
+            }
+            Ok(_) => panic!("should fail"),
+        }
+    }
+
+    #[test]
+    fn add_naming_unknown_tool_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: &known_devices(),
+            tools: &["get_junos_config"],
+        };
+
+        let result = TokenStoreFile::<NoGrant>::add(
+            &path,
+            "lab",
+            ScopeSet::Wildcard,
+            ScopeSet::Allowlist(vec!["not_a_tool".to_owned()]),
+            &known,
+        );
+
+        match result {
+            Err(err) => {
+                assert!(err.to_string().contains("not_a_tool"));
+                assert!(err.to_string().contains("unknown tool"));
+            }
+            Ok(_) => panic!("should fail"),
+        }
+    }
+
+    #[test]
+    fn add_with_wildcard_scopes_passes_even_when_known_lists_are_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: &[],
+            tools: &[],
+        };
+
+        let secret = TokenStoreFile::<NoGrant>::add(
+            &path,
+            "lab",
+            ScopeSet::Wildcard,
+            ScopeSet::Wildcard,
+            &known,
+        )
+        .expect("wildcard scopes bypass reference validation");
+
+        let file: TokenStoreFile = TokenStoreFile::load(&path).expect("load");
+        assert!(file.store().authenticate(secret.expose_secret()).is_some());
+    }
+
+    #[test]
+    fn rotate_preserves_scopes_expiry_and_grant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: &known_devices(),
+            tools: &["get_junos_config", "load_and_commit_config"],
+        };
+
+        // Use a far-future timestamp so the token is not expired
+        let expires_at = DateTime::from_timestamp(4_102_444_800, 0);
+
+        let original_secret = TokenStoreFile::<NoGrant>::add_with_options(
+            &path,
+            "lab",
+            ScopeSet::Allowlist(vec!["edge-fw".to_owned()]),
+            ScopeSet::Allowlist(vec!["get_junos_config".to_owned()]),
+            expires_at,
+            None,
+            &known,
+        )
+        .expect("add");
+
+        let before: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load before rotate");
+        let store_before = before.store();
+        let entry_before = store_before
+            .entries()
+            .iter()
+            .find(|e| e.name == "lab")
+            .expect("entry");
+
+        let rotated_secret = TokenStoreFile::<NoGrant>::rotate(&path, "lab", &known).expect("rotate");
+
+        let after: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load after rotate");
+        let store_after = after.store();
+        let entry_after = store_after
+            .entries()
+            .iter()
+            .find(|e| e.name == "lab")
+            .expect("entry");
+
+        // Old secret must not work
+        assert!(
+            store_after.authenticate(original_secret.expose_secret()).is_none(),
+            "old secret must be invalidated"
+        );
+
+        // New secret must work
+        assert!(
+            store_after.authenticate(rotated_secret.expose_secret()).is_some(),
+            "new secret must authenticate"
+        );
+
+        // All other fields must be preserved
+        assert_eq!(entry_after.devices, entry_before.devices, "devices must be preserved");
+        assert_eq!(entry_after.tools, entry_before.tools, "tools must be preserved");
+        assert_eq!(entry_after.expires_at, entry_before.expires_at, "expires_at must be preserved");
+        assert_eq!(entry_after.grant, entry_before.grant, "grant must be preserved");
+
+        // created_at should be updated
+        assert!(
+            entry_after.created_at >= entry_before.created_at,
+            "created_at should be refreshed"
+        );
+    }
+
+    #[test]
+    fn rotate_on_missing_name_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: &known_devices(),
+            tools: &["get_junos_config"],
+        };
+
+        TokenStoreFile::<NoGrant>::add(
+            &path,
+            "lab",
+            ScopeSet::Wildcard,
+            ScopeSet::Wildcard,
+            &known,
+        )
+        .expect("add");
+
+        let result = TokenStoreFile::<NoGrant>::rotate(&path, "missing", &known);
+        match result {
+            Err(err) => {
+                assert!(err.to_string().contains("missing"));
+                assert!(err.to_string().contains("does not exist"));
+            }
+            Ok(_) => panic!("should fail"),
+        }
+    }
+
+    #[test]
+    fn revoke_removes_token_and_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: &known_devices(),
+            tools: &["get_junos_config"],
+        };
+
+        let secret = TokenStoreFile::<NoGrant>::add(
+            &path,
+            "lab",
+            ScopeSet::Wildcard,
+            ScopeSet::Wildcard,
+            &known,
+        )
+        .expect("add");
+
+        let removed = TokenStoreFile::<NoGrant>::revoke(&path, "lab", &known).expect("revoke");
+        assert!(removed, "first revoke should return true");
+
+        let file: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load");
+        let store = file.store();
+        assert!(
+            store.authenticate(secret.expose_secret()).is_none(),
+            "revoked token must not authenticate"
+        );
+
+        let removed_again = TokenStoreFile::<NoGrant>::revoke(&path, "lab", &known).expect("revoke again");
+        assert!(!removed_again, "second revoke should return false");
+    }
+
+    #[test]
+    fn lifecycle_operations_write_mode_0600_with_no_plaintext() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: &known_devices(),
+            tools: &["get_junos_config"],
+        };
+
+        let secret = TokenStoreFile::<NoGrant>::add(
+            &path,
+            "lab",
+            ScopeSet::Wildcard,
+            ScopeSet::Wildcard,
+            &known,
+        )
+        .expect("add");
+
+        let bytes = std::fs::read(&path).expect("read file");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            !body.contains(secret.expose_secret()),
+            "plaintext secret must never appear in file"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(&path).expect("metadata");
+            let mode = metadata.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "file must be mode 0600");
+        }
+
+        let rotated = TokenStoreFile::<NoGrant>::rotate(&path, "lab", &known).expect("rotate");
+        let bytes_after = std::fs::read(&path).expect("read after rotate");
+        let body_after = String::from_utf8_lossy(&bytes_after);
+        assert!(
+            !body_after.contains(rotated.expose_secret()),
+            "rotated plaintext must never appear in file"
+        );
     }
 }
