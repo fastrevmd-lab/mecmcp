@@ -531,6 +531,7 @@ fn rustix_getuid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grant::GrantError;
     use std::io::Write;
 
     const TWO_TOKENS: &str = r#"{
@@ -1322,5 +1323,112 @@ mod tests {
         let entry_after = store_after.entries().iter().find(|e| e.name == "lab").expect("entry after");
 
         assert_eq!(entry_after.created_at, created_at_before, "created_at must not be refreshed");
+    }
+
+    #[test]
+    fn set_scopes_with_both_none_is_a_validating_no_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: &known_devices(),
+            tools: &["get_junos_config"],
+        };
+
+        let expires_at = DateTime::from_timestamp(4_102_444_800, 0);
+
+        let secret = TokenStoreFile::<NoGrant>::add_with_options(
+            &path,
+            "lab",
+            ScopeSet::Allowlist(vec!["edge-fw".to_owned()]),
+            ScopeSet::Allowlist(vec!["get_junos_config".to_owned()]),
+            expires_at,
+            None,
+            &known,
+        )
+        .expect("add");
+
+        let before: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load before");
+        let store_before = before.store();
+        let entry_before = store_before.entries().iter().find(|e| e.name == "lab").expect("entry before");
+
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known)
+            .expect("set_scopes with both None");
+
+        let after: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load after");
+        let store_after = after.store();
+        let entry_after = store_after.entries().iter().find(|e| e.name == "lab").expect("entry after");
+
+        assert_eq!(entry_after.digest, entry_before.digest);
+        assert_eq!(entry_after.devices, entry_before.devices);
+        assert_eq!(entry_after.tools, entry_before.tools);
+        assert_eq!(entry_after.created_at, entry_before.created_at);
+        assert_eq!(entry_after.expires_at, entry_before.expires_at);
+        assert_eq!(entry_after.grant, entry_before.grant);
+
+        assert!(
+            store_after.authenticate(secret.expose_secret()).is_some(),
+            "original secret must still authenticate"
+        );
+    }
+
+    #[test]
+    fn set_scopes_preserves_a_non_default_grant() {
+        #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        struct TestGrant {
+            subjects: Vec<String>,
+        }
+        impl Grant for TestGrant {
+            type Action = ();
+            fn allows_action(&self, _action: ()) -> bool {
+                true
+            }
+            fn allows_subject(&self, subject: &str) -> bool {
+                self.subjects.iter().any(|s| s == subject)
+            }
+            fn validate(&self) -> Result<(), GrantError> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: &known_devices(),
+            tools: &["get_junos_config", "load_and_commit_config"],
+        };
+
+        let grant = TestGrant {
+            subjects: vec!["/configuration".to_owned(), "/system".to_owned()],
+        };
+
+        TokenStoreFile::<TestGrant>::add_with_options(
+            &path,
+            "writer",
+            ScopeSet::Wildcard,
+            ScopeSet::Wildcard,
+            None,
+            Some(grant.clone()),
+            &known,
+        )
+        .expect("add");
+
+        TokenStoreFile::<TestGrant>::set_scopes(
+            &path,
+            "writer",
+            None,
+            Some(ScopeSet::Allowlist(vec!["load_and_commit_config".to_owned()])),
+            &known,
+        )
+        .expect("set_scopes");
+
+        let after: TokenStoreFile<TestGrant> = TokenStoreFile::load(&path).expect("load after");
+        let store_after = after.store();
+        let entry_after = store_after.entries().iter().find(|e| e.name == "writer").expect("entry after");
+
+        let grant_after = entry_after.grant.as_ref().expect("grant must be present");
+        assert_eq!(grant_after, &grant, "grant must be preserved exactly");
+        assert!(grant_after.allows_subject("/configuration"));
+        assert!(grant_after.allows_subject("/system"));
+        assert!(!grant_after.allows_subject("/other"));
     }
 }
