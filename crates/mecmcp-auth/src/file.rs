@@ -51,6 +51,14 @@ pub enum FileError {
     },
 }
 
+/// The envelope version written by the first two consuming servers.
+///
+/// Server A accepted and wrote `1` (required, no default).
+/// Server B accepted `1` or `2` and wrote `2`.
+/// Files our own 0.1.0–0.1.2 releases wrote had no version field at all,
+/// so we must deserialize that case successfully and treat it as this default.
+const DEFAULT_STORE_VERSION: u32 = 1;
+
 /// On-disk document shape. Both existing servers use a `tokens` array.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(bound(
@@ -58,7 +66,19 @@ pub enum FileError {
     deserialize = "G: Grant + Deserialize<'de>"
 ))]
 struct TokenDocument<G: Grant> {
+    /// Envelope version, for rollback-safety to previous consuming binaries.
+    ///
+    /// Files written by our own 0.1.0–0.1.2 releases omitted this field;
+    /// missing is treated as [`DEFAULT_STORE_VERSION`].
+    #[serde(default = "default_version")]
+    version: u32,
+    /// Token entries.
     tokens: Vec<TokenEntry<G>>,
+}
+
+/// Serde default for the missing version field.
+fn default_version() -> u32 {
+    DEFAULT_STORE_VERSION
 }
 
 /// The names a token's scopes are allowed to reference.
@@ -78,6 +98,8 @@ pub struct KnownNames<'a> {
 pub struct TokenStoreFile<G: Grant = NoGrant> {
     path: PathBuf,
     store: ArcSwap<TokenStore<G>>,
+    /// The version that was read from the file; preserved on write.
+    version: ArcSwap<u32>,
 }
 
 impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G> {
@@ -87,10 +109,11 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
     /// Returns [`FileError`] on I/O failure, malformed JSON, unsafe
     /// permissions, or an invalid store.
     pub fn load(path: &Path) -> Result<Self, FileError> {
-        let store = Self::read_store(path)?;
+        let (store, version) = Self::read_store(path)?;
         Ok(Self {
             path: path.to_path_buf(),
             store: ArcSwap::from_pointee(store),
+            version: ArcSwap::from_pointee(version),
         })
     }
 
@@ -114,12 +137,13 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
     /// # Errors
     /// Returns [`FileError`] if the new contents are unusable.
     pub fn reload(&self) -> Result<(), FileError> {
-        let store = Self::read_store(&self.path)?;
+        let (store, version) = Self::read_store(&self.path)?;
         self.store.store(Arc::new(store));
+        self.version.store(Arc::new(version));
         Ok(())
     }
 
-    fn read_store(path: &Path) -> Result<TokenStore<G>, FileError> {
+    fn read_store(path: &Path) -> Result<(TokenStore<G>, u32), FileError> {
         check_permissions(path)?;
         let body = std::fs::read_to_string(path).map_err(|source| FileError::Io {
             path: path.to_path_buf(),
@@ -130,10 +154,25 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
                 path: path.to_path_buf(),
                 source,
             })?;
-        TokenStore::try_new(document.tokens).map_err(|source| FileError::Store {
+
+        // Validate version: accept 1 and 2 only
+        if document.version != 1 && document.version != 2 {
+            return Err(FileError::Store {
+                path: path.to_path_buf(),
+                source: StoreError::Entry(crate::entry::EntryError::Invalid(
+                    format!(
+                        "unsupported store version {}, supported versions: 1, 2",
+                        document.version
+                    )
+                )),
+            });
+        }
+
+        let store = TokenStore::try_new(document.tokens).map_err(|source| FileError::Store {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        Ok((store, document.version))
     }
 
     /// Add one scoped token and return its one-time plaintext.
@@ -167,10 +206,10 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
     ) -> Result<TokenSecret, FileError> {
         use crate::token::TokenSecret;
 
-        let current = if path.exists() {
+        let (current, version) = if path.exists() {
             Self::read_store(path)?
         } else {
-            TokenStore::default()
+            (TokenStore::default(), DEFAULT_STORE_VERSION)
         };
 
         if current.entries().iter().any(|entry| entry.name == name) {
@@ -206,7 +245,7 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
             source: StoreError::Entry(crate::entry::EntryError::Invalid(error)),
         })?;
 
-        write_atomic(path, updated.entries())?;
+        write_atomic(path, updated.entries(), version)?;
         Ok(secret)
     }
 
@@ -222,7 +261,7 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
     ) -> Result<TokenSecret, FileError> {
         use crate::token::TokenSecret;
 
-        let current = Self::read_store(path)?;
+        let (current, version) = Self::read_store(path)?;
 
         if !current.entries().iter().any(|entry| entry.name == name) {
             return Err(FileError::Store {
@@ -269,7 +308,7 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
             source: StoreError::Entry(crate::entry::EntryError::Invalid(error)),
         })?;
 
-        write_atomic(path, updated.entries())?;
+        write_atomic(path, updated.entries(), version)?;
         Ok(secret)
     }
 
@@ -290,7 +329,7 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
         tools: Option<ScopeSet>,
         known: &KnownNames<'_>,
     ) -> Result<(), FileError> {
-        let current = Self::read_store(path)?;
+        let (current, version) = Self::read_store(path)?;
 
         if !current.entries().iter().any(|entry| entry.name == name) {
             return Err(FileError::Store {
@@ -331,7 +370,7 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
             source: StoreError::Entry(crate::entry::EntryError::Invalid(error)),
         })?;
 
-        write_atomic(path, updated.entries())?;
+        write_atomic(path, updated.entries(), version)?;
         Ok(())
     }
 
@@ -345,7 +384,7 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
         name: &str,
         known: &KnownNames<'_>,
     ) -> Result<bool, FileError> {
-        let current = Self::read_store(path)?;
+        let (current, version) = Self::read_store(path)?;
         let mut entries = current.entries().to_vec();
         let before = entries.len();
         entries.retain(|entry| entry.name != name);
@@ -362,7 +401,7 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
                 source: StoreError::Entry(crate::entry::EntryError::Invalid(error)),
             })?;
 
-            write_atomic(path, updated.entries())?;
+            write_atomic(path, updated.entries(), version)?;
         }
 
         Ok(removed)
@@ -371,14 +410,19 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
 
 /// Write entries to `path` atomically, via a same-directory temporary file.
 ///
+/// The version is preserved from the file that was read, so a previous
+/// consuming binary can still parse our output.
+///
 /// # Errors
 /// Returns [`FileError`] on serialization or I/O failure.
 pub fn write_atomic<G: Grant + serde::Serialize>(
     path: &Path,
     entries: &[TokenEntry<G>],
+    version: u32,
 ) -> Result<(), FileError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let document = TokenDocument {
+        version,
         tokens: entries.to_vec(),
     };
     let body = serde_json::to_vec_pretty(&document).map_err(|source| FileError::Parse {
@@ -659,7 +703,8 @@ mod tests {
             let source = write_file(&dir, TWO_TOKENS);
             TokenStoreFile::load(&source).expect("load")
         };
-        write_atomic(&path, file.store().entries()).expect("write");
+        let version = **file.version.load();
+        write_atomic(&path, file.store().entries(), version).expect("write");
         let reloaded: TokenStoreFile = TokenStoreFile::load(&path).expect("reload");
         assert_eq!(reloaded.store().len(), 2);
     }
@@ -1430,5 +1475,203 @@ mod tests {
         assert!(grant_after.allows_subject("/configuration"));
         assert!(grant_after.allows_subject("/system"));
         assert!(!grant_after.allows_subject("/other"));
+    }
+
+    #[test]
+    fn version_1_round_trips_through_lifecycle_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let v1_file = r#"{
+            "version": 1,
+            "tokens": [
+                {
+                    "name": "lab",
+                    "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+                    "devices": ["*"],
+                    "tools": ["*"],
+                    "created_at_unix": 1783850400
+                }
+            ]
+        }"#;
+        let path = write_file(&dir, v1_file);
+        let known = KnownNames {
+            devices: &known_devices(),
+            tools: &["get_junos_config"],
+        };
+
+        // Run a lifecycle op (set_scopes is cheapest)
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known).expect("set_scopes");
+
+        // Reload the raw JSON and verify version is still 1
+        let body = std::fs::read_to_string(&path).expect("read");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+        assert_eq!(parsed["version"], 1, "version 1 must be preserved, not changed");
+    }
+
+    #[test]
+    fn version_2_round_trips_through_lifecycle_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let v2_file = r#"{
+            "version": 2,
+            "tokens": [
+                {
+                    "name": "lab",
+                    "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+                    "devices": ["*"],
+                    "tools": ["*"],
+                    "created_at_unix": 1783850400
+                }
+            ]
+        }"#;
+        let path = write_file(&dir, v2_file);
+        let known = KnownNames {
+            devices: &known_devices(),
+            tools: &["get_junos_config"],
+        };
+
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known).expect("set_scopes");
+
+        let body = std::fs::read_to_string(&path).expect("read");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+        assert_eq!(parsed["version"], 2, "version 2 must be preserved as 2, NOT normalised to 1");
+    }
+
+    #[test]
+    fn missing_version_loads_and_writes_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let no_version_file = r#"{
+            "tokens": [
+                {
+                    "name": "lab",
+                    "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+                    "devices": ["*"],
+                    "tools": ["*"],
+                    "created_at_unix": 1783850400
+                }
+            ]
+        }"#;
+        let path = write_file(&dir, no_version_file);
+
+        // Must load successfully
+        let file: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load");
+        assert_eq!(file.store().len(), 1);
+
+        // After a lifecycle op, version field must appear with DEFAULT_STORE_VERSION
+        let known = KnownNames {
+            devices: &known_devices(),
+            tools: &["get_junos_config"],
+        };
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known).expect("set_scopes");
+
+        let body = std::fs::read_to_string(&path).expect("read");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+        assert_eq!(
+            parsed["version"], DEFAULT_STORE_VERSION,
+            "missing version must write as DEFAULT_STORE_VERSION"
+        );
+    }
+
+    #[test]
+    fn unsupported_version_3_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let v3_file = r#"{
+            "version": 3,
+            "tokens": []
+        }"#;
+        let path = write_file(&dir, v3_file);
+
+        let result = TokenStoreFile::<NoGrant>::load(&path);
+        match result {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("3"), "error must name the found version");
+                assert!(msg.contains("unsupported"), "error must say unsupported");
+            }
+            Ok(_) => panic!("version 3 should be rejected"),
+        }
+    }
+
+    #[test]
+    fn unsupported_version_0_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let v0_file = r#"{
+            "version": 0,
+            "tokens": []
+        }"#;
+        let path = write_file(&dir, v0_file);
+
+        let result = TokenStoreFile::<NoGrant>::load(&path);
+        match result {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("0"), "error must name the found version");
+                assert!(msg.contains("unsupported"), "error must say unsupported");
+            }
+            Ok(_) => panic!("version 0 should be rejected"),
+        }
+    }
+
+    #[test]
+    fn brand_new_file_contains_version_1() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: &known_devices(),
+            tools: &["get_junos_config"],
+        };
+
+        TokenStoreFile::<NoGrant>::add(
+            &path,
+            "lab",
+            ScopeSet::Wildcard,
+            ScopeSet::Wildcard,
+            &known,
+        )
+        .expect("add");
+
+        let body = std::fs::read_to_string(&path).expect("read");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+        assert_eq!(parsed["version"], 1, "brand-new file must contain version 1");
+    }
+
+    #[test]
+    fn version_2_file_still_parses_under_strict_envelope() {
+        // This is the real regression gate: after a lifecycle op on a v2 file,
+        // the resulting JSON must still parse under a strict struct that mirrors
+        // the old server envelope with deny_unknown_fields.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let v2_file = r#"{
+            "version": 2,
+            "tokens": [
+                {
+                    "name": "lab",
+                    "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+                    "devices": ["*"],
+                    "tools": ["*"],
+                    "created_at_unix": 1783850400
+                }
+            ]
+        }"#;
+        let path = write_file(&dir, v2_file);
+        let known = KnownNames {
+            devices: &known_devices(),
+            tools: &["get_junos_config"],
+        };
+
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known).expect("set_scopes");
+
+        let bytes = std::fs::read(&path).expect("read file");
+
+        // The strict envelope that mimics the old server's deserialization
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StrictEnvelope {
+            version: u32,
+            #[allow(dead_code)]
+            tokens: serde_json::Value,
+        }
+
+        let envelope: StrictEnvelope = serde_json::from_slice(&bytes)
+            .expect("v2 file must still parse under strict deny_unknown_fields envelope");
+        assert_eq!(envelope.version, 2, "version must be 2 in the strict parse");
     }
 }
