@@ -14,9 +14,9 @@ Copied verbatim from [`PLAN.md`](../../../PLAN.md). Every task's requirements im
 
 - Edition 2024, MSRV 1.88.
 - Workspace lints: `missing_docs = "warn"`, `unsafe_code = "forbid"`, `clippy::all = "warn"` (priority -1), `dbg_macro = "deny"`, `todo = "deny"`, `unwrap_used = "warn"`.
-- No breaking change to on-disk `tokens.json`. Live deployments exist (LXC 609, `/etc/jmcp/tokens.json`). Field renames ship as serde aliases; the old spelling keeps working and stays tested.
+- No breaking change to on-disk `tokens.json`. Live deployments exist (the deployment container, `/etc/jmcp/tokens.json`). Field renames ship as serde aliases; the old spelling keeps working and stays tested.
 - No breaking change to the MCP tool surface of either server.
-- The deployed systemd override on LXC 609 must keep working unchanged: `0.0.0.0:30031`, `--allow-insecure-bind`, `--allowed-host 192.168.1.194`, no `--inventory-readonly`.
+- The deployed systemd override on the deployment container must keep working unchanged: `0.0.0.0:30031`, `--allow-insecure-bind`, `--allowed-host <server-lan-ip>`, no `--inventory-readonly`.
 - Licence: MIT, single. `license = "MIT"` on every crate.
 - `mecmcp-auth` must compile with **neither** vendor server as a dependency, and must not contain the strings `xpath`, `XPath`, `junos`, `panos`, or `routers` outside of serde aliases and doc comments.
 - Consumed as a git dependency pinned by tag: `tag = "auth-v0.1.0"`.
@@ -1976,10 +1976,10 @@ git commit -m "feat(auth): token file load, permission checks, hot reload, atomi
 - Produces: a regression gate proving neither deployment breaks. No new API.
 
 **Before writing the fixtures:** capture the *shape* of the live files without
-their digests. On LXC 609:
+their digests. On the deployment container:
 
 ```bash
-ssh root@pve3.mechub.org "pct exec 609 -- jq '.tokens[0] | keys' /etc/jmcp/tokens.json"
+ssh <proxmox-host> "<container-exec> jq '.tokens[0] | keys' /etc/jmcp/tokens.json"
 ```
 
 Reproduce every key that appears, with fabricated digests. **Never copy a real
@@ -2160,7 +2160,7 @@ fn a_junos_wildcard_tool_scope_still_excludes_write_tools() {
 > tool scope; after migration it does not. Every deployed token that relies on a
 > wildcard scope to call `load_and_commit_config` must be re-minted with an
 > explicit tool list **before** Task 10 is deployed. Enumerate affected tokens
-> with `rust-junosmcp token list` on LXC 609 and record them in the migration
+> with `rust-junosmcp token list` on the deployment container and record them in the migration
 > note required by Task 10, Step 4.
 
 - [ ] **Step 3: Run the tests to verify they fail, then pass**
@@ -2435,7 +2435,7 @@ non-write tools; write tools must be named explicitly.
 Enumerate before upgrading:
 
 ```bash
-ssh root@pve3.mechub.org "pct exec 609 -- rust-junosmcp token list"
+ssh <proxmox-host> "<container-exec> rust-junosmcp token list"
 ```
 
 Any token with a `*` tool scope that is used for configuration change must be
@@ -2467,21 +2467,21 @@ behaviour, with the change noted in the commit message.
 
 ```bash
 # non-destructive: validate a copy of the live file
-scp root@pve3.mechub.org:/tmp/tokens-copy.json /tmp/
+scp <proxmox-host>:/tmp/tokens-copy.json /tmp/
 cargo run -p rust-junosmcp -- validate-config --tokens /tmp/tokens-copy.json
 ```
 
-Expected: same token count and scopes as `rust-junosmcp token list` on LXC 609.
+Expected: same token count and scopes as `rust-junosmcp token list` on the deployment container.
 
 Then deploy per the standard procedure and confirm the systemd override is
 intact:
 
 ```bash
-ssh root@pve3.mechub.org "pct exec 609 -- systemctl cat rust-junosmcp.service | grep -A5 'override.conf'"
-ssh root@pve3.mechub.org "pct exec 609 -- systemctl status rust-junosmcp.service"
+ssh <proxmox-host> "<container-exec> systemctl cat rust-junosmcp.service | grep -A5 'override.conf'"
+ssh <proxmox-host> "<container-exec> systemctl status rust-junosmcp.service"
 ```
 
-Expected: `0.0.0.0:30031`, `--allow-insecure-bind`, `--allowed-host 192.168.1.194`,
+Expected: `0.0.0.0:30031`, `--allow-insecure-bind`, `--allowed-host <server-lan-ip>`,
 service active. Then confirm end to end with an MCP call against a lab device.
 
 - [ ] **Step 7: Commit**
@@ -2505,5 +2505,5 @@ Phase 1 is done when all of the following hold:
 - [ ] `rustjunosmcp` has token expiry, scope bounds, and name validation it did not have before.
 - [ ] `grep -rniE 'xpath|junos|panos' crates/mecmcp-auth/src/` returns matches only in doc comments and serde aliases.
 - [ ] `mecmcp` tagged `auth-v0.1.0`; both consumers pin that tag.
-- [ ] LXC 609 running the migrated `rustjunosmcp` with its systemd override intact, verified against a lab vSRX.
+- [ ] the deployment container running the migrated `rustjunosmcp` with its systemd override intact, verified against a lab vSRX.
 - [ ] Migration note published for the wildcard tool-scope tightening, with affected tokens re-minted.

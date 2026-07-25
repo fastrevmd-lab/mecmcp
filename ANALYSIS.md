@@ -60,7 +60,7 @@ duplication: a fix applied to one server silently does not reach the other.
 ### Concrete divergences in the auth layer
 
 These matter because both servers have **deployed `tokens.json` files in
-production** (`/etc/jmcp/tokens.json` on LXC 609), so extraction must preserve
+production** (`/etc/jmcp/tokens.json` on the deployment container), so extraction must preserve
 on-disk compatibility:
 
 | Field | rustjunosmcp | rustpanosmcp |
@@ -188,5 +188,5 @@ The LOC reduction is secondary. The primary effects are:
    is therefore a separate repo consumed as a tagged git dependency.
 3. **Edition/MSRV alignment.** rustjunosmcp must move to edition 2024 / MSRV
    1.88 and adopt the workspace lint set before it can consume the crates.
-4. **`--inventory-readonly` and the deployed systemd override** on LXC 609 must
+4. **`--inventory-readonly` and the deployed systemd override** on the deployment container must
    keep working unchanged through every phase.
