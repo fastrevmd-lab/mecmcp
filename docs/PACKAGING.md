@@ -34,6 +34,39 @@ before being mandated. See §5.
 **Pin the digest at adoption time**, by resolving the tag then — not by copying a
 digest out of this document, which is stale the moment it is written.
 
+### Check this before adopting distroless: does the server spawn processes?
+
+**Distroless presumes the binary is the whole program.** There is no shell and
+there are no utilities, so anything reached through `Command::new` is simply
+absent at run time — and it fails when that code path is first exercised, not at
+build or start, which is the worst possible time to find out.
+
+Before moving a repo to distroless, run:
+
+```bash
+grep -rn "Command::new" --include='*.rs' <crate>/src/
+```
+
+and account for every hit in non-test code.
+
+This is not hypothetical. `rustjunosmcp` cannot currently adopt distroless:
+
+| Path | Spawns | Tools that would break |
+|---|---|---|
+| `tools/transfer_file.rs` | `scp` | `transfer_file`, `fetch_file` |
+| `workflows/support_bundle/mod.rs` | `tar` | `collect_jtac_support_bundle` |
+
+Its Dockerfile installs `openssh-client` precisely for this. `rustpanosmcp` has no
+such paths, which is why the identical move succeeded there.
+
+A server in this position has two honest options: move the spawned work into the
+binary (SFTP over the SSH connection it already holds; a Rust archive crate
+instead of `tar`), which is worth doing anyway because it removes process spawns
+from a credential-holding server — or stay on a slim distro base at the same
+distro generation as its LXC, and revisit. Embedding static copies of the
+utilities is not an option: it restores the attack surface distroless exists to
+remove.
+
 ### The glibc constraint
 
 A glibc binary runs on the same or newer glibc, never older. So:
@@ -105,23 +138,25 @@ comment between two commands, so anyone pasting the block walks into it. Either
 ship only the example and fail with an explicit "no devices configured" message,
 or write a minimal valid config that starts.
 
-**Ship a config example inside the archive.** `rustjunosmcp` ships
-`devices.json.example`; `rust-panosmcp` does not, and its schema differs from the
-Junos one, so a tarball user cannot discover the shape without leaving the
-artifact and reading the repo.
+**Ship a config example inside the archive.** *(Fixed in rustpanosmcp#48 — kept
+as a rule for new repos.)* `rustjunosmcp` ships `devices.json.example`;
+`rust-panosmcp` did not, and its schema differs from the Junos one, so a tarball
+user could not discover the shape without leaving the artifact and reading the
+repo.
 
 **README commands must match the archive.** `rust-panosmcp`'s README told users
 to `cd rust-panosmcp-v<VER>-x86_64-unknown-linux-gnu` and install
 `rust-panosmcp` from the archive root; the archive extracts to
 `rust-panosmcp-v<VER>/` and puts the binary in `bin/`. Both commands failed
-verbatim. **Verify the install section against a real archive before each
-release**, or generate the paths.
+verbatim. *(Fixed in rustpanosmcp#48.)* **Verify the install section against a
+real archive before each release**, or generate the paths — this is the rule that
+keeps it fixed.
 
-**Minting a token should not require full runtime credentials.**
-`rust-panosmcp`'s `token add` resolves the whole inventory, so every device's
-API-key environment variable must be set before a token can be created — even
-though minting never contacts a device. That blocks an operator setting up before
-credentials are provisioned.
+**Minting a token should not require full runtime credentials.** *(Fixed in
+rustpanosmcp#48 via a name-only inventory load.)* `token add` resolved the whole
+inventory, so every device's API-key environment variable had to be set before a
+token could be created — even though minting never contacts a device. That blocks
+an operator setting up before credentials are provisioned.
 
 ---
 
@@ -151,6 +186,8 @@ the standard.
 
 For a new repo, or one being brought into line:
 
+- [ ] `grep -rn "Command::new" --include='*.rs' <crate>/src/` accounted for —
+      distroless has no shell or utilities, so a spawn is a blocker (see §1)
 - [ ] Runtime `gcr.io/distroless/cc-debian13:nonroot`, digest-pinned
 - [ ] Builder pinned from `rust-toolchain.toml`, digest-pinned, distro generation
       not newer than the runtime
