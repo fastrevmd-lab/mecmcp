@@ -67,16 +67,5 @@ jobs:
       - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@1.88.0
 
-      # Library targets only, deliberately — not --all-targets.
-      #
-      # The MSRV promises that a *consumer* can build this crate at 1.88, and a
-      # consumer compiles the library, never its tests. The test code currently
-      # needs a newer toolchain: 27 sites construct `KnownNames { devices:
-      # Some(&["x".to_owned()]) }` inline, which is E0716 "temporary value
-      # dropped while borrowed" on 1.88 and only compiles on later rustc.
-      #
-      # Gating on that would fail CI over something no consumer depends on. The
-      # library itself checks clean at 1.88 — verified — so this is the honest
-      # scope for the guarantee being made.
-      - name: Check library targets at MSRV
-        run: cargo check --workspace
+      - name: Check workspace at MSRV
+        run: cargo check --workspace --all-targets
