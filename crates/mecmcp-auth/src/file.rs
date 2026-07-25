@@ -93,6 +93,22 @@ pub struct KnownNames<'a> {
     pub tools: &'a [&'a str],
 }
 
+/// Validate that a version is supported (1 or 2).
+///
+/// Single source of truth for supported versions, called from both read and
+/// write boundaries so the two can never drift apart.
+fn check_supported_version(version: u32, path: &Path) -> Result<(), FileError> {
+    if version != 1 && version != 2 {
+        return Err(FileError::Store {
+            path: path.to_path_buf(),
+            source: StoreError::Entry(crate::entry::EntryError::Invalid(format!(
+                "unsupported store version {version}, supported versions: 1, 2"
+            ))),
+        });
+    }
+    Ok(())
+}
+
 /// A token file plus the store parsed from it, swappable on reload.
 #[derive(Debug)]
 pub struct TokenStoreFile<G: Grant = NoGrant> {
@@ -155,18 +171,7 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
                 source,
             })?;
 
-        // Validate version: accept 1 and 2 only
-        if document.version != 1 && document.version != 2 {
-            return Err(FileError::Store {
-                path: path.to_path_buf(),
-                source: StoreError::Entry(crate::entry::EntryError::Invalid(
-                    format!(
-                        "unsupported store version {}, supported versions: 1, 2",
-                        document.version
-                    )
-                )),
-            });
-        }
+        check_supported_version(document.version, path)?;
 
         let store = TokenStore::try_new(document.tokens).map_err(|source| FileError::Store {
             path: path.to_path_buf(),
@@ -414,12 +419,18 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
 /// consuming binary can still parse our output.
 ///
 /// # Errors
-/// Returns [`FileError`] on serialization or I/O failure.
+/// Returns [`FileError`] on serialization, I/O failure, or if the version
+/// is unsupported (anything other than 1 or 2). An unsupported version is
+/// rejected before any filesystem operation, so a bad call touches nothing.
 pub fn write_atomic<G: Grant + serde::Serialize>(
     path: &Path,
     entries: &[TokenEntry<G>],
     version: u32,
 ) -> Result<(), FileError> {
+    // Validate version before doing any filesystem work, so we cannot produce
+    // a file our own loader would refuse.
+    check_supported_version(version, path)?;
+
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let document = TokenDocument {
         version,
@@ -1673,5 +1684,56 @@ mod tests {
         let envelope: StrictEnvelope = serde_json::from_slice(&bytes)
             .expect("v2 file must still parse under strict deny_unknown_fields envelope");
         assert_eq!(envelope.version, 2, "version must be 2 in the strict parse");
+    }
+
+    #[test]
+    fn write_atomic_rejects_an_unsupported_version_without_touching_disk() {
+        use crate::token::TokenSecret;
+
+        // Guards the write boundary: read_store validates on the way in, and this
+        // ensures we cannot produce a file our own loader would refuse.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+
+        let (_secret, digest) = TokenSecret::mint().expect("mint");
+        let entry: TokenEntry<NoGrant> = TokenEntry {
+            name: "lab".to_owned(),
+            digest,
+            devices: ScopeSet::Wildcard,
+            tools: ScopeSet::Wildcard,
+            created_at: DateTime::from_timestamp(1_783_850_400, 0).expect("timestamp"),
+            expires_at: None,
+            grant: None,
+        };
+        let entries = vec![entry];
+
+        // Attempt to write with unsupported version 3
+        let result = write_atomic(&path, &entries, 3);
+
+        // Must error
+        match result {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("3"), "error must name the found version");
+                assert!(msg.contains("unsupported"), "error must say unsupported");
+            }
+            Ok(_) => panic!("write_atomic with version 3 should be rejected"),
+        }
+
+        // Must not have created the file
+        assert!(!path.exists(), "no file must exist after rejected write");
+
+        // Same test with version 0
+        let result_v0 = write_atomic(&path, &entries, 0);
+        match result_v0 {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("0"), "error must name the found version");
+                assert!(msg.contains("unsupported"), "error must say unsupported");
+            }
+            Ok(_) => panic!("write_atomic with version 0 should be rejected"),
+        }
+
+        assert!(!path.exists(), "no file must exist after second rejected write");
     }
 }
