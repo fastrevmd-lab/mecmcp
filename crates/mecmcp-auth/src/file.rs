@@ -52,7 +52,7 @@ pub enum FileError {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "G: Grant + Serialize",
-    deserialize = "G: Grant + Default + Deserialize<'de>"
+    deserialize = "G: Grant + Deserialize<'de>"
 ))]
 struct TokenDocument<G: Grant> {
     tokens: Vec<TokenEntry<G>>,
@@ -65,7 +65,7 @@ pub struct TokenStoreFile<G: Grant = NoGrant> {
     store: ArcSwap<TokenStore<G>>,
 }
 
-impl<G: Grant + Default + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G> {
+impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G> {
     /// Read, validate, and parse a token file.
     ///
     /// # Errors

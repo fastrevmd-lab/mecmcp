@@ -74,12 +74,22 @@ pub struct TokenEntry<G: Grant = NoGrant> {
     pub expires_at: Option<DateTime<Utc>>,
 
     /// Optional vendor-specific write authority.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default = "no_grant", skip_serializing_if = "Option::is_none")]
     pub grant: Option<G>,
 }
 
 fn wildcard() -> ScopeSet {
     ScopeSet::Wildcard
+}
+
+/// The default grant: none.
+///
+/// Spelled as an explicit function rather than `#[serde(default)]` so serde's
+/// derive does not add a `G: Default` bound. `Option<T>` needs no bound on `T`
+/// to default to `None`, and requiring `Default` on a write-authority type
+/// would force every consumer to define a "default write grant".
+fn no_grant<G>() -> Option<G> {
+    None
 }
 
 impl<G: Grant> TokenEntry<G> {
@@ -305,5 +315,40 @@ mod tests {
         assert!(json.contains("\"devices\""));
         assert!(!json.contains("\"hash\""));
         assert!(!json.contains("\"routers\""));
+    }
+
+    #[test]
+    fn a_grant_type_without_default_can_be_deserialized() {
+        // Guards the public contract: a consumer's write-authority type must not
+        // be forced to answer "what is the default write authority?".
+        #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        struct NoDefaultGrant {
+            subjects: Vec<String>,
+        }
+        impl Grant for NoDefaultGrant {
+            type Action = ();
+            fn allows_action(&self, _action: ()) -> bool {
+                true
+            }
+            fn allows_subject(&self, subject: &str) -> bool {
+                self.subjects.iter().any(|s| s == subject)
+            }
+            fn validate(&self) -> Result<(), GrantError> {
+                Ok(())
+            }
+        }
+
+        let raw = r#"{
+            "name": "writer",
+            "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+            "devices": ["*"],
+            "tools": ["*"],
+            "created_at_unix": 1783850400,
+            "grant": { "subjects": ["/a/b"] }
+        }"#;
+        let entry: TokenEntry<NoDefaultGrant> = serde_json::from_str(raw).expect("parse");
+        let grant = entry.grant.as_ref().expect("grant present");
+        assert!(grant.allows_subject("/a/b"));
+        assert!(!grant.allows_subject("/a/c"));
     }
 }
