@@ -67,11 +67,7 @@ impl<G: Grant> TokenStore<G> {
     /// Every entry is compared even after a match, so lookup time does not
     /// depend on an entry's position in the store.
     #[must_use]
-    pub fn authenticate_at(
-        &self,
-        candidate: &str,
-        now: DateTime<Utc>,
-    ) -> Option<&TokenEntry<G>> {
+    pub fn authenticate_at(&self, candidate: &str, now: DateTime<Utc>) -> Option<&TokenEntry<G>> {
         let mut found = None;
         for entry in &self.entries {
             if entry.digest.verify(candidate) && !entry.is_expired_at(now) {
@@ -176,7 +172,10 @@ mod tests {
     fn authenticates_a_known_secret() {
         let (secret, entry) = entry_named("lab");
         let store = TokenStore::try_new(vec![entry]).expect("store");
-        assert_eq!(store.authenticate(&secret).map(|e| e.name.as_str()), Some("lab"));
+        assert_eq!(
+            store.authenticate(&secret).map(|e| e.name.as_str()),
+            Some("lab")
+        );
     }
 
     #[test]
@@ -219,7 +218,9 @@ mod tests {
 
     #[test]
     fn more_than_max_tokens_is_rejected() {
-        let entries = (0..=MAX_TOKENS).map(|i| entry_named(&format!("t{i}")).1).collect();
+        let entries = (0..=MAX_TOKENS)
+            .map(|i| entry_named(&format!("t{i}")).1)
+            .collect();
         assert!(matches!(
             TokenStore::try_new(entries),
             Err(StoreError::TooMany(_))
@@ -234,10 +235,8 @@ mod tests {
             tools: ScopeSet::Wildcard,
             grant: None,
         };
-        let visible = filter_device_names(
-            Some(&ctx),
-            vec!["edge-fw".to_owned(), "core-fw".to_owned()],
-        );
+        let visible =
+            filter_device_names(Some(&ctx), vec!["edge-fw".to_owned(), "core-fw".to_owned()]);
         assert_eq!(visible, vec!["edge-fw".to_owned()]);
     }
 

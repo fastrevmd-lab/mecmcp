@@ -1,0 +1,34 @@
+# cargo-deny policy for the mecmcp crate family.
+#
+# Kept aligned with the consuming servers (rustjunosmcp, rustpanosmcp) so all
+# three repos enforce one supply-chain posture. If a licence is added here it
+# should be added there too, and vice versa.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    # foldhash, reached transitively through hashbrown. Permissive, OSI-approved.
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
