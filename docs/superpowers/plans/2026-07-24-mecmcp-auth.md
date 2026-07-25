@@ -894,7 +894,7 @@ mod tests {
         "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
         "devices": ["panosvm"],
         "tools": ["get_panos_config"],
-        "created_at_unix": 1752314400
+        "created_at_unix": 1783850400
     }"#;
 
     #[test]
@@ -940,12 +940,12 @@ mod tests {
             "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
             "devices": ["*"],
             "tools": ["*"],
-            "created_at_unix": 1752314400,
-            "expires_at_unix": 1752400800
+            "created_at_unix": 1783850400,
+            "expires_at_unix": 1783936800
         }"#;
         let entry: TokenEntry = serde_json::from_str(raw).expect("parse");
-        let before = DateTime::from_timestamp(1_752_350_000, 0).expect("timestamp");
-        let after = DateTime::from_timestamp(1_752_500_000, 0).expect("timestamp");
+        let before = DateTime::from_timestamp(1_783_900_000, 0).expect("timestamp");
+        let after = DateTime::from_timestamp(1_784_100_000, 0).expect("timestamp");
         assert!(!entry.is_expired_at(before));
         assert!(entry.is_expired_at(after));
     }
@@ -957,7 +957,7 @@ mod tests {
             "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
             "devices": ["a", "a"],
             "tools": ["*"],
-            "created_at_unix": 1752314400
+            "created_at_unix": 1783850400
         }"#;
         let entry: TokenEntry = serde_json::from_str(raw).expect("parse");
         assert!(entry.validate().is_err());
@@ -971,7 +971,7 @@ mod tests {
                 "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
                 "devices": ["*"],
                 "tools": ["*"],
-                "created_at_unix": 1752314400
+                "created_at_unix": 1783850400
             }}"#,
             "x".repeat(200)
         );
@@ -1256,7 +1256,7 @@ mod tests {
             digest,
             devices: ScopeSet::Wildcard,
             tools: ScopeSet::Wildcard,
-            created_at: DateTime::from_timestamp(1_752_314_400, 0).expect("timestamp"),
+            created_at: DateTime::from_timestamp(1_783_850_400, 0).expect("timestamp"),
             expires_at: None,
             grant: None,
         };
@@ -1280,10 +1280,10 @@ mod tests {
     #[test]
     fn rejects_an_expired_secret() {
         let (secret, mut entry) = entry_named("lab");
-        entry.expires_at = Some(DateTime::from_timestamp(1_752_400_800, 0).expect("timestamp"));
+        entry.expires_at = Some(DateTime::from_timestamp(1_783_936_800, 0).expect("timestamp"));
         let store = TokenStore::try_new(vec![entry]).expect("store");
-        let after = DateTime::from_timestamp(1_752_500_000, 0).expect("timestamp");
-        let before = DateTime::from_timestamp(1_752_350_000, 0).expect("timestamp");
+        let after = DateTime::from_timestamp(1_784_100_000, 0).expect("timestamp");
+        let before = DateTime::from_timestamp(1_783_900_000, 0).expect("timestamp");
         assert!(store.authenticate_at(&secret, before).is_some());
         assert!(store.authenticate_at(&secret, after).is_none());
     }
@@ -1564,7 +1564,7 @@ mod tests {
                 "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
                 "devices": ["edge-fw"],
                 "tools": ["*"],
-                "created_at_unix": 1752314400
+                "created_at_unix": 1783850400
             },
             {
                 "name": "writer",
@@ -2019,7 +2019,7 @@ authentication material, and this repo is a different trust boundary.
       "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
       "devices": ["panosvm"],
       "tools": ["get_panos_config", "list_devices", "stage_panos_config"],
-      "created_at_unix": 1752314400,
+      "created_at_unix": 1783850400,
       "mutation": {
         "allowed_xpath_roots": ["/config/devices/entry/vsys/entry/rulebase"],
         "actions": ["set", "delete"]
