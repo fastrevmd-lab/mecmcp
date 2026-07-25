@@ -74,7 +74,7 @@ pub struct TokenEntry<G: Grant = NoGrant> {
     pub expires_at: Option<DateTime<Utc>>,
 
     /// Optional vendor-specific write authority.
-    #[serde(default = "no_grant", skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "mutation", default = "no_grant", skip_serializing_if = "Option::is_none")]
     pub grant: Option<G>,
 }
 

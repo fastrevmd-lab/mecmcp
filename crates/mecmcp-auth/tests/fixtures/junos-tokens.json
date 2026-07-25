@@ -1,0 +1,18 @@
+{
+  "tokens": [
+    {
+      "name": "claude-desktop",
+      "hash": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+      "routers": ["*"],
+      "tools": ["*"],
+      "created_at": "2026-07-12T10:00:00Z"
+    },
+    {
+      "name": "readonly-observer",
+      "hash": "sha256:LPJNul-wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ",
+      "routers": ["edge-fw", "core-fw", "dc-fw"],
+      "tools": ["get_junos_config", "execute_junos_command", "get_router_list"],
+      "created_at": "2026-07-12T10:05:00Z"
+    }
+  ]
+}
