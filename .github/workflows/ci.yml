@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  build-test:
+    name: Build, lint, and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Build documentation
+        run: cargo doc --workspace --no-deps
+
+  msrv:
+    # mecmcp-auth is a library consumed by two binaries, so an accidental MSRV
+    # bump breaks them rather than this repo. That makes it exactly the wrong
+    # thing to discover downstream.
+    name: Minimum supported Rust 1.88
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml pins the working toolchain; the MSRV floor declared
+      # in Cargo.toml is deliberately lower. Remove the pin so the 1.88
+      # toolchain below is what actually runs.
+      - name: Drop the toolchain pin
+        run: rm -f rust-toolchain.toml
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      # Library targets only, deliberately — not --all-targets.
+      #
+      # The MSRV promises that a *consumer* can build this crate at 1.88, and a
+      # consumer compiles the library, never its tests. The test code currently
+      # needs a newer toolchain: 27 sites construct `KnownNames { devices:
+      # Some(&["x".to_owned()]) }` inline, which is E0716 "temporary value
+      # dropped while borrowed" on 1.88 and only compiles on later rustc.
+      #
+      # Gating on that would fail CI over something no consumer depends on. The
+      # library itself checks clean at 1.88 — verified — so this is the honest
+      # scope for the guarantee being made.
+      - name: Check library targets at MSRV
+        run: cargo check --workspace
