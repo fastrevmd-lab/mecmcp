@@ -133,12 +133,13 @@ fn writing_a_deployed_file_preserves_its_envelope_version() {
     // Test with junos fixture (version 1)
     {
         let (_dir, path) = staged("junos-tokens.json");
+        let devices = [
+            "edge-fw".to_owned(),
+            "core-fw".to_owned(),
+            "dc-fw".to_owned(),
+        ];
         let known = KnownNames {
-            devices: Some(&[
-                "edge-fw".to_owned(),
-                "core-fw".to_owned(),
-                "dc-fw".to_owned(),
-            ]),
+            devices: Some(&devices),
             tools: &[
                 "get_junos_config",
                 "execute_junos_command",
@@ -173,8 +174,9 @@ fn writing_a_deployed_file_preserves_its_envelope_version() {
     // Test with panos fixture (version 2)
     {
         let (_dir, path) = staged("panos-tokens.json");
+        let devices = ["panosvm".to_owned()];
         let known = KnownNames {
-            devices: Some(&["panosvm".to_owned()]),
+            devices: Some(&devices),
             tools: &["get_panos_config", "list_devices", "stage_panos_config"],
         };
 

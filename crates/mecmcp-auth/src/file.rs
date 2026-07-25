@@ -727,8 +727,14 @@ mod tests {
         assert_eq!(reloaded.store().len(), 2);
     }
 
-    fn known_devices() -> Vec<String> {
-        vec!["edge-fw".to_owned(), "core-fw".to_owned()]
+    /// Borrowable for `'static`, so callers can write
+    /// `KnownNames { devices: Some(known_devices()), .. }` without the returned
+    /// `Vec` being a temporary that is dropped at the end of the statement.
+    /// Returning `Vec<String>` here required every call site to borrow a
+    /// temporary, which is E0716 on the crate's MSRV.
+    fn known_devices() -> &'static [String] {
+        static DEVICES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        DEVICES.get_or_init(|| vec!["edge-fw".to_owned(), "core-fw".to_owned()])
     }
 
     #[test]
@@ -736,7 +742,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -760,7 +766,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -795,7 +801,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -821,7 +827,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -869,7 +875,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config", "load_and_commit_config"],
         };
 
@@ -954,7 +960,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -982,7 +988,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1015,7 +1021,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1057,7 +1063,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config", "load_and_commit_config"],
         };
 
@@ -1103,7 +1109,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1173,7 +1179,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1224,7 +1230,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1291,7 +1297,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1326,7 +1332,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1369,7 +1375,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1412,7 +1418,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1465,7 +1471,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1536,7 +1542,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config", "load_and_commit_config"],
         };
 
@@ -1598,7 +1604,7 @@ mod tests {
         }"#;
         let path = write_file(&dir, v1_file);
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1632,7 +1638,7 @@ mod tests {
         }"#;
         let path = write_file(&dir, v2_file);
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1669,7 +1675,7 @@ mod tests {
 
         // After a lifecycle op, version field must appear with DEFAULT_STORE_VERSION
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
         TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known)
@@ -1728,7 +1734,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1769,7 +1775,7 @@ mod tests {
         }"#;
         let path = write_file(&dir, v2_file);
         let known = KnownNames {
-            devices: Some(&known_devices()),
+            devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1917,8 +1923,9 @@ mod tests {
         // Existing strict behaviour must be intact.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
+        let devices = ["edge-fw".to_owned(), "core-fw".to_owned()];
         let known = KnownNames {
-            devices: Some(&["edge-fw".to_owned(), "core-fw".to_owned()]),
+            devices: Some(&devices),
             tools: &["get_junos_config"],
         };
 
@@ -1969,8 +1976,9 @@ mod tests {
         // Narrowing a token's tools must not fail merely because the CLI lacks an inventory.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
+        let add_devices = ["edge-fw".to_owned()];
         let known_add = KnownNames {
-            devices: Some(&["edge-fw".to_owned()]),
+            devices: Some(&add_devices),
             tools: &["get_junos_config", "load_and_commit_config"],
         };
 
