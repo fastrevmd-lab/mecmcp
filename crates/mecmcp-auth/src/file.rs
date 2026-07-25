@@ -391,11 +391,7 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
     /// # Errors
     /// Returns [`FileError`] on I/O or validation failure. Returns `Ok(false)`
     /// if the token was not present.
-    pub fn revoke(
-        path: &Path,
-        name: &str,
-        known: &KnownNames<'_>,
-    ) -> Result<bool, FileError> {
+    pub fn revoke(path: &Path, name: &str, known: &KnownNames<'_>) -> Result<bool, FileError> {
         let (current, version) = Self::read_store(path)?;
         let mut entries = current.entries().to_vec();
         let before = entries.len();
@@ -627,8 +623,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .expect("chmod");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
         }
         path
     }
@@ -892,7 +887,8 @@ mod tests {
         )
         .expect("add");
 
-        let before: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load before rotate");
+        let before: TokenStoreFile<NoGrant> =
+            TokenStoreFile::load(&path).expect("load before rotate");
         let store_before = before.store();
         let entry_before = store_before
             .entries()
@@ -900,9 +896,11 @@ mod tests {
             .find(|e| e.name == "lab")
             .expect("entry");
 
-        let rotated_secret = TokenStoreFile::<NoGrant>::rotate(&path, "lab", &known).expect("rotate");
+        let rotated_secret =
+            TokenStoreFile::<NoGrant>::rotate(&path, "lab", &known).expect("rotate");
 
-        let after: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load after rotate");
+        let after: TokenStoreFile<NoGrant> =
+            TokenStoreFile::load(&path).expect("load after rotate");
         let store_after = after.store();
         let entry_after = store_after
             .entries()
@@ -912,21 +910,37 @@ mod tests {
 
         // Old secret must not work
         assert!(
-            store_after.authenticate(original_secret.expose_secret()).is_none(),
+            store_after
+                .authenticate(original_secret.expose_secret())
+                .is_none(),
             "old secret must be invalidated"
         );
 
         // New secret must work
         assert!(
-            store_after.authenticate(rotated_secret.expose_secret()).is_some(),
+            store_after
+                .authenticate(rotated_secret.expose_secret())
+                .is_some(),
             "new secret must authenticate"
         );
 
         // All other fields must be preserved
-        assert_eq!(entry_after.devices, entry_before.devices, "devices must be preserved");
-        assert_eq!(entry_after.tools, entry_before.tools, "tools must be preserved");
-        assert_eq!(entry_after.expires_at, entry_before.expires_at, "expires_at must be preserved");
-        assert_eq!(entry_after.grant, entry_before.grant, "grant must be preserved");
+        assert_eq!(
+            entry_after.devices, entry_before.devices,
+            "devices must be preserved"
+        );
+        assert_eq!(
+            entry_after.tools, entry_before.tools,
+            "tools must be preserved"
+        );
+        assert_eq!(
+            entry_after.expires_at, entry_before.expires_at,
+            "expires_at must be preserved"
+        );
+        assert_eq!(
+            entry_after.grant, entry_before.grant,
+            "grant must be preserved"
+        );
 
         // created_at should be updated
         assert!(
@@ -991,7 +1005,8 @@ mod tests {
             "revoked token must not authenticate"
         );
 
-        let removed_again = TokenStoreFile::<NoGrant>::revoke(&path, "lab", &known).expect("revoke again");
+        let removed_again =
+            TokenStoreFile::<NoGrant>::revoke(&path, "lab", &known).expect("revoke again");
         assert!(!removed_again, "second revoke should return false");
     }
 
@@ -1068,7 +1083,9 @@ mod tests {
         let store = file.store();
 
         // Original secret must still work
-        let entry = store.authenticate(secret.expose_secret()).expect("original secret must authenticate");
+        let entry = store
+            .authenticate(secret.expose_secret())
+            .expect("original secret must authenticate");
         assert_eq!(entry.name, "lab");
 
         // Tools scope must be narrowed
@@ -1111,9 +1128,16 @@ mod tests {
 
         let file: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load");
         let store = file.store();
-        let entry = store.entries().iter().find(|e| e.name == "lab").expect("entry");
+        let entry = store
+            .entries()
+            .iter()
+            .find(|e| e.name == "lab")
+            .expect("entry");
 
-        assert_eq!(entry.devices, ScopeSet::Allowlist(vec!["core-fw".to_owned()]));
+        assert_eq!(
+            entry.devices,
+            ScopeSet::Allowlist(vec!["core-fw".to_owned()])
+        );
         assert_eq!(entry.tools, ScopeSet::Wildcard);
 
         // Now change only tools
@@ -1128,10 +1152,20 @@ mod tests {
 
         let file_after: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load after");
         let store_after = file_after.store();
-        let entry_after = store_after.entries().iter().find(|e| e.name == "lab").expect("entry after");
+        let entry_after = store_after
+            .entries()
+            .iter()
+            .find(|e| e.name == "lab")
+            .expect("entry after");
 
-        assert_eq!(entry_after.devices, ScopeSet::Allowlist(vec!["core-fw".to_owned()]));
-        assert_eq!(entry_after.tools, ScopeSet::Allowlist(vec!["get_junos_config".to_owned()]));
+        assert_eq!(
+            entry_after.devices,
+            ScopeSet::Allowlist(vec!["core-fw".to_owned()])
+        );
+        assert_eq!(
+            entry_after.tools,
+            ScopeSet::Allowlist(vec!["get_junos_config".to_owned()])
+        );
     }
 
     #[test]
@@ -1158,7 +1192,11 @@ mod tests {
 
         let before: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load before");
         let store_before = before.store();
-        let entry_before = store_before.entries().iter().find(|e| e.name == "lab").expect("entry before");
+        let entry_before = store_before
+            .entries()
+            .iter()
+            .find(|e| e.name == "lab")
+            .expect("entry before");
 
         TokenStoreFile::<NoGrant>::set_scopes(
             &path,
@@ -1171,7 +1209,11 @@ mod tests {
 
         let after: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load after");
         let store_after = after.store();
-        let entry_after = store_after.entries().iter().find(|e| e.name == "lab").expect("entry after");
+        let entry_after = store_after
+            .entries()
+            .iter()
+            .find(|e| e.name == "lab")
+            .expect("entry after");
 
         assert_eq!(entry_after.expires_at, entry_before.expires_at);
         assert_eq!(entry_after.grant, entry_before.grant);
@@ -1206,7 +1248,11 @@ mod tests {
 
         let before: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load before");
         let store_before = before.store();
-        let ci_entry_before = store_before.entries().iter().find(|e| e.name == "ci").expect("ci before");
+        let ci_entry_before = store_before
+            .entries()
+            .iter()
+            .find(|e| e.name == "ci")
+            .expect("ci before");
         let ci_digest_before = ci_entry_before.digest.clone();
         let ci_created_at_before = ci_entry_before.created_at;
         let ci_devices_before = ci_entry_before.devices.clone();
@@ -1224,7 +1270,11 @@ mod tests {
 
         let after: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load after");
         let store_after = after.store();
-        let ci_entry_after = store_after.entries().iter().find(|e| e.name == "ci").expect("ci after");
+        let ci_entry_after = store_after
+            .entries()
+            .iter()
+            .find(|e| e.name == "ci")
+            .expect("ci after");
 
         // ci token must be completely untouched
         assert_eq!(ci_entry_after.digest, ci_digest_before);
@@ -1308,7 +1358,10 @@ mod tests {
         }
 
         let bytes_after = std::fs::read(&path).expect("read after");
-        assert_eq!(bytes_before, bytes_after, "file must be unchanged after failed validation");
+        assert_eq!(
+            bytes_before, bytes_after,
+            "file must be unchanged after failed validation"
+        );
     }
 
     #[test]
@@ -1348,7 +1401,10 @@ mod tests {
         }
 
         let bytes_after = std::fs::read(&path).expect("read after");
-        assert_eq!(bytes_before, bytes_after, "file must be unchanged after failed validation");
+        assert_eq!(
+            bytes_before, bytes_after,
+            "file must be unchanged after failed validation"
+        );
     }
 
     #[test]
@@ -1371,7 +1427,11 @@ mod tests {
 
         let before: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load before");
         let store_before = before.store();
-        let entry_before = store_before.entries().iter().find(|e| e.name == "lab").expect("entry before");
+        let entry_before = store_before
+            .entries()
+            .iter()
+            .find(|e| e.name == "lab")
+            .expect("entry before");
         let created_at_before = entry_before.created_at;
 
         // Small delay to ensure time has advanced
@@ -1388,9 +1448,16 @@ mod tests {
 
         let after: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load after");
         let store_after = after.store();
-        let entry_after = store_after.entries().iter().find(|e| e.name == "lab").expect("entry after");
+        let entry_after = store_after
+            .entries()
+            .iter()
+            .find(|e| e.name == "lab")
+            .expect("entry after");
 
-        assert_eq!(entry_after.created_at, created_at_before, "created_at must not be refreshed");
+        assert_eq!(
+            entry_after.created_at, created_at_before,
+            "created_at must not be refreshed"
+        );
     }
 
     #[test]
@@ -1417,14 +1484,22 @@ mod tests {
 
         let before: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load before");
         let store_before = before.store();
-        let entry_before = store_before.entries().iter().find(|e| e.name == "lab").expect("entry before");
+        let entry_before = store_before
+            .entries()
+            .iter()
+            .find(|e| e.name == "lab")
+            .expect("entry before");
 
         TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known)
             .expect("set_scopes with both None");
 
         let after: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load after");
         let store_after = after.store();
-        let entry_after = store_after.entries().iter().find(|e| e.name == "lab").expect("entry after");
+        let entry_after = store_after
+            .entries()
+            .iter()
+            .find(|e| e.name == "lab")
+            .expect("entry after");
 
         assert_eq!(entry_after.digest, entry_before.digest);
         assert_eq!(entry_after.devices, entry_before.devices);
@@ -1484,14 +1559,20 @@ mod tests {
             &path,
             "writer",
             None,
-            Some(ScopeSet::Allowlist(vec!["load_and_commit_config".to_owned()])),
+            Some(ScopeSet::Allowlist(vec![
+                "load_and_commit_config".to_owned(),
+            ])),
             &known,
         )
         .expect("set_scopes");
 
         let after: TokenStoreFile<TestGrant> = TokenStoreFile::load(&path).expect("load after");
         let store_after = after.store();
-        let entry_after = store_after.entries().iter().find(|e| e.name == "writer").expect("entry after");
+        let entry_after = store_after
+            .entries()
+            .iter()
+            .find(|e| e.name == "writer")
+            .expect("entry after");
 
         let grant_after = entry_after.grant.as_ref().expect("grant must be present");
         assert_eq!(grant_after, &grant, "grant must be preserved exactly");
@@ -1522,12 +1603,16 @@ mod tests {
         };
 
         // Run a lifecycle op (set_scopes is cheapest)
-        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known).expect("set_scopes");
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known)
+            .expect("set_scopes");
 
         // Reload the raw JSON and verify version is still 1
         let body = std::fs::read_to_string(&path).expect("read");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse");
-        assert_eq!(parsed["version"], 1, "version 1 must be preserved, not changed");
+        assert_eq!(
+            parsed["version"], 1,
+            "version 1 must be preserved, not changed"
+        );
     }
 
     #[test]
@@ -1551,11 +1636,15 @@ mod tests {
             tools: &["get_junos_config"],
         };
 
-        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known).expect("set_scopes");
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known)
+            .expect("set_scopes");
 
         let body = std::fs::read_to_string(&path).expect("read");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse");
-        assert_eq!(parsed["version"], 2, "version 2 must be preserved as 2, NOT normalised to 1");
+        assert_eq!(
+            parsed["version"], 2,
+            "version 2 must be preserved as 2, NOT normalised to 1"
+        );
     }
 
     #[test]
@@ -1583,7 +1672,8 @@ mod tests {
             devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
-        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known).expect("set_scopes");
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known)
+            .expect("set_scopes");
 
         let body = std::fs::read_to_string(&path).expect("read");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse");
@@ -1653,7 +1743,10 @@ mod tests {
 
         let body = std::fs::read_to_string(&path).expect("read");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse");
-        assert_eq!(parsed["version"], 1, "brand-new file must contain version 1");
+        assert_eq!(
+            parsed["version"], 1,
+            "brand-new file must contain version 1"
+        );
     }
 
     #[test]
@@ -1680,7 +1773,8 @@ mod tests {
             tools: &["get_junos_config"],
         };
 
-        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known).expect("set_scopes");
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known)
+            .expect("set_scopes");
 
         let bytes = std::fs::read(&path).expect("read file");
 
@@ -1746,7 +1840,10 @@ mod tests {
             Ok(_) => panic!("write_atomic with version 0 should be rejected"),
         }
 
-        assert!(!path.exists(), "no file must exist after second rejected write");
+        assert!(
+            !path.exists(),
+            "no file must exist after second rejected write"
+        );
     }
 
     #[test]
@@ -1888,7 +1985,11 @@ mod tests {
 
         let before: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load before");
         let store_before = before.store();
-        let entry_before = store_before.entries().iter().find(|e| e.name == "lab").expect("entry before");
+        let entry_before = store_before
+            .entries()
+            .iter()
+            .find(|e| e.name == "lab")
+            .expect("entry before");
         let digest_before = entry_before.digest.clone();
 
         // Now use set_scopes with devices: None to narrow the tools
@@ -1908,10 +2009,17 @@ mod tests {
 
         let after: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load after");
         let store_after = after.store();
-        let entry_after = store_after.entries().iter().find(|e| e.name == "lab").expect("entry after");
+        let entry_after = store_after
+            .entries()
+            .iter()
+            .find(|e| e.name == "lab")
+            .expect("entry after");
 
         // Digest must be preserved (secret unchanged)
-        assert_eq!(entry_after.digest, digest_before, "digest must be preserved");
+        assert_eq!(
+            entry_after.digest, digest_before,
+            "digest must be preserved"
+        );
 
         // Original secret must still work
         assert!(
@@ -1926,6 +2034,9 @@ mod tests {
         );
 
         // Devices scope must be unchanged
-        assert_eq!(entry_after.devices, ScopeSet::Allowlist(vec!["edge-fw".to_owned()]));
+        assert_eq!(
+            entry_after.devices,
+            ScopeSet::Allowlist(vec!["edge-fw".to_owned()])
+        );
     }
 }

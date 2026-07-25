@@ -54,8 +54,7 @@ fn staged(name: &str) -> (tempfile::TempDir, PathBuf) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
-            .expect("chmod");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     }
     (dir, target)
 }
@@ -115,8 +114,16 @@ fn a_junos_wildcard_tool_scope_still_excludes_write_tools() {
         .find(|e| e.name == "claude-desktop")
         .expect("entry");
 
-    assert!(wildcard.tools.allows_tool("get_junos_config", JUNOS_WRITE_TOOLS));
-    assert!(!wildcard.tools.allows_tool("load_and_commit_config", JUNOS_WRITE_TOOLS));
+    assert!(
+        wildcard
+            .tools
+            .allows_tool("get_junos_config", JUNOS_WRITE_TOOLS)
+    );
+    assert!(
+        !wildcard
+            .tools
+            .allows_tool("load_and_commit_config", JUNOS_WRITE_TOOLS)
+    );
 }
 
 #[test]
@@ -127,8 +134,16 @@ fn writing_a_deployed_file_preserves_its_envelope_version() {
     {
         let (_dir, path) = staged("junos-tokens.json");
         let known = KnownNames {
-            devices: Some(&["edge-fw".to_owned(), "core-fw".to_owned(), "dc-fw".to_owned()]),
-            tools: &["get_junos_config", "execute_junos_command", "get_router_list"],
+            devices: Some(&[
+                "edge-fw".to_owned(),
+                "core-fw".to_owned(),
+                "dc-fw".to_owned(),
+            ]),
+            tools: &[
+                "get_junos_config",
+                "execute_junos_command",
+                "get_router_list",
+            ],
         };
 
         TokenStoreFile::<NoGrant>::set_scopes(&path, "readonly-observer", None, None, &known)

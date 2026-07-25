@@ -74,7 +74,11 @@ pub struct TokenEntry<G: Grant = NoGrant> {
     pub expires_at: Option<DateTime<Utc>>,
 
     /// Optional vendor-specific write authority.
-    #[serde(alias = "mutation", default = "no_grant", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        alias = "mutation",
+        default = "no_grant",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub grant: Option<G>,
 }
 
@@ -242,7 +246,10 @@ mod tests {
     fn loads_the_panos_on_disk_shape() {
         let entry: TokenEntry = serde_json::from_str(PANOS_SHAPE).expect("parse panos shape");
         assert_eq!(entry.name, "lab");
-        assert_eq!(entry.devices, ScopeSet::Allowlist(vec!["panosvm".to_owned()]));
+        assert_eq!(
+            entry.devices,
+            ScopeSet::Allowlist(vec!["panosvm".to_owned()])
+        );
         assert!(entry.digest.verify("test"));
     }
 
