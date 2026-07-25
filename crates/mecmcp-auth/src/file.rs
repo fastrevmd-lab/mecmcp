@@ -87,9 +87,16 @@ fn default_version() -> u32 {
 /// vendor-neutral: each consuming server has its own device inventory and its
 /// own tool surface.
 pub struct KnownNames<'a> {
-    /// Device names present in the caller's inventory.
-    pub devices: &'a [String],
-    /// Tool names the caller's server actually implements.
+    /// Device names present in the caller's inventory, or `None` to skip
+    /// device-name validation entirely.
+    ///
+    /// `None` is for callers that legitimately cannot know the device set at
+    /// this point — for example a CLI minting a token before the device exists
+    /// in inventory. Tool names are always validated regardless, because a
+    /// caller's tool surface is fixed at compile time and an unknown tool name
+    /// is always a mistake.
+    pub devices: Option<&'a [String]>,
+    /// Tool names the caller's server actually implements. Always enforced.
     pub tools: &'a [&'a str],
 }
 
@@ -491,16 +498,21 @@ fn validate_references<G: Grant>(
 ) -> Result<(), String> {
     for entry in store.entries() {
         if let ScopeSet::Allowlist(devices) = &entry.devices {
-            for device in devices {
-                if !known.devices.iter().any(|known| known == device) {
-                    return Err(format!(
-                        "token '{}' references unknown device '{device}'",
-                        entry.name
-                    ));
+            // Only validate device names if Some(...) was provided.
+            // None means skip device-name checks entirely.
+            if let Some(known_devices) = known.devices {
+                for device in devices {
+                    if !known_devices.iter().any(|known| known == device) {
+                        return Err(format!(
+                            "token '{}' references unknown device '{device}'",
+                            entry.name
+                        ));
+                    }
                 }
             }
         }
         if let ScopeSet::Allowlist(tools) = &entry.tools {
+            // Tool validation is always enforced.
             for tool in tools {
                 if !known.tools.iter().any(|known| known == tool) {
                     return Err(format!(
@@ -729,7 +741,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -753,7 +765,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -788,7 +800,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -814,7 +826,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -840,7 +852,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &[],
+            devices: Some(&[]),
             tools: &[],
         };
 
@@ -862,7 +874,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config", "load_and_commit_config"],
         };
 
@@ -928,7 +940,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -956,7 +968,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -988,7 +1000,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1030,7 +1042,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config", "load_and_commit_config"],
         };
 
@@ -1074,7 +1086,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1127,7 +1139,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1170,7 +1182,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1229,7 +1241,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1264,7 +1276,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1304,7 +1316,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1344,7 +1356,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1386,7 +1398,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1449,7 +1461,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config", "load_and_commit_config"],
         };
 
@@ -1505,7 +1517,7 @@ mod tests {
         }"#;
         let path = write_file(&dir, v1_file);
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1535,7 +1547,7 @@ mod tests {
         }"#;
         let path = write_file(&dir, v2_file);
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1568,7 +1580,7 @@ mod tests {
 
         // After a lifecycle op, version field must appear with DEFAULT_STORE_VERSION
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
         TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known).expect("set_scopes");
@@ -1626,7 +1638,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokens.json");
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1664,7 +1676,7 @@ mod tests {
         }"#;
         let path = write_file(&dir, v2_file);
         let known = KnownNames {
-            devices: &known_devices(),
+            devices: Some(&known_devices()),
             tools: &["get_junos_config"],
         };
 
@@ -1735,5 +1747,185 @@ mod tests {
         }
 
         assert!(!path.exists(), "no file must exist after second rejected write");
+    }
+
+    #[test]
+    fn add_with_none_devices_allows_unknown_device_and_preserves_it() {
+        // Regression gate: the exact workflow that failed in the CLI.
+        // With `devices: None`, `add` must succeed for a device scope referencing
+        // a device name that exists in NO inventory. The scope must survive
+        // exactly as written — skipping validation is not license to silently
+        // drop or rewrite.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: None, // No inventory known
+            tools: &["execute_junos_command_batch"],
+        };
+
+        let secret = TokenStoreFile::<NoGrant>::add(
+            &path,
+            "scoped",
+            ScopeSet::Allowlist(vec!["r1".to_owned()]), // r1 is not in any inventory
+            ScopeSet::Allowlist(vec!["execute_junos_command_batch".to_owned()]),
+            &known,
+        )
+        .expect("add must succeed when devices is None");
+
+        let file: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load");
+        let store = file.store();
+        let entry = store.authenticate(secret.expose_secret()).expect("auth");
+
+        assert_eq!(entry.name, "scoped");
+        assert_eq!(
+            entry.devices,
+            ScopeSet::Allowlist(vec!["r1".to_owned()]),
+            "device scope must be preserved exactly as written"
+        );
+        assert_eq!(
+            entry.tools,
+            ScopeSet::Allowlist(vec!["execute_junos_command_batch".to_owned()])
+        );
+    }
+
+    #[test]
+    fn add_with_none_devices_still_rejects_unknown_tool() {
+        // The asymmetry: device validation is optional, tool validation is always on.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: None,
+            tools: &["get_junos_config"],
+        };
+
+        let result = TokenStoreFile::<NoGrant>::add(
+            &path,
+            "lab",
+            ScopeSet::Wildcard,
+            ScopeSet::Allowlist(vec!["not_a_tool".to_owned()]),
+            &known,
+        );
+
+        match result {
+            Err(err) => {
+                assert!(err.to_string().contains("not_a_tool"));
+                assert!(err.to_string().contains("unknown tool"));
+            }
+            Ok(_) => panic!("unknown tool must still be rejected even when devices is None"),
+        }
+    }
+
+    #[test]
+    fn add_with_some_devices_still_rejects_unknown_device() {
+        // Existing strict behaviour must be intact.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: Some(&["edge-fw".to_owned(), "core-fw".to_owned()]),
+            tools: &["get_junos_config"],
+        };
+
+        let result = TokenStoreFile::<NoGrant>::add(
+            &path,
+            "lab",
+            ScopeSet::Allowlist(vec!["missing-fw".to_owned()]),
+            ScopeSet::Wildcard,
+            &known,
+        );
+
+        match result {
+            Err(err) => {
+                assert!(err.to_string().contains("missing-fw"));
+                assert!(err.to_string().contains("unknown device"));
+            }
+            Ok(_) => panic!("unknown device must be rejected when devices is Some"),
+        }
+    }
+
+    #[test]
+    fn add_with_none_devices_and_wildcard_device_scope_succeeds() {
+        // Nothing to check either way when the scope is Wildcard.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: None,
+            tools: &["get_junos_config"],
+        };
+
+        let secret = TokenStoreFile::<NoGrant>::add(
+            &path,
+            "lab",
+            ScopeSet::Wildcard,
+            ScopeSet::Allowlist(vec!["get_junos_config".to_owned()]),
+            &known,
+        )
+        .expect("wildcard device scope must succeed regardless of devices");
+
+        let file: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load");
+        let store = file.store();
+        assert!(store.authenticate(secret.expose_secret()).is_some());
+    }
+
+    #[test]
+    fn set_scopes_with_none_devices_allows_unknown_device_and_preserves_digest() {
+        // Apply the same None case to set_scopes, not just add.
+        // Narrowing a token's tools must not fail merely because the CLI lacks an inventory.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known_add = KnownNames {
+            devices: Some(&["edge-fw".to_owned()]),
+            tools: &["get_junos_config", "load_and_commit_config"],
+        };
+
+        let secret = TokenStoreFile::<NoGrant>::add(
+            &path,
+            "lab",
+            ScopeSet::Allowlist(vec!["edge-fw".to_owned()]),
+            ScopeSet::Wildcard,
+            &known_add,
+        )
+        .expect("add");
+
+        let before: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load before");
+        let store_before = before.store();
+        let entry_before = store_before.entries().iter().find(|e| e.name == "lab").expect("entry before");
+        let digest_before = entry_before.digest.clone();
+
+        // Now use set_scopes with devices: None to narrow the tools
+        let known_narrow = KnownNames {
+            devices: None, // No inventory available in this invocation
+            tools: &["get_junos_config", "load_and_commit_config"],
+        };
+
+        TokenStoreFile::<NoGrant>::set_scopes(
+            &path,
+            "lab",
+            None,
+            Some(ScopeSet::Allowlist(vec!["get_junos_config".to_owned()])),
+            &known_narrow,
+        )
+        .expect("set_scopes must succeed when devices is None");
+
+        let after: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load after");
+        let store_after = after.store();
+        let entry_after = store_after.entries().iter().find(|e| e.name == "lab").expect("entry after");
+
+        // Digest must be preserved (secret unchanged)
+        assert_eq!(entry_after.digest, digest_before, "digest must be preserved");
+
+        // Original secret must still work
+        assert!(
+            store_after.authenticate(secret.expose_secret()).is_some(),
+            "original secret must still authenticate"
+        );
+
+        // Tools scope must be narrowed
+        assert_eq!(
+            entry_after.tools,
+            ScopeSet::Allowlist(vec!["get_junos_config".to_owned()])
+        );
+
+        // Devices scope must be unchanged
+        assert_eq!(entry_after.devices, ScopeSet::Allowlist(vec!["edge-fw".to_owned()]));
     }
 }
