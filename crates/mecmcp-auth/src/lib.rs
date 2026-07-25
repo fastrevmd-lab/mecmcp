@@ -10,8 +10,11 @@ pub mod grant;
 pub mod entry;
 pub mod store;
 
+pub mod file;
+
 pub use token::{TokenDigest, TokenError, TokenSecret};
 pub use scope::{MAX_SCOPE_NAMES, ScopeError, ScopeSet};
 pub use grant::{Grant, GrantError, NoAction, NoGrant};
 pub use entry::{EntryError, MAX_TOKEN_NAME, TokenEntry};
 pub use store::{CallerCtx, MAX_TOKENS, StoreError, TokenStore, filter_device_names};
+pub use file::{FileError, TokenStoreFile, write_atomic};
