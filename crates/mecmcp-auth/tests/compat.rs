@@ -127,7 +127,7 @@ fn writing_a_deployed_file_preserves_its_envelope_version() {
     {
         let (_dir, path) = staged("junos-tokens.json");
         let known = KnownNames {
-            devices: &["edge-fw".to_owned(), "core-fw".to_owned(), "dc-fw".to_owned()],
+            devices: Some(&["edge-fw".to_owned(), "core-fw".to_owned(), "dc-fw".to_owned()]),
             tools: &["get_junos_config", "execute_junos_command", "get_router_list"],
         };
 
@@ -159,7 +159,7 @@ fn writing_a_deployed_file_preserves_its_envelope_version() {
     {
         let (_dir, path) = staged("panos-tokens.json");
         let known = KnownNames {
-            devices: &["panosvm".to_owned()],
+            devices: Some(&["panosvm".to_owned()]),
             tools: &["get_panos_config", "list_devices", "stage_panos_config"],
         };
 
