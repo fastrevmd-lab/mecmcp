@@ -45,6 +45,7 @@ and the extraction plan; code lands per the phases in [`PLAN.md`](PLAN.md).
 | [`ANALYSIS.md`](ANALYSIS.md) | Side-by-side teardown of both repos — what is duplicated, what is asymmetric, what stays vendor-specific |
 | [`PLAN.md`](PLAN.md) | Program-level extraction plan: crate map, phase sequencing, decisions, exit criteria |
 | [`ROADMAP.md`](ROADMAP.md) | What "enterprise grade" means at 150 engineers and 4,000 multi-vendor firewalls |
+| [`docs/PACKAGING.md`](docs/PACKAGING.md) | How a mechub MCP server is delivered and installed — container base, LXC, README requirements |
 | [`docs/superpowers/plans/`](docs/superpowers/plans/) | Executable per-phase implementation plans |
 
 ## The crate family
