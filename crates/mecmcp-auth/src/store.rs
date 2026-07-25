@@ -35,6 +35,14 @@ impl<G: Grant> TokenStore<G> {
     /// # Errors
     /// Returns [`StoreError`] describing the first failing check.
     pub fn try_new(entries: Vec<TokenEntry<G>>) -> Result<Self, StoreError> {
+        // Deliberately NOT rejected here: an entry whose device and tool scopes
+        // are both empty. Such a token authenticates but authorizes nothing,
+        // which reads like a configuration mistake — but rejecting it would fail
+        // the whole call, and this call validates the entire file. One useless
+        // entry would then stop every other token in `tokens.json` from loading
+        // and take authentication offline server-wide. An entry that authorizes
+        // nothing is already fail-closed and harmless; a fleet-wide outage is
+        // not. Surface it in `token list` output instead, never here.
         if entries.len() > MAX_TOKENS {
             return Err(StoreError::TooMany(entries.len()));
         }
@@ -252,5 +260,20 @@ mod tests {
         };
         let visible = filter_device_names(Some(&ctx), vec!["edge-fw".to_owned()]);
         assert!(visible.is_empty());
+    }
+
+    #[test]
+    fn wildcard_scope_sees_the_whole_inventory() {
+        // The most common shape for a real token, and the one case the other
+        // filter tests do not reach.
+        let ctx: CallerCtx = CallerCtx {
+            token_name: "lab".to_owned(),
+            devices: ScopeSet::Wildcard,
+            tools: ScopeSet::Wildcard,
+            grant: None,
+        };
+        let names = vec!["edge-fw".to_owned(), "core-fw".to_owned()];
+        let visible = filter_device_names(Some(&ctx), names.clone());
+        assert_eq!(visible, names, "a wildcard device scope must not filter");
     }
 }

@@ -38,6 +38,8 @@ impl ScopeSet {
     /// A wildcard tool scope is a convenience for read-only automation; granting
     /// write authority must always be an explicit, named decision. The caller
     /// supplies its own write-tool registry so this crate stays vendor-neutral.
+    /// An empty allowlist permits nothing — the set is simply empty, so no name
+    /// can match.
     #[must_use]
     pub fn allows_tool(&self, name: &str, write_tools: &[&str]) -> bool {
         match self {
