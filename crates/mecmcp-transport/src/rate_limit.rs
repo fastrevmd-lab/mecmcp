@@ -128,6 +128,11 @@ struct RateLimitState {
 }
 
 impl RateLimitState {
+    /// Whether the per-IP dimension is configured.
+    fn ip_rate_limit_enabled(&self) -> bool {
+        self.ip_rate_per_second > 0 && self.ip_burst > 0
+    }
+
     fn new(config: &LimitsConfig) -> Self {
         debug_assert!(
             config.ip_rate_limit_enabled() || config.token_rate_limit_enabled(),
@@ -164,19 +169,62 @@ impl RateLimitState {
     }
 }
 
+/// Warn exactly once that per-IP limiting is configured but unreachable.
+///
+/// Once, not per request: a server mounted without `ConnectInfo` would otherwise
+/// emit this on every single request and bury everything else in the log.
+fn warn_missing_connect_info_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "per-IP rate limiting is configured but no ConnectInfo is present; \
+             per-IP limits are NOT being enforced. Serve the router with \
+             `into_make_service_with_connect_info::<SocketAddr>()` to enable them. \
+             Per-token limiting is unaffected."
+        );
+    });
+}
+
+/// `ConnectInfo` is **optional**, deliberately.
+///
+/// As a required extractor it rejects with `500 Internal Server Error` whenever
+/// the peer address is absent — which is not an error condition, it is a
+/// property of how the server was mounted. A router served without
+/// `into_make_service_with_connect_info`, or exercised via `oneshot` in a test,
+/// has no `ConnectInfo`, and turning that into a 500 converts a mounting nuance
+/// into a total outage on every request. That is exactly what happened when
+/// rustpanosmcp first adopted this crate: every request 500'd, including ones
+/// that should have been 401.
+///
+/// Absence is not attacker-controllable — `ConnectInfo` is inserted by the
+/// server's own make-service, never by the client — so skipping the per-IP
+/// dimension when it is missing is safe. Per-token limiting still applies. The
+/// misconfiguration is surfaced by a warning rather than by failing closed.
 async fn rate_limit_middleware(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<RateLimitState>,
     request: Request,
     next: Next,
 ) -> Response {
     let now = Instant::now();
-    let ip = addr.ip().to_string();
 
-    if let RateDecision::Limited { retry_after_secs } = state.check_ip(&ip, now) {
+    // Read from extensions rather than taking `ConnectInfo` as an extractor: a
+    // required extractor rejects with 500 when the peer address is absent, and
+    // `Option<ConnectInfo<_>>` needs `OptionalFromRequestParts`, which axum does
+    // not provide for it. Extensions is where the make-service puts it anyway.
+    let ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip().to_string());
+    if ip.is_none() && state.ip_rate_limit_enabled() {
+        warn_missing_connect_info_once();
+    }
+
+    if let Some(ip) = ip.as_deref()
+        && let RateDecision::Limited { retry_after_secs } = state.check_ip(ip, now)
+    {
         tracing::warn!(
             limit = "ip_rate",
-            ip = %ip,
+            ip = ip,
             rate = state.ip_rate_per_second,
             burst = state.ip_burst,
             retry_after_secs,
@@ -628,5 +676,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// Regression: a router with no `ConnectInfo` must still serve.
+    ///
+    /// `ConnectInfo` was previously a required extractor, so its absence
+    /// rejected with 500 — on *every* request, including ones that should have
+    /// been 401. That is not hypothetical: it is what rustpanosmcp saw the first
+    /// time it adopted this crate, because its tests drive the router with
+    /// `oneshot`, which has no peer address. A server mounted without
+    /// `into_make_service_with_connect_info` would have behaved the same way in
+    /// production.
+    #[tokio::test]
+    async fn missing_connect_info_does_not_500() {
+        use axum::routing::get;
+        use tower::ServiceExt as _;
+
+        let config = LimitsConfig {
+            max_requests_per_second_per_ip: 100,
+            max_request_burst_per_ip: 100,
+            max_requests_per_second_per_token: 100,
+            max_request_burst_per_token: 100,
+            ..LimitsConfig::default()
+        };
+        let app = apply_rate_limit(Router::new().route("/", get(|| async { "ok" })), &config);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "absent ConnectInfo must skip per-IP limiting, not fail the request"
+        );
     }
 }
