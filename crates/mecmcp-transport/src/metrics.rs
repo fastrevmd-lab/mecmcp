@@ -61,10 +61,14 @@ impl PrometheusRuntime {
         );
         metrics::gauge!(active_sessions_name.clone()).set(0.0);
 
-        // Install metric names in thread-local storage for use by middleware
-        ACTIVE_SESSIONS_NAME.with(|cell| *cell.borrow_mut() = Some(active_sessions_name.clone()));
-        LIMIT_HITS_NAME.with(|cell| *cell.borrow_mut() = Some(limit_hits_name.clone()));
-        SESSIONS_REAPED_NAME.with(|cell| *cell.borrow_mut() = Some(sessions_reaped_name.clone()));
+        // Publish the names process-globally so middleware on any worker thread
+        // can read them. `set` returns Err if a second runtime is installed in
+        // the same process; the first install wins and that is the contract.
+        let _ = METRIC_NAMES.set(MetricNames {
+            active_sessions: active_sessions_name.clone(),
+            limit_hits: limit_hits_name.clone(),
+            sessions_reaped: sessions_reaped_name.clone(),
+        });
 
         let upkeep_handle = handle.clone();
         let upkeep = AbortOnDropHandle::new(tokio::spawn(async move {
@@ -183,10 +187,76 @@ async fn render_metrics(State(handle): State<PrometheusHandle>) -> Response {
 
 // Module-level metric name storage for use by overload responses and other
 // middleware that don't have direct access to PrometheusRuntime.
+/// The prefix-derived metric names, resolved once at `install()`.
+#[derive(Debug)]
+pub(crate) struct MetricNames {
+    /// Read by the session tracker, which lands in Task 5.
+    #[allow(dead_code)] // Used in phases 3-10
+    pub(crate) active_sessions: String,
+    pub(crate) limit_hits: String,
+    /// Read by the session reaper, which lands in Task 5.
+    #[allow(dead_code)] // Used in phases 3-10
+    pub(crate) sessions_reaped: String,
+}
+
+/// Process-global, deliberately **not** thread-local.
+///
+/// These names are read by middleware running on tokio worker threads, while
+/// `install()` runs on whichever thread starts the server. A `thread_local`
+/// here is silently wrong: the worker sees `None` and the metric is never
+/// recorded — no panic, no log, just a series that stops existing. A
+/// `current_thread` test runtime hides it, because there the setter and the
+/// reader are the same thread.
+///
+/// `OnceLock` because a process serves exactly one server, so the names are
+/// fixed for its lifetime. This matches `mecmcp_audit::install_duration_metric_name`.
+static METRIC_NAMES: std::sync::OnceLock<MetricNames> = std::sync::OnceLock::new();
+
+// Test-only per-thread override.
+//
+// Production reads METRIC_NAMES, which is process-global and therefore visible
+// from every tokio worker thread — that is the bug fix. But the unit tests
+// install several different prefixes in one process and run in parallel, which
+// a OnceLock cannot serve. This override gives each test thread its own names
+// while leaving the production path global.
+//
+// It is #[cfg(test)]: no override exists in a release build, so there is no way
+// for this to mask the cross-thread bug it is carved out around.
+#[cfg(test)]
 thread_local! {
-    static ACTIVE_SESSIONS_NAME: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-    static LIMIT_HITS_NAME: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-    static SESSIONS_REAPED_NAME: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static TEST_METRIC_NAMES: std::cell::RefCell<Option<MetricNames>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set the calling thread's metric names for the duration of a test.
+#[cfg(test)]
+pub(crate) fn set_test_metric_names(prefix: &str) {
+    TEST_METRIC_NAMES.with(|cell| {
+        *cell.borrow_mut() = Some(MetricNames {
+            active_sessions: format!("{prefix}_active_sessions"),
+            limit_hits: format!("{prefix}_limit_hits_total"),
+            sessions_reaped: format!("{prefix}_sessions_reaped_total"),
+        });
+    });
+}
+
+/// The `<prefix>_limit_hits_total` name, or `None` before `install()` has run.
+pub(crate) fn limit_hits_metric_name() -> Option<String> {
+    #[cfg(test)]
+    {
+        if let Some(name) =
+            TEST_METRIC_NAMES.with(|cell| cell.borrow().as_ref().map(|n| n.limit_hits.clone()))
+        {
+            return Some(name);
+        }
+    }
+    METRIC_NAMES.get().map(|names| names.limit_hits.clone())
+}
+
+/// Metric names resolved at install, or `None` before `install()` has run.
+#[allow(dead_code)] // Used in phases 3-10
+pub(crate) fn metric_names() -> Option<&'static MetricNames> {
+    METRIC_NAMES.get()
 }
 
 /// Record a limit hit using the installed metric names.
@@ -194,8 +264,7 @@ thread_local! {
 /// This function is called by overload response builders that don't have
 /// direct access to the PrometheusRuntime instance.
 pub(crate) fn record_limit_hit(limit: &'static str, event: &'static str) {
-    let name = LIMIT_HITS_NAME.with(|cell| cell.borrow().clone());
-    if let Some(name) = name {
+    if let Some(name) = limit_hits_metric_name() {
         metrics::counter!(
             name,
             "limit" => limit,
@@ -217,9 +286,9 @@ pub(crate) fn test_recorder(
     let tool_duration_name = format!("{prefix}_tool_duration_seconds");
     let sessions_reaped_name = format!("{prefix}_sessions_reaped_total");
 
-    ACTIVE_SESSIONS_NAME.with(|cell| *cell.borrow_mut() = Some(active_sessions_name.clone()));
-    LIMIT_HITS_NAME.with(|cell| *cell.borrow_mut() = Some(limit_hits_name.clone()));
-    SESSIONS_REAPED_NAME.with(|cell| *cell.borrow_mut() = Some(sessions_reaped_name.clone()));
+    // Per-thread, not the process global: several prefixes coexist in one test
+    // binary. See set_test_metric_names for why this carve-out is safe.
+    set_test_metric_names(prefix);
 
     let recorder = prometheus_builder("test", &tool_duration_name)
         .expect("fixed non-empty histogram buckets")
@@ -258,10 +327,7 @@ mod tests {
         with_local_recorder(&recorder, || {
             metrics::gauge!("junosmcp_active_sessions").set(2.0);
             record_limit_hit("global_concurrency", "request_rejected");
-            SESSIONS_REAPED_NAME.with(|cell| {
-                let name = cell.borrow().clone().unwrap();
-                metrics::counter!(name, "reason" => "idle").increment(1);
-            });
+            metrics::counter!("junosmcp_sessions_reaped_total", "reason" => "idle").increment(1);
             // Use AuditScope to emit mecmcp_tool_duration_seconds, not a direct
             // metrics::histogram! call. This tests the real code path.
             let mut audit =
@@ -362,5 +428,40 @@ mod tests {
         // explicitly requested
         assert!(!text_alpha.contains("junosmcp_"));
         assert!(!text_beta.contains("junosmcp_"));
+    }
+
+    /// Regression: the metric names must be readable from a **different thread**
+    /// than the one that published them.
+    ///
+    /// An earlier implementation kept them in `thread_local!` storage.
+    /// `install()` runs on whichever thread starts the server; the middleware
+    /// that records limit hits runs on tokio worker threads. The worker read
+    /// `None`, so `record_limit_hit` silently did nothing and
+    /// `<prefix>_limit_hits_total` stopped existing — no panic, no log.
+    ///
+    /// Deliberately prefix-agnostic: it asserts the invariant (same value on
+    /// any thread) rather than a specific name, so it does not race the other
+    /// tests over the `OnceLock`. A `current_thread` runtime cannot fail this
+    /// way, which is precisely why the original test missed the bug.
+    #[test]
+    fn metric_names_are_visible_across_threads() {
+        let _ = METRIC_NAMES.set(MetricNames {
+            active_sessions: "xthread_active_sessions".into(),
+            limit_hits: "xthread_limit_hits_total".into(),
+            sessions_reaped: "xthread_sessions_reaped_total".into(),
+        });
+
+        let on_main = metric_names().map(|n| n.limit_hits.clone());
+        assert!(on_main.is_some(), "names unset on the publishing thread");
+
+        let on_worker = std::thread::spawn(|| metric_names().map(|n| n.limit_hits.clone()))
+            .join()
+            .expect("worker thread panicked");
+
+        assert_eq!(
+            on_main, on_worker,
+            "metric names differ across threads — this is the thread_local \
+             regression: middleware on a tokio worker would record nothing"
+        );
     }
 }
