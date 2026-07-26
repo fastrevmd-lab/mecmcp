@@ -84,9 +84,93 @@ first.
 
 ## 2. LXC
 
-Debian 13 stable, unprivileged, `nesting=1` only where the repo genuinely needs
-it. Matching the container's distro generation means one CVE surface to track
-rather than two.
+**Debian 13 (trixie), unprivileged.** `nesting=1` only where the repo genuinely
+needs it. This is a hard requirement, not a default — see below.
+
+### Why Debian 13 specifically
+
+A glibc binary runs on the same or newer glibc, never older, so the LXC's distro
+generation sets a floor on where a release can run. Measured on the published
+artifacts:
+
+| | glibc | rustjunosmcp 0.11.0 (needs 2.39) | rustpanosmcp 0.4.0 (needs 2.34) |
+|---|---|---|---|
+| Debian 12 | 2.36 | **fails at start** | ok |
+| Ubuntu 24.04 | 2.39 | exact, no headroom | ok |
+| **Debian 13** | **2.41** | ok | ok |
+
+`rustjunosmcp`'s README used to say "Debian 12 / Ubuntu 24.04". That container
+builds clean, installs clean, and then dies at first start with
+`GLIBC_2.39 not found` — the worst place to find out, because everything up to
+that point looks successful.
+
+**Read the floor from the artifact, do not assume it:**
+
+```bash
+objdump -T <extracted>/usr/local/bin/<binary> \
+  | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1
+```
+
+The two servers differ — 2.34 versus 2.39 — because `rustpanosmcp` builds in CI
+against a fixed base while `rustjunosmcp`'s `package-lxc.sh` builds against
+whatever host runs it. **A release built on a developer workstation is only as
+portable as that workstation.** New repos should build releases in CI against a
+pinned base for this reason; it is also a provenance requirement if the project
+is heading for NIST SSDF (SP 800-218) attestation.
+
+### Logging: journald stays, and is configured, not trimmed
+
+The smallest possible container is one without journald. That is the wrong trade
+for a server holding firewall credentials, and it forecloses the audit story.
+
+**Never trim:** `systemd`, `systemd-journald`, `ca-certificates`.
+**Trim freely:** compilers and toolchains (the installers ship prebuilt binaries
+— no repo needs `cargo` or `rustc` in the container), docs, man pages, anything
+desktop.
+**Per-repo additions:** whatever the binary spawns. `rustjunosmcp` needs
+`openssh-client` and `tar` because `transfer_file`, `fetch_file`, and
+`collect_jtac_support_bundle` shell out; that is also why it cannot use
+distroless (§1).
+
+Configure journald deliberately:
+
+```ini
+# /etc/systemd/journald.conf.d/mecmcp.conf
+[Journal]
+Storage=persistent
+Seal=yes
+SystemMaxUse=512M
+```
+
+`Seal=yes` plus `journalctl --setup-keys` enables **Forward Secure Sealing**,
+which makes retroactive tampering detectable. This is load-bearing rather than
+decorative: `rustpanosmcp`'s approve event carries the change-set id and digest
+precisely so there is independent evidence that a second principal reviewed the
+exact digest applied. A log an attacker can quietly edit destroys that evidence,
+and the state file alone was never sufficient — it is rewritten by the server.
+
+Forward with `systemd-journal-upload`, or to classic syslog via rsyslog if the
+site collector expects it. Both are small.
+
+### Audit flags: the baseline every server runs
+
+All servers share the `mecmcp-audit` surface. The deployed baseline is:
+
+```
+--audit-format json
+--audit-journald
+--audit-redact <fields>=hmac
+--audit-hmac-key-file /etc/<svc>/audit-hmac.key
+```
+
+Turn redaction on **at first install, not later.** Once events are leaving the
+box, device names crossing that boundary is a disclosure decision; HMAC
+pseudonymisation keeps events correlatable without exporting the inventory.
+Retrofitting means re-keying and losing correlation across the change.
+
+The key is passed as a **path**, never as a flag value or environment variable,
+so it cannot leak into `ps` output, a unit file, or a container inspect. Mode
+0600, owned by the service user.
 
 Every repo ships `packaging/lxc/install.sh`. It must:
 
@@ -200,3 +284,21 @@ For a new repo, or one being brought into line:
 - [ ] README has complete LXC and Docker sections, verified against a real archive
 - [ ] CI gates the repo — see [#7](https://github.com/fastrevmd-lab/mecmcp/issues/7)
       for the check set
+
+**LXC and observability (§2):**
+
+- [ ] LXC is **Debian 13**, unprivileged. The README says so and says why.
+- [ ] The release binary's glibc floor is **measured** with `objdump -T`, not
+      assumed, and recorded in the README
+- [ ] The release is built **in CI against a pinned base**, not on a developer
+      workstation — otherwise the artifact is only as portable as whoever built it
+- [ ] `journald` configured `Storage=persistent`, `Seal=yes`, with
+      `journalctl --setup-keys` run once at provisioning
+- [ ] Server runs with `--audit-format json --audit-journald`
+- [ ] `--audit-redact` enabled **at first install** with an HMAC key file at
+      mode 0600, owned by the service user, passed as a **path**
+- [ ] Log forwarding configured (`systemd-journal-upload` or rsyslog) or
+      explicitly deferred with a note saying so
+- [ ] No `cargo`/`rustc` in the container — the installer ships a prebuilt binary
+- [ ] Anything the binary spawns (`grep -rn "Command::new"`) is installed in the
+      LXC, and listed in the README
