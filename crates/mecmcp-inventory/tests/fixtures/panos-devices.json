@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "devices": [
+    {
+      "name": "lab-fw-01",
+      "endpoint": "https://panos-lab.example.net",
+      "vsys": "vsys1",
+      "api_key": {
+        "type": "env",
+        "name": "PANOS_LAB_API_KEY"
+      },
+      "tls": {
+        "type": "custom_ca",
+        "path": "/etc/rust-panosmcp/panos-lab-ca.pem"
+      },
+      "tags": ["lab", "read-only"],
+      "connect_timeout_secs": 10,
+      "request_timeout_secs": 30,
+      "max_concurrency": 4,
+      "max_response_bytes": 5242880
+    }
+  ]
+}

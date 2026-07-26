@@ -1,3 +1,18 @@
+//! Loads the **real** inventory fixtures from both servers through the shared
+//! trait.
+//!
+//! The fixtures are vendored copies of:
+//!   - `rustjunosmcp/devices-template.json`
+//!   - `rustpanosmcp/config/devices.example.json`
+//!
+//! They are copied in rather than read from a sibling checkout because the
+//! first version of this test hardcoded absolute paths under a developer's home
+//! directory and **skipped itself** when they were absent. That made the single
+//! most important test in Phase 4 — "does a real devices.json still load?" — a
+//! no-op everywhere except one machine, while still reporting success.
+//!
+//! Refresh these copies if either server changes its example. A stale fixture
+//! is a visible failure; a skipped test is not.
 //! Integration test loading real fixture files from both server repos.
 
 #![allow(clippy::unwrap_used)]
@@ -54,12 +69,10 @@ struct PanosDevice {
 
 #[test]
 fn loads_real_junos_fixture() {
-    let junos_path = "/home/mharman/Projects/RustJunosMCP/devices-template.json";
-    if !std::path::Path::new(junos_path).exists() {
-        eprintln!("Skipping test: {} not found", junos_path);
-        return;
-    }
-
+    let junos_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/junos-devices.json"
+    );
     let inv: mecmcp_inventory::FileInventory<JunosDevice, JunosPolicy> =
         mecmcp_inventory::FileInventory::load(junos_path).expect("load junos fixture");
     let names = inv.names();
@@ -75,12 +88,10 @@ fn loads_real_junos_fixture() {
 
 #[test]
 fn loads_real_panos_fixture() {
-    let panos_path = "/home/mharman/Projects/rust-panosmcp/config/devices.example.json";
-    if !std::path::Path::new(panos_path).exists() {
-        eprintln!("Skipping test: {} not found", panos_path);
-        return;
-    }
-
+    let panos_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/panos-devices.json"
+    );
     let inv: mecmcp_inventory::FileInventory<PanosDevice, ()> =
         mecmcp_inventory::FileInventory::load(panos_path).expect("load panos fixture");
     let names = inv.names();

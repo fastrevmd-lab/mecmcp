@@ -1,0 +1,57 @@
+{
+    "_blocklist_defaults": {
+        "commands": [
+            {"action": "deny", "pattern": "request system *"},
+            {"action": "deny", "pattern": "clear system commit"}
+        ],
+        "config": [
+            {"action": "deny", "pattern": "delete *"}
+        ],
+        "pfe_commands": [
+            {"action": "deny", "pattern": "set *"}
+        ]
+    },
+    "r1": {
+        "ip": "ip",
+        "port": 22,
+        "username": "user",
+        "auth": {
+            "type": "password",
+            "password": "pwd"
+        }
+    },
+    "r2": {
+        "ip": "ip",
+        "port": 22,
+        "username": "user",
+        "auth": {
+            "type": "ssh_key",
+            "private_key_path": "/path/to/private/key.pem"
+        }
+    },
+    "r3": {
+        "ip": "ip",
+        "port": 22,
+        "username": "user",
+        "ssh_config": "~/.ssh/config_dc",
+        "auth": {
+            "type": "ssh_key",
+            "private_key_path": "/path/to/private/key.pem"
+        }
+    },
+    "r4": {
+        "ip": "ip",
+        "port": 22,
+        "username": "user",
+        "ssh_config": "/home/user/.ssh/config_jumphost",
+        "auth": {
+            "type": "password",
+            "password": "pwd"
+        },
+        "blocklist": {
+            "commands": [
+                {"action": "allow", "pattern": "request system reboot"}
+            ]
+        }
+    }
+}
