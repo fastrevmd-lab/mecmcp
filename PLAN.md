@@ -237,8 +237,51 @@ preflight becomes an additional layer in it. CLI, TLS, and token subcommands
 move to `mecmcp-runtime`. Largest mechanical diff, lowest conceptual risk.
 
 **Exit:** `rustpanosmcp` gains per-token session caps, per-token RPS limits, and
-`/metrics`; `rustjunosmcp` gains pre-dispatch scope preflight; the the deployment container
+`/metrics`; `rustjunosmcp` gains pre-dispatch scope preflight; the deployed
 systemd override still works verbatim.
+
+**Completed 2026-07-26**, split into 3a (`mecmcp-transport`, `transport-v0.1.6`)
+and 3b (`mecmcp-runtime`, `runtime-v0.1.6`). Findings worth carrying forward:
+
+- **The extraction was bidirectional**, which this plan did not anticipate.
+  `rustjunosmcp` supplied the hardening `rustpanosmcp` lacked entirely —
+  concurrency caps, session caps and reaper, Prometheus metrics, typed overload
+  responses. `rustpanosmcp` supplied a materially stronger TLS loader
+  (`O_NOFOLLOW`, mode and owner checks, size caps, `Zeroizing`) and the scope
+  preflight concept. Neither repo was simply the source.
+
+- **Four defects reached review in the shared crate, every one a silent
+  degradation.** Metric names in `thread_local!` storage, invisible to tokio
+  workers so `<prefix>_limit_hits_total` stopped recording with no panic and no
+  log. `rmcp` pinned to 0.2.1, carrying RUSTSEC-2026-0189 — DNS rebinding in the
+  Streamable HTTP transport, the very component the crate exists to harden.
+  `rustls` 0.22 pulling three certificate-validation advisories. `ConnectInfo`
+  as a required extractor, returning **500 on every request** when the router is
+  mounted without `into_make_service_with_connect_info`.
+
+  None were caught by the crate's own 202 tests. Each surfaced only from a
+  *second* consumer or a differently-shaped test. **A shared crate verified
+  against one consumer is not verified.**
+
+- **Two of those share a root cause worth naming: the shared crate was older
+  than its consumers.** Both servers already ran `rmcp` 2.x and `rustls` 0.23.
+  So the rule this program keeps relearning has a second half — not only "do not
+  bake in a consumer's choice", but "do not hand a consumer something worse than
+  what it already has".
+
+- **One git ref, always.** Two refs for `mecmcp-auth` produce two `CallerCtx`
+  types with different `TypeId`s; `Extensions::get` then silently returns `None`
+  and per-token limits stop enforcing while startup still logs them as
+  configured. `grep -c '^name = "mecmcp-auth"' Cargo.lock` must print `1`, and
+  it is worth checking on every dependency change.
+
+- **Plans drifted from the tree three times.** Phase 5's D6 specified a
+  state-file migration that already existed; Phase 3b's D1 specified a TLS port
+  Phase 3a had already done, and its Task 1 still said to port the loader even
+  after D1 was corrected — which would have made a third copy. Chasing the D1
+  discrepancy also surfaced that v0.11.1 shipped a breaking TLS key-mode
+  requirement with nothing in the release notes. **Verify each decision against
+  `main` before implementing.**
 
 ### Phase 4 — `mecmcp-policy` + `mecmcp-inventory` + `mecmcp-device`
 
