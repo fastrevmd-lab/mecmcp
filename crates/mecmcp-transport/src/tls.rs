@@ -60,7 +60,7 @@ pub fn load(
     let key = PrivateKeyDer::from_pem_slice(&key_bytes)
         .map_err(|error| TlsError::Invalid(format!("private-key PEM: {error}")))?;
     let config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(|error| TlsError::Invalid(format!("TLS versions: {error}")))?
         .with_no_client_auth()
         .with_single_cert(certs, key)
