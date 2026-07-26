@@ -13,6 +13,11 @@ workspace = true
 
 [dependencies]
 axum        = { version = "0.8", default-features = false, features = ["tokio"] }
+dashmap     = "6.1"
+futures     = "0.3"
+http        = "1"
+http-body   = "1"
+http-body-util = "0.1"
 mecmcp-auth = { version = "0.1.5", path = "../mecmcp-auth" }
 metrics     = { workspace = true }
 # metrics-exporter-prometheus must have default-features = false to avoid
@@ -20,11 +25,13 @@ metrics     = { workspace = true }
 # consumers pinning `ring`. The workspace already sets this, but it's repeated
 # here for emphasis.
 metrics-exporter-prometheus = { workspace = true }
+rmcp        = { version = "0.2", features = ["transport-streamable-http-server", "transport-streamable-http-server-session", "transport-worker"] }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 thiserror   = { workspace = true }
 tokio       = { version = "1", features = ["time", "sync"] }
 tokio-util  = { version = "0.7", default-features = false, features = ["rt"] }
+tower-http  = { version = "0.6", features = ["limit"] }
 tracing     = { workspace = true }
 
 [dev-dependencies]
