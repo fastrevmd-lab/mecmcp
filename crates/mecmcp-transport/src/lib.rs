@@ -10,7 +10,7 @@ mod config;
 mod identity;
 mod metrics;
 mod overload;
-mod preflight;
+pub mod preflight;
 mod rate_limit;
 mod session;
 mod target;

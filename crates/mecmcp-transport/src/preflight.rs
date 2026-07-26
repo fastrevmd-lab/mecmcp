@@ -6,88 +6,123 @@
 //!
 //! `None` must be behaviourally identical to Junos today.
 
-use async_trait::async_trait;
-use axum::{body::Body, http::Request};
+use mecmcp_auth::CallerCtx;
 use std::sync::Arc;
 
-/// Preflight authorization check before routing to the handler.
+/// Preflight authorization check, run before the request reaches the handler.
 ///
-/// Invoked at the middleware layer with the raw request body. Implementations
-/// parse the body, extract the tool name and any target device, and check
-/// against the token's scopes.
+/// Returning `Ok(())` allows the request to proceed. Returning `Err(reason)`
+/// causes a 403 carrying that reason.
 ///
-/// Returning `Ok(())` allows the request to proceed. Returning `Err(...)` with
-/// a specific error message causes a 403 response with that message.
-#[async_trait]
+/// # Why this is synchronous
+///
+/// The body arrives as `&[u8]` rather than as a `Request`, and the method does
+/// not return a future. Both follow from what the only real implementation
+/// does: `rustpanosmcp`'s `request_exceeds_scope(bytes: &[u8], caller:
+/// &CallerContext) -> bool` and its `tool_call_exceeds_scope` contain **zero**
+/// `await` points — they parse an in-memory buffer and compare against scopes
+/// already loaded in `CallerCtx`.
+///
+/// The middleware has those bytes in hand regardless, because it must buffer
+/// the body to enforce the size limit. Making this `async` would therefore add
+/// an `async-trait` dependency and a `Box<dyn Future>` allocation on the hot
+/// path of every MCP request, to await nothing. If a future implementation
+/// genuinely needs to await — consulting a remote authorization service, say —
+/// this trait changes then, and the crate has no external consumers yet to
+/// break.
 pub trait ScopePreflight: Send + Sync {
-    /// Check whether the request is authorized to proceed.
+    /// Check whether `caller` may issue the request carried in `body`.
     ///
-    /// The request body is provided in its raw form. The implementation is
-    /// responsible for parsing it and extracting the necessary fields.
-    async fn check(&self, request: &Request<Body>) -> Result<(), String>;
+    /// `body` is the complete, already-buffered request body. `Err` should
+    /// carry a reason safe to return to the caller.
+    fn check(&self, body: &[u8], caller: &CallerCtx) -> Result<(), String>;
 }
 
-/// Type alias for an optional preflight checker.
-///
-/// `None` disables preflight; the request proceeds directly to the handler.
-/// This reproduces the Junos behaviour where authorization is handler-local.
+/// An optional preflight. `None` disables it entirely.
 pub type OptionalPreflight = Option<Arc<dyn ScopePreflight>>;
 
+/// Run a preflight if one is configured.
+///
+/// This is the whole of the `None` contract: with no preflight there is no
+/// check, and every request proceeds exactly as it does on a server that never
+/// had one. Middleware calls this rather than matching on the `Option` itself,
+/// so the skip semantics live in one place and are testable.
+pub fn run_preflight(
+    preflight: &OptionalPreflight,
+    body: &[u8],
+    caller: &CallerCtx,
+) -> Result<(), String> {
+    match preflight {
+        Some(check) => check.check(body, caller),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request};
+    use mecmcp_auth::ScopeSet;
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn none_preflight_passes_all_requests() {
-        // Task 7 requirement: None must be behaviourally identical to Junos.
-        // A request that a Some(...) preflight would reject must pass untouched.
-        let preflight: OptionalPreflight = None;
+    /// Body that a scope-checking preflight would reject: a tool call naming a
+    /// tool and device the caller has no claim to.
+    const FORBIDDEN: &[u8] = br#"{"method":"tools/call","params":{"name":"forbidden_tool","arguments":{"device":"blocked"}}}"#;
 
-        let _request = Request::builder()
-            .uri("/mcp")
-            .method("POST")
-            .body(Body::from(
-                r#"{"method":"tools/call","params":{"name":"forbidden_tool","arguments":{"device":"blocked"}}}"#,
-            ))
-            .expect("valid request");
-
-        // With None, there is no preflight to invoke — the request would go
-        // straight to the handler. This test asserts the type allows None.
-        assert!(preflight.is_none());
-
-        // A real middleware would do:
-        // if let Some(checker) = &preflight {
-        //     checker.check(&request).await?;
-        // }
-        // With None, the check is skipped entirely, so any request proceeds.
-    }
-
-    struct AlwaysReject;
-
-    #[async_trait]
-    impl ScopePreflight for AlwaysReject {
-        async fn check(&self, _request: &Request<Body>) -> Result<(), String> {
-            Err("always rejected".to_owned())
+    fn caller() -> CallerCtx {
+        CallerCtx {
+            token_name: "t1".into(),
+            devices: ScopeSet::Wildcard,
+            tools: ScopeSet::Wildcard,
+            grant: None,
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn some_preflight_can_reject() {
-        // Verify that a Some(...) preflight can enforce policy, contrasting
-        // with the None case above where everything passes.
-        let preflight: OptionalPreflight = Some(Arc::new(AlwaysReject));
+    struct AlwaysReject;
+    impl ScopePreflight for AlwaysReject {
+        fn check(&self, _body: &[u8], _caller: &CallerCtx) -> Result<(), String> {
+            Err("insufficient_scope".to_owned())
+        }
+    }
 
-        let request = Request::builder()
-            .uri("/mcp")
-            .method("POST")
-            .body(Body::from(r#"{"method":"tools/call"}"#))
-            .expect("valid request");
+    /// Task 7's requirement, asserted on behaviour rather than on the shape of
+    /// the `Option`: the *same* body that `Some(...)` rejects must be admitted
+    /// when the preflight is `None`. Checking only `preflight.is_none()` would
+    /// pass even if `run_preflight` rejected everything.
+    #[test]
+    fn none_admits_a_body_that_some_rejects() {
+        let caller = caller();
 
-        let checker = preflight.as_ref().expect("preflight is Some");
-        let result = checker.check(&request).await;
+        let rejecting: OptionalPreflight = Some(Arc::new(AlwaysReject));
+        assert_eq!(
+            run_preflight(&rejecting, FORBIDDEN, &caller),
+            Err("insufficient_scope".to_owned()),
+            "the fixture must actually be rejected, or the None case proves nothing"
+        );
 
-        assert!(result.is_err());
-        assert_eq!(result.expect_err("should be rejected"), "always rejected");
+        let disabled: OptionalPreflight = None;
+        assert_eq!(
+            run_preflight(&disabled, FORBIDDEN, &caller),
+            Ok(()),
+            "None must admit every request — this is the Junos behaviour"
+        );
+    }
+
+    /// The preflight sees the body the middleware buffered, unmodified.
+    #[test]
+    fn body_reaches_the_implementation_unaltered() {
+        struct Capture(std::sync::Mutex<Vec<u8>>);
+        impl ScopePreflight for Capture {
+            fn check(&self, body: &[u8], _caller: &CallerCtx) -> Result<(), String> {
+                *self.0.lock().unwrap() = body.to_vec();
+                Ok(())
+            }
+        }
+
+        let capture = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        let preflight: OptionalPreflight = Some(capture.clone());
+
+        run_preflight(&preflight, FORBIDDEN, &caller()).unwrap();
+
+        assert_eq!(capture.0.lock().unwrap().as_slice(), FORBIDDEN);
     }
 }
