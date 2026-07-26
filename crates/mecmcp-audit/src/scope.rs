@@ -93,6 +93,35 @@ impl AuditScope {
     }
 }
 
+/// The default name for the tool-duration histogram.
+pub const DEFAULT_DURATION_METRIC: &str = "mecmcp_tool_duration_seconds";
+
+static DURATION_METRIC: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Set the tool-duration histogram's metric name.
+///
+/// A metric name is part of the consuming server's public interface — dashboards
+/// and alerts are written against it — so this crate must not impose one. A
+/// server adopting this crate should install its existing name here rather than
+/// silently renaming a metric its operators already query.
+///
+/// Idempotent, matching [`crate::redact::install`]: a second call is a no-op.
+/// Install before the first [`AuditScope`] is dropped; afterwards the name is
+/// fixed for the process, so the emitted name can never diverge from whatever
+/// bucket configuration was registered for it.
+pub fn install_duration_metric_name(name: &'static str) {
+    let _ = DURATION_METRIC.set(name);
+}
+
+/// The metric name in effect, defaulting to [`DEFAULT_DURATION_METRIC`].
+#[must_use]
+pub fn duration_metric_name() -> &'static str {
+    DURATION_METRIC
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_DURATION_METRIC)
+}
+
 impl Drop for AuditScope {
     fn drop(&mut self) {
         let elapsed = self.started.elapsed();
@@ -143,7 +172,7 @@ impl Drop for AuditScope {
         let change_ref = self.attribution.change_ref.as_deref().unwrap_or("");
 
         metrics::histogram!(
-            "mecmcp_tool_duration_seconds",
+            duration_metric_name(),
             "tool" => self.tool,
             "result" => result
         )
