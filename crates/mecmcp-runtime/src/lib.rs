@@ -8,3 +8,4 @@
 
 pub mod cli;
 pub mod cli_validate;
+pub mod token_cmd;
