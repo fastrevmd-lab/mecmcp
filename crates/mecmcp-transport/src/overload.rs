@@ -11,15 +11,16 @@ const RETRY_AFTER_SECS: u64 = 1;
 
 /// Build a 429 Too Many Requests response with the given retry-after interval.
 #[allow(dead_code)] // Used in phases 3-10
-pub(crate) fn rate_limited_response(retry_after_secs: u64) -> Response {
-    crate::metrics::record_limit_hit("token_rate", "request_rejected");
+pub(crate) fn rate_limited_response(limit_kind: &'static str, retry_after_secs: u64) -> Response {
+    crate::metrics::record_limit_hit(limit_kind, "request_rejected");
+    let body = format!(r#"{{"error":"rate_limited","limit":"{limit_kind}"}}"#);
     (
         StatusCode::TOO_MANY_REQUESTS,
         [
             (RETRY_AFTER, retry_after_secs.to_string()),
             (CONTENT_TYPE, "application/json".to_owned()),
         ],
-        r#"{"error":"rate_limited","limit":"token_rate"}"#,
+        body,
     )
         .into_response()
 }
@@ -71,7 +72,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn rate_limited_response_has_stable_contract_and_metric() {
         let (recorder, handle) = crate::metrics::test_recorder("junos");
-        let response = metrics::with_local_recorder(&recorder, || rate_limited_response(3));
+        let response =
+            metrics::with_local_recorder(&recorder, || rate_limited_response("token_rate", 3));
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "3");
