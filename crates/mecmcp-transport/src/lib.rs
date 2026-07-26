@@ -9,8 +9,12 @@ mod config;
 mod identity;
 mod metrics;
 mod overload;
+mod rate_limit;
+mod target;
 
 pub use config::{LimitsConfig, LimitsConfigError};
 pub use identity::TransportIdentity;
 pub use metrics::PrometheusRuntime;
 pub use overload::overload_response;
+pub use rate_limit::apply_rate_limit;
+pub use target::{TargetLimiter, extract_targets};

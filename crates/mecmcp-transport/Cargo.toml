@@ -12,7 +12,8 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
-axum        = { version = "0.8", default-features = false }
+axum        = { version = "0.8", default-features = false, features = ["tokio"] }
+mecmcp-auth = { version = "0.1.5", path = "../mecmcp-auth" }
 metrics     = { workspace = true }
 # metrics-exporter-prometheus must have default-features = false to avoid
 # pulling in rustls's aws-lc-rs backend via hyper-rustls, which conflicts with
@@ -20,8 +21,9 @@ metrics     = { workspace = true }
 # here for emphasis.
 metrics-exporter-prometheus = { workspace = true }
 serde       = { workspace = true }
+serde_json  = { workspace = true }
 thiserror   = { workspace = true }
-tokio       = { version = "1", features = ["time"] }
+tokio       = { version = "1", features = ["time", "sync"] }
 tokio-util  = { version = "0.7", default-features = false, features = ["rt"] }
 tracing     = { workspace = true }
 
@@ -33,5 +35,5 @@ tracing     = { workspace = true }
 # server. Keep it here, and keep default-features off.
 mecmcp-audit = { version = "0.1.5", path = "../mecmcp-audit" }
 metrics-exporter-prometheus = { workspace = true }
-tokio       = { version = "1", features = ["macros", "rt"] }
+tokio       = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 tower       = { version = "0.5", features = ["util"] }
