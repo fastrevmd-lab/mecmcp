@@ -10,7 +10,7 @@ use globset::{Glob, GlobMatcher};
 /// the human-readable error message on denial.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuleSource {
-    /// Rule from the `_blocklist_defaults` section.
+    /// Rule from a global or shared defaults section.
     Defaults,
     /// Rule from a device-specific blocklist.
     Device,
