@@ -13,9 +13,12 @@ clap        = { version = "4", features = ["derive"] }
 mecmcp-auth = { path = "../mecmcp-auth" }
 rustix      = { workspace = true, features = ["process", "fs"] }
 thiserror   = { workspace = true }
+tokio       = { version = "1", features = ["rt", "signal", "sync"] }
+tracing     = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio    = { version = "1", features = ["macros", "rt", "time"] }
 
 [lints]
 workspace = true
