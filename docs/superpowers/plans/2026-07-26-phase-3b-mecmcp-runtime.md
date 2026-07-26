@@ -127,15 +127,33 @@ New crate `crates/mecmcp-runtime/`:
 
 Each task ends green and independently reviewable.
 
-### Task 1 — Scaffold the crate and port TLS loading
+### Task 1 — Scaffold the crate
 
-Create `crates/mecmcp-runtime/` with `Cargo.toml` declaring dependencies: `clap`, `rustix` (features = `["process", "fs"]`), `rustls`, `rustls-pemfile`, `zeroize`, `thiserror`, `anyhow`.
+Create `crates/mecmcp-runtime/` with `Cargo.toml` declaring: `clap`, `rustix`
+(features = `["process", "fs"]`), `thiserror`, `anyhow`. Add it to the workspace.
 
-Port `rustpanosmcp/src/tls.rs` as `mecmcp-runtime/src/tls.rs`, preserving the hardened loader exactly. Add rustjunosmcp to the workspace `Cargo.toml` if not already present.
+**Do NOT port a TLS loader.** An earlier draft of this task said to port
+`rustpanosmcp/src/tls.rs` here, which contradicts D1 and would create a *third*
+copy: panos's original, `mecmcp-transport::tls` (where Phase 3a put it), and a new
+one here. Both servers already consume the transport crate's loader —
+`rust-junosmcp/src/tls.rs` is a thin shim over `mecmcp_transport::tls::load`.
 
-**Test:** Write a test that refuses a key file at mode 0644, accepts one at 0600, and asserts the error message names the file, its mode, and the remedy (`chmod 600 <path>`). Also test that a symlink is refused with `O_NOFOLLOW`.
+`PLAN.md`'s crate map assigns "TLS bootstrap" to this crate, and that remains
+right, but bootstrap means the **CLI plumbing**: parsing `--tls-cert`/`--tls-key`,
+validating that they are supplied as a pair, and installing the consumer's crypto
+provider before handing paths to `mecmcp_transport::tls::load`. That work belongs
+to Task 2 with the rest of the CLI. The loader itself does not move.
 
-**Exit:** `cargo test -p mecmcp-runtime` passes; the TLS loader compiles and is documented.
+If this crate ends up needing a `tls` module at all, it re-exports from
+`mecmcp-transport` rather than reimplementing. Per D4 of the Phase 3a plan the
+crypto provider stays a parameter, so nothing here selects `ring` or `aws-lc-rs`.
+
+**Test:** `cargo build -p mecmcp-runtime` succeeds and the crate is in the
+workspace. There is nothing behavioural to test yet — resist adding a placeholder
+test that asserts nothing.
+
+**Exit:** the crate exists, builds, and `cargo tree -e normal -p mecmcp-runtime`
+pulls no rustls crypto provider.
 
 ### Task 2 — Port CLI structure and validation
 
