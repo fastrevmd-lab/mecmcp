@@ -188,7 +188,7 @@ async fn render_metrics(State(handle): State<PrometheusHandle>) -> Response {
 // Module-level metric name storage for use by overload responses and other
 // middleware that don't have direct access to PrometheusRuntime.
 /// The prefix-derived metric names, resolved once at `install()`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct MetricNames {
     /// Read by the session tracker, which lands in Task 5.
     #[allow(dead_code)] // Used in phases 3-10
@@ -255,8 +255,14 @@ pub(crate) fn limit_hits_metric_name() -> Option<String> {
 
 /// Metric names resolved at install, or `None` before `install()` has run.
 #[allow(dead_code)] // Used in phases 3-10
-pub(crate) fn metric_names() -> Option<&'static MetricNames> {
-    METRIC_NAMES.get()
+pub(crate) fn metric_names() -> Option<MetricNames> {
+    #[cfg(test)]
+    {
+        if let Some(names) = TEST_METRIC_NAMES.with(|cell| cell.borrow().clone()) {
+            return Some(names);
+        }
+    }
+    METRIC_NAMES.get().cloned()
 }
 
 /// Record a limit hit using the installed metric names.
