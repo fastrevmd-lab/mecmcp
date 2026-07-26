@@ -198,6 +198,7 @@ fn signal_reload(pid: Option<i32>) -> Result<(), TokenCommandError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -219,11 +220,7 @@ mod tests {
 
     #[test]
     fn mixed_wildcard_rejected() {
-        let err = parse_scope(
-            vec!["*".to_owned(), "device1".to_owned()],
-            "devices",
-        )
-        .unwrap_err();
+        let err = parse_scope(vec!["*".to_owned(), "device1".to_owned()], "devices").unwrap_err();
         if let TokenCommandError::Scope { field, message } = err {
             assert_eq!(field, "devices");
             assert!(message.contains("'*'"));

@@ -1,9 +1,14 @@
 //! Integration tests for token command implementation.
+//!
+//! `unwrap()` is idiomatic in a test — a panic *is* the failure, and the
+//! workspace sets `unwrap_used = "warn"` for shipping code, not for tests.
+//! The sibling crates apply the same allow at their test-module boundaries.
+#![allow(clippy::unwrap_used)]
 
 use mecmcp_auth::TokenStoreFile;
 use mecmcp_runtime::{
     cli::TokenAction,
-    token_cmd::{run, TokenCommandError},
+    token_cmd::{TokenCommandError, run},
 };
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -286,7 +291,10 @@ fn signal_reload_with_valid_pid_succeeds() {
     assert_eq!(store_file.store().entries().len(), 1);
     // If we got an error, it should be I/O (EPERM), not parsing
     if let Err(e) = result {
-        assert!(matches!(e, TokenCommandError::Io(_)), "unexpected error: {e:?}");
+        assert!(
+            matches!(e, TokenCommandError::Io(_)),
+            "unexpected error: {e:?}"
+        );
     }
 }
 

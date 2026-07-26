@@ -51,13 +51,17 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     #[cfg(unix)]
     #[tokio::test]
     async fn hup_handler_invokes_callback() {
-        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
         use std::time::Duration;
 
         let counter = Arc::new(AtomicUsize::new(0));
@@ -79,14 +83,22 @@ mod tests {
         // Wait for signal delivery and callback execution
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "callback should have been invoked once");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "callback should have been invoked once"
+        );
 
         // Send another SIGHUP
         rustix::process::kill_process(pid, rustix::process::Signal::HUP)
             .expect("failed to send SIGHUP");
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert_eq!(counter.load(Ordering::SeqCst), 2, "callback should have been invoked twice");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "callback should have been invoked twice"
+        );
     }
 
     #[cfg(not(unix))]
