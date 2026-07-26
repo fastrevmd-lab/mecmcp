@@ -51,6 +51,47 @@ Every phase inherits these. Copied verbatim into each per-phase plan.
 - **Consumed as a git dependency pinned by tag**, e.g.
   `mecmcp-auth = { git = "https://github.com/fastrevmd-lab/mecmcp", tag = "auth-v0.1.0" }`.
 
+### The rule these phases keep learning the hard way
+
+**Anything that belongs to the consuming server must be a parameter, not baked
+into a shared crate.** Metric names, tool registries, TLS backends, device
+vocabularies, log field names — these are part of a *server's* public interface.
+A shared crate that decides them forces every consumer to accept its choice, and
+the breakage lands on operators rather than on compilation.
+
+Four instances so far, each found only after it reached a consumer:
+
+| What was baked in | What it broke |
+|---|---|
+| `metrics-exporter-prometheus` as a normal dependency with default features | Pulled `hyper-rustls` → `aws-lc-rs`, colliding with a consumer pinning `ring`. Broke two-person change control in tests and would have killed a production TLS listener on deploy |
+| The tool-duration metric name | Renamed a consumer's public metric, silently breaking every `histogram_quantile` dashboard querying its `_bucket` series |
+| `G: Default` inferred on the grant type | Forced every consumer to define a "default write authority" — a concept with no safe answer |
+| `principal` flattened to `String`, with `"stdio"` as a sentinel | Let a token *named* `stdio` be logged as unauthenticated, forging caller identity in the audit trail |
+
+`mecmcp-auth` got this right once, deliberately: `allows_tool` takes the
+write-tool registry as a `&[&str]` **parameter** because each server has its own
+tool surface. That is the shape to copy.
+
+Practical test when adding anything to a shared crate: *if two consumers could
+reasonably want different values, it is a parameter.* If it reaches
+`Cargo.toml`, also ask whether default features drag in a TLS or async backend a
+consumer may already have pinned — `cargo tree -e normal` from the consumer's
+side is the check.
+
+This is why `Principal` is an enum rather than a `String`: the variant *is* the
+authorization fact, so a token cannot forge `Unauthenticated` by being named
+`stdio`. Where a type in this plan carries a security or correctness invariant
+that a primitive would lose, that choice is normative and a phase may not
+quietly flatten it.
+
+That is narrower than "every non-primitive in a code block is mandatory." The
+struct sketches below are illustrative: a field holding free text — an external
+ticket ID, a human's name — is correctly a `String`, and wrapping it buys
+nothing. Phase 2's `Attribution` shipped exactly this way, and the shipped API
+is the contract once a phase is released.
+
+---
+
 ## Crate map
 
 | Crate | Responsibility | Primary source | Depends on |
@@ -173,7 +214,7 @@ pub struct Attribution {
     pub actor_type: ActorType,         // Human | Agent
     pub agent: Option<AgentIdentity>,  // model id, session id, MCP client
     pub on_behalf_of: Option<String>,  // the human whose authority an agent used
-    pub change_ref: Option<ChangeRef>, // CHG0012345
+    pub change_ref: Option<String>,    // CHG0012345 — free text, no newtype
     pub request_id: Uuid,
 }
 ```
