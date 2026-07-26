@@ -67,7 +67,58 @@ The extraction is heavily asymmetric. PAN-OS contributes the full lifecycle mach
 
 **D5 — `commit()` takes `Attribution`, not a principal string.** The crate depends on `mecmcp-audit` for `Attribution`, which carries `principal: Principal`, `actor_type`, `agent`, `on_behalf_of`, `change_ref`, and `request_id`. This makes `Attribution` available to the device so Junos can write `commit comment "CHG0012345 by alice via claude-opus-5"` and PAN-OS can write `<commit><description>...</description></commit>`. The crate serializes the attribution into the persisted operation record for audit.
 
-**D6 — The state file schema gains a `version: u32` wrapper, and v1 is the PAN-OS format.** The on-disk format is `{"version": 1, "state": { "operations": {...}, "change_sets": {...} }}`. This allows a v2 schema migration without rewriting the deserializer. PAN-OS keeps `version: 1` and gains the wrapper via a serde alias: `#[serde(alias = "state")]` on the `OnDiskChangesetState` outer struct, so a bare `{"operations": ...}` file upgrades transparently to `{"version": 1, "state": {...}}` on the next write.
+**D6 — The state file schema is already versioned. Adopt it unchanged; do not migrate.**
+
+Verified against `rust-panosmcp-core/src/mutation.rs` on `main`, not inferred:
+
+```rust
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OnDiskMutationState {   // mutation.rs:499
+    version: u32,
+    state: MutationState,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MutationState {          // mutation.rs:490
+    #[serde(default)]
+    operations: BTreeMap<String, OperationRecord>,
+    #[serde(default)]
+    change_sets: BTreeMap<String, ChangeSetRecord>,
+}
+```
+
+and the loader already rejects anything else (`mutation.rs:1977`):
+
+```rust
+if on_disk.version != 1 {
+    return Err(PanosMcpError::Configuration(format!(
+        "unsupported mutation state version {}", on_disk.version)));
+}
+```
+
+So the wrapper exists, `version: 1` is enforced, and the file on LXC 608 is
+already in this shape. **There is no bare `{"operations": ...}` format in the
+field and no migration to write.** An earlier draft of this decision proposed
+adding the wrapper via `#[serde(alias = "state")]`; that would have been a
+no-op at best and a regression of a working version gate at worst. The shared
+crate adopts this layout as-is and keeps `version: 1`.
+
+**The real hazard is `deny_unknown_fields`, on *both* structs.** It makes the
+schema strictly closed in both directions:
+
+- Adding any field to the shared `ChangesetState` produces a file that an
+  **older** binary cannot read at all — it fails the whole load, not just the
+  new field. On a server holding approval history, a failed load is an outage.
+- So a field addition is a **version bump**, not an additive change. Bumping to
+  `version: 2` is the honest signal, and the loader must then accept 1 and 2
+  and upgrade 1 on read.
+
+Any task in this plan that adds a field to the persisted state must say which
+version it lands in and how a v1 file is read. Rollback matters as much as
+upgrade here: 608 has no standby, so the recovery path is a Proxmox snapshot
+restore, and a state file the previous binary cannot parse defeats it.
 
 **D7 — `rollback()` is a trait method, not a tool-level concern.** Junos `rollback_config` loads archive N and commits it as a single action. PAN-OS has no archive-based rollback; it reverts candidate changes attributed to an admin. Both are vendor-specific, but both are part of the transaction lifecycle. The trait exposes `async fn rollback(&self, to: RollbackRef) -> Result<Outcome, Self::Error>` where `RollbackRef` is an enum: `RollbackRef::Archive(u32)` for Junos, `RollbackRef::CandidateRevert` for PAN-OS. The shared crate does not call it directly; the consuming server's `rollback_*` tool invokes it.
 
@@ -109,9 +160,9 @@ Each task ends green and independently reviewable.
 ### Task 1 — Scaffold and persistence
 
 - [ ] Create `crates/mecmcp-changeset/` with `Cargo.toml` (edition 2024, MSRV 1.88, workspace lints, MIT license, depends on `mecmcp-audit`, `serde`, `serde_json`, `sha2`, `getrandom`, `tokio`, `tempfile`).
-- [ ] Port `persistence.rs`: `read_state()`, `write_state()`, `validate_state()` from mutation.rs lines 1929-2086. Introduce `OnDiskChangesetState` with `version: u32` wrapper and serde alias `#[serde(alias = "state")]` so a v1-format file without the wrapper upgrades transparently.
+- [ ] Port `persistence.rs`: `read_state()`, `write_state()`, `validate_state()` from mutation.rs lines 1929-2086. Port `OnDiskChangesetState` as `{ version: u32, state: ChangesetState }` with `#[serde(deny_unknown_fields)]` — this is the shape already on disk (see D6). Keep the `version != 1` rejection. Add no alias and no migration: there is no older format in the field.
 - [ ] Port `digest.rs`: `change_set_digest()`, `validate_digest()`, `validate_fingerprint()`, `bytes_hex()`, `digest_hex()` from mutation.rs lines 1719-2109.
-- [ ] Test: write a v1 state file with the wrapper, read it back. Write a bare `{"operations": {}}` file (old PAN-OS format), read it, assert it upgrades to `{"version": 1, "state": {...}}` on the next write. Verify `sha256:<64 lowercase hex>` validation rejects uppercase, rejects 63 chars, rejects `sha512:`.
+- [ ] Test: write a `{"version": 1, "state": {...}}` file, read it back, assert it round-trips byte-identically. Assert `{"version": 2, ...}` is **rejected** with a message naming the version. Assert a bare `{"operations": {}}` file is **rejected** — it is not a legacy format to support, and `deny_unknown_fields` plus the missing `version` field means accepting it would require deliberately weakening the schema. Verify `sha256:<64 lowercase hex>` validation rejects uppercase, rejects 63 chars, rejects `sha512:`.
 
 ### Task 2 — Lifecycle state machines
 
@@ -319,7 +370,7 @@ Both fit naturally. The trait does not force either into an awkward adapter.
 
 | Risk | Mitigation |
 |---|---|
-| Corrupting `/var/lib/rust-panosmcp/mutation-state.json` on LXC 608 | Snapshot 608 before deploying. The state-file read path accepts both bare `{"operations": ...}` (old) and `{"version": 1, "state": {...}}` (new) via serde alias. Write a property test asserting any valid v1 file round-trips through read+write unchanged. |
+| Corrupting `/var/lib/rust-panosmcp/mutation-state.json` on LXC 608 | Snapshot 608 before deploying. The format does not change — the shared crate adopts the existing `{"version": 1, "state": {...}}` layout unchanged (D6). Write a property test asserting any valid v1 file round-trips through read+write byte-identically. Because `deny_unknown_fields` makes the schema closed in both directions, a rollback to the previous binary must also be tested: restore the snapshot and confirm the older build still loads a file the newer build wrote. |
 | Losing approval evidence in the migration | The `ChangeSetRecord` fields `{id, owner, device, digest, approver, actions}` are load-bearing and must survive the migration byte-for-byte. Write a test loading a v1 state file with an approved change set, assert every field matches after deserialization. |
 | The trait does not fit Junos candidate/commit | Task 11 implements the Junos side and validates the fit. If `DeviceTransaction` needs adjustment (e.g., an additional method for Junos-specific ephemeral configuration), adjust the trait in Task 3 and document the rationale. Do not ship a forced adapter. |
 | Breaking the two-principal check | The crate must compare principals by `mecmcp_audit::Principal`, not by string. Write a test where two tokens with the same name but different `Principal` variants (e.g., `Principal::Token("alice")` vs `Principal::Oidc("alice")`) are treated as distinct. |
