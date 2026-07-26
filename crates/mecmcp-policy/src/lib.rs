@@ -162,6 +162,269 @@ pub fn evaluate<'r, A>(
         })
 }
 
+use std::collections::HashMap;
+
+/// Pre-compiled rule collections for one subject domain (commands, config, or pfe_commands).
+///
+/// Generic over the action type to support both Junos (Allow/Deny) and PAN-OS action enums.
+#[derive(Debug)]
+pub struct DomainRules<A> {
+    /// Rules that apply to all devices.
+    pub defaults: Vec<CompiledRule<A>>,
+    /// Per-device additions to defaults.
+    pub device_specific: HashMap<String, Vec<CompiledRule<A>>>,
+}
+
+impl<A> Default for DomainRules<A> {
+    fn default() -> Self {
+        Self {
+            defaults: Vec::new(),
+            device_specific: HashMap::new(),
+        }
+    }
+}
+
+/// Compiled, per-device blocklist policy.
+///
+/// **Important:** This is a **fail-open, deny-pattern blocklist**. Any input that does
+/// not match a deny rule is **allowed**. Callers expecting fail-closed behaviour (where
+/// unmatched input is denied) must use a different authorisation model, such as an allowlist
+/// or prefix validator. This engine is designed for operational blocklists where an operator
+/// lists what must never run, and everything else is permitted.
+///
+/// The policy is built once at startup from pre-compiled rules and is cheap to clone via `Arc`.
+/// Tool handlers consult it before any device interaction.
+///
+/// Generic over the action type `A` to support different action enums (e.g., Junos Allow/Deny,
+/// PAN-OS equivalents). The action type must implement `Copy` and `PartialEq`.
+#[derive(Debug)]
+pub struct Policy<A> {
+    /// Compiled rules for the "commands" domain.
+    commands: DomainRules<A>,
+    /// Compiled rules for the "config" domain.
+    config: DomainRules<A>,
+    /// Compiled rules for the "pfe_commands" domain.
+    pfe_commands: DomainRules<A>,
+}
+
+impl<A> Policy<A>
+where
+    A: Copy + PartialEq,
+{
+    /// Build a policy from pre-compiled domain rule sets.
+    ///
+    /// This constructor accepts three `DomainRules` structs (one per subject domain:
+    /// commands, config, pfe_commands), each containing default rules and per-device
+    /// additions. The caller is responsible for compiling globs via `compile_rules()`
+    /// before passing them in.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mecmcp_policy::{Policy, DomainRules};
+    ///
+    /// let commands = DomainRules::default();
+    /// let config = DomainRules::default();
+    /// let pfe_commands = DomainRules::default();
+    ///
+    /// let policy: Policy<()> = Policy::new(commands, config, pfe_commands);
+    /// ```
+    pub fn new(
+        commands: DomainRules<A>,
+        config: DomainRules<A>,
+        pfe_commands: DomainRules<A>,
+    ) -> Self {
+        Self {
+            commands,
+            config,
+            pfe_commands,
+        }
+    }
+
+    /// Effective command rules for a device = defaults ⊕ device-specific.
+    pub fn command_rules_for(&self, device: &str) -> Vec<&CompiledRule<A>> {
+        self.commands
+            .defaults
+            .iter()
+            .chain(
+                self.commands
+                    .device_specific
+                    .get(device)
+                    .into_iter()
+                    .flat_map(|v| v.iter()),
+            )
+            .collect()
+    }
+
+    /// Effective config rules for a device = defaults ⊕ device-specific.
+    pub fn config_rules_for(&self, device: &str) -> Vec<&CompiledRule<A>> {
+        self.config
+            .defaults
+            .iter()
+            .chain(
+                self.config
+                    .device_specific
+                    .get(device)
+                    .into_iter()
+                    .flat_map(|v| v.iter()),
+            )
+            .collect()
+    }
+
+    /// True if the per-device effective config rule list is non-empty.
+    pub fn has_config_rules_for(&self, device: &str) -> bool {
+        !self.config.defaults.is_empty()
+            || self
+                .config
+                .device_specific
+                .get(device)
+                .is_some_and(|v| !v.is_empty())
+    }
+
+    /// Effective PFE-command rules for a device = defaults ⊕ device-specific.
+    pub fn pfe_command_rules_for(&self, device: &str) -> Vec<&CompiledRule<A>> {
+        self.pfe_commands
+            .defaults
+            .iter()
+            .chain(
+                self.pfe_commands
+                    .device_specific
+                    .get(device)
+                    .into_iter()
+                    .flat_map(|v| v.iter()),
+            )
+            .collect()
+    }
+
+    /// Decide whether `command` is allowed on `device` in the commands domain.
+    ///
+    /// **Fail-open behaviour:** If no deny rule matches (or there are no rules), the
+    /// command is **allowed**. This is a blocklist, not an allowlist.
+    ///
+    /// Whitespace is normalized before matching (trimmed and collapsed to single spaces).
+    pub fn check_command<'a>(
+        &'a self,
+        device: &str,
+        command: &str,
+        deny_action: A,
+    ) -> Decision<'a, A> {
+        let normalized = normalize_input(command);
+        let rules = self.command_rules_for(device);
+        match evaluate(&rules, &normalized) {
+            Some(rule) if rule.action == deny_action => Decision::Deny {
+                rule,
+                source: rule.source,
+                line_number: None,
+            },
+            _ => Decision::Allow,
+        }
+    }
+
+    /// Decide whether `pfe_command` is allowed on `device` in the pfe_commands domain.
+    ///
+    /// **Fail-open behaviour:** If no deny rule matches (or there are no rules), the
+    /// command is **allowed**. This is a blocklist, not an allowlist.
+    ///
+    /// Whitespace is normalized before matching. Independent from `check_command`.
+    pub fn check_pfe_command<'a>(
+        &'a self,
+        device: &str,
+        pfe_command: &str,
+        deny_action: A,
+    ) -> Decision<'a, A> {
+        let normalized = normalize_input(pfe_command);
+        let rules = self.pfe_command_rules_for(device);
+        match evaluate(&rules, &normalized) {
+            Some(rule) if rule.action == deny_action => Decision::Deny {
+                rule,
+                source: rule.source,
+                line_number: None,
+            },
+            _ => Decision::Allow,
+        }
+    }
+
+    /// Decide whether `config_text` is allowed on `device` in the config domain.
+    ///
+    /// **Fail-open behaviour:** If no deny rule matches (or there are no rules), the
+    /// config is **allowed**. This is a blocklist, not an allowlist.
+    ///
+    /// If `config_format` is not the expected format string and rules exist for this
+    /// device, returns an error. Config text is checked line-by-line; comment lines
+    /// (starting with `#`) and blank lines are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `config_format` is not the expected format and the device
+    /// has effective config rules. The expected format and error type are supplied by
+    /// the caller.
+    pub fn check_config<'a, E>(
+        &'a self,
+        device: &str,
+        config_format: &str,
+        config_text: &str,
+        deny_action: A,
+        expected_format: &str,
+        error_builder: impl FnOnce(String) -> E,
+    ) -> Result<Decision<'a, A>, E> {
+        let rules = self.config_rules_for(device);
+        if rules.is_empty() {
+            return Ok(Decision::Allow);
+        }
+        if config_format != expected_format {
+            return Err(error_builder(config_format.to_string()));
+        }
+
+        for (idx, raw_line) in config_text.lines().enumerate() {
+            let line = normalize_input(raw_line);
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(rule) = evaluate(&rules, &line)
+                && rule.action == deny_action
+            {
+                return Ok(Decision::Deny {
+                    rule,
+                    source: rule.source,
+                    line_number: Some(idx + 1),
+                });
+            }
+        }
+        Ok(Decision::Allow)
+    }
+
+    /// Counts for startup info logging.
+    pub fn rule_counts(&self) -> PolicyCounts {
+        let devices_with_rules = self
+            .commands
+            .device_specific
+            .keys()
+            .chain(self.config.device_specific.keys())
+            .chain(self.pfe_commands.device_specific.keys())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        PolicyCounts {
+            default_commands: self.commands.defaults.len(),
+            default_config: self.config.defaults.len(),
+            default_pfe_commands: self.pfe_commands.defaults.len(),
+            devices_with_rules,
+        }
+    }
+}
+
+/// Summary numbers for startup logging.
+#[derive(Debug, Clone, Copy)]
+pub struct PolicyCounts {
+    /// Number of default command rules.
+    pub default_commands: usize,
+    /// Number of default config rules.
+    pub default_config: usize,
+    /// Number of default PFE-command rules.
+    pub default_pfe_commands: usize,
+    /// Count of devices with at least one device-specific rule.
+    pub devices_with_rules: usize,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -203,6 +466,16 @@ mod tests {
     }
 
     #[test]
+    fn count_literal_chars_handles_wildcards_and_classes() {
+        assert_eq!(count_literal_chars("request system reboot"), 21);
+        assert_eq!(count_literal_chars("request system *"), 15);
+        assert_eq!(count_literal_chars("*"), 0);
+        assert_eq!(count_literal_chars("?abc"), 3);
+        assert_eq!(count_literal_chars("ab[cd]ef"), 4);
+        assert_eq!(count_literal_chars(r"\*literal"), 8);
+    }
+
+    #[test]
     fn normalize_input_trims_and_collapses() {
         assert_eq!(normalize_input("  foo   bar  "), "foo bar");
         assert_eq!(normalize_input("foo\t\tbar"), "foo bar");
@@ -235,6 +508,21 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.scope, "test");
         assert_eq!(err.pattern, "[unclosed");
+    }
+
+    #[test]
+    fn compile_rules_errors_with_scope_on_bad_glob() {
+        let rules = vec![(TestAction::Deny, "[unterminated".to_string())];
+        let result = compile_rules(
+            &rules,
+            "_blocklist_defaults.commands",
+            RuleSource::Defaults,
+            test_error_builder,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.scope, "_blocklist_defaults.commands");
+        assert_eq!(err.pattern, "[unterminated");
     }
 
     #[test]
@@ -284,5 +572,368 @@ mod tests {
         let result = evaluate(&all_rules, "request system reboot");
         assert!(result.is_some());
         assert_eq!(result.unwrap().source, RuleSource::Device);
+    }
+
+    // Policy builder and decision tests
+
+    fn make_policy_no_rules() -> Policy<TestAction> {
+        Policy::new(
+            DomainRules::default(),
+            DomainRules::default(),
+            DomainRules::default(),
+        )
+    }
+
+    fn make_compiled_rule(
+        action: TestAction,
+        pattern: &str,
+        source: RuleSource,
+    ) -> CompiledRule<TestAction> {
+        let rules = vec![(action, pattern.to_string())];
+        compile_rules(&rules, "test", source, test_error_builder)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn policy_build_handles_no_rules() {
+        let p = make_policy_no_rules();
+        assert!(p.command_rules_for("r1").is_empty());
+        assert!(p.config_rules_for("r1").is_empty());
+        assert!(p.pfe_command_rules_for("r1").is_empty());
+    }
+
+    #[test]
+    fn policy_merges_defaults_and_device_rules() {
+        let mut commands = DomainRules::default();
+        commands.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "request system *",
+            RuleSource::Defaults,
+        ));
+        commands.device_specific.insert(
+            "r1".to_string(),
+            vec![make_compiled_rule(
+                TestAction::Allow,
+                "request system reboot",
+                RuleSource::Device,
+            )],
+        );
+
+        let p = Policy::new(commands, DomainRules::default(), DomainRules::default());
+        let r1_cmds = p.command_rules_for("r1");
+        assert_eq!(r1_cmds.len(), 2);
+        assert!(r1_cmds.iter().any(|r| r.source == RuleSource::Defaults));
+        assert!(r1_cmds.iter().any(|r| r.source == RuleSource::Device));
+    }
+
+    #[test]
+    fn policy_empty_per_device_blocklist_does_not_inflate_rule_counts() {
+        let mut commands = DomainRules::default();
+        commands.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "x",
+            RuleSource::Defaults,
+        ));
+
+        let p = Policy::new(commands, DomainRules::default(), DomainRules::default());
+        let counts = p.rule_counts();
+        assert_eq!(counts.default_commands, 1);
+        assert_eq!(counts.default_config, 0);
+        assert_eq!(
+            counts.devices_with_rules, 0,
+            "r1 has empty blocklist; should not count"
+        );
+    }
+
+    #[test]
+    fn policy_check_command_no_rules_allows() {
+        let p = make_policy_no_rules();
+        assert!(matches!(
+            p.check_command("r1", "show version", TestAction::Deny),
+            Decision::Allow
+        ));
+    }
+
+    #[test]
+    fn policy_check_command_equal_specificity_device_wins() {
+        let mut commands = DomainRules::default();
+        commands.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "request system *",
+            RuleSource::Defaults,
+        ));
+        commands.device_specific.insert(
+            "r1".to_string(),
+            vec![make_compiled_rule(
+                TestAction::Allow,
+                "request system *",
+                RuleSource::Device,
+            )],
+        );
+
+        let p = Policy::new(commands, DomainRules::default(), DomainRules::default());
+        assert!(matches!(
+            p.check_command("r1", "request system reboot", TestAction::Deny),
+            Decision::Allow
+        ));
+    }
+
+    #[test]
+    fn policy_check_command_more_specific_device_allow_overrides_broader_deny() {
+        let mut commands = DomainRules::default();
+        commands.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "request system *",
+            RuleSource::Defaults,
+        ));
+        commands.device_specific.insert(
+            "r1".to_string(),
+            vec![make_compiled_rule(
+                TestAction::Allow,
+                "request system reboot",
+                RuleSource::Device,
+            )],
+        );
+
+        let p = Policy::new(commands, DomainRules::default(), DomainRules::default());
+        assert!(matches!(
+            p.check_command("r1", "request system reboot", TestAction::Deny),
+            Decision::Allow
+        ));
+        assert!(matches!(
+            p.check_command("r1", "request system halt", TestAction::Deny),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn policy_check_command_whitespace_is_normalized() {
+        let mut commands = DomainRules::default();
+        commands.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "request system reboot",
+            RuleSource::Defaults,
+        ));
+
+        let p = Policy::new(commands, DomainRules::default(), DomainRules::default());
+        assert!(matches!(
+            p.check_command("r1", "  request   system\treboot  ", TestAction::Deny),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn policy_check_command_deny_carries_matched_rule_metadata() {
+        let mut commands = DomainRules::default();
+        commands.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "request system *",
+            RuleSource::Defaults,
+        ));
+
+        let p = Policy::new(commands, DomainRules::default(), DomainRules::default());
+        match p.check_command("r1", "request system reboot", TestAction::Deny) {
+            Decision::Deny {
+                rule,
+                source,
+                line_number,
+            } => {
+                assert_eq!(rule.pattern, "request system *");
+                assert_eq!(source, RuleSource::Defaults);
+                assert!(line_number.is_none());
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_check_config_no_rules_allows_any_format() {
+        let p = make_policy_no_rules();
+        let r = p
+            .check_config(
+                "r1",
+                "xml",
+                "<configuration/>",
+                TestAction::Deny,
+                "set",
+                |f| f,
+            )
+            .unwrap();
+        assert!(matches!(r, Decision::Allow));
+    }
+
+    #[test]
+    fn policy_check_config_non_expected_format_with_rules_errors() {
+        let mut config = DomainRules::default();
+        config.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "delete *",
+            RuleSource::Defaults,
+        ));
+
+        let p = Policy::new(DomainRules::default(), config, DomainRules::default());
+        let err = p
+            .check_config("r1", "xml", "<x/>", TestAction::Deny, "set", |f| f)
+            .unwrap_err();
+        assert_eq!(err, "xml");
+    }
+
+    #[test]
+    fn policy_check_config_per_line_match_rejects_first_offending_line() {
+        let mut config = DomainRules::default();
+        config.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "delete *",
+            RuleSource::Defaults,
+        ));
+
+        let p = Policy::new(DomainRules::default(), config, DomainRules::default());
+        let payload =
+            "set interfaces ge-0/0/0 description ok\ndelete protocols bgp\nset system host-name r1";
+        match p
+            .check_config("r1", "set", payload, TestAction::Deny, "set", |f| f)
+            .unwrap()
+        {
+            Decision::Deny {
+                line_number, rule, ..
+            } => {
+                assert_eq!(line_number, Some(2));
+                assert_eq!(rule.pattern, "delete *");
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_check_config_comment_lines_are_skipped() {
+        let mut config = DomainRules::default();
+        config.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "delete *",
+            RuleSource::Defaults,
+        ));
+
+        let p = Policy::new(DomainRules::default(), config, DomainRules::default());
+        let payload = "# delete this is just a comment\nset system host-name r1";
+        let r = p
+            .check_config("r1", "set", payload, TestAction::Deny, "set", |f| f)
+            .unwrap();
+        assert!(matches!(r, Decision::Allow));
+    }
+
+    #[test]
+    fn policy_check_config_per_line_allow_carve_out_works() {
+        let mut config = DomainRules::default();
+        config.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "delete *",
+            RuleSource::Defaults,
+        ));
+        config.device_specific.insert(
+            "r1".to_string(),
+            vec![make_compiled_rule(
+                TestAction::Allow,
+                "delete interfaces ge-0/0/0",
+                RuleSource::Device,
+            )],
+        );
+
+        let p = Policy::new(DomainRules::default(), config, DomainRules::default());
+        let payload = "delete interfaces ge-0/0/0\nset interfaces ge-0/0/0 description new";
+        let r = p
+            .check_config("r1", "set", payload, TestAction::Deny, "set", |f| f)
+            .unwrap();
+        assert!(matches!(r, Decision::Allow));
+    }
+
+    #[test]
+    fn policy_build_collects_pfe_commands_from_defaults_and_device() {
+        let mut pfe_commands = DomainRules::default();
+        pfe_commands.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "set *",
+            RuleSource::Defaults,
+        ));
+        pfe_commands.device_specific.insert(
+            "r1".to_string(),
+            vec![make_compiled_rule(
+                TestAction::Allow,
+                "set debug *",
+                RuleSource::Device,
+            )],
+        );
+
+        let p = Policy::new(DomainRules::default(), DomainRules::default(), pfe_commands);
+        let r1_pfe = p.pfe_command_rules_for("r1");
+        assert_eq!(r1_pfe.len(), 2);
+        assert!(r1_pfe.iter().any(|r| r.source == RuleSource::Defaults));
+        assert!(r1_pfe.iter().any(|r| r.source == RuleSource::Device));
+    }
+
+    #[test]
+    fn policy_pfe_rules_independent_from_command_rules() {
+        let mut commands = DomainRules::default();
+        commands.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "request system *",
+            RuleSource::Defaults,
+        ));
+
+        let mut pfe_commands = DomainRules::default();
+        pfe_commands.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "set *",
+            RuleSource::Defaults,
+        ));
+
+        let p = Policy::new(commands, DomainRules::default(), pfe_commands);
+        assert_eq!(p.command_rules_for("r1").len(), 1);
+        assert_eq!(p.pfe_command_rules_for("r1").len(), 1);
+        assert_eq!(p.command_rules_for("r1")[0].pattern, "request system *");
+        assert_eq!(p.pfe_command_rules_for("r1")[0].pattern, "set *");
+    }
+
+    #[test]
+    fn policy_check_pfe_command_denies_when_pattern_matches() {
+        let mut pfe_commands = DomainRules::default();
+        pfe_commands.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "set *",
+            RuleSource::Defaults,
+        ));
+
+        let p = Policy::new(DomainRules::default(), DomainRules::default(), pfe_commands);
+        match p.check_pfe_command("r1", "set jnh 0 debug", TestAction::Deny) {
+            Decision::Deny { rule, .. } => assert_eq!(rule.pattern, "set *"),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_check_pfe_command_allows_when_no_rules() {
+        let p = make_policy_no_rules();
+        assert!(matches!(
+            p.check_pfe_command("r1", "show jnh 0 stats", TestAction::Deny),
+            Decision::Allow
+        ));
+    }
+
+    #[test]
+    fn policy_check_pfe_command_does_not_consult_command_rules() {
+        let mut commands = DomainRules::default();
+        commands.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "set *",
+            RuleSource::Defaults,
+        ));
+
+        let p = Policy::new(commands, DomainRules::default(), DomainRules::default());
+        assert!(matches!(
+            p.check_pfe_command("r1", "set anything", TestAction::Deny),
+            Decision::Allow
+        ));
     }
 }
