@@ -17,4 +17,6 @@ pub use redact::{
     AuditRedaction, FieldTransform, REDACTABLE_FIELDS, RedactError, active, install, render,
 };
 pub use schema::{AuditOutcome, AuditValue};
-pub use scope::AuditScope;
+pub use scope::{
+    AuditScope, DEFAULT_DURATION_METRIC, duration_metric_name, install_duration_metric_name,
+};

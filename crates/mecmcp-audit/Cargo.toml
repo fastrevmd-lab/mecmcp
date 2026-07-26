@@ -12,10 +12,9 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
-mecmcp-auth = { version = "0.1.4", path = "../mecmcp-auth" }
+mecmcp-auth = { version = "0.1.5", path = "../mecmcp-auth" }
 hmac        = { workspace = true }
 metrics     = { workspace = true }
-metrics-exporter-prometheus = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 sha2        = { workspace = true }
@@ -24,6 +23,14 @@ tracing     = { workspace = true }
 tracing-journald = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid        = { workspace = true }
+
+[dev-dependencies]
+# Test-only: the exporter is used solely to render metrics in unit tests.
+# It must NOT be a normal dependency — its default features pull an HTTP
+# listener and hyper-rustls, which enables rustls's aws-lc-rs backend and
+# conflicts with a consumer that pins `ring`. That broke TLS in a downstream
+# server. Keep it here, and keep default-features off.
+metrics-exporter-prometheus = { workspace = true }
 
 [features]
 test-util = []
