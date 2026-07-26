@@ -12,6 +12,7 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
+async-trait = "0.1"
 axum        = { version = "0.8", default-features = false, features = ["tokio"] }
 dashmap     = "6.1"
 futures     = "0.3"
@@ -26,6 +27,9 @@ metrics     = { workspace = true }
 # here for emphasis.
 metrics-exporter-prometheus = { workspace = true }
 rmcp        = { version = "0.2", features = ["transport-streamable-http-server", "transport-streamable-http-server-session", "transport-worker"] }
+rustix      = { version = "0.38", features = ["process", "fs"] }
+rustls      = { version = "0.22", default-features = false }
+rustls-pki-types = { version = "1", default-features = false }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 thiserror   = { workspace = true }
@@ -33,6 +37,7 @@ tokio       = { version = "1", features = ["time", "sync"] }
 tokio-util  = { version = "0.7", default-features = false, features = ["rt"] }
 tower-http  = { version = "0.6", features = ["limit"] }
 tracing     = { workspace = true }
+zeroize     = "1"
 
 [dev-dependencies]
 # Test-only: the exporter is used solely to render metrics in unit tests.
@@ -42,5 +47,10 @@ tracing     = { workspace = true }
 # server. Keep it here, and keep default-features off.
 mecmcp-audit = { version = "0.1.5", path = "../mecmcp-audit" }
 metrics-exporter-prometheus = { workspace = true }
+rcgen       = "0.13"
+# ring is dev-only for tests. The main crate uses the process-global provider
+# that the consuming application installs. Both current consumers use ring.
+rustls      = { version = "0.22", default-features = false, features = ["ring"] }
+tempfile    = "3"
 tokio       = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 tower       = { version = "0.5", features = ["util"] }
