@@ -62,7 +62,34 @@ Measured from `RustJunosMCP/rust-junosmcp/` and `rust-panosmcp/rust-panosmcp/` o
 
 ## Decisions
 
-**D1 — TLS loader comes from panos, not junos.** It is strictly stronger: `O_NOFOLLOW` defeats a symlink swap, the mode and owner checks refuse a world-readable key, and `Zeroizing` clears the key bytes on drop. Junos gains all of this. **Consequence: a junos deployment whose key file is looser than 0600 will stop starting.** That is the correct outcome, but it is an upgrade note, and the error must name the file, its mode, and the remedy (e.g., `chmod 600 /path/to/key.pem`).
+**D1 — the hardened TLS loader is already done. This phase inherits it; it does not port it.**
+
+Phase 3a delivered this. `rust-junosmcp/src/tls.rs` is already a thin shim:
+
+```rust
+//! This is a thin shim over `mecmcp_transport::tls::load` that installs the
+//! ...
+    mecmcp_transport::tls::load(cert, key, provider)
+```
+
+Task 6 ported the loader from `rustpanosmcp` into `mecmcp-transport`, and Task 8
+wired junos onto it. The evidence is in junos's own tests: `http_tls.rs` and
+`srx_http_tls.rs` both gained `set_permissions(0o600)` during Task 8, because the
+hardened loader began refusing the 0644 keys `fs::write` creates.
+
+**Do not put a TLS port in the task list.** An earlier draft of this decision did,
+which would have sent an implementer to redo finished work.
+
+Recorded here because the *next* server to adopt `mecmcp-runtime` meets the same
+requirement and should not rediscover it: the loader enforces `O_NOFOLLOW` on open,
+a size cap, a mode of 0600 or stricter, and an owner matching the effective uid or
+root, with `Zeroizing` on the key bytes.
+
+**The operator impact already shipped, in v0.11.1.** A junos deployment whose key
+file is looser than 0600 stops starting. That was omitted from the original
+release notes — found while reviewing this plan — and has since been corrected in
+both the published notes and the CHANGELOG. `mecmcp-runtime` inherits the
+behaviour unchanged; there is nothing further to announce.
 
 **D2 — `--devices` everywhere, with `--routers` retained as a hidden alias in junos.** Matches mecmcp #29's decision comment. `devices` is the universal term — the fleet includes PAN-OS firewalls and the Proxmox/UniFi servers being built next, none of them routers. Junos is already internally inconsistent: v0.11.0 renamed the *audit* fields `routers` → `devices` and `router_count` → `device_count`, so the emitted events use the new term while the token CLI still takes `--routers`. The alias is hidden rather than deprecated-with-a-warning: `token add` is a one-shot admin command, and a warning on a box touched twice a year is noise.
 
