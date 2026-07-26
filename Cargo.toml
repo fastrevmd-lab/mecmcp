@@ -1,5 +1,5 @@
 [workspace]
-members  = ["crates/mecmcp-auth", "crates/mecmcp-audit"]
+members  = ["crates/mecmcp-auth", "crates/mecmcp-audit", "crates/mecmcp-transport"]
 resolver = "2"
 
 [workspace.package]
