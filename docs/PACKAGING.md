@@ -84,8 +84,29 @@ first.
 
 ## 2. LXC
 
-**Debian 13 (trixie), unprivileged.** `nesting=1` only where the repo genuinely
-needs it. This is a hard requirement, not a default — see below.
+**Debian 13 (trixie), unprivileged, `nesting=1`.** All three are requirements,
+not defaults — see below.
+
+### `nesting=1` is required on Debian 13, not optional
+
+Earlier guidance here said "only where the repo genuinely needs it". That is
+wrong for Debian 13, and the difference was measured on a clean container:
+
+| `features` | `systemctl is-system-running` | failed units |
+|---|---|---|
+| *(none)* | `degraded` | `dev-mqueue.mount`, `run-lock.mount`, `tmp.mount` |
+| `nesting=1` | `running` | none |
+
+Debian 13 ships **systemd 257**, and Proxmox itself warns at creation time:
+`WARN: Systemd 257 detected. You may need to enable nesting.`
+
+The failures are not fatal — `/tmp` and `/run/lock` remain writable as plain
+directories rather than tmpfs, and `systemd-journald` starts and is readable
+either way. But a permanently `degraded` unit state is something monitoring
+flags forever and operators learn to ignore, which is the same failure mode as
+a CI gate that goes red for unrelated reasons.
+
+Set it at creation. Adding it afterwards needs a container reboot.
 
 ### Why Debian 13 specifically
 
@@ -287,7 +308,9 @@ For a new repo, or one being brought into line:
 
 **LXC and observability (§2):**
 
-- [ ] LXC is **Debian 13**, unprivileged. The README says so and says why.
+- [ ] LXC is **Debian 13**, unprivileged, **`nesting=1`**. The README says so
+      and says why. Without nesting, systemd 257 runs `degraded` with three
+      failed mounts.
 - [ ] The release binary's glibc floor is **measured** with `objdump -T`, not
       assumed, and recorded in the README
 - [ ] The release is built **in CI against a pinned base**, not on a developer
