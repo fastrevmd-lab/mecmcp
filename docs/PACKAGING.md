@@ -159,19 +159,51 @@ Configure journald deliberately:
 # /etc/systemd/journald.conf.d/mecmcp.conf
 [Journal]
 Storage=persistent
-Seal=yes
 SystemMaxUse=512M
 ```
 
-`Seal=yes` plus `journalctl --setup-keys` enables **Forward Secure Sealing**,
-which makes retroactive tampering detectable. This is load-bearing rather than
-decorative: `rustpanosmcp`'s approve event carries the change-set id and digest
-precisely so there is independent evidence that a second principal reviewed the
-exact digest applied. A log an attacker can quietly edit destroys that evidence,
-and the state file alone was never sufficient — it is rewritten by the server.
+### Forward Secure Sealing does not work here — forward instead
 
-Forward with `systemd-journal-upload`, or to classic syslog via rsyslog if the
-site collector expects it. Both are small.
+An earlier version of this section prescribed `Seal=yes` plus
+`journalctl --setup-keys` for tamper-evident logs. **That is not achievable in
+an unprivileged LXC**, which is the container model this document mandates.
+Measured on a clean Debian 13 container and its Proxmox host, both on ext4:
+
+| | `journalctl --setup-keys` |
+|---|---|
+| Privileged host | succeeds — `/var/log/journal/<id>/fss` created |
+| **Unprivileged LXC** | **fails: `Failed to generate key pair: Operation not supported`** |
+
+Same filesystem, so it is not an ext4 limitation. FSS needs to set a file
+attribute that the user namespace blocks, and `capsh` reporting `cap_sys_admin`
+in the bounding set does not change that. Running the container privileged to
+regain sealing would be a far worse trade for a process holding firewall
+credentials than losing the feature.
+
+**So remote forwarding is the primary integrity control, not a supplement:**
+
+```
+systemd-journal-upload  ->  central journald
+        or  rsyslog     ->  site SIEM
+```
+
+This is arguably the stronger control regardless. Local sealing only makes
+tampering *detectable after the fact*, and only while the attacker lacks the
+sealing key — but the threat model that matters here is "the MCP server was
+compromised", which is exactly when local evidence is least trustworthy. A copy
+already written to a collector the compromised host cannot reach is not merely
+detectable-if-edited; it cannot be edited at all.
+
+This matters concretely: `rustpanosmcp`'s approve event carries the change-set
+id and digest specifically so there is independent evidence that a second
+principal reviewed the exact digest applied. `mutation-state.json` was never
+sufficient on its own, because the server rewrites it. If that event exists only
+in a local journal on the box that was compromised, it is not independent
+evidence of anything.
+
+**Configure forwarding at provisioning, before the server handles real traffic.**
+An audit trail that only becomes durable in month two has a two-month hole in
+exactly the period when a new deployment is least hardened.
 
 ### Audit flags: the baseline every server runs
 
@@ -315,8 +347,10 @@ For a new repo, or one being brought into line:
       assumed, and recorded in the README
 - [ ] The release is built **in CI against a pinned base**, not on a developer
       workstation — otherwise the artifact is only as portable as whoever built it
-- [ ] `journald` configured `Storage=persistent`, `Seal=yes`, with
-      `journalctl --setup-keys` run once at provisioning
+- [ ] `journald` configured `Storage=persistent`. **Not** `Seal=yes` — Forward
+      Secure Sealing cannot initialise in an unprivileged LXC (measured; see §2)
+- [ ] Remote forwarding configured **at provisioning**, since it is the integrity
+      control that replaces sealing, not an optional extra
 - [ ] Server runs with `--audit-format json --audit-journald`
 - [ ] `--audit-redact` enabled **at first install** with an HMAC key file at
       mode 0600, owned by the service user, passed as a **path**
