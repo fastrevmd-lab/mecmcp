@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod coordinator;
 pub mod digest;
 pub mod lifecycle;
 pub mod persistence;
@@ -14,6 +15,7 @@ pub mod records;
 pub mod transaction;
 pub mod types;
 
+pub use coordinator::{ChangesetCoordinator, CoordinatorError};
 pub use lifecycle::{ChangeSetState, LifecycleState};
 pub use persistence::{ChangesetState, PersistenceError, read_state, validate_state, write_state};
 pub use records::{
