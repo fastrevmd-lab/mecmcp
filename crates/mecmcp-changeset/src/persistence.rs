@@ -173,10 +173,24 @@ pub fn validate_state(state: &ChangesetState) -> Result<(), PersistenceError> {
                 "changeset state change set has an invalid action count",
             ));
         }
-        // Note: We do NOT recompute the digest here because that requires vendor-specific
-        // action types. The digest format is validated above, which is sufficient for
-        // detecting corruption. Digest verification at apply-time is the consumer's
-        // responsibility using their own action types.
+        // Recompute the digest to detect tampering. With preserve_order enabled on
+        // serde_json::Value, the key order from the file is preserved and this check
+        // reproduces the original digest exactly. Without preserve_order, this would
+        // reject all production state files due to key reordering.
+        let expected = crate::digest::change_set_digest(
+            &record.owner,
+            &record.device,
+            &record.expected_candidate_fingerprint,
+            &record.actions,
+        )
+        .map_err(|error| {
+            PersistenceError::new(format!("could not recompute change-set digest: {error}"))
+        })?;
+        if expected != record.digest {
+            return Err(PersistenceError::new(
+                "changeset state change-set digest mismatch",
+            ));
+        }
     }
 
     Ok(())

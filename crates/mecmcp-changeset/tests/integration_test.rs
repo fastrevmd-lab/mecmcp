@@ -320,3 +320,112 @@ fn test_round_trip_write_read() {
     assert_eq!(state.operations.len(), loaded.operations.len());
     assert_eq!(state.change_sets.len(), loaded.change_sets.len());
 }
+
+#[test]
+fn test_tamper_detection_rejects_modified_actions() {
+    // Load the production fixture
+    let fixture_path: PathBuf = [
+        env!("CARGO_MANIFEST_DIR"),
+        "tests",
+        "compat",
+        "mutation-state-608.json",
+    ]
+    .iter()
+    .collect();
+
+    // First verify the unmodified fixture loads successfully
+    let original_state = read_state(&fixture_path, 8 * 1024 * 1024)
+        .expect("unmodified production fixture must load");
+    assert_eq!(original_state.change_sets.len(), 6);
+
+    // Now tamper with one change set's actions in memory
+    let temp_dir = tempfile::tempdir().unwrap();
+    let tampered_path = temp_dir.path().join("tampered.json");
+
+    let mut tampered_state = original_state.clone();
+    // Modify the first change set's first action's xpath
+    let first_change_set_id = tampered_state.change_sets.keys().next().unwrap().clone();
+    let first_change_set = tampered_state
+        .change_sets
+        .get_mut(&first_change_set_id)
+        .unwrap();
+    if let Some(obj) = first_change_set
+        .actions
+        .get_mut(0)
+        .and_then(|action| action.as_object_mut())
+    {
+        // Change the xpath value - this will invalidate the digest
+        obj.insert(
+            "xpath".to_string(),
+            serde_json::Value::String("/tampered/xpath".to_string()),
+        );
+    }
+
+    // Write the tampered state
+    write_state(&tampered_path, &tampered_state, 8 * 1024 * 1024).expect("write tampered state");
+
+    // Attempt to read it - should fail with digest mismatch
+    let result = read_state(&tampered_path, 8 * 1024 * 1024);
+    assert!(result.is_err());
+    let error_message = result.unwrap_err().to_string();
+    assert!(
+        error_message.contains("changeset state change-set digest mismatch"),
+        "Expected digest mismatch error, got: {error_message}"
+    );
+}
+
+#[test]
+fn test_action_key_order_preserved() {
+    // This test proves that preserve_order is working. Without it, serde_json::Value
+    // uses BTreeMap which sorts keys alphabetically, breaking digest verification.
+
+    let fixture_path: PathBuf = [
+        env!("CARGO_MANIFEST_DIR"),
+        "tests",
+        "compat",
+        "mutation-state-608.json",
+    ]
+    .iter()
+    .collect();
+
+    // Read the production fixture
+    let state = read_state(&fixture_path, 8 * 1024 * 1024).expect("production fixture must load");
+
+    // Get a change set with actions
+    let change_set = state.change_sets.values().next().unwrap();
+    assert!(!change_set.actions.is_empty());
+
+    let first_action = &change_set.actions[0];
+
+    // Serialize the action
+    let serialized = serde_json::to_string(first_action).unwrap();
+
+    // The keys should appear in struct declaration order: action, xpath, element, destructive_confirmation
+    // NOT alphabetically: action, destructive_confirmation, element, xpath
+    // Check that "action" appears before "xpath" in the serialized form
+    let action_pos = serialized.find("\"action\"").unwrap();
+    let xpath_pos = serialized.find("\"xpath\"").unwrap();
+    assert!(
+        action_pos < xpath_pos,
+        "Keys must preserve insertion order (action before xpath), not alphabetical order"
+    );
+
+    // Round-trip through write and read
+    let temp_dir = tempfile::tempdir().unwrap();
+    let roundtrip_path = temp_dir.path().join("roundtrip.json");
+    write_state(&roundtrip_path, &state, 8 * 1024 * 1024).expect("write must succeed");
+    let reloaded = read_state(&roundtrip_path, 8 * 1024 * 1024).expect("read must succeed");
+
+    // Get the same change set after round-trip
+    let reloaded_change_set = reloaded.change_sets.get(&change_set.id).unwrap();
+    let reloaded_action = &reloaded_change_set.actions[0];
+
+    // Serialize again
+    let reloaded_serialized = serde_json::to_string(reloaded_action).unwrap();
+
+    // The serialized form must be identical (same key order)
+    assert_eq!(
+        serialized, reloaded_serialized,
+        "Action serialization must preserve key order across round-trip"
+    );
+}

@@ -10,7 +10,7 @@ authors.workspace = true
 [dependencies]
 mecmcp-audit = { path = "../mecmcp-audit" }
 serde        = { workspace = true }
-serde_json   = { workspace = true }
+serde_json   = { workspace = true, features = ["preserve_order"] }
 sha2         = { workspace = true }
 getrandom    = { workspace = true }
 tokio        = { version = "1", features = ["sync", "macros", "rt"] }
