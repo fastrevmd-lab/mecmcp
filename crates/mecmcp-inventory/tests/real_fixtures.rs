@@ -127,3 +127,42 @@ fn panos_parses_empty_devices_array() {
         mecmcp_inventory::FileInventory::load(empty.path()).expect("panos parses empty array");
     assert!(inv.names().is_empty());
 }
+
+/// Exercises the `Inventory` **trait**, not the concrete type.
+///
+/// This is the gap that let a broken trait ship. `FileInventory::get` returned
+/// `Err` unconditionally and `policy` returned `None`, because the original
+/// signatures borrowed out of an `RwLock` and could not be honoured — yet the
+/// whole suite passed, since every test reached for the inherent clone-based
+/// accessors instead.
+///
+/// Calling through `&dyn Inventory` is what makes the difference: it is the
+/// path a consumer generic over the trait actually takes.
+#[test]
+fn trait_methods_work_through_dyn() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/junos-devices.json"
+    );
+    let concrete: mecmcp_inventory::FileInventory<JunosDevice, JunosPolicy> =
+        mecmcp_inventory::FileInventory::load(path).expect("load junos fixture");
+
+    let inventory: &dyn mecmcp_inventory::Inventory<JunosDevice, JunosPolicy> = &concrete;
+
+    let names = inventory.names();
+    assert!(!names.is_empty(), "trait names() returned nothing");
+
+    let first = &names[0];
+    inventory
+        .get(first)
+        .unwrap_or_else(|error| panic!("trait get({first}) failed: {error}"));
+
+    inventory
+        .get("no-such-device")
+        .expect_err("an unknown device must be an error, not a default");
+
+    assert!(
+        inventory.policy().is_some(),
+        "the junos fixture carries _blocklist_defaults, so policy() must return it"
+    );
+}

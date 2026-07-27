@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::RwLock;
 
 /// File-backed inventory loading both Junos (flat map) and PAN-OS (versioned
 /// envelope) schemas. Supports atomic write and hot-reload.
@@ -50,9 +50,9 @@ where
 
     /// Re-read the source file and atomically replace the inventory if
     /// validation succeeds. Returns the number of devices after reload.
-    pub async fn reload(&self) -> Result<usize, InventoryError> {
+    pub fn reload(&self) -> Result<usize, InventoryError> {
         let path = {
-            let inner = self.inner.read().await;
+            let inner = self.inner.read().expect("inventory lock poisoned");
             inner.source.clone()
         };
 
@@ -60,15 +60,15 @@ where
         let (devices, policy) = parse_inventory(&bytes)?;
         let count = devices.len();
 
-        let mut inner = self.inner.write().await;
+        let mut inner = self.inner.write().expect("inventory lock poisoned");
         inner.devices = devices;
         inner.policy = policy;
         Ok(count)
     }
 
     /// Source path this inventory was loaded from.
-    pub async fn source(&self) -> PathBuf {
-        let inner = self.inner.read().await;
+    pub fn source(&self) -> PathBuf {
+        let inner = self.inner.read().expect("inventory lock poisoned");
         inner.source.clone()
     }
 }
@@ -79,25 +79,24 @@ where
     P: Send + Sync + Clone,
 {
     fn names(&self) -> Vec<String> {
-        let inner = self.inner.blocking_read();
+        let inner = self.inner.read().expect("inventory lock poisoned");
         let mut names: Vec<String> = inner.devices.keys().cloned().collect();
         names.sort();
         names
     }
 
-    fn get(&self, _name: &str) -> Result<&D, Box<dyn std::error::Error + Send + Sync>> {
-        // Cannot return a reference into an RwLock without holding the guard
-        // across the call boundary. FileInventory callers must clone or the
-        // servers must wrap devices in Arc at load time.
-        Err(Box::new(InventoryError::UnknownDevice(
-            "FileInventory::get() cannot return borrowed device; use a server wrapper".into(),
-        )))
+    fn get(&self, name: &str) -> Result<D, Box<dyn std::error::Error + Send + Sync>> {
+        let inner = self.inner.read().expect("inventory lock poisoned");
+        inner
+            .devices
+            .get(name)
+            .cloned()
+            .ok_or_else(|| Box::new(InventoryError::UnknownDevice(name.to_string())) as Box<_>)
     }
 
-    fn policy(&self) -> Option<&P> {
-        // Same borrowing limitation as get(). Servers hold Arc<FileInventory>
-        // and access the policy field directly via a helper method.
-        None
+    fn policy(&self) -> Option<P> {
+        let inner = self.inner.read().expect("inventory lock poisoned");
+        inner.policy.clone()
     }
 }
 
@@ -106,10 +105,13 @@ where
     D: Send + Sync + Clone,
     P: Send + Sync + Clone,
 {
-    /// Get a cloned device entry. Servers use this instead of the trait's
-    /// borrowed `get()` to work around the RwLock borrowing constraint.
-    pub async fn get_device(&self, name: &str) -> Result<D, InventoryError> {
-        let inner = self.inner.read().await;
+    /// A cloned device entry, with the crate's own error type.
+    ///
+    /// Retained alongside the trait's `get`, which returns a boxed error: a
+    /// caller that already depends on this crate usually wants to match on
+    /// `InventoryError` rather than downcast.
+    pub fn get_device(&self, name: &str) -> Result<D, InventoryError> {
+        let inner = self.inner.read().expect("inventory lock poisoned");
         inner
             .devices
             .get(name)
@@ -117,9 +119,9 @@ where
             .ok_or_else(|| InventoryError::UnknownDevice(name.to_string()))
     }
 
-    /// Get a cloned policy. Servers use this instead of the trait's `policy()`.
-    pub async fn get_policy(&self) -> Option<P> {
-        let inner = self.inner.read().await;
+    /// A cloned policy payload.
+    pub fn get_policy(&self) -> Option<P> {
+        let inner = self.inner.read().expect("inventory lock poisoned");
         inner.policy.clone()
     }
 }
@@ -375,8 +377,10 @@ mod tests {
                 r#"{"r1": {"ip": "1.2.3.4", "username": "admin"}, "r2": {"ip": "1.2.3.5", "username": "netconf"}}"#,
             )
             .unwrap();
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let count = rt.block_on(inv.reload()).unwrap();
+            // No runtime needed: reload is synchronous. It was async only
+            // because the lock was tokio's, which also made names() call
+            // blocking_read() — a panic if reached from async code.
+            let count = inv.reload().unwrap();
             assert_eq!(count, 2);
             let names = inv.names();
             assert_eq!(names, vec!["r1", "r2"]);
