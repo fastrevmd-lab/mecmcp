@@ -31,19 +31,14 @@ impl fmt::Display for Tier {
 }
 
 /// The type of actor performing an action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ActorType {
     /// A human operator directly invoking a tool.
+    #[default]
     Human,
     /// An autonomous agent (LLM-driven or otherwise) acting under delegation.
     Agent,
-}
-
-impl Default for ActorType {
-    fn default() -> Self {
-        ActorType::Human
-    }
 }
 
 /// Default actor type for tokens that don't declare one.
