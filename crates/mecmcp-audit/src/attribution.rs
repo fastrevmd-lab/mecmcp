@@ -34,30 +34,35 @@ pub enum ActorType {
 }
 
 /// LLM provider tier: public hosted vs. private/self-hosted deployment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ProviderTier {
+pub enum Tier {
     /// Publicly hosted LLM service (e.g., Anthropic's public API).
+    #[default]
     Public,
     /// Private or self-hosted LLM deployment.
     Private,
 }
 
-impl fmt::Display for ProviderTier {
+impl fmt::Display for Tier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProviderTier::Public => write!(f, "public"),
-            ProviderTier::Private => write!(f, "private"),
+            Tier::Public => write!(f, "public"),
+            Tier::Private => write!(f, "private"),
         }
     }
 }
 
-/// Identity of an agent actor: the model, session, MCP client, provider tier,
-/// and skills used.
+/// Identity of an agent actor: the model, session, MCP client, provider, and skills used.
 ///
 /// This provenance information flows into commit comments and audit events,
 /// making committed changes traceable to the model and skills that generated
 /// them (SSDF provenance tracking, mecmcp#26).
+///
+/// # Skill naming constraint
+///
+/// Skill names MUST NOT contain spaces — they are joined with a single space
+/// in the provenance string to maintain exactly 4 comma-separated fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentIdentity {
     /// Model identifier (e.g. `"claude-sonnet-4-5"`).
@@ -66,11 +71,16 @@ pub struct AgentIdentity {
     pub session_id: String,
     /// MCP client name or user-agent, if known.
     pub client_name: Option<String>,
+    /// Provider name (e.g., "anthropic", "ollama"). Explicit data, not inferred.
+    ///
+    /// Defaults to `"unknown"` if absent (existing audit events without this field).
+    #[serde(default = "default_provider")]
+    pub provider: String,
     /// Provider tier: public hosted vs. private/self-hosted.
     ///
     /// Defaults to `Public` if absent (existing audit events without this field).
-    #[serde(default = "default_provider_tier")]
-    pub provider_tier: ProviderTier,
+    #[serde(default)]
+    pub provider_tier: Tier,
     /// Skills invoked during this action.
     ///
     /// Defaults to an empty list (existing audit events without this field).
@@ -78,8 +88,8 @@ pub struct AgentIdentity {
     pub skills_used: Vec<String>,
 }
 
-fn default_provider_tier() -> ProviderTier {
-    ProviderTier::Public
+fn default_provider() -> String {
+    "unknown".to_string()
 }
 
 impl AgentIdentity {
@@ -89,32 +99,22 @@ impl AgentIdentity {
     ///
     /// Example: `"anthropic-public, claude-opus-5, none, fastrevmd@gmail.com"`
     ///
-    /// The provider name is inferred from the model ID (heuristic: "claude-*" → "anthropic").
-    /// Skills render as comma-separated names, or "none" if the list is empty.
+    /// The provider name comes from the `provider` field (explicit data, not inferred).
+    /// Skills render as space-separated names, or "none" if the list is empty.
     /// The user is the human on whose behalf the agent acts (`on_behalf_of`).
     ///
     /// If `on_behalf_of` is `None`, the rendered string is still valid; the last
     /// component is omitted (e.g., `"anthropic-public, claude-opus-5, none"`).
     pub fn provenance_string(&self, on_behalf_of: Option<&str>) -> String {
-        let provider = if self.model_id.starts_with("claude-") {
-            "anthropic"
-        } else {
-            "unknown"
-        };
+        let provider_tier = format!("{}-{}", self.provider, self.provider_tier).to_lowercase();
         let skills = if self.skills_used.is_empty() {
             "none".to_string()
         } else {
-            self.skills_used.join(", ")
+            self.skills_used.join(" ")
         };
         match on_behalf_of {
-            Some(user) => format!(
-                "{}-{}, {}, {}, {}",
-                provider, self.provider_tier, self.model_id, skills, user
-            ),
-            None => format!(
-                "{}-{}, {}, {}",
-                provider, self.provider_tier, self.model_id, skills
-            ),
+            Some(user) => format!("{}, {}, {}, {}", provider_tier, self.model_id, skills, user),
+            None => format!("{}, {}, {}", provider_tier, self.model_id, skills),
         }
     }
 }
@@ -237,7 +237,8 @@ mod tests {
             model_id: "claude-sonnet-4-5".into(),
             session_id: "sess-12345".into(),
             client_name: Some("mcp-client/1.0".into()),
-            provider_tier: ProviderTier::Public,
+            provider: "anthropic".into(),
+            provider_tier: Tier::Public,
             skills_used: vec![],
         });
         a.on_behalf_of = Some("alice".into());
@@ -248,6 +249,8 @@ mod tests {
         assert_eq!(agent.model_id, "claude-sonnet-4-5");
         assert_eq!(agent.session_id, "sess-12345");
         assert_eq!(agent.client_name.as_deref(), Some("mcp-client/1.0"));
+        assert_eq!(agent.provider, "anthropic");
+        assert_eq!(agent.provider_tier, Tier::Public);
         assert_eq!(a.on_behalf_of.as_deref(), Some("alice"));
         assert_eq!(a.change_ref.as_deref(), Some("CHG0012345"));
     }
@@ -258,7 +261,8 @@ mod tests {
             model_id: "claude-opus-5".into(),
             session_id: "sess-12345".into(),
             client_name: None,
-            provider_tier: ProviderTier::Public,
+            provider: "anthropic".into(),
+            provider_tier: Tier::Public,
             skills_used: vec![],
         };
         assert_eq!(
@@ -273,12 +277,13 @@ mod tests {
             model_id: "claude-opus-5".into(),
             session_id: "sess-12345".into(),
             client_name: None,
-            provider_tier: ProviderTier::Public,
-            skills_used: vec!["skill1".into(), "skill2".into()],
+            provider: "anthropic".into(),
+            provider_tier: Tier::Public,
+            skills_used: vec!["srx-nat".into(), "srx-policy".into(), "srx-mnha".into()],
         };
         assert_eq!(
-            agent.provenance_string(Some("alice")),
-            "anthropic-public, claude-opus-5, skill1, skill2, alice"
+            agent.provenance_string(Some("fastrevmd@gmail.com")),
+            "anthropic-public, claude-opus-5, srx-nat srx-policy srx-mnha, fastrevmd@gmail.com"
         );
     }
 
@@ -288,7 +293,8 @@ mod tests {
             model_id: "claude-sonnet-4-5".into(),
             session_id: "sess-12345".into(),
             client_name: None,
-            provider_tier: ProviderTier::Private,
+            provider: "anthropic".into(),
+            provider_tier: Tier::Private,
             skills_used: vec![],
         };
         assert_eq!(
@@ -303,7 +309,8 @@ mod tests {
             model_id: "claude-opus-5".into(),
             session_id: "sess-12345".into(),
             client_name: None,
-            provider_tier: ProviderTier::Public,
+            provider: "anthropic".into(),
+            provider_tier: Tier::Public,
             skills_used: vec![],
         };
         assert_eq!(
@@ -313,8 +320,55 @@ mod tests {
     }
 
     #[test]
+    fn provenance_string_ollama_private() {
+        let agent = AgentIdentity {
+            model_id: "llama-3.3-70b".into(),
+            session_id: "sess-local".into(),
+            client_name: None,
+            provider: "ollama".into(),
+            provider_tier: Tier::Private,
+            skills_used: vec![],
+        };
+        assert_eq!(
+            agent.provenance_string(Some("user")),
+            "ollama-private, llama-3.3-70b, none, user"
+        );
+    }
+
+    #[test]
+    fn provenance_field_count_is_stable() {
+        // Field count must be exactly 4 for zero, one, and three skills
+        let zero = AgentIdentity {
+            model_id: "claude-opus-5".into(),
+            session_id: "s".into(),
+            client_name: None,
+            provider: "anthropic".into(),
+            provider_tier: Tier::Public,
+            skills_used: vec![],
+        };
+        let one = AgentIdentity {
+            skills_used: vec!["srx-nat".into()],
+            ..zero.clone()
+        };
+        let three = AgentIdentity {
+            skills_used: vec!["srx-nat".into(), "srx-policy".into(), "srx-mnha".into()],
+            ..zero.clone()
+        };
+
+        for (agent, label) in [(zero, "zero"), (one, "one"), (three, "three")] {
+            let s = agent.provenance_string(Some("user"));
+            let field_count = s.split(", ").count();
+            assert_eq!(
+                field_count, 4,
+                "{} skills must produce 4 fields, got {}: {}",
+                label, field_count, s
+            );
+        }
+    }
+
+    #[test]
     fn backward_compat_deserializes_old_json_without_new_fields() {
-        // Existing audit JSON without provider_tier or skills_used
+        // Existing audit JSON without provider, provider_tier, or skills_used
         let json = r#"{
             "model_id": "claude-sonnet-4-5",
             "session_id": "sess-old",
@@ -322,7 +376,8 @@ mod tests {
         }"#;
         let agent: AgentIdentity = serde_json::from_str(json).unwrap();
         assert_eq!(agent.model_id, "claude-sonnet-4-5");
-        assert_eq!(agent.provider_tier, ProviderTier::Public); // default
+        assert_eq!(agent.provider, "unknown"); // default
+        assert_eq!(agent.provider_tier, Tier::Public); // default
         assert!(agent.skills_used.is_empty()); // default
     }
 
@@ -335,9 +390,9 @@ mod tests {
             "model_id": "claude-sonnet-4-5",
             "session_id": "sess-old"
         }"#;
-        // If provider_tier or skills_used lacked #[serde(default)], this would fail.
-        // We use #[should_panic] to document the expectation, but in reality the
-        // test above (backward_compat_deserializes_old_json_without_new_fields)
+        // If provider, provider_tier, or skills_used lacked #[serde(default)],
+        // this would fail. We use #[should_panic] to document the expectation, but
+        // in reality the test above (backward_compat_deserializes_old_json_without_new_fields)
         // passing proves the defaults work.
         //
         // To actually test the negative case, we'd need to conditionally compile
@@ -349,8 +404,9 @@ mod tests {
             model_id: String,
             session_id: String,
             client_name: Option<String>,
-            provider_tier: ProviderTier, // no default
-            skills_used: Vec<String>,    // no default
+            provider: String,         // no default
+            provider_tier: Tier,      // no default
+            skills_used: Vec<String>, // no default
         }
         let _: AgentWithoutDefaults = serde_json::from_str(json).unwrap();
     }

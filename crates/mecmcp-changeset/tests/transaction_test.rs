@@ -529,7 +529,7 @@ impl DeviceTransaction for JunosMockTransaction {
 // ============================================================================
 
 fn test_attribution() -> Attribution {
-    use mecmcp_audit::{AgentIdentity, ProviderTier};
+    use mecmcp_audit::{AgentIdentity, Tier};
     Attribution {
         principal: Principal::Token("test-token".into()),
         actor_type: ActorType::Agent,
@@ -537,7 +537,8 @@ fn test_attribution() -> Attribution {
             model_id: "claude-opus-5".into(),
             session_id: "sess-test".into(),
             client_name: None,
-            provider_tier: ProviderTier::Public,
+            provider: "anthropic".into(),
+            provider_tier: Tier::Public,
             skills_used: vec![],
         }),
         on_behalf_of: Some("fastrevmd@gmail.com".into()),
@@ -870,13 +871,14 @@ async fn junos_confirming_commit_applies_attribution() {
 
 #[tokio::test]
 async fn provenance_string_matches_owner_example() {
-    use mecmcp_audit::{AgentIdentity, ProviderTier};
+    use mecmcp_audit::{AgentIdentity, Tier};
 
     let agent = AgentIdentity {
         model_id: "claude-opus-5".into(),
         session_id: "sess-test".into(),
         client_name: None,
-        provider_tier: ProviderTier::Public,
+        provider: "anthropic".into(),
+        provider_tier: Tier::Public,
         skills_used: vec![],
     };
 
