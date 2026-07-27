@@ -13,6 +13,7 @@ pub mod digest;
 pub mod lifecycle;
 pub mod persistence;
 pub mod records;
+pub mod recovery;
 pub mod transaction;
 pub mod types;
 
@@ -25,6 +26,7 @@ pub use records::{
     mutation_policy_signature, require_operation_fingerprint, require_operation_policy,
     validate_change_set_actions,
 };
+pub use recovery::{RecoveryDisposition, ResolvedOperationOutput, resolve_persisted_operation};
 pub use transaction::{
     CommitOptions, CommitOutcome, DeviceTransaction, RollbackOutcome, RollbackRef,
 };
