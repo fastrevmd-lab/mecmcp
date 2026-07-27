@@ -2,8 +2,14 @@
 //!
 //! The `Inventory` trait provides a common interface for device lookup and
 //! policy retrieval, abstracting over vendor-specific storage formats. This
-//! crate ships a file-backed implementation that reads both Junos's flat-map
-//! schema and PAN-OS's versioned-envelope schema without requiring migration.
+//! crate ships a file-backed implementation that reads three on-disk schemas
+//! without requiring migration:
+//!
+//! - **Canonical envelope**: `{ "version": 1, "devices": {...}, "policy": {...} }`
+//! - **Legacy PAN-OS**: `{ "version": 1, "devices": [...] }` (array)
+//! - **Legacy Junos**: flat map with optional `_blocklist_defaults` magic key
+//!
+//! All three normalize to a name-indexed device map plus optional policy.
 
 mod file;
 pub use file::FileInventory;
