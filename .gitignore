@@ -2,6 +2,9 @@
 **/*.rs.bk
 Cargo.lock
 
+# Agent scratch: git worktrees for parallel task branches.
+/.claude/
+
 # Never commit real authentication material, even hashed.
 tokens.json
 *.tokens.json
