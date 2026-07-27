@@ -18,11 +18,21 @@ pub trait Inventory<D, P>: Send + Sync {
     /// Return all device names in stable order.
     fn names(&self) -> Vec<String>;
 
-    /// Resolve a device by exact name.
-    fn get(&self, name: &str) -> Result<&D, Box<dyn Error + Send + Sync>>;
+    /// Resolve a device by exact name, returning an **owned** value.
+    ///
+    /// Owned rather than borrowed because any hot-reloadable inventory needs
+    /// interior mutability — SIGHUP swaps the contents under live readers — and
+    /// a reference cannot outlive the lock guard that protects it.
+    ///
+    /// This trait originally returned `Result<&D, _>`, which `FileInventory`
+    /// could not honour: its `get` returned `Err` unconditionally and `policy`
+    /// returned `None`, with comments telling callers to use inherent methods
+    /// instead. Two of three methods were inert, and no test caught it because
+    /// every test used the concrete type rather than the trait.
+    fn get(&self, name: &str) -> Result<D, Box<dyn Error + Send + Sync>>;
 
-    /// Return the global policy, if one exists.
-    fn policy(&self) -> Option<&P>;
+    /// The inventory-wide policy payload, owned for the same reason.
+    fn policy(&self) -> Option<P>;
 }
 
 /// Validate a device name per the constraints both servers enforce:
