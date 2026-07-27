@@ -164,6 +164,10 @@ mod tests {
             created_at: DateTime::from_timestamp(1_783_850_400, 0).expect("timestamp"),
             expires_at: None,
             grant: None,
+            provider: None,
+            provider_tier: None,
+            on_behalf_of: None,
+            actor_type: crate::ActorType::Human,
         };
         (plaintext, entry)
     }

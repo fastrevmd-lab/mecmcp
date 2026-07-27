@@ -5,9 +5,56 @@ use crate::scope::{ScopeError, ScopeSet};
 use crate::token::TokenDigest;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Maximum length of an operator-facing token name.
 pub const MAX_TOKEN_NAME: usize = 128;
+
+/// LLM provider tier: public hosted vs. private/self-hosted deployment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    /// Publicly hosted LLM service (e.g., Anthropic's public API).
+    #[default]
+    Public,
+    /// Private or self-hosted LLM deployment.
+    Private,
+}
+
+impl fmt::Display for Tier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Tier::Public => write!(f, "public"),
+            Tier::Private => write!(f, "private"),
+        }
+    }
+}
+
+/// The type of actor performing an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActorType {
+    /// A human operator directly invoking a tool.
+    Human,
+    /// An autonomous agent (LLM-driven or otherwise) acting under delegation.
+    Agent,
+}
+
+impl Default for ActorType {
+    fn default() -> Self {
+        ActorType::Human
+    }
+}
+
+/// Default actor type for tokens that don't declare one.
+///
+/// Conservatively defaults to `Human` rather than `Agent` because:
+/// - Human actions carry different audit and approval requirements
+/// - An untagged credential should not gain agent privileges by default
+/// - Existing tokens predating this field are human-operator tokens
+fn default_actor_type() -> ActorType {
+    ActorType::Human
+}
 
 /// Rejection reason for a malformed token entry.
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +127,37 @@ pub struct TokenEntry<G: Grant = NoGrant> {
         skip_serializing_if = "Option::is_none"
     )]
     pub grant: Option<G>,
+
+    /// Provider name (e.g., "anthropic", "ollama").
+    ///
+    /// Server-verified provenance field. When present, the server populates
+    /// `AgentIdentity.provider` from this value rather than accepting it
+    /// from the client. Absent for human-operator tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
+    /// Provider tier: public hosted vs. private/self-hosted.
+    ///
+    /// Server-verified provenance field. Absent for human-operator tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_tier: Option<crate::Tier>,
+
+    /// The human on whose behalf this credential acts.
+    ///
+    /// Server-verified provenance field. Populated for agent tokens acting
+    /// under delegation (e.g., "fastrevmd@gmail.com"). May also be set for
+    /// human-operator tokens to record the identity the token represents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
+
+    /// Whether this credential belongs to a human operator or an agent.
+    ///
+    /// Server-verified provenance field. Defaults to `Human` when absent
+    /// (conservative: an untagged token is assumed to be a human operator,
+    /// not an autonomous agent, since human actions carry different audit
+    /// and approval requirements).
+    #[serde(default = "default_actor_type")]
+    pub actor_type: ActorType,
 }
 
 fn wildcard() -> ScopeSet {
@@ -322,6 +400,37 @@ mod tests {
         assert!(json.contains("\"devices\""));
         assert!(!json.contains("\"hash\""));
         assert!(!json.contains("\"routers\""));
+    }
+
+    #[test]
+    fn existing_tokens_without_provenance_fields_load_with_defaults() {
+        // HARD CONSTRAINT: tokens.json is deployed on LXC 600, 601, 608, 609.
+        // This test proves existing files load unchanged with safe defaults.
+        // Written FIRST, must fail before defaults are added, then pass.
+        let raw = r#"{
+            "name": "lab",
+            "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+            "devices": ["*"],
+            "tools": ["*"],
+            "created_at_unix": 1783850400
+        }"#;
+        let entry: TokenEntry = serde_json::from_str(raw).expect("parse existing token");
+        assert_eq!(entry.name, "lab");
+        // All new fields default to None or Human
+        assert!(entry.provider.is_none(), "provider defaults to None");
+        assert!(
+            entry.provider_tier.is_none(),
+            "provider_tier defaults to None"
+        );
+        assert!(
+            entry.on_behalf_of.is_none(),
+            "on_behalf_of defaults to None"
+        );
+        assert_eq!(
+            entry.actor_type,
+            ActorType::Human,
+            "actor_type defaults to Human (conservative: untagged = human operator)"
+        );
     }
 
     #[test]

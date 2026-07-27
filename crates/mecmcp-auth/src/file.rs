@@ -245,6 +245,10 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
             created_at: Utc::now(),
             expires_at,
             grant,
+            provider: None,
+            provider_tier: None,
+            on_behalf_of: None,
+            actor_type: crate::ActorType::Human,
         });
 
         let updated = TokenStore::try_new(entries).map_err(|source| FileError::Store {
@@ -308,6 +312,10 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
                         created_at: entry.created_at,
                         expires_at: entry.expires_at,
                         grant: entry.grant.clone(),
+                        provider: entry.provider.clone(),
+                        provider_tier: entry.provider_tier,
+                        on_behalf_of: entry.on_behalf_of.clone(),
+                        actor_type: entry.actor_type,
                     }
                 } else {
                     entry.clone()
@@ -370,6 +378,10 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
                         created_at: entry.created_at,
                         expires_at: entry.expires_at,
                         grant: entry.grant.clone(),
+                        provider: entry.provider.clone(),
+                        provider_tier: entry.provider_tier,
+                        on_behalf_of: entry.on_behalf_of.clone(),
+                        actor_type: entry.actor_type,
                     }
                 } else {
                     entry.clone()
@@ -1821,6 +1833,10 @@ mod tests {
             created_at: DateTime::from_timestamp(1_783_850_400, 0).expect("timestamp"),
             expires_at: None,
             grant: None,
+            provider: None,
+            provider_tier: None,
+            on_behalf_of: None,
+            actor_type: crate::ActorType::Human,
         };
         let entries = vec![entry];
 
