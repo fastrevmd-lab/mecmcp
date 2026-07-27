@@ -63,6 +63,14 @@ pub struct OperationRecord {
     /// is optional and omitted rather than written as `null`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attribution: Option<PersistedAttribution>,
+    /// Confirmed-commit auto-rollback deadline (Junos only), as unix timestamp.
+    ///
+    /// When `AwaitingConfirmation`, the device will automatically rollback the
+    /// commit at this time unless a confirming commit is issued. Absent on
+    /// operations that do not use confirmed commit, and on records written
+    /// before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_deadline_unix: Option<u64>,
 }
 
 /// The attribution fields worth keeping in the state file.
@@ -86,6 +94,30 @@ pub struct PersistedAttribution {
     pub change_ref: Option<String>,
     /// Correlation id linking this record to the audit event for the request.
     pub request_id: String,
+    /// Agent identity, when `actor_type == "agent"`. Durable projection of
+    /// `mecmcp_audit::AgentIdentity` for audit trail: model, provider, tier,
+    /// skills used. Optional for backward compatibility — records written before
+    /// this field existed have no agent identity, and must still load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<PersistedAgentIdentity>,
+}
+
+/// Durable projection of `mecmcp_audit::AgentIdentity`.
+///
+/// Captures the provenance of an agent-driven commit: which model, provider,
+/// tier, and skills generated the change. This is the contract requirement
+/// from transaction.rs: "The attribution is also serialized into the persisted
+/// operation record for audit, independent of what the device logs."
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedAgentIdentity {
+    /// Model identifier (e.g. `"claude-sonnet-4-5"`).
+    pub model_id: String,
+    /// Provider name (e.g., "anthropic", "ollama").
+    pub provider: String,
+    /// Provider tier: public hosted vs. private/self-hosted.
+    pub provider_tier: String,
+    /// Skills invoked during this action, space-separated or "none".
+    pub skills_used: String,
 }
 
 impl From<&mecmcp_audit::Attribution> for PersistedAttribution {
@@ -98,6 +130,19 @@ impl From<&mecmcp_audit::Attribution> for PersistedAttribution {
             on_behalf_of: attribution.on_behalf_of.clone(),
             change_ref: attribution.change_ref.clone(),
             request_id: attribution.request_id.to_string(),
+            agent: attribution
+                .agent
+                .as_ref()
+                .map(|agent| PersistedAgentIdentity {
+                    model_id: agent.model_id.clone(),
+                    provider: agent.provider.clone(),
+                    provider_tier: agent.provider_tier.to_string(),
+                    skills_used: if agent.skills_used.is_empty() {
+                        "none".to_string()
+                    } else {
+                        agent.skills_used.join(" ")
+                    },
+                }),
         }
     }
 }

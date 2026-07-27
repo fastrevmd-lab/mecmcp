@@ -87,6 +87,12 @@ impl ChangesetCoordinator {
         // Generate operation ID
         let operation_id = crate::changeset::new_operation_id()?;
 
+        // P2-e: Validate expected fingerprint format before persisting. A malformed
+        // fingerprint written into the record makes `read_state` reject the entire
+        // state file, not just this record — so validation must happen before insert.
+        crate::digest::validate_fingerprint(expected_fingerprint)
+            .map_err(|e| CoordinatorError::new("expected_candidate_fingerprint", e.to_string()))?;
+
         // Create initial operation record in Staging state
         let mut record = OperationRecord {
             id: operation_id.clone(),
@@ -111,6 +117,7 @@ impl ChangesetCoordinator {
             config_lock_held: false,
             policy_signature: policy_signature.to_owned(),
             attribution: None,
+            rollback_deadline_unix: None,
         };
 
         // Insert the record early so restart recovery can see it
@@ -141,6 +148,15 @@ impl ChangesetCoordinator {
             // Past this point the candidate may have been modified, whatever the
             // outcome, so the record must survive for recovery.
             device_touched = true;
+
+            // P2-f: Persist lock-risk before the staging RPC. `device_touched` lives
+            // only on the stack, so if the process dies after `stage()` takes the
+            // device lock or changes the candidate, the persisted record still says
+            // `Staging` with `config_lock_held = false`. Restart recovery flips the
+            // state to `Indeterminate` but keeps that false flag, telling the operator
+            // no lock is held when one may be. Persist the lock-risk now.
+            record.config_lock_held = true;
+            self.update(record.clone()).await?;
 
             // Stage the transaction
             let staged = transaction
@@ -261,7 +277,7 @@ impl ChangesetCoordinator {
         cancellation: &CancellationToken,
     ) -> Result<T::Validation, CoordinatorError> {
         // Retrieve and validate the operation record
-        let mut record = self.record(operation_id, owner, device).await?;
+        let record = self.record(operation_id, owner, device).await?;
 
         if record.state != LifecycleState::Staged {
             return Err(CoordinatorError::new(
@@ -272,6 +288,20 @@ impl ChangesetCoordinator {
 
         // Acquire device guard
         let _guard = self.device_guard(&record.endpoint, cancellation).await?;
+
+        // P1-b-validate: Re-read state after acquiring guard. Two validations starting
+        // from `Staged` both pass the pre-lock check; the second uses its stale record
+        // after the first stored `Validated`, re-running validation, and a transient
+        // failure there can overwrite the success with `Failed`. Re-read now.
+        let mut record = self.record(operation_id, owner, device).await?;
+
+        // Re-check state after acquiring guard
+        if record.state != LifecycleState::Staged {
+            return Err(CoordinatorError::new(
+                "operation_id",
+                "operation is not in staged state",
+            ));
+        }
 
         // Validate fingerprint
         let actual_fp = transaction
@@ -403,7 +433,12 @@ impl ChangesetCoordinator {
                 };
                 record.job_id = job_id.clone();
                 record.details = details.clone();
-                record.config_lock_held = false; // Lock should be released after commit
+                // P2-g: `Reconciled { succeeded: false }` used to clear the lock flag,
+                // but the trait only guarantees release on a *successful* commit.
+                // Preserve the held state unless release is established.
+                if succeeded {
+                    record.config_lock_held = false;
+                }
                 self.update(record).await?;
 
                 Ok(CommitOutcome::Reconciled {
@@ -432,9 +467,14 @@ impl ChangesetCoordinator {
                 rollback_deadline_unix,
                 details,
             }) => {
-                // Junos confirmed commit case
+                // P2-h: Persist confirmed-commit deadlines. On `AwaitingConfirmation`
+                // the `rollback_deadline_unix` went only into the response, not the
+                // record. If the client loses the response or the server restarts,
+                // nothing knows when the provisional commit rolls back or whether
+                // confirmation is still valid. Store it as structured state.
                 record.job_id = job_id.clone();
                 record.details = details.clone();
+                record.rollback_deadline_unix = Some(rollback_deadline_unix);
                 // Keep in Committing state until confirmed
                 self.update(record).await?;
                 Ok(CommitOutcome::AwaitingConfirmation {
@@ -476,7 +516,7 @@ impl ChangesetCoordinator {
         cancellation: &CancellationToken,
     ) -> Result<String, CoordinatorError> {
         // Retrieve and validate the operation record
-        let mut record = self.record(operation_id, owner, device).await?;
+        let record = self.record(operation_id, owner, device).await?;
 
         // Cannot discard operations in certain states
         if matches!(
@@ -495,6 +535,29 @@ impl ChangesetCoordinator {
 
         // Acquire device guard
         let _guard = self.device_guard(&record.endpoint, cancellation).await?;
+
+        // P1-a-discard: Re-read state after acquiring the guard. Discard reads a
+        // `Validated` record, then waits behind `commit_operation`. The commit
+        // persists `Committed`; discard proceeds with its stale record, and because
+        // a commit usually leaves the candidate fingerprint unchanged the fingerprint
+        // guard passes — so the stale update overwrites `Committed` with `Discarded`.
+        // A committed change would be recorded as discarded. Re-read and re-check now.
+        let mut record = self.record(operation_id, owner, device).await?;
+
+        // Re-check state after acquiring guard
+        if matches!(
+            record.state,
+            LifecycleState::Validating
+                | LifecycleState::Committing
+                | LifecycleState::Committed
+                | LifecycleState::Discarded
+                | LifecycleState::Indeterminate
+        ) {
+            return Err(CoordinatorError::new(
+                "operation_id",
+                "operation cannot be discarded in its current state",
+            ));
+        }
 
         // Validate fingerprint
         let actual_fp = transaction
@@ -523,10 +586,16 @@ impl ChangesetCoordinator {
             ));
         }
 
-        // P2-b: Persist successful rollback before attempting fingerprint read
-        // If fingerprint fails, the rollback still happened and must be recorded
+        // P1-c-persist: Persist rollback completion before the next await. If the
+        // process exits after rollback succeeds but while `unlock()` or the
+        // fingerprint call is still awaiting, disk still says `Staged`/`Failed`.
+        // Restart recovery does not convert those, and the reverted candidate no
+        // longer matches the stored fingerprint, so every retry is blocked with no
+        // recovery path. Persist an in-progress or indeterminate record before the
+        // next await.
         record.state = LifecycleState::Discarded;
         record.details = Some("candidate reverted".to_owned());
+        self.update(record.clone()).await?;
 
         // P1-c: Attempt to unlock via rollback; if that doesn't release the lock,
         // the implementation must provide explicit unlock support
@@ -535,10 +604,15 @@ impl ChangesetCoordinator {
                 record.config_lock_held = false;
             }
             Ok(crate::transaction::UnlockOutcome::Unsupported) => {
-                // Nothing released the lock, so nothing may claim it was. Leave
-                // the recorded flag as it stands and say plainly what happened;
-                // clearing it here is how a device ends up locked against every
-                // later change while the state file reads clean.
+                // P1-d: An unreleased lock must not end terminal. When `unlock()`
+                // returns the default `Unsupported` and the rollback did not release
+                // the lock, the method keeps `config_lock_held = true` but returns
+                // success with state `Discarded`. `Discarded` is terminal and
+                // evictable, another discard is refused, and offline recovery only
+                // accepts `Indeterminate` — so the held lock has no route to
+                // resolution. Treat that outcome as `Indeterminate` unless lock
+                // release was actually established.
+                record.state = LifecycleState::Indeterminate;
                 record.details = Some(
                     "candidate reverted; the transaction offers no explicit unlock, \
                      so the configuration lock state is unchanged"
