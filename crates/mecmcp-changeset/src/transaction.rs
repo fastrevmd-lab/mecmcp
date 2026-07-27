@@ -257,6 +257,44 @@ pub trait DeviceTransaction: Send + Sync {
     /// - The rollback target is unsupported by this implementation (e.g.,
     ///   `Archive(N)` on PAN-OS).
     async fn rollback(&self, to: RollbackRef) -> Result<RollbackOutcome, Self::Error>;
+
+    /// Issue a confirming commit after a confirmed commit (Junos only).
+    ///
+    /// When [`commit()`](Self::commit) with `CommitOptions { confirm_timeout: Some(N) }`
+    /// returns [`CommitOutcome::AwaitingConfirmation`], the device has committed
+    /// the configuration but will automatically roll it back after N seconds
+    /// unless a confirming commit is issued.
+    ///
+    /// This method issues that confirming commit, which:
+    ///
+    /// 1. Prevents the auto-rollback (the change becomes permanent).
+    /// 2. Applies a commit comment carrying the attribution and referencing the
+    ///    confirmed commit, so the provenance lands on the device even though
+    ///    the initial confirmed commit dropped the comment.
+    ///
+    /// The comment format is implementation-defined but must make the linkage
+    /// explicit. Example (Junos):
+    /// `"Confirming commit <operation_id>: CHG0012345 by alice via anthropic-public, claude-opus-5, none, fastrevmd@gmail.com"`
+    ///
+    /// # PAN-OS behavior
+    ///
+    /// PAN-OS has no confirmed commit feature. An implementation should return
+    /// an error stating the operation is unsupported, exactly as
+    /// [`rollback(RollbackRef::Archive(N))`](Self::rollback) does on PAN-OS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// - The device is unreachable or the confirming commit RPC fails.
+    /// - The operation is unsupported by this vendor (PAN-OS).
+    /// - There is no confirmed commit awaiting confirmation (the operation ID
+    ///   does not match a pending confirmed commit).
+    async fn confirm_commit(
+        &self,
+        operation_id: &str,
+        attribution: &Attribution,
+    ) -> Result<CommitOutcome, Self::Error>;
 }
 
 /// Rollback target.
@@ -286,20 +324,22 @@ pub enum RollbackRef {
 /// Options for commit behavior.
 ///
 /// This type allows Junos to express confirmed-commit auto-rollback and
-/// PAN-OS to pass no options, without forcing PAN-OS to implement a
-/// meaningless stub.
+/// PAN-OS to reject unsupported options explicitly.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitOptions {
     /// Junos confirmed commit: automatically rollback after this duration
     /// unless a confirming commit is issued.
     ///
     /// Junos: translates to `<commit confirmed="{seconds}"/>`.
-    /// PAN-OS: ignored (no equivalent feature).
+    /// PAN-OS: **returns an error** if `Some(...)`. Silently ignoring a
+    /// requested auto-rollback safety feature is worse than an error — the
+    /// operator believes the device will revert itself and it will not.
     ///
     /// **Critical Junos behavior:** A confirmed commit does NOT apply the
-    /// commit comment. The comment is silently dropped by Junos. An
-    /// implementation must either apply the comment in a second confirming
-    /// commit, or omit the comment and log the attribution separately.
+    /// commit comment. The comment is silently dropped by Junos. The
+    /// attribution is applied later via [`confirm_commit()`](DeviceTransaction::confirm_commit),
+    /// which issues a second commit carrying the comment and referencing
+    /// the confirmed commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm_timeout: Option<Duration>,
 }

@@ -104,6 +104,8 @@ enum PanosError {
     CommitFailed(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
+    #[error("confirmed commit not supported on PAN-OS")]
+    ConfirmedCommitUnsupported,
 }
 
 #[async_trait]
@@ -186,8 +188,13 @@ impl DeviceTransaction for PanosMockTransaction {
         &self,
         staged: &Self::Staged,
         _attribution: &Attribution,
-        _options: &CommitOptions,
+        options: &CommitOptions,
     ) -> Result<CommitOutcome, Self::Error> {
+        // PAN-OS does not support confirmed commit; return error if requested
+        if options.confirm_timeout.is_some() {
+            return Err(PanosError::ConfirmedCommitUnsupported);
+        }
+
         let mut state = self.state.lock().unwrap();
 
         // PAN-OS commits are async but we simulate success
@@ -203,6 +210,16 @@ impl DeviceTransaction for PanosMockTransaction {
             job_id: Some("commit-456".into()),
             details: Some("commit completed".into()),
         })
+    }
+
+    async fn confirm_commit(
+        &self,
+        _operation_id: &str,
+        _attribution: &Attribution,
+    ) -> Result<CommitOutcome, Self::Error> {
+        Err(PanosError::Unsupported(
+            "PAN-OS does not support confirmed commit".into(),
+        ))
     }
 
     async fn rollback(&self, to: RollbackRef) -> Result<RollbackOutcome, Self::Error> {
@@ -296,6 +313,30 @@ impl JunosMockTransaction {
 
     fn with_state(state: Arc<Mutex<JunosDeviceState>>) -> Self {
         Self { state }
+    }
+
+    fn build_commit_comment(
+        &self,
+        attribution: &Attribution,
+        confirming_operation_id: Option<&str>,
+    ) -> String {
+        let change_ref = attribution.change_ref.as_deref().unwrap_or("N/A");
+        let principal = &attribution.principal;
+
+        let provenance = if let Some(agent) = &attribution.agent {
+            agent.provenance_string(attribution.on_behalf_of.as_deref())
+        } else {
+            format!("human-initiated by {}", principal)
+        };
+
+        if let Some(op_id) = confirming_operation_id {
+            format!(
+                "Confirming commit {}: {} via {}",
+                op_id, change_ref, provenance
+            )
+        } else {
+            format!("{} via {}", change_ref, provenance)
+        }
     }
 }
 
@@ -411,17 +452,10 @@ impl DeviceTransaction for JunosMockTransaction {
                 )),
             })
         } else {
-            // Normal commit with comment
-            let _comment = format!(
-                "{} by {} via {}",
-                attribution.change_ref.as_deref().unwrap_or("N/A"),
-                attribution.principal,
-                attribution
-                    .agent
-                    .as_ref()
-                    .map(|a| a.model_id.as_str())
-                    .unwrap_or("unknown")
-            );
+            // Normal commit with comment (attribution provenance)
+            let comment = self.build_commit_comment(attribution, None);
+            // In real impl: ConfigManager::commit_with_comment(&comment)
+            let _ = comment; // silence unused warning in mock
 
             Ok(CommitOutcome::Reconciled {
                 succeeded: true,
@@ -429,6 +463,26 @@ impl DeviceTransaction for JunosMockTransaction {
                 details: Some("commit complete".into()),
             })
         }
+    }
+
+    async fn confirm_commit(
+        &self,
+        operation_id: &str,
+        attribution: &Attribution,
+    ) -> Result<CommitOutcome, Self::Error> {
+        // Issue confirming commit with attribution comment
+        let comment = self.build_commit_comment(attribution, Some(operation_id));
+        // In real impl: ConfigManager::commit_with_comment(&comment)
+        let _ = comment; // silence unused warning in mock
+
+        Ok(CommitOutcome::Reconciled {
+            succeeded: true,
+            job_id: None,
+            details: Some(format!(
+                "confirming commit for operation {} complete",
+                operation_id
+            )),
+        })
     }
 
     async fn rollback(&self, to: RollbackRef) -> Result<RollbackOutcome, Self::Error> {
@@ -475,12 +529,30 @@ impl DeviceTransaction for JunosMockTransaction {
 // ============================================================================
 
 fn test_attribution() -> Attribution {
+    use mecmcp_audit::{AgentIdentity, ProviderTier};
     Attribution {
         principal: Principal::Token("test-token".into()),
+        actor_type: ActorType::Agent,
+        agent: Some(AgentIdentity {
+            model_id: "claude-opus-5".into(),
+            session_id: "sess-test".into(),
+            client_name: None,
+            provider_tier: ProviderTier::Public,
+            skills_used: vec![],
+        }),
+        on_behalf_of: Some("fastrevmd@gmail.com".into()),
+        change_ref: Some("CHG0012345".into()),
+        request_id: Uuid::new_v4(),
+    }
+}
+
+fn test_human_attribution() -> Attribution {
+    Attribution {
+        principal: Principal::Token("human-token".into()),
         actor_type: ActorType::Human,
         agent: None,
         on_behalf_of: None,
-        change_ref: Some("CHG0012345".into()),
+        change_ref: Some("CHG0099999".into()),
         request_id: Uuid::new_v4(),
     }
 }
@@ -717,7 +789,7 @@ async fn junos_mock_archive_not_found() {
 }
 
 #[tokio::test]
-async fn trait_allows_panos_to_ignore_confirm_timeout() {
+async fn panos_rejects_unsupported_confirm_timeout() {
     let panos = PanosMockTransaction::new("admin".into());
     let actions = vec![PanosAction {
         action: PanosActionType::Set,
@@ -726,21 +798,101 @@ async fn trait_allows_panos_to_ignore_confirm_timeout() {
     }];
     let staged = panos.stage(&actions).await.unwrap();
 
-    // PAN-OS gets CommitOptions with confirm_timeout, but ignores it
+    // PAN-OS must return an error if confirm_timeout is requested
     let options = CommitOptions {
         confirm_timeout: Some(Duration::from_secs(300)),
     };
-    let outcome = panos
+    let result = panos.commit(&staged, &test_attribution(), &options).await;
+
+    // Must error, not silently ignore
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("confirmed commit not supported")
+    );
+}
+
+#[tokio::test]
+async fn panos_confirm_commit_unsupported() {
+    let panos = PanosMockTransaction::new("admin".into());
+    let result = panos
+        .confirm_commit("some-op-id", &test_attribution())
+        .await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("not support"));
+}
+
+#[tokio::test]
+async fn junos_confirming_commit_applies_attribution() {
+    let junos = JunosMockTransaction::new();
+
+    // First: confirmed commit returns AwaitingConfirmation
+    let actions = vec![JunosAction {
+        payload: ConfigPayload::Set("set system host-name confirm-test".into()),
+        rollback_source: None,
+    }];
+    let staged = junos.stage(&actions).await.unwrap();
+    let options = CommitOptions {
+        confirm_timeout: Some(Duration::from_secs(300)),
+    };
+    let outcome = junos
         .commit(&staged, &test_attribution(), &options)
         .await
         .unwrap();
 
-    // Still returns Reconciled (not AwaitingConfirmation)
-    assert!(matches!(
-        outcome,
+    let operation_id = match outcome {
+        CommitOutcome::AwaitingConfirmation { .. } => "test-op-123",
+        _ => panic!("expected AwaitingConfirmation"),
+    };
+
+    // Second: confirming commit applies attribution
+    let confirm_outcome = junos
+        .confirm_commit(operation_id, &test_attribution())
+        .await
+        .unwrap();
+
+    match confirm_outcome {
         CommitOutcome::Reconciled {
-            succeeded: true,
-            ..
+            succeeded, details, ..
+        } => {
+            assert!(succeeded);
+            assert!(
+                details
+                    .unwrap()
+                    .contains(&format!("confirming commit for operation {}", operation_id))
+            );
         }
-    ));
+        _ => panic!("expected Reconciled after confirm_commit"),
+    }
+}
+
+#[tokio::test]
+async fn provenance_string_matches_owner_example() {
+    use mecmcp_audit::{AgentIdentity, ProviderTier};
+
+    let agent = AgentIdentity {
+        model_id: "claude-opus-5".into(),
+        session_id: "sess-test".into(),
+        client_name: None,
+        provider_tier: ProviderTier::Public,
+        skills_used: vec![],
+    };
+
+    let provenance = agent.provenance_string(Some("fastrevmd@gmail.com"));
+    assert_eq!(
+        provenance,
+        "anthropic-public, claude-opus-5, none, fastrevmd@gmail.com"
+    );
+}
+
+#[tokio::test]
+async fn human_initiated_commit_renders_sensibly() {
+    let junos = JunosMockTransaction::new();
+    let human_attr = test_human_attribution();
+
+    let comment = junos.build_commit_comment(&human_attr, None);
+    assert!(comment.contains("CHG0099999"));
+    assert!(comment.contains("human-initiated"));
 }

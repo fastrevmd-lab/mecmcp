@@ -376,6 +376,8 @@ mod tests {
                 model_id: "claude-sonnet-4-5".into(),
                 session_id: "sess-abc".into(),
                 client_name: Some("mcp-client/1.0".into()),
+                provider_tier: crate::ProviderTier::Public,
+                skills_used: vec![],
             });
             attr.on_behalf_of = Some("alice".into());
             attr.change_ref = Some("CHG0012345".into());
