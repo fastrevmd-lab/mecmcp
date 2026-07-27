@@ -143,110 +143,175 @@ where
     }
 }
 
-/// Untagged enum detecting canonical vs legacy schemas.
-///
-/// Discriminates three shapes:
-/// 1. Canonical: `{ "version": 1, "devices": {...}, "policy": {...} }` — map
-/// 2. Legacy PAN-OS: `{ "version": 1, "devices": [...] }` — array
-/// 3. Legacy Junos: flat map with optional `_blocklist_defaults` magic key
-///
-/// Ordering is critical: serde tries variants top to bottom, and the Junos
-/// flat-map will match anything if it comes before the versioned envelopes.
+/// Canonical envelope: `{ "version": 1, "devices": {...}, "policy": {...} }`.
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum RawInventory<D, P> {
-    /// Canonical envelope: devices as a map, version required, policy optional.
-    /// Must come before PanosEnvelope because both have `version` + `devices`,
-    /// but this one's `devices` is an object while PAN-OS's is an array —
-    /// serde will try this first and fail if devices is not a map.
-    CanonicalEnvelope {
-        version: u32,
-        policy: Option<P>,
-        devices: HashMap<String, D>,
-    },
-    /// Legacy PAN-OS: `{ "version": 1, "devices": [...] }` — array of devices.
-    PanosEnvelope { version: u32, devices: Vec<D> },
-    /// Legacy Junos: flat map with optional `_blocklist_defaults` magic key.
-    /// Must come last because it will match any JSON object.
-    JunosFlat {
-        #[serde(rename = "_blocklist_defaults")]
-        policy: Option<P>,
-        #[serde(flatten)]
-        devices: HashMap<String, D>,
-    },
+struct CanonicalEnvelope<D, P> {
+    version: u32,
+    policy: Option<P>,
+    devices: HashMap<String, D>,
 }
 
-/// Trait to extract the device name from a parsed device payload.
-/// PAN-OS devices carry their name in a `name` field; Junos devices are
-/// keyed by name in the map and do not have an internal name field.
-#[allow(dead_code)]
-trait HasName {
-    fn name(&self) -> Option<&str>;
+/// Legacy PAN-OS envelope: `{ "version": 1, "devices": [...] }`.
+#[derive(Deserialize)]
+struct PanosEnvelope<D> {
+    version: u32,
+    devices: Vec<D>,
+}
+
+/// Legacy Junos flat map: `{ "device-name": {...}, "_blocklist_defaults": {...} }`.
+#[derive(Deserialize)]
+struct JunosFlat<D, P> {
+    #[serde(rename = "_blocklist_defaults")]
+    policy: Option<P>,
+    #[serde(flatten)]
+    devices: HashMap<String, D>,
+}
+
+/// Detected inventory shape based on observable structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InventoryShape {
+    Canonical,
+    LegacyPanos,
+    LegacyJunos,
+}
+
+/// Discriminate the inventory shape from a parsed JSON value.
+///
+/// Rules (applied in order):
+/// 1. Not a JSON object -> error
+/// 2. Has `version` and `devices` where `devices` is an object -> Canonical
+/// 3. Has `version` and `devices` where `devices` is an array -> LegacyPanos
+/// 4. Has neither `version` nor `devices` -> LegacyJunos
+/// 5. Has `version` but no `devices` (or misspelled) -> error
+/// 6. Has `devices` but no `version` -> error (ambiguous)
+fn detect_shape(value: &serde_json::Value) -> Result<InventoryShape, InventoryError> {
+    let obj = value.as_object().ok_or_else(|| {
+        InventoryError::ParseError(
+            "inventory must be a JSON object, found array or primitive".into(),
+        )
+    })?;
+
+    let has_version = obj.contains_key("version");
+    let has_devices = obj.contains_key("devices");
+
+    match (has_version, has_devices) {
+        (true, true) => {
+            // Both version and devices present — discriminate by devices type
+            // We already checked has_devices, so get() cannot return None
+            let devices_value = obj
+                .get("devices")
+                .expect("devices key must exist after contains_key check");
+            match devices_value {
+                serde_json::Value::Object(_) => Ok(InventoryShape::Canonical),
+                serde_json::Value::Array(_) => Ok(InventoryShape::LegacyPanos),
+                _ => Err(InventoryError::ParseError(
+                    "found \"version\" and \"devices\" but \"devices\" is not an object or array"
+                        .into(),
+                )),
+            }
+        }
+        (true, false) => {
+            // Has version but no devices — likely a typo
+            let keys: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
+            Err(InventoryError::ParseError(format!(
+                "found \"version\" but no \"devices\" key (found keys: {}) — expected canonical envelope {{\"version\":1,\"devices\":{{...}}}} or legacy PAN-OS {{\"version\":1,\"devices\":[...]}}",
+                keys.join(", ")
+            )))
+        }
+        (false, true) => {
+            // Has devices but no version — ambiguous (could be canonical with version omitted, or a mistake)
+            Err(InventoryError::ParseError(
+                "found \"devices\" but no \"version\" key — ambiguous shape (canonical envelope requires \"version\")".into(),
+            ))
+        }
+        (false, false) => {
+            // Neither version nor devices — legacy Junos flat map
+            Ok(InventoryShape::LegacyJunos)
+        }
+    }
 }
 
 /// Parse all three schemas and return (devices_map, global_policy).
+///
+/// Discrimination happens in two phases:
+/// 1. Parse to `serde_json::Value` and detect shape from observable structure
+/// 2. Deserialize into the chosen concrete type, preserving field-path errors
 fn parse_inventory<D, P>(bytes: &[u8]) -> Result<(HashMap<String, D>, Option<P>), InventoryError>
 where
     for<'de> D: Deserialize<'de> + serde::Serialize,
     for<'de> P: Deserialize<'de>,
 {
-    let raw: RawInventory<D, P> =
+    // Phase 1: Parse to Value and detect shape
+    let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| InventoryError::ParseError(e.to_string()))?;
+    let shape = detect_shape(&value)?;
 
-    match raw {
-        RawInventory::CanonicalEnvelope {
-            version,
-            policy,
-            devices,
-        } => {
-            if version != 1 {
-                return Err(InventoryError::UnsupportedVersion(version));
+    // Phase 2: Deserialize into the chosen concrete type
+    match shape {
+        InventoryShape::Canonical => {
+            let envelope: CanonicalEnvelope<D, P> = serde_json::from_value(value)
+                .map_err(|e| InventoryError::ParseError(format!("canonical envelope: {e}")))?;
+
+            if envelope.version != 1 {
+                return Err(InventoryError::UnsupportedVersion(envelope.version));
             }
+
             // Validate all device names in the canonical envelope.
-            for name in devices.keys() {
+            for name in envelope.devices.keys() {
                 validate_device_name(name)?;
             }
-            // Canonical envelope accepts empty devices map (same as legacy Junos).
-            Ok((devices, policy))
-        }
-        RawInventory::PanosEnvelope { version, devices } => {
-            if version != 1 {
-                return Err(InventoryError::UnsupportedVersion(version));
-            }
-            // PAN-OS devices must be converted to a map. This requires the
-            // devices to implement a trait we can call to get their name.
-            // For now, we use serde_json::Value as an intermediate step.
-            let devices_json = serde_json::to_value(&devices)
-                .map_err(|e| InventoryError::ParseError(e.to_string()))?;
-            let devices_array = devices_json
-                .as_array()
-                .ok_or_else(|| InventoryError::ParseError("devices not an array".into()))?;
 
+            // Canonical envelope accepts empty devices map (same as legacy Junos).
+            Ok((envelope.devices, envelope.policy))
+        }
+        InventoryShape::LegacyPanos => {
+            let envelope: PanosEnvelope<serde_json::Value> = serde_json::from_value(value)
+                .map_err(|e| InventoryError::ParseError(format!("legacy PAN-OS envelope: {e}")))?;
+
+            if envelope.version != 1 {
+                return Err(InventoryError::UnsupportedVersion(envelope.version));
+            }
+
+            // Convert array to map by extracting each device's "name" field
             let mut map = HashMap::new();
-            for device_val in devices_array {
+            for (idx, device_val) in envelope.devices.iter().enumerate() {
                 let name = device_val
                     .get("name")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| InventoryError::ParseError("device missing name".into()))?
+                    .ok_or_else(|| {
+                        InventoryError::ParseError(format!(
+                            "legacy PAN-OS envelope: device at index {idx} missing \"name\" field"
+                        ))
+                    })?
                     .to_string();
                 validate_device_name(&name)?;
-                let device: D = serde_json::from_value(device_val.clone())
-                    .map_err(|e| InventoryError::ParseError(e.to_string()))?;
+
+                let device: D = serde_json::from_value(device_val.clone()).map_err(|e| {
+                    InventoryError::ParseError(format!(
+                        "legacy PAN-OS envelope: device \"{name}\": {e}"
+                    ))
+                })?;
+
                 if map.insert(name.clone(), device).is_some() {
                     return Err(InventoryError::DuplicateName(name));
                 }
             }
+
             // Legacy PAN-OS has no policy slot.
             Ok((map, None))
         }
-        RawInventory::JunosFlat { policy, devices } => {
+        InventoryShape::LegacyJunos => {
+            let flat: JunosFlat<D, P> = serde_json::from_value(value)
+                .map_err(|e| InventoryError::ParseError(format!("legacy Junos flat map: {e}")))?;
+
             // Validate all device names (the magic _blocklist_defaults key was
             // already parsed into `policy` and removed from `devices` by serde).
-            for name in devices.keys() {
+            for name in flat.devices.keys() {
                 validate_device_name(name)?;
             }
+
             // Legacy Junos accepts empty map.
-            Ok((devices, policy))
+            Ok((flat.devices, flat.policy))
         }
     }
 }
