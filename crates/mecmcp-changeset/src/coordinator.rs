@@ -70,6 +70,7 @@ pub struct ChangesetCoordinator {
     state_path: Option<PathBuf>,
     limits: OperationLimits,
     approval_ttl: Duration,
+    lab_mode: bool,
 }
 
 impl Default for ChangesetCoordinator {
@@ -80,6 +81,7 @@ impl Default for ChangesetCoordinator {
             state_path: None,
             limits: OperationLimits::default(),
             approval_ttl: Duration::from_secs(15 * 60),
+            lab_mode: false,
         }
     }
 }
@@ -99,6 +101,7 @@ impl ChangesetCoordinator {
         path: Option<&Path>,
         limits: OperationLimits,
         approval_ttl: Duration,
+        lab_mode: bool,
     ) -> Result<Self, CoordinatorError> {
         let Some(path) = path else {
             return Ok(Self {
@@ -107,6 +110,7 @@ impl ChangesetCoordinator {
                 state_path: None,
                 limits,
                 approval_ttl,
+                lab_mode,
             });
         };
 
@@ -158,6 +162,7 @@ impl ChangesetCoordinator {
             state_path: Some(path.to_path_buf()),
             limits,
             approval_ttl,
+            lab_mode,
         })
     }
 
@@ -434,6 +439,16 @@ impl ChangesetCoordinator {
     #[must_use]
     pub fn limits(&self) -> &OperationLimits {
         &self.limits
+    }
+
+    /// Returns whether lab mode is enabled.
+    ///
+    /// When lab mode is enabled, change sets can be applied without a second
+    /// principal approval, and the approval is recorded as waived rather than
+    /// fabricating an approver.
+    #[must_use]
+    pub fn lab_mode(&self) -> bool {
+        self.lab_mode
     }
 
     /// Persists the state to disk atomically.

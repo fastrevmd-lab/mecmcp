@@ -91,7 +91,7 @@ async fn test_insert_and_reload_persists_operation() {
     // Create coordinator and insert an operation
     {
         let coordinator =
-            ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl).unwrap();
+            ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
         let operation = make_operation_record(
             "0000000000000000000000000000000000000000000000000000000000000001",
             "https://device.example.com",
@@ -101,7 +101,8 @@ async fn test_insert_and_reload_persists_operation() {
     }
 
     // Drop and reload the coordinator
-    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl).unwrap();
+    let coordinator =
+        ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
 
     // Verify the operation persisted
     let record = coordinator
@@ -126,7 +127,7 @@ async fn test_restart_recovery_marks_staging_indeterminate() {
     // Create coordinator and insert an operation in Staging state
     {
         let coordinator =
-            ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl).unwrap();
+            ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
         let operation = make_operation_record(
             "0000000000000000000000000000000000000000000000000000000000000001",
             "https://device.example.com",
@@ -136,7 +137,8 @@ async fn test_restart_recovery_marks_staging_indeterminate() {
     }
 
     // Reload - should trigger recovery
-    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl).unwrap();
+    let coordinator =
+        ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
 
     // Verify the operation is now Indeterminate
     let record = coordinator
@@ -168,7 +170,7 @@ async fn test_restart_recovery_marks_applying_failed() {
     // Create coordinator and insert a change set in Applying state
     {
         let coordinator =
-            ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl).unwrap();
+            ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
         let change_set = make_change_set_record(
             "0000000000000000000000000000000000000000000000000000000000000001",
             ChangeSetState::Applying,
@@ -177,7 +179,8 @@ async fn test_restart_recovery_marks_applying_failed() {
     }
 
     // Reload - should trigger recovery
-    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl).unwrap();
+    let coordinator =
+        ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
 
     // Verify the change set is now Failed
     let record = coordinator
@@ -243,7 +246,8 @@ async fn test_persist_failure_rolls_back_insert() {
     let limits = OperationLimits::default();
     let approval_ttl = Duration::from_secs(900);
 
-    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl).unwrap();
+    let coordinator =
+        ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
     let operation = make_operation_record(
         "0000000000000000000000000000000000000000000000000000000000000001",
         "https://device.example.com",
@@ -284,7 +288,8 @@ async fn test_persist_failure_rolls_back_update() {
     let approval_ttl = Duration::from_secs(900);
 
     // Create coordinator and insert an operation
-    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl).unwrap();
+    let coordinator =
+        ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
     let mut operation = make_operation_record(
         "0000000000000000000000000000000000000000000000000000000000000001",
         "https://device.example.com",
@@ -342,7 +347,8 @@ async fn test_capacity_limits_from_operation_limits() {
     };
     let approval_ttl = Duration::from_secs(900);
 
-    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl).unwrap();
+    let coordinator =
+        ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
 
     // Insert two operations (at capacity)
     let op1 = make_operation_record(
@@ -386,7 +392,8 @@ async fn test_terminal_records_evicted_at_capacity() {
     };
     let approval_ttl = Duration::from_secs(900);
 
-    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl).unwrap();
+    let coordinator =
+        ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
 
     // Insert two operations in terminal states
     let op1 = make_operation_record(
@@ -435,7 +442,7 @@ async fn test_production_fixture_no_rewrite() {
 
     // Load the coordinator from the fixture
     let _coordinator =
-        ChangesetCoordinator::load(Some(&fixture_path), limits, approval_ttl).unwrap();
+        ChangesetCoordinator::load(Some(&fixture_path), limits, approval_ttl, false).unwrap();
 
     // Read the file again
     let after_bytes = std::fs::read(&fixture_path).unwrap();
@@ -472,7 +479,7 @@ async fn test_production_fixture_terminal_records_survive() {
 
     // Load the coordinator
     let _coordinator =
-        ChangesetCoordinator::load(Some(&fixture_path), limits, approval_ttl).unwrap();
+        ChangesetCoordinator::load(Some(&fixture_path), limits, approval_ttl, false).unwrap();
 
     // Read the state again
     let after_state = read_state(&fixture_path, 8 * 1024 * 1024).unwrap();

@@ -39,8 +39,8 @@ fn setup_coordinator() -> (tempfile::TempDir, ChangesetCoordinator) {
     };
     let approval_ttl = Duration::from_secs(15 * 60);
 
-    let coordinator =
-        ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl).expect("coordinator");
+    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false)
+        .expect("coordinator");
 
     (dir, coordinator)
 }
@@ -198,8 +198,8 @@ async fn test_expired_change_set_transitions_on_status_poll() {
     // Use a 1-second approval TTL so it expires immediately
     let approval_ttl = Duration::from_secs(1);
 
-    let coordinator =
-        ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl).expect("coordinator");
+    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false)
+        .expect("coordinator");
 
     let actions = vec![TestAction {
         action: "set".to_string(),
@@ -293,8 +293,8 @@ async fn test_approval_digest_tamper_detection_swap_approver() {
     };
     let approval_ttl = Duration::from_secs(15 * 60);
 
-    let coordinator =
-        ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl).expect("coordinator");
+    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false)
+        .expect("coordinator");
 
     let actions = vec![TestAction {
         action: "set".to_string(),
@@ -333,7 +333,7 @@ async fn test_approval_digest_tamper_detection_swap_approver() {
     // Tamper: swap approver to alice (masking a self-approval)
     let record = state.change_sets.get_mut(&created.change_set_id).unwrap();
     if let Some(approval) = &mut record.approval {
-        approval.approver = "alice".to_string(); // tamper
+        approval.approver = Some("alice".to_string()); // tamper
     }
 
     // Write the tampered state back
@@ -363,8 +363,8 @@ async fn test_new_approval_has_approval_digest() {
     };
     let approval_ttl = Duration::from_secs(15 * 60);
 
-    let coordinator =
-        ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl).expect("coordinator");
+    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false)
+        .expect("coordinator");
 
     let actions = vec![TestAction {
         action: "set".to_string(),
@@ -400,7 +400,7 @@ async fn test_new_approval_has_approval_digest() {
 
     assert!(record.approval.is_some(), "approval record must be present");
     let approval = record.approval.as_ref().unwrap();
-    assert_eq!(approval.approver, "bob");
+    assert_eq!(approval.approver, Some("bob".to_string()));
     assert!(approval.digest.starts_with("sha256:"));
     assert_eq!(approval.digest.len(), "sha256:".len() + 64);
 }

@@ -2,10 +2,9 @@
 
 use crate::{
     ChangeSetRecord, OperationRecord,
-    digest::{bytes_hex, validate_fingerprint},
+    digest::{compute_approval_digest, compute_waiver_digest, validate_fingerprint},
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
@@ -202,13 +201,19 @@ pub fn validate_state(state: &ChangesetState) -> Result<(), PersistenceError> {
                 |error| PersistenceError::new(format!("approval digest invalid: {error}")),
             )?;
 
-            let expected_approval_digest = compute_approval_digest(
-                id,
-                &record.digest,
-                &record.owner,
-                &approval.approver,
-                approval.approved_at_unix,
-            );
+            let expected_approval_digest = if let Some(approver) = &approval.approver {
+                // Genuine two-person approval
+                compute_approval_digest(
+                    id,
+                    &record.digest,
+                    &record.owner,
+                    approver,
+                    approval.approved_at_unix,
+                )
+            } else {
+                // Waived approval in lab mode
+                compute_waiver_digest(id, &record.digest, &record.owner, approval.approved_at_unix)
+            };
 
             if expected_approval_digest != approval.digest {
                 return Err(PersistenceError::new(
@@ -312,30 +317,4 @@ fn validate_operation_id(value: &str) -> Result<(), PersistenceError> {
             "value must contain exactly 64 hexadecimal characters",
         ))
     }
-}
-
-/// Computes an approval digest binding the approval act to the plan.
-///
-/// The approval digest covers `(change_set_id, plan_digest, owner, approver, approved_at)`.
-/// This makes the approval itself tamper-evident: anyone editing the state file to swap
-/// the approver or mask a self-approval will invalidate the digest.
-fn compute_approval_digest(
-    change_set_id: &str,
-    plan_digest: &str,
-    owner: &str,
-    approver: &str,
-    approved_at_unix: u64,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(change_set_id.as_bytes());
-    hasher.update(b"|");
-    hasher.update(plan_digest.as_bytes());
-    hasher.update(b"|");
-    hasher.update(owner.as_bytes());
-    hasher.update(b"|");
-    hasher.update(approver.as_bytes());
-    hasher.update(b"|");
-    hasher.update(approved_at_unix.to_string().as_bytes());
-
-    format!("sha256:{}", bytes_hex(&hasher.finalize()))
 }
