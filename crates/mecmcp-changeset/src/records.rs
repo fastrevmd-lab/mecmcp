@@ -205,6 +205,8 @@ pub struct ChangeSetRecord {
     pub expires_at_unix: u64,
     /// Operation identifier created when this change set was applied.
     pub operation_id: Option<String>,
+    /// Policy signature at the time of change-set creation.
+    pub policy_signature: String,
 }
 
 /// Approval record stored on a change set after successful approval or waiver.

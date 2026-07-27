@@ -12,6 +12,55 @@ use mecmcp_audit::Attribution;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
+/// Canonicalizes an endpoint URL to a consistent form for use as a device guard key.
+///
+/// This function:
+/// - Validates the URL starts with `https://`
+/// - Lowercases the scheme and host
+/// - Removes trailing slashes from the path
+/// - Rejects malformed URLs
+///
+/// # Errors
+///
+/// Returns an error if the endpoint is not a valid HTTPS URL.
+fn canonicalize_endpoint(endpoint: &str) -> Result<String, CoordinatorError> {
+    if !endpoint.starts_with("https://") && !endpoint.starts_with("HTTPS://") {
+        return Err(CoordinatorError::new(
+            "endpoint",
+            "endpoint must start with https://",
+        ));
+    }
+
+    // Parse the URL to validate structure
+    let url = url::Url::parse(endpoint)
+        .map_err(|e| CoordinatorError::new("endpoint", format!("invalid endpoint URL: {e}")))?;
+
+    if url.scheme() != "https" {
+        return Err(CoordinatorError::new(
+            "endpoint",
+            "endpoint must use https scheme",
+        ));
+    }
+
+    // Rebuild with normalized components
+    let host = url
+        .host_str()
+        .ok_or_else(|| CoordinatorError::new("endpoint", "endpoint must contain a valid host"))?;
+
+    let mut canonical = format!("https://{}", host.to_lowercase());
+
+    if let Some(port) = url.port() {
+        canonical.push_str(&format!(":{port}"));
+    }
+
+    let path = url.path().trim_end_matches('/');
+    if !path.is_empty() && path != "/" {
+        canonical.push_str(path);
+    }
+
+    Ok(canonical)
+}
+
 /// Output from applying a change set.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApplyOutput<S> {
@@ -36,6 +85,20 @@ impl ChangesetCoordinator {
     /// On partial failure (e.g., the third action fails), the coordinator auto-reverts
     /// any staged changes and marks the change set as `Failed`. The change set must NOT
     /// be left looking `Applied` after a partial failure.
+    ///
+    /// # Cross-process atomicity limitation
+    ///
+    /// The in-process device guard serializes concurrent `apply_change_set` calls within
+    /// this process, but it cannot exclude external sessions (other processes, SSH, GUI).
+    /// Between the fingerprint check and the `stage()` call, an external session could
+    /// mutate the candidate, causing actions to be staged onto a state that was never
+    /// approved.
+    ///
+    /// To narrow the window, this method re-reads the fingerprint immediately before
+    /// staging and compares it to the expected value. This is not true atomicity —
+    /// that requires a device-side lock held across the check-then-stage sequence —
+    /// but it detects drift that happens in the (now much smaller) window. A future
+    /// task will add a device-lock primitive to close the window entirely.
     ///
     /// # Lab mode
     ///
@@ -84,12 +147,8 @@ impl ChangesetCoordinator {
         crate::digest::validate_fingerprint(&expected_fingerprint)
             .map_err(|e| CoordinatorError::new("expected_fingerprint", e.to_string()))?;
 
-        if !endpoint.starts_with("https://") {
-            return Err(CoordinatorError::new(
-                "endpoint",
-                "endpoint must start with https://",
-            ));
-        }
+        // Canonicalize and validate the endpoint before using it as a device guard key
+        let endpoint = canonicalize_endpoint(&endpoint)?;
 
         // Retrieve and validate the change set before acquiring the device guard
         let mut change_set = self.change_set(&change_set_id, &device).await?;
@@ -108,20 +167,25 @@ impl ChangesetCoordinator {
             ));
         }
 
-        // Validate approval is present and either genuine or waived
-        let approval = change_set.approval.as_ref().ok_or_else(|| {
-            CoordinatorError::new(
-                "change_set_id",
-                "approved change set missing approval record",
-            )
-        })?;
-
-        // Accept both genuine approvals (approver present) and waived approvals
-        if approval.approver.is_none() && approval.waived.is_none() {
-            return Err(CoordinatorError::new(
-                "change_set_id",
-                "approval record must contain either an approver or a waiver",
-            ));
+        // Validate approval is present and either genuine or waived.
+        // Legacy compatibility: records created before the approval-digest feature have
+        // `approver: Some(...)` but `approval: None`. Accept both forms.
+        if let Some(approval) = &change_set.approval {
+            // New tamper-evident approval: must have either an approver or a waiver
+            if approval.approver.is_none() && approval.waived.is_none() {
+                return Err(CoordinatorError::new(
+                    "change_set_id",
+                    "approval record must contain either an approver or a waiver",
+                ));
+            }
+        } else {
+            // Legacy approval: must have an approver in the top-level field
+            if change_set.approver.is_none() {
+                return Err(CoordinatorError::new(
+                    "change_set_id",
+                    "approved change set missing approval record",
+                ));
+            }
         }
 
         let now = now_unix()?;
@@ -153,15 +217,27 @@ impl ChangesetCoordinator {
         // Re-check the change set after acquiring the guard
         change_set = self.change_set(&change_set_id, &device).await?;
 
+        let now_after_guard = now_unix()?;
+
         if change_set.owner != owner
             || change_set.state != ChangeSetState::Approved
             || change_set.digest != expected_digest
             || change_set.expected_candidate_fingerprint != expected_fingerprint
-            || now_unix()? >= change_set.expires_at_unix
         {
             return Err(CoordinatorError::new(
                 "change_set_id",
                 "change set is no longer the exact unexpired approved plan",
+            ));
+        }
+
+        // Check expiration after acquiring the guard. If the TTL elapses while waiting
+        // for a busy guard, transition the change set to Expired rather than proceeding.
+        if now_after_guard >= change_set.expires_at_unix {
+            change_set.state = ChangeSetState::Expired;
+            self.update_change_set(change_set).await?;
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                "change set expired while waiting for device guard",
             ));
         }
 
@@ -178,6 +254,26 @@ impl ChangesetCoordinator {
                 format!(
                     "device fingerprint changed: expected {}, found {}",
                     expected_fingerprint, before_fingerprint
+                ),
+            ));
+        }
+
+        // CRITICAL: The in-process guard cannot exclude external sessions (other processes,
+        // SSH, GUI). Between the fingerprint read above and the stage() call below, another
+        // session could mutate the candidate. To narrow the window, re-read the fingerprint
+        // immediately before staging and compare. This is not true atomicity — that requires
+        // a device-side lock held across the check — but it detects drift that happens in
+        // the (now much smaller) window.
+        let pre_stage_fingerprint = transaction.fingerprint().await.map_err(|e| {
+            CoordinatorError::new("device", format!("pre-stage fingerprint failed: {e}"))
+        })?;
+
+        if pre_stage_fingerprint != expected_fingerprint {
+            return Err(CoordinatorError::new(
+                "expected_fingerprint",
+                format!(
+                    "device fingerprint changed between check and stage: expected {}, found {}",
+                    expected_fingerprint, pre_stage_fingerprint
                 ),
             ));
         }
@@ -219,15 +315,19 @@ impl ChangesetCoordinator {
                 actions.len()
             )),
             config_lock_held: false,
-            policy_signature: String::new(),
+            policy_signature: change_set.policy_signature.clone(),
         };
 
         self.insert(operation_record).await?;
 
-        // Mark change set as Applying
+        // Mark change set as Applying. On failure, remove the operation reservation
+        // to unblock the endpoint.
         change_set.state = ChangeSetState::Applying;
         change_set.operation_id = Some(operation_id.clone());
-        self.update_change_set(change_set.clone()).await?;
+        if let Err(error) = self.update_change_set(change_set.clone()).await {
+            self.remove(&operation_id).await;
+            return Err(error);
+        }
 
         // Stage all actions through the transaction
         let staged = match transaction.stage(&actions).await {
@@ -258,54 +358,31 @@ impl ChangesetCoordinator {
         let after_fingerprint = match transaction.fingerprint().await {
             Ok(fp) => fp,
             Err(error) => {
-                // Fingerprint read failed; attempt to revert
-                let revert_result = transaction
-                    .rollback(crate::transaction::RollbackRef::CandidateRevert)
-                    .await;
-
+                // Fingerprint read failed after a successful stage. DO NOT revert:
+                // 1. The approved fingerprint may legitimately include pre-existing
+                //    uncommitted work.
+                // 2. Both Junos rollback-0 and PAN-OS partial admin revert clear more
+                //    than just this change set — they would destroy unrelated operator work.
+                //
+                // Instead, mark the operation as Indeterminate and leave the change set
+                // as Failed. The operator must inspect the device and decide whether to
+                // commit or revert manually.
                 change_set.state = ChangeSetState::Failed;
                 self.update_change_set(change_set).await?;
 
-                return match revert_result {
-                    Ok(outcome) if outcome.succeeded => Err(CoordinatorError::new(
-                        "device",
-                        format!("fingerprint read failed after staging (reverted): {error}"),
-                    )),
-                    Ok(outcome) => {
-                        // Rollback did not succeed; operation is indeterminate
-                        let mut record = self.record(&operation_id, &owner, &device).await?;
-                        record.state = LifecycleState::Indeterminate;
-                        record.details = Some(format!(
-                            "fingerprint read failed: {error}; rollback did not succeed ({})",
-                            outcome.details.as_deref().unwrap_or("no detail")
-                        ));
-                        self.update(record).await?;
+                let mut record = self.record(&operation_id, &owner, &device).await?;
+                record.state = LifecycleState::Indeterminate;
+                record.details = Some(format!(
+                    "fingerprint read failed after staging: {error}; staged changes remain on device"
+                ));
+                self.update(record).await?;
 
-                        Err(CoordinatorError::new(
-                            "device",
-                            format!(
-                                "fingerprint read failed: {error}; rollback did not succeed ({})",
-                                outcome.details.as_deref().unwrap_or("no detail")
-                            ),
-                        ))
-                    }
-                    Err(revert_error) => {
-                        // Rollback itself failed; operation is indeterminate
-                        let mut record = self.record(&operation_id, &owner, &device).await?;
-                        record.state = LifecycleState::Indeterminate;
-                        record.details = Some(format!(
-                            "fingerprint read failed: {error}; rollback failed: {revert_error}"
-                        ));
-                        self.update(record).await?;
-
-                        Err(CoordinatorError::new(
-                            "device",
-                            format!(
-                                "fingerprint read failed: {error}; rollback failed: {revert_error}"
-                            ),
-                        ))
-                    }
-                };
+                return Err(CoordinatorError::new(
+                    "device",
+                    format!(
+                        "fingerprint read failed after staging: {error}; operation is indeterminate"
+                    ),
+                ));
             }
         };
 
@@ -318,11 +395,34 @@ impl ChangesetCoordinator {
             change_set_id,
             actions.len()
         ));
-        self.update(operation_record).await?;
+        // A successful stage may hold a configuration lock (PAN-OS) or candidate lock (Junos).
+        // The trait does not expose whether a lock is held, so we conservatively record that
+        // a lock may be held. Later discard/commit operations must attempt to release it.
+        operation_record.config_lock_held = true;
 
-        // Mark change set as Applied
+        // Persist the operation update. On failure, mark the operation as Indeterminate
+        // rather than leaving it in Staging — the device candidate is changed but we
+        // cannot confirm the persisted state matches.
+        if let Err(persist_error) = self.update(operation_record.clone()).await {
+            operation_record.state = LifecycleState::Indeterminate;
+            operation_record.details = Some(format!(
+                "staging succeeded but state persistence failed: {persist_error}"
+            ));
+            // Try once more to persist the indeterminate state; if this also fails,
+            // the operation remains Staging in memory and will be marked Indeterminate
+            // on restart.
+            let _ = self.update(operation_record).await;
+            return Err(persist_error);
+        }
+
+        // Mark change set as Applied. On failure, the operation is already Staged,
+        // so we leave it terminal and mark the change set as Failed.
         change_set.state = ChangeSetState::Applied;
-        self.update_change_set(change_set).await?;
+        if let Err(persist_error) = self.update_change_set(change_set.clone()).await {
+            change_set.state = ChangeSetState::Failed;
+            let _ = self.update_change_set(change_set).await;
+            return Err(persist_error);
+        }
 
         Ok(ApplyOutput {
             operation_id,

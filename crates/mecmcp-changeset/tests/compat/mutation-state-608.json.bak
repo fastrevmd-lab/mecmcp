@@ -183,8 +183,7 @@
         "state": "applied",
         "approver": "lab-change-reviewer",
         "expires_at_unix": 1783733470,
-        "operation_id": "2a3b1f77ab4eebc5ef6833dbc7118af06f88b832d515ce8915e90a888fb2c0ec",
-        "policy_signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        "operation_id": "2a3b1f77ab4eebc5ef6833dbc7118af06f88b832d515ce8915e90a888fb2c0ec"
       },
       "49b676c81843a90b04078172fbbe3d00362497f3da969984ff38dbad80000b45": {
         "id": "49b676c81843a90b04078172fbbe3d00362497f3da969984ff38dbad80000b45",
@@ -209,8 +208,7 @@
         "state": "applied",
         "approver": "lab-change-reviewer",
         "expires_at_unix": 1783728660,
-        "operation_id": "c8d5e5b5726d835d98beda398768b911d4041139fb2ff8d82e6c2c4fb76407fd",
-        "policy_signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        "operation_id": "c8d5e5b5726d835d98beda398768b911d4041139fb2ff8d82e6c2c4fb76407fd"
       },
       "5ec3151eb953cf74c1de314bdf4a9af3fb5497cb5ae13c7a016788843fcaa4b4": {
         "id": "5ec3151eb953cf74c1de314bdf4a9af3fb5497cb5ae13c7a016788843fcaa4b4",
@@ -229,8 +227,7 @@
         "state": "applied",
         "approver": "lab-change-reviewer",
         "expires_at_unix": 1783734404,
-        "operation_id": "52bb10d5bc6318e89c2dca0951b48016f2d5b5b071b5ab7843dc9c9c941748a1",
-        "policy_signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        "operation_id": "52bb10d5bc6318e89c2dca0951b48016f2d5b5b071b5ab7843dc9c9c941748a1"
       },
       "6753f58e8858069c4850f0fa52e5ef60a3596072c18b6470d556eb075441a3ce": {
         "id": "6753f58e8858069c4850f0fa52e5ef60a3596072c18b6470d556eb075441a3ce",
@@ -255,8 +252,7 @@
         "state": "applied",
         "approver": "lab-change-reviewer",
         "expires_at_unix": 1783733293,
-        "operation_id": "b7827dec86a1aa69ad4321a90b23b1c20d70abf5cf7ef48f39d5a3552d5fd983",
-        "policy_signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        "operation_id": "b7827dec86a1aa69ad4321a90b23b1c20d70abf5cf7ef48f39d5a3552d5fd983"
       },
       "e9c2899388674cc6e217762a9b860210010580ad7b8e625ba389f43af8b3285e": {
         "id": "e9c2899388674cc6e217762a9b860210010580ad7b8e625ba389f43af8b3285e",
@@ -275,8 +271,7 @@
         "state": "applied",
         "approver": "lab-change-reviewer",
         "expires_at_unix": 1783728715,
-        "operation_id": "12b8f2abd38559f06c5fe0227e91e6a50c47284ea64b48ac412256abb8654814",
-        "policy_signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        "operation_id": "12b8f2abd38559f06c5fe0227e91e6a50c47284ea64b48ac412256abb8654814"
       },
       "fd142a1c9c79b6c0e2286af2306efde286d8aedeb59c699d4bed252f50a9a65c": {
         "id": "fd142a1c9c79b6c0e2286af2306efde286d8aedeb59c699d4bed252f50a9a65c",
@@ -295,8 +290,7 @@
         "state": "applied",
         "approver": "lab-change-reviewer",
         "expires_at_unix": 1783728923,
-        "operation_id": "5b70334a54834381d20fe0b66c0f61cf9954ff93ff088b7591396c322cb2ff39",
-        "policy_signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        "operation_id": "5b70334a54834381d20fe0b66c0f61cf9954ff93ff088b7591396c322cb2ff39"
       }
     }
   }

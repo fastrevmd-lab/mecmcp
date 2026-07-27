@@ -84,6 +84,7 @@ fn make_change_set_record(id: &str, state: ChangeSetState) -> ChangeSetRecord {
         approval: None,
         expires_at_unix: 0,
         operation_id: None,
+        policy_signature: String::new(),
     }
 }
 

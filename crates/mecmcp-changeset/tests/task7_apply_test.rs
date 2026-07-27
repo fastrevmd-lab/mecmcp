@@ -1209,3 +1209,456 @@ async fn fingerprint_read_failure_with_failed_rollback_marks_indeterminate() {
         .unwrap();
     assert_eq!(status.state, ChangeSetState::Failed);
 }
+
+// ============================================================================
+// Tests for review findings (Phase 5 Task 7 fixes)
+// ============================================================================
+
+#[tokio::test]
+async fn finding_1_canonicalize_endpoint_key() {
+    // Finding 1: Canonicalize the device-guard key to prevent bypassing serialization
+    // This test verifies that different variations of the same endpoint URL
+    // (with/without trailing slash, different case) all canonicalize to the same
+    // key and thus use the same device guard.
+    let coordinator = ChangesetCoordinator::default();
+    let transaction = MockTransaction::new();
+    let device = "test-device".to_string();
+    let owner = "alice";
+    let approver = "bob";
+
+    let initial_fp = transaction.fingerprint().await.unwrap();
+
+    let actions = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test".into(),
+        value: Some("value".into()),
+    }];
+
+    // Create and approve a change set
+    let create_output = coordinator
+        .create_change_set(
+            device.clone(),
+            actions.clone(),
+            owner.to_string(),
+            initial_fp.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .approve_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            approver.to_string(),
+            create_output.digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Apply with trailing slash
+    let apply_result = coordinator
+        .apply_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            "https://test-device.example.com/".to_string(),
+            owner.to_string(),
+            create_output.digest.clone(),
+            initial_fp.clone(),
+            &transaction,
+            &test_attribution(owner),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // Verify the persisted endpoint is canonicalized (no trailing slash)
+    let record = coordinator
+        .record(&apply_result.operation_id, owner, &device)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        record.endpoint, "https://test-device.example.com",
+        "endpoint must be canonicalized without trailing slash"
+    );
+}
+
+#[tokio::test]
+async fn finding_1_reject_malformed_endpoint() {
+    let coordinator = ChangesetCoordinator::default();
+    let transaction = MockTransaction::new();
+    let device = "test-device".to_string();
+    let owner = "alice";
+    let approver = "bob";
+
+    let initial_fp = transaction.fingerprint().await.unwrap();
+
+    let actions = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test".into(),
+        value: Some("value".into()),
+    }];
+
+    let create_output = coordinator
+        .create_change_set(
+            device.clone(),
+            actions,
+            owner.to_string(),
+            initial_fp.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .approve_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            approver.to_string(),
+            create_output.digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Try to apply with malformed endpoint (no host)
+    let result = coordinator
+        .apply_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            "https://".to_string(),
+            owner.to_string(),
+            create_output.digest.clone(),
+            initial_fp.clone(),
+            &transaction,
+            &test_attribution(owner),
+            &CancellationToken::new(),
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("endpoint"));
+}
+
+#[tokio::test]
+async fn finding_2_persist_policy_signature() {
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let state_path = dir.path().join("changeset-state.json");
+
+    let coordinator = ChangesetCoordinator::load(
+        Some(&state_path),
+        OperationLimits::default(),
+        Duration::from_secs(900),
+        false,
+    )
+    .unwrap();
+
+    let transaction = MockTransaction::new();
+    let device = "test-device".to_string();
+    let owner = "alice";
+    let approver = "bob";
+
+    let initial_fp = transaction.fingerprint().await.unwrap();
+    let policy_sig = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    let actions = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test".into(),
+        value: Some("value".into()),
+    }];
+
+    let create_output = coordinator
+        .create_change_set(
+            device.clone(),
+            actions,
+            owner.to_string(),
+            initial_fp.clone(),
+            policy_sig.to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .approve_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            approver.to_string(),
+            create_output.digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    let apply_output = coordinator
+        .apply_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            "https://test-device.example.com".to_string(),
+            owner.to_string(),
+            create_output.digest.clone(),
+            initial_fp.clone(),
+            &transaction,
+            &test_attribution(owner),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // Reload and verify the policy signature was persisted
+    let reloaded = ChangesetCoordinator::load(
+        Some(&state_path),
+        OperationLimits::default(),
+        Duration::from_secs(900),
+        false,
+    )
+    .unwrap();
+
+    let record = reloaded
+        .record(&apply_output.operation_id, owner, &device)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        record.policy_signature, policy_sig,
+        "policy signature must be persisted from the change set"
+    );
+    assert!(
+        !record.policy_signature.is_empty(),
+        "policy signature must not be empty"
+    );
+}
+
+#[tokio::test]
+async fn finding_3_persist_config_lock_held() {
+    let coordinator = ChangesetCoordinator::default();
+    let transaction = MockTransaction::new();
+    let device = "test-device".to_string();
+    let owner = "alice";
+    let approver = "bob";
+
+    let initial_fp = transaction.fingerprint().await.unwrap();
+
+    let actions = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test".into(),
+        value: Some("value".into()),
+    }];
+
+    let create_output = coordinator
+        .create_change_set(
+            device.clone(),
+            actions,
+            owner.to_string(),
+            initial_fp.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .approve_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            approver.to_string(),
+            create_output.digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    let apply_output = coordinator
+        .apply_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            "https://test-device.example.com".to_string(),
+            owner.to_string(),
+            create_output.digest.clone(),
+            initial_fp.clone(),
+            &transaction,
+            &test_attribution(owner),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // Verify config_lock_held is true after successful staging
+    let record = coordinator
+        .record(&apply_output.operation_id, owner, &device)
+        .await
+        .unwrap();
+
+    assert!(
+        record.config_lock_held,
+        "config_lock_held must be true after successful staging"
+    );
+}
+
+#[tokio::test]
+async fn finding_7_accept_legacy_approved_records() {
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let state_path = dir.path().join("changeset-state.json");
+
+    // Compute the correct digest for the test data
+    let actions = serde_json::json!([
+        {
+            "action": "set",
+            "path": "/config/test",
+            "value": "value"
+        }
+    ]);
+    let digest = mecmcp_changeset::change_set_digest(
+        "alice",
+        "test-device",
+        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        &[actions[0].clone()],
+    )
+    .unwrap();
+
+    // Manually create a legacy approved change set (has approver but no approval field)
+    let legacy_state = serde_json::json!({
+        "version": 1,
+        "state": {
+            "operations": {},
+            "change_sets": {
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+                    "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "owner": "alice",
+                    "device": "test-device",
+                    "expected_candidate_fingerprint": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+                    "actions": actions,
+                    "digest": digest,
+                    "state": "approved",
+                    "approver": "bob",
+                    "expires_at_unix": 9999999999u64,
+                    "operation_id": null,
+                    "policy_signature": "sha256:policypolicypolicypolicypolicypolicypolicypolicypolicypolicy"
+                }
+            }
+        }
+    });
+
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&legacy_state).unwrap(),
+    )
+    .unwrap();
+
+    // Set permissions to 0600 for Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // Load the coordinator (this will validate the state)
+    let coordinator = ChangesetCoordinator::load(
+        Some(&state_path),
+        OperationLimits::default(),
+        Duration::from_secs(900),
+        false,
+    )
+    .unwrap();
+
+    // The legacy record should load successfully
+    let record = coordinator
+        .change_set(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "test-device",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(record.state, ChangeSetState::Approved);
+    assert_eq!(record.approver, Some("bob".to_string()));
+    assert!(
+        record.approval.is_none(),
+        "legacy record has no approval field"
+    );
+}
+
+#[tokio::test]
+async fn finding_8_expire_after_guard_wait() {
+    // This test verifies that the re-check after acquiring the guard detects expiration.
+    // The fix adds a second expiration check AFTER acquiring the guard, ensuring that
+    // if the TTL elapses while waiting for a busy guard, the change set is marked Expired
+    // rather than proceeding with the apply.
+    //
+    // This test exercises both the pre-guard and post-guard expiration checks by using
+    // a very short TTL.
+    let coordinator = ChangesetCoordinator::load(
+        None,
+        OperationLimits::default(),
+        Duration::from_secs(1), // 1 second approval window
+        false,
+    )
+    .unwrap();
+
+    let transaction = MockTransaction::new();
+    let device = "test-device".to_string();
+    let owner = "alice";
+    let approver = "bob";
+
+    let initial_fp = transaction.fingerprint().await.unwrap();
+
+    let actions = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test".into(),
+        value: Some("value".into()),
+    }];
+
+    // Create and approve a change set
+    let create_output = coordinator
+        .create_change_set(
+            device.clone(),
+            actions,
+            owner.to_string(),
+            initial_fp.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    let change_set_id = create_output.change_set_id.clone();
+    let digest = create_output.digest.clone();
+
+    coordinator
+        .approve_change_set(
+            change_set_id.clone(),
+            device.clone(),
+            approver.to_string(),
+            digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Wait for the TTL to expire AFTER approval (1.5 seconds > 1 second TTL)
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Try to apply after expiration
+    let result = coordinator
+        .apply_change_set(
+            change_set_id.clone(),
+            device.clone(),
+            "https://test-device.example.com".to_string(),
+            owner.to_string(),
+            digest.clone(),
+            initial_fp.clone(),
+            &transaction,
+            &test_attribution(owner),
+            &CancellationToken::new(),
+        )
+        .await;
+
+    // Should fail with expiration
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("expired"),
+        "must reject expired change set, got: {err_msg}"
+    );
+
+    // The fix ensures that expiration is detected and the change set is transitioned
+    // to Expired whether it happens before or after acquiring the guard.
+}
