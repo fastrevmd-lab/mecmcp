@@ -199,6 +199,12 @@ impl<G: Grant> TokenEntry<G> {
     /// demanding the operator restate it keeps the documented token shape from
     /// issue #52 loadable, while `validate` still refuses the one combination
     /// that contradicts itself.
+    ///
+    /// Note the ambiguity this cannot resolve: `actor_type` deserializes to
+    /// `Unknown` whether the key was omitted or written explicitly as
+    /// `"unknown"`, so a hand-edited file declaring both a provider and an
+    /// explicit `unknown` is read as an agent. The CLI refuses that combination
+    /// at the point where the two are distinguishable.
     #[must_use]
     pub fn effective_actor_type(&self) -> ActorType {
         if self.provider.is_some() && self.actor_type == ActorType::Unknown {
@@ -268,6 +274,20 @@ impl<G: Grant> TokenEntry<G> {
         // store over a field the operator never had to state. `effective_actor_type`
         // reads such a token as an agent, since nothing but an agent has an LLM
         // provider.
+        // Blank provenance is worse than absent: `Some("")` reads as declared, so
+        // `from_caller` marks the field token-verified and the audit event then
+        // carries a verified-but-empty provider or delegated user.
+        for (field, value) in [
+            ("provider", self.provider.as_deref()),
+            ("on_behalf_of", self.on_behalf_of.as_deref()),
+        ] {
+            if value.is_some_and(|v| v.trim().is_empty()) {
+                return Err(EntryError::Invalid(format!(
+                    "token '{}': {field} is present but empty",
+                    self.name
+                )));
+            }
+        }
         if self.provider.is_some() && self.actor_type == ActorType::Human {
             return Err(EntryError::Invalid(format!(
                 "token '{}': provider metadata contradicts actor_type \"human\"",
@@ -616,6 +636,35 @@ mod tests {
             .expect_err("provider on a human token must be rejected")
             .to_string();
         assert!(err.contains("contradicts"), "unexpected error {err}");
+    }
+
+    #[test]
+    fn blank_provenance_values_fail_validation() {
+        // `Some("")` reads as declared, so it would be marked token-verified and
+        // emitted as a verified-but-empty field. Absent and blank are different
+        // things and only one of them is legitimate.
+        for (field, extra) in [
+            ("provider", r#""provider": "  ", "provider_tier": "public""#),
+            ("on_behalf_of", r#""on_behalf_of": """#),
+        ] {
+            let raw = format!(
+                r#"{{
+                    "name": "blank",
+                    "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+                    "devices": ["*"],
+                    "tools": ["*"],
+                    "created_at_unix": 1783850400,
+                    {extra}
+                }}"#
+            );
+            let entry: TokenEntry = serde_json::from_str(&raw).expect("parse");
+            let err = entry
+                .validate()
+                .expect_err("blank provenance must be rejected")
+                .to_string();
+            assert!(err.contains(field), "expected {field} in error, got {err}");
+            assert!(err.contains("empty"), "unexpected error {err}");
+        }
     }
 
     #[test]

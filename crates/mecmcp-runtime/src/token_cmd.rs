@@ -106,6 +106,18 @@ pub fn run(
             // override an actor type they stated explicitly.
             let parsed_actor = match (parsed_actor, provider.as_ref()) {
                 (None, Some(_)) => Some(mecmcp_auth::ActorType::Agent),
+                // Here — and only here — an omitted flag is distinguishable from
+                // an explicit `unknown`. On disk both deserialize to `Unknown`,
+                // so silently deriving `Agent` would override a choice the
+                // operator actually made. Refuse instead of guessing.
+                (Some(mecmcp_auth::ActorType::Unknown), Some(_)) => {
+                    return Err(TokenCommandError::InvalidArgument(
+                        "--actor-type unknown cannot be combined with --provider: a provider \
+                         belongs to an agent. Pass --actor-type agent, or omit the flag to have \
+                         it derived."
+                            .to_owned(),
+                    ));
+                }
                 (existing, _) => existing,
             };
 
