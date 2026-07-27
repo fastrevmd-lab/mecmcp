@@ -175,6 +175,22 @@ impl Drop for AuditScope {
             .as_ref()
             .and_then(|a| a.client_name.as_deref())
             .unwrap_or("");
+        // The provider and its tier are the fields this whole mechanism exists to
+        // make trustworthy. Carrying them on the Attribution but never emitting
+        // them would leave every SIEM consumer with the trust marker and nothing
+        // for it to describe.
+        let provider = self
+            .attribution
+            .agent
+            .as_ref()
+            .map(|a| a.provider.as_str())
+            .unwrap_or("");
+        let provider_tier = self
+            .attribution
+            .agent
+            .as_ref()
+            .map(|a| a.provider_tier.to_string())
+            .unwrap_or_default();
         let on_behalf_of = self.attribution.on_behalf_of.as_deref().unwrap_or("");
         let change_ref = self.attribution.change_ref.as_deref().unwrap_or("");
 
@@ -191,6 +207,8 @@ impl Drop for AuditScope {
             caller = %self.attribution.principal,
             actor_type = %actor_type,
             provenance_source = %provenance_source,
+            provider = %provider,
+            provider_tier = %provider_tier,
             model_id = %model_id,
             session_id = %session_id,
             client_name = %client_name,

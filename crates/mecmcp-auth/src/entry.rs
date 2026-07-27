@@ -242,6 +242,17 @@ impl<G: Grant> TokenEntry<G> {
             }
             _ => {}
         }
+        // An LLM provider only means something for an agent. Allowing a token to
+        // declare `provider: anthropic` while claiming to be a human operator
+        // produces a record that contradicts itself, and `Attribution::from_caller`
+        // would build an agent identity for an actor typed as human. Reject the
+        // combination rather than silently picking one side of it.
+        if self.provider.is_some() && self.actor_type != ActorType::Agent {
+            return Err(EntryError::Invalid(format!(
+                "token '{}': provider metadata requires actor_type \"agent\", found {:?}",
+                self.name, self.actor_type
+            )));
+        }
         Ok(())
     }
 }
@@ -545,7 +556,7 @@ mod tests {
 
     #[test]
     fn complete_provider_pair_validates() {
-        // When both provider and provider_tier are present, validation succeeds.
+        // Both provider and provider_tier present, on an agent token: valid.
         let raw = r#"{
             "name": "complete",
             "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
@@ -553,12 +564,43 @@ mod tests {
             "tools": ["*"],
             "created_at_unix": 1783850400,
             "provider": "anthropic",
-            "provider_tier": "public"
+            "provider_tier": "public",
+            "actor_type": "agent"
         }"#;
         let entry: TokenEntry = serde_json::from_str(raw).expect("parse");
         assert!(
             entry.validate().is_ok(),
-            "complete provider pair should validate"
+            "complete provider pair on an agent token should validate"
         );
+    }
+
+    #[test]
+    fn provider_on_a_non_agent_token_fails_validation() {
+        // An LLM provider on a token typed as a human operator is a record that
+        // contradicts itself, and would make from_caller build an agent identity
+        // for a human actor. Reject it rather than silently honouring one half.
+        for actor in ["human", "unknown"] {
+            let raw = format!(
+                r#"{{
+                    "name": "contradictory",
+                    "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+                    "devices": ["*"],
+                    "tools": ["*"],
+                    "created_at_unix": 1783850400,
+                    "provider": "anthropic",
+                    "provider_tier": "public",
+                    "actor_type": "{actor}"
+                }}"#
+            );
+            let entry: TokenEntry = serde_json::from_str(&raw).expect("parse");
+            let err = entry
+                .validate()
+                .expect_err("provider on a non-agent token must be rejected")
+                .to_string();
+            assert!(
+                err.contains("requires actor_type"),
+                "actor_type {actor}: unexpected error {err}"
+            );
+        }
     }
 }

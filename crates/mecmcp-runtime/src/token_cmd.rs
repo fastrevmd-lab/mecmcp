@@ -99,6 +99,16 @@ pub fn run(
                 })
                 .transpose()?;
 
+            // Declaring an LLM provider is only meaningful for an agent, and a
+            // token entry carrying provider metadata with any other actor type is
+            // rejected at validation. Derive it rather than making the operator
+            // pass --actor-type agent to satisfy a rule they cannot see, but never
+            // override an actor type they stated explicitly.
+            let parsed_actor = match (parsed_actor, provider.as_ref()) {
+                (None, Some(_)) => Some(mecmcp_auth::ActorType::Agent),
+                (existing, _) => existing,
+            };
+
             let secret = TokenStoreFile::<NoGrant>::add_with_options(
                 &tokens_file,
                 &name,
