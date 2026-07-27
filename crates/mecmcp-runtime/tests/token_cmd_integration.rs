@@ -143,15 +143,21 @@ fn rotate_changes_secret_preserves_scopes() {
         &entry_after.tools,
         mecmcp_auth::ScopeSet::Allowlist(t) if t == &["get_config"]
     ));
-    // Timestamps should be identical - rotate preserves created_at
-    // Allow for minor differences due to serialization precision
-    let time_diff = (entry_after.created_at.timestamp_nanos_opt().unwrap()
-        - created_at_before.timestamp_nanos_opt().unwrap())
-    .abs();
-    assert!(
-        time_diff < 1_000_000,
-        "created_at changed: before={created_at_before:?}, after={:?}",
-        entry_after.created_at
+    // Exactly equal, not "close enough".
+    //
+    // This assertion previously allowed a 1ms tolerance, described as
+    // serialization precision. It was not: rotate regenerated created_at with
+    // Utc::now(), and the test only passed because add and rotate completed
+    // within a millisecond of each other on a fast machine. CI was slower and
+    // caught it.
+    //
+    // A tolerance on a value that should round-trip unchanged hides exactly
+    // this. Rotation replaces the secret; the credential's creation time is not
+    // a thing that can legitimately drift by any amount.
+    assert_eq!(
+        entry_after.created_at, created_at_before,
+        "rotate must preserve created_at exactly; regenerating it erases when \
+         the credential was first issued"
     );
 }
 
