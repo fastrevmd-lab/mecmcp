@@ -2,6 +2,10 @@
 
 #![allow(clippy::unwrap_used)]
 
+/// A real https endpoint, because the coordinator now validates the scheme and
+/// uses this as the device-guard key rather than deriving one from the name.
+const TEST_ENDPOINT: &str = "https://device.example.com";
+
 use async_trait::async_trait;
 use mecmcp_audit::{ActorType, AgentIdentity, Attribution, Principal, Tier};
 use mecmcp_changeset::{
@@ -65,6 +69,8 @@ impl Default for MockDeviceState {
 struct MockTransaction {
     state: Arc<Mutex<MockDeviceState>>,
     commit_behavior: Arc<Mutex<CommitBehavior>>,
+    /// Whether this transaction reports an explicit unlock capability.
+    can_unlock: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +87,16 @@ impl MockTransaction {
         Self {
             state: Arc::new(Mutex::new(MockDeviceState::default())),
             commit_behavior: Arc::new(Mutex::new(CommitBehavior::Success)),
+            can_unlock: false,
+        }
+    }
+
+    /// A transaction that really can release the configuration lock, as a
+    /// vendor implementation with an explicit unlock RPC would.
+    fn with_unlock() -> Self {
+        Self {
+            can_unlock: true,
+            ..Self::new()
         }
     }
 
@@ -88,6 +104,7 @@ impl MockTransaction {
         Self {
             state,
             commit_behavior: Arc::new(Mutex::new(CommitBehavior::Success)),
+            can_unlock: false,
         }
     }
 
@@ -238,6 +255,14 @@ impl DeviceTransaction for MockTransaction {
         ))
     }
 
+    async fn unlock(&self) -> Result<mecmcp_changeset::UnlockOutcome, Self::Error> {
+        if !self.can_unlock {
+            return Ok(mecmcp_changeset::UnlockOutcome::Unsupported);
+        }
+        self.state.lock().unwrap().locked = false;
+        Ok(mecmcp_changeset::UnlockOutcome::Released)
+    }
+
     async fn rollback(&self, to: RollbackRef) -> Result<RollbackOutcome, Self::Error> {
         match to {
             RollbackRef::CandidateRevert => {
@@ -309,6 +334,7 @@ async fn happy_path_stage_diff_validate_commit() {
             device,
             owner,
             &initial_fp,
+            TEST_ENDPOINT,
             &transaction,
             &actions,
             policy_sig,
@@ -374,6 +400,7 @@ async fn happy_path_stage_diff_validate_commit() {
             device,
             owner,
             &stage_output.after_fingerprint,
+            policy_sig,
             &transaction,
             &stage_output.staged,
             &test_attribution(),
@@ -430,6 +457,7 @@ async fn commit_with_indeterminate_outcome() {
             device,
             owner,
             &initial_fp,
+            TEST_ENDPOINT,
             &transaction,
             &actions,
             policy_sig,
@@ -458,6 +486,7 @@ async fn commit_with_indeterminate_outcome() {
             device,
             owner,
             &stage_output.after_fingerprint,
+            policy_sig,
             &transaction,
             &stage_output.staged,
             &test_attribution(),
@@ -513,6 +542,7 @@ async fn discard_after_failed_validation() {
             device,
             owner,
             &initial_fp,
+            TEST_ENDPOINT,
             &transaction,
             &actions,
             policy_sig,
@@ -551,7 +581,79 @@ async fn discard_after_failed_validation() {
         .await
         .unwrap();
     assert_eq!(record.state, LifecycleState::Discarded);
-    assert!(!record.config_lock_held);
+
+    // MockTransaction takes the default `unlock`, which reports Unsupported:
+    // reverting a candidate does not release a configuration lock, and on PAN-OS
+    // the commit lock outlives the revert. So the flag must be left standing and
+    // the record must say why. Clearing it here is how a device ends up locked
+    // against every later change while the state file reads clean.
+    assert!(
+        record.config_lock_held,
+        "a transaction with no unlock support must not have its lock flag cleared"
+    );
+    let details = record.details.unwrap_or_default();
+    assert!(
+        details.contains("no explicit unlock"),
+        "the record must explain why the lock state is unchanged, got: {details}"
+    );
+}
+
+#[tokio::test]
+async fn discard_clears_the_lock_when_the_transaction_can_unlock() {
+    let coordinator = ChangesetCoordinator::load(
+        None,
+        OperationLimits::default(),
+        std::time::Duration::from_secs(900),
+        false,
+    )
+    .unwrap();
+    let transaction = MockTransaction::with_unlock();
+    let cancellation = CancellationToken::new();
+    let device = "test-device";
+    let owner = "alice";
+    let policy_sig = "sha256:aaaa";
+
+    let initial_fp = transaction.fingerprint().await.unwrap();
+    let actions = vec![MockAction {
+        name: "/config/test".to_string(),
+        value: "test-value".to_string(),
+    }];
+
+    let stage_output = coordinator
+        .stage_operation(
+            device,
+            owner,
+            &initial_fp,
+            TEST_ENDPOINT,
+            &transaction,
+            &actions,
+            policy_sig,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .discard_operation(
+            &stage_output.operation_id,
+            device,
+            owner,
+            &stage_output.after_fingerprint,
+            &transaction,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+
+    let record = coordinator
+        .record(&stage_output.operation_id, owner, device)
+        .await
+        .unwrap();
+    assert_eq!(record.state, LifecycleState::Discarded);
+    assert!(
+        !record.config_lock_held,
+        "an implementation that reports Released must clear the flag"
+    );
 }
 
 #[tokio::test]
@@ -585,6 +687,7 @@ async fn diff_validate_commit_reject_fingerprint_mismatch() {
             device,
             owner,
             &initial_fp,
+            TEST_ENDPOINT,
             &transaction,
             &actions,
             policy_sig,
@@ -647,6 +750,7 @@ async fn operation_id_ownership_validation() {
             device,
             owner1,
             &initial_fp,
+            TEST_ENDPOINT,
             &transaction,
             &actions,
             policy_sig,
@@ -694,6 +798,7 @@ async fn discard_rejects_invalid_states() {
             device,
             owner,
             &initial_fp,
+            TEST_ENDPOINT,
             &transaction,
             &actions,
             policy_sig,
@@ -769,6 +874,7 @@ async fn commit_rejects_non_validated_operation() {
             device,
             owner,
             &initial_fp,
+            TEST_ENDPOINT,
             &transaction,
             &actions,
             policy_sig,
@@ -784,6 +890,7 @@ async fn commit_rejects_non_validated_operation() {
             device,
             owner,
             &stage_output.after_fingerprint,
+            policy_sig,
             &transaction,
             &stage_output.staged,
             &test_attribution(),

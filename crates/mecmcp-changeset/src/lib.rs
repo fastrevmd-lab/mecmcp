@@ -30,6 +30,6 @@ pub use records::{
 };
 pub use recovery::{RecoveryDisposition, ResolvedOperationOutput, resolve_persisted_operation};
 pub use transaction::{
-    CommitOptions, CommitOutcome, DeviceTransaction, RollbackOutcome, RollbackRef,
+    CommitOptions, CommitOutcome, DeviceTransaction, RollbackOutcome, RollbackRef, UnlockOutcome,
 };
 pub use types::{Fingerprint, FingerprintError, OperationId, OperationIdError, OperationLimits};

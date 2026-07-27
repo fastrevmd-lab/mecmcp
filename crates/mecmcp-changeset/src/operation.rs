@@ -7,7 +7,7 @@
 use crate::{
     coordinator::{ChangesetCoordinator, CoordinatorError},
     lifecycle::LifecycleState,
-    records::{OperationRecord, require_operation_fingerprint},
+    records::{OperationRecord, require_operation_fingerprint, require_operation_policy},
     transaction::{CommitOptions, CommitOutcome, DeviceTransaction, RollbackRef},
 };
 use mecmcp_audit::Attribution;
@@ -55,14 +55,30 @@ impl ChangesetCoordinator {
         device: &str,
         owner: &str,
         expected_fingerprint: &str,
+        endpoint: &str,
         transaction: &T,
         actions: &[T::Action],
         policy_signature: &str,
         cancellation: &CancellationToken,
     ) -> Result<StageOutput<T::Staged>, CoordinatorError> {
+        // P2-a: Validate non-empty actions
+        if actions.is_empty() {
+            return Err(CoordinatorError::new(
+                "actions",
+                "actions must not be empty",
+            ));
+        }
+
+        // P1-f: Validate endpoint format
+        if !endpoint.starts_with("https://") {
+            return Err(CoordinatorError::new(
+                "endpoint",
+                "endpoint must start with https://",
+            ));
+        }
+
         // Acquire device guard
-        let endpoint = format!("https://{}", device); // Simplified - real impl would get this from inventory
-        let _guard = self.device_guard(&endpoint, cancellation).await?;
+        let _guard = self.device_guard(endpoint, cancellation).await?;
 
         if cancellation.is_cancelled() {
             return Err(CoordinatorError::new("device", "operation cancelled"));
@@ -76,7 +92,7 @@ impl ChangesetCoordinator {
             id: operation_id.clone(),
             owner: owner.to_owned(),
             device: device.to_owned(),
-            endpoint: endpoint.clone(),
+            endpoint: endpoint.to_owned(),
             action: serde_json::to_value(&actions[0])
                 .map_err(|e| CoordinatorError::new("actions", e.to_string()))?,
             xpath: None,
@@ -94,10 +110,17 @@ impl ChangesetCoordinator {
             details: None,
             config_lock_held: false,
             policy_signature: policy_signature.to_owned(),
+            attribution: None,
         };
 
         // Insert the record early so restart recovery can see it
         self.insert(record.clone()).await?;
+
+        // Whether the device was actually touched. A failure before staging
+        // begins leaves nothing behind, and recording that as `Indeterminate`
+        // would be its own kind of lie — it fills the recovery queue with
+        // operations that need no recovery, which is how a real one gets missed.
+        let mut device_touched = false;
 
         // Stage the operation
         let stage_result: Result<_, CoordinatorError> = async {
@@ -114,6 +137,10 @@ impl ChangesetCoordinator {
                     "candidate changed since the caller observed it",
                 ));
             }
+
+            // Past this point the candidate may have been modified, whatever the
+            // outcome, so the record must survive for recovery.
+            device_touched = true;
 
             // Stage the transaction
             let staged = transaction
@@ -146,8 +173,23 @@ impl ChangesetCoordinator {
                     after_fingerprint: after_fp,
                 })
             }
+            Err(error) if device_touched => {
+                // Staging began. The device may hold changes and a lock, and
+                // nothing here established which, so the record is retained as
+                // Indeterminate for `resolve_persisted_operation` to settle.
+                record.state = LifecycleState::Indeterminate;
+                record.details = Some(format!(
+                    "staging failed after the candidate was touched: {error}"
+                ));
+                record.config_lock_held = true;
+                let _ = self.update(record).await; // Persist best-effort
+                Err(error)
+            }
             Err(error) => {
-                // Remove the failed operation
+                // Nothing reached the device — a fingerprint read that failed, or
+                // a candidate that had already moved. There is no uncertainty to
+                // record, so drop the reservation instead of leaving an operation
+                // an operator would have to resolve by hand for no reason.
                 self.remove(&operation_id).await;
                 Err(error)
             }
@@ -275,6 +317,7 @@ impl ChangesetCoordinator {
     /// Returns an error if:
     /// - The operation is not in `Validated` state
     /// - The operation's fingerprint no longer matches the device state
+    /// - The operation's policy signature no longer matches the current policy
     /// - The transaction's `commit()` method fails
     /// - Persistence fails
     #[allow(clippy::too_many_arguments)]
@@ -284,13 +327,18 @@ impl ChangesetCoordinator {
         device: &str,
         owner: &str,
         expected_fingerprint: &str,
+        current_policy_signature: &str,
         transaction: &T,
         staged: &T::Staged,
         attribution: &Attribution,
         options: &CommitOptions,
         cancellation: &CancellationToken,
     ) -> Result<CommitOutcome, CoordinatorError> {
-        // Retrieve and validate the operation record
+        // P1-e: Acquire guard before reading record to prevent concurrent commits
+        let record = self.record(operation_id, owner, device).await?;
+        let _guard = self.device_guard(&record.endpoint, cancellation).await?;
+
+        // Re-check state after acquiring guard
         let mut record = self.record(operation_id, owner, device).await?;
 
         if record.state != LifecycleState::Validated {
@@ -299,6 +347,10 @@ impl ChangesetCoordinator {
                 "operation must validate successfully before commit",
             ));
         }
+
+        // P1-a: Validate policy signature to detect policy drift
+        require_operation_policy(&record, current_policy_signature)
+            .map_err(|e| CoordinatorError::new(e.field(), e.message().to_owned()))?;
 
         // Validate fingerprint
         let actual_fp = transaction
@@ -309,21 +361,31 @@ impl ChangesetCoordinator {
         require_operation_fingerprint(&record, expected_fingerprint, &actual_fp)
             .map_err(|e| CoordinatorError::new(e.field(), e.message().to_owned()))?;
 
+        // Persist who asked for this commit before the device is told to do it.
+        // Without it, a restart mid-commit leaves an operation nobody can be
+        // attributed for. This goes in its own field rather than `details`,
+        // which recovery.rs also writes — one field with two writers would
+        // silently lose whichever wrote first.
+        record.attribution = Some(crate::records::PersistedAttribution::from(attribution));
+
         // Transition to Committing
         record.state = LifecycleState::Committing;
         self.update(record.clone()).await?;
 
-        // Perform the commit with cancellation support
+        // P1-b: Perform the commit with cancellation support
+        // If cancelled, return Indeterminate consistently (no detached worker survives)
         let commit_result = tokio::select! {
             result = transaction.commit(staged, attribution, options) => {
                 result
             }
             () = cancellation.cancelled() => {
-                // If cancelled, the commit may have started but we don't know the outcome
+                // Cancellation drops the commit future; outcome is unknown
                 record.state = LifecycleState::Indeterminate;
                 record.details = Some("commit cancelled; outcome unknown".to_owned());
                 self.update(record).await?;
-                return Ok(CommitOutcome::Detached { job_id: None });
+                return Ok(CommitOutcome::Indeterminate {
+                    reason: "commit cancelled; outcome unknown".to_owned(),
+                });
             }
         };
 
@@ -461,26 +523,67 @@ impl ChangesetCoordinator {
             ));
         }
 
-        // Capture the after-discard fingerprint
-        let after_fp = transaction
-            .fingerprint()
-            .await
-            .map_err(|e| CoordinatorError::new("transaction", e.to_string()))?;
-
-        record.current = after_fp.clone();
-
-        // Note: Lock release would happen here in a real implementation,
-        // but the DeviceTransaction trait doesn't expose a lock release method.
-        // In practice, this is handled by the implementation-specific transaction
-        // (e.g., PAN-OS release_config_lock, Junos unlock candidate).
-        // For now, we just mark the lock as released.
-        record.config_lock_held = false;
-
-        // Transition to Discarded
+        // P2-b: Persist successful rollback before attempting fingerprint read
+        // If fingerprint fails, the rollback still happened and must be recorded
         record.state = LifecycleState::Discarded;
-        record.details = None;
-        self.update(record).await?;
+        record.details = Some("candidate reverted".to_owned());
 
-        Ok(after_fp)
+        // P1-c: Attempt to unlock via rollback; if that doesn't release the lock,
+        // the implementation must provide explicit unlock support
+        match transaction.unlock().await {
+            Ok(crate::transaction::UnlockOutcome::Released) => {
+                record.config_lock_held = false;
+            }
+            Ok(crate::transaction::UnlockOutcome::Unsupported) => {
+                // Nothing released the lock, so nothing may claim it was. Leave
+                // the recorded flag as it stands and say plainly what happened;
+                // clearing it here is how a device ends up locked against every
+                // later change while the state file reads clean.
+                record.details = Some(
+                    "candidate reverted; the transaction offers no explicit unlock, \
+                     so the configuration lock state is unchanged"
+                        .to_owned(),
+                );
+            }
+            Err(error) => {
+                // The revert landed but the unlock did not. That is not a clean
+                // discard, and recording it as one would hide a held lock.
+                record.state = LifecycleState::Indeterminate;
+                record.details = Some(format!("candidate reverted but unlock failed: {error}"));
+                record.config_lock_held = true;
+                self.update(record).await?;
+                return Err(CoordinatorError::new(
+                    "transaction",
+                    format!(
+                        "candidate reverted but the configuration lock could not be released: {error}"
+                    ),
+                ));
+            }
+        }
+
+        // Capture the after-discard fingerprint (best-effort)
+        let after_fp = transaction.fingerprint().await.map_err(|e| {
+            // Fingerprint read failed but rollback succeeded; persist what we know
+            record.details = Some(format!("candidate reverted; fingerprint read failed: {e}"));
+            e
+        });
+
+        match after_fp {
+            Ok(fp) => {
+                record.current = fp.clone();
+                // Leave `details` alone: the unlock step may have recorded that
+                // the configuration lock state is unchanged, and clearing it here
+                // would drop the one note explaining why `config_lock_held` is
+                // still set on a record that otherwise reads as a clean discard.
+                self.update(record).await?;
+                Ok(fp)
+            }
+            Err(e) => {
+                // Persist Indeterminate state if fingerprint cannot be read
+                record.state = LifecycleState::Indeterminate;
+                self.update(record).await?;
+                Err(CoordinatorError::new("transaction", e.to_string()))
+            }
+        }
     }
 }

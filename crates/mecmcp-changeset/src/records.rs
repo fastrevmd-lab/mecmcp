@@ -56,6 +56,50 @@ pub struct OperationRecord {
     pub config_lock_held: bool,
     /// Policy signature at the time of staging.
     pub policy_signature: String,
+    /// Who requested the commit, captured before the device was contacted.
+    ///
+    /// Absent on operations that have not reached commit, and on records written
+    /// before this field existed — deployed state files must keep loading, so it
+    /// is optional and omitted rather than written as `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<PersistedAttribution>,
+}
+
+/// The attribution fields worth keeping in the state file.
+///
+/// [`mecmcp_audit::Attribution`] is a live request object holding types that are
+/// not serializable and values that mean nothing after a restart. This is the
+/// durable projection of it: enough to answer "who asked for this, on whose
+/// behalf, and under what change reference" when an operator finds an
+/// unresolved operation tomorrow morning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedAttribution {
+    /// Rendered principal — a token name, or the unauthenticated marker.
+    pub principal: String,
+    /// Whether the actor was a human, an agent, or undeclared.
+    pub actor_type: String,
+    /// The human the actor was acting for, when the credential declared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
+    /// External change-control reference, when supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_ref: Option<String>,
+    /// Correlation id linking this record to the audit event for the request.
+    pub request_id: String,
+}
+
+impl From<&mecmcp_audit::Attribution> for PersistedAttribution {
+    fn from(attribution: &mecmcp_audit::Attribution) -> Self {
+        Self {
+            principal: attribution.principal.to_string(),
+            // Rendered via Debug so a new actor-type variant lands here as its
+            // own name rather than being silently folded into an existing one.
+            actor_type: format!("{:?}", attribution.actor_type).to_lowercase(),
+            on_behalf_of: attribution.on_behalf_of.clone(),
+            change_ref: attribution.change_ref.clone(),
+            request_id: attribution.request_id.to_string(),
+        }
+    }
 }
 
 /// Persisted change-set record.

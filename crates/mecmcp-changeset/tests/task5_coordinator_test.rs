@@ -52,6 +52,7 @@ fn make_operation_record(id: &str, endpoint: &str, state: LifecycleState) -> Ope
         config_lock_held: false,
         policy_signature: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
             .to_string(),
+        attribution: None,
     }
 }
 
