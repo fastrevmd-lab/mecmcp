@@ -35,20 +35,28 @@ impl fmt::Display for Tier {
 #[serde(rename_all = "lowercase")]
 pub enum ActorType {
     /// A human operator directly invoking a tool.
-    #[default]
     Human,
     /// An autonomous agent (LLM-driven or otherwise) acting under delegation.
     Agent,
+    /// Actor type is unknown (untagged legacy token).
+    ///
+    /// This is the default for tokens that predated this field. Recording
+    /// `Unknown` in audit trails is truthful: the token entry declared neither
+    /// `Human` nor `Agent`, so the server cannot know. Defaulting to `Human`
+    /// would fabricate a fact, violating the principle from issue #54 that
+    /// audit provenance must never invent an actor to satisfy a schema.
+    #[default]
+    Unknown,
 }
 
 /// Default actor type for tokens that don't declare one.
 ///
-/// Conservatively defaults to `Human` rather than `Agent` because:
-/// - Human actions carry different audit and approval requirements
-/// - An untagged credential should not gain agent privileges by default
-/// - Existing tokens predating this field are human-operator tokens
+/// Returns `Unknown` rather than `Human` or `Agent` because:
+/// - The token entry provides no data, so the server cannot know which it is
+/// - Recording `Human` for an untagged agent token would fabricate a fact
+/// - Issue #54 mandates that audit provenance never invents an actor
 fn default_actor_type() -> ActorType {
-    ActorType::Human
+    ActorType::Unknown
 }
 
 /// Rejection reason for a malformed token entry.
@@ -147,12 +155,20 @@ pub struct TokenEntry<G: Grant = NoGrant> {
 
     /// Whether this credential belongs to a human operator or an agent.
     ///
-    /// Server-verified provenance field. Defaults to `Human` when absent
-    /// (conservative: an untagged token is assumed to be a human operator,
-    /// not an autonomous agent, since human actions carry different audit
-    /// and approval requirements).
-    #[serde(default = "default_actor_type")]
+    /// Server-verified provenance field. Defaults to `Unknown` when absent,
+    /// preserving the truthfulness of audit trails: an untagged token provides
+    /// no data, so the server cannot assert `Human` or `Agent` without
+    /// fabricating a fact (issue #54).
+    #[serde(
+        default = "default_actor_type",
+        skip_serializing_if = "is_default_actor_type"
+    )]
     pub actor_type: ActorType,
+}
+
+/// Predicate for `skip_serializing_if` on `actor_type`.
+fn is_default_actor_type(t: &ActorType) -> bool {
+    matches!(t, ActorType::Unknown)
 }
 
 fn wildcard() -> ScopeSet {
@@ -423,8 +439,8 @@ mod tests {
         );
         assert_eq!(
             entry.actor_type,
-            ActorType::Human,
-            "actor_type defaults to Human (conservative: untagged = human operator)"
+            ActorType::Unknown,
+            "actor_type defaults to Unknown (untagged legacy token provides no data)"
         );
     }
 

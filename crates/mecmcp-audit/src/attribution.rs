@@ -31,6 +31,8 @@ pub enum ActorType {
     Human,
     /// An autonomous agent (LLM-driven or otherwise) acting under delegation.
     Agent,
+    /// Actor type is unknown (untagged legacy credential or no data available).
+    Unknown,
 }
 
 /// LLM provider tier: public hosted vs. private/self-hosted deployment.
@@ -139,40 +141,116 @@ pub struct Attribution {
     pub change_ref: Option<String>,
     /// Per-request correlation ID.
     pub request_id: Uuid,
+    /// Where the provenance fields above came from.
+    ///
+    /// This must be recorded, not inferred. `provider` and `actor_type` can be
+    /// populated either by the server from the token entry or by a call site
+    /// relaying what the client claimed, and the resulting `Attribution` looks
+    /// identical either way. An auditor reading the event needs to know which
+    /// it was — that is the whole point of mecmcp#52 — so the fact is carried
+    /// explicitly from the one place that knows it.
+    pub provenance_source: ProvenanceSource,
+}
+
+/// Whether an attribution's provenance was verified by the server or asserted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProvenanceSource {
+    /// The server read the values from the token entry. The caller cannot forge them.
+    Token,
+    /// The values were supplied by the caller, or by a call site relaying a
+    /// caller's claim. Treat them as unverified.
+    Client,
+    /// No provenance was available from either source.
+    None,
+}
+
+impl fmt::Display for ProvenanceSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Token => write!(f, "token"),
+            Self::Client => write!(f, "client"),
+            Self::None => write!(f, "none"),
+        }
+    }
 }
 
 impl Attribution {
-    /// Build an attribution for a human caller from an authenticated context.
+    /// Build an attribution from an authenticated context.
     ///
-    /// Defaults to `ActorType::Human` with no agent identity. Call sites that
-    /// know they are serving an agent should build an `Attribution` directly with
-    /// `actor_type = Agent` and pass it to `AuditScope::new`, rather than calling
-    /// this helper and mutating the result.
+    /// Propagates server-verified provenance fields from the token entry:
+    /// `actor_type`, `on_behalf_of`, and when the token declares a provider,
+    /// an `AgentIdentity` populated with the verified `provider` and
+    /// `provider_tier`. Client-asserted fields (`model_id`, `session_id`,
+    /// `client_name`, `skills_used`) are left at their empty defaults —
+    /// they are not knowable at this point and must not be invented.
     pub fn from_caller<G>(ctx: &mecmcp_auth::CallerCtx<G>) -> Self
     where
         G: mecmcp_auth::Grant,
     {
+        // Convert mecmcp_auth::ActorType to mecmcp_audit::ActorType.
+        let actor_type = match ctx.actor_type {
+            mecmcp_auth::ActorType::Human => ActorType::Human,
+            mecmcp_auth::ActorType::Agent => ActorType::Agent,
+            mecmcp_auth::ActorType::Unknown => ActorType::Unknown,
+        };
+
+        // When the token declares a provider, populate an AgentIdentity with
+        // server-verified fields only. Client-asserted fields remain empty.
+        let agent = match (&ctx.provider, ctx.provider_tier) {
+            (Some(provider), Some(tier)) => Some(AgentIdentity {
+                model_id: String::new(),
+                session_id: String::new(),
+                client_name: None,
+                provider: provider.clone(),
+                provider_tier: match tier {
+                    mecmcp_auth::Tier::Public => Tier::Public,
+                    mecmcp_auth::Tier::Private => Tier::Private,
+                },
+                skills_used: Vec::new(),
+            }),
+            _ => None,
+        };
+
+        // The token entry is the server's own record, so anything it declared is
+        // verified by construction. A token that declared nothing gets `None` —
+        // never `Client`, because no claim was relayed here either.
+        let provenance_source = if ctx.provider.is_some()
+            || ctx.on_behalf_of.is_some()
+            || ctx.actor_type != mecmcp_auth::ActorType::Unknown
+        {
+            ProvenanceSource::Token
+        } else {
+            ProvenanceSource::None
+        };
+
         Self {
             principal: Principal::Token(ctx.token_name.clone()),
-            actor_type: ActorType::Human,
-            agent: None,
-            on_behalf_of: None,
+            actor_type,
+            agent,
+            on_behalf_of: ctx.on_behalf_of.clone(),
             change_ref: None,
             request_id: Uuid::new_v4(),
+            provenance_source,
         }
     }
 
     /// Build an attribution for the stdio / no-auth path.
     ///
-    /// The principal is `Principal::Unauthenticated` and the actor is assumed to be human.
+    /// The principal is `Principal::Unauthenticated` and the actor type is
+    /// `Unknown`: no credential was presented, so there is nothing to read it
+    /// from. The stdio path is at least as often a desktop MCP client as a
+    /// human at a terminal, so assuming either would put a guess into the
+    /// audit trail.
     pub fn stdio() -> Self {
         Self {
             principal: Principal::Unauthenticated,
-            actor_type: ActorType::Human,
+            actor_type: ActorType::Unknown,
             agent: None,
             on_behalf_of: None,
             change_ref: None,
             request_id: Uuid::new_v4(),
+            provenance_source: ProvenanceSource::None,
         }
     }
 }
@@ -192,16 +270,16 @@ mod tests {
             provider: None,
             provider_tier: None,
             on_behalf_of: None,
-            actor_type: mecmcp_auth::ActorType::Human,
+            actor_type: mecmcp_auth::ActorType::Unknown,
         }
     }
 
     #[test]
-    fn from_caller_defaults_to_human_no_agent() {
-        let c = ctx("ci-token");
+    fn from_caller_with_untagged_token_yields_unknown() {
+        let c = ctx("legacy-token");
         let a = Attribution::from_caller(&c);
-        assert_eq!(a.principal, Principal::Token("ci-token".into()));
-        assert_eq!(a.actor_type, ActorType::Human);
+        assert_eq!(a.principal, Principal::Token("legacy-token".into()));
+        assert_eq!(a.actor_type, ActorType::Unknown);
         assert!(a.agent.is_none());
         assert!(a.on_behalf_of.is_none());
         assert!(a.change_ref.is_none());
@@ -211,7 +289,11 @@ mod tests {
     fn stdio_attribution_is_usable() {
         let a = Attribution::stdio();
         assert_eq!(a.principal, Principal::Unauthenticated);
-        assert_eq!(a.actor_type, ActorType::Human);
+        // No credential was presented, so the actor is genuinely unknown. The
+        // stdio path is at least as often an agent (a desktop MCP client) as a
+        // human at a terminal, and recording either would be a guess.
+        assert_eq!(a.actor_type, ActorType::Unknown);
+        assert_eq!(a.provenance_source, ProvenanceSource::None);
         assert!(a.agent.is_none());
     }
 
@@ -413,5 +495,81 @@ mod tests {
             skills_used: Vec<String>, // no default
         }
         let _: AgentWithoutDefaults = serde_json::from_str(json).unwrap();
+    }
+
+    #[test]
+    fn from_caller_propagates_token_verified_provenance() {
+        let ctx: CallerCtx<NoGrant> = CallerCtx {
+            token_name: "claude-code-ops".into(),
+            devices: ScopeSet::Wildcard,
+            tools: ScopeSet::Wildcard,
+            grant: None,
+            provider: Some("anthropic".into()),
+            provider_tier: Some(mecmcp_auth::Tier::Public),
+            on_behalf_of: Some("fastrevmd@gmail.com".into()),
+            actor_type: mecmcp_auth::ActorType::Agent,
+        };
+        let a = Attribution::from_caller(&ctx);
+
+        assert_eq!(a.principal, Principal::Token("claude-code-ops".into()));
+        assert_eq!(a.actor_type, ActorType::Agent);
+        assert_eq!(
+            a.on_behalf_of.as_deref(),
+            Some("fastrevmd@gmail.com"),
+            "on_behalf_of must flow from token entry"
+        );
+
+        let agent = a
+            .agent
+            .as_ref()
+            .expect("agent identity must be populated when token declares provider");
+        assert_eq!(
+            agent.provider, "anthropic",
+            "provider must come from token entry"
+        );
+        assert_eq!(
+            agent.provider_tier,
+            Tier::Public,
+            "provider_tier must come from token entry"
+        );
+        assert_eq!(
+            agent.model_id, "",
+            "model_id is client-asserted, must not be invented"
+        );
+        assert_eq!(
+            agent.session_id, "",
+            "session_id is client-asserted, must not be invented"
+        );
+        assert!(
+            agent.client_name.is_none(),
+            "client_name is client-asserted, must not be invented"
+        );
+        assert!(
+            agent.skills_used.is_empty(),
+            "skills_used is client-asserted, must not be invented"
+        );
+    }
+
+    #[test]
+    fn from_caller_human_token_does_not_populate_agent() {
+        let ctx: CallerCtx<NoGrant> = CallerCtx {
+            token_name: "human-operator".into(),
+            devices: ScopeSet::Wildcard,
+            tools: ScopeSet::Wildcard,
+            grant: None,
+            provider: None,
+            provider_tier: None,
+            on_behalf_of: Some("alice@example.com".into()),
+            actor_type: mecmcp_auth::ActorType::Human,
+        };
+        let a = Attribution::from_caller(&ctx);
+
+        assert_eq!(a.actor_type, ActorType::Human);
+        assert!(a.agent.is_none(), "human tokens must not populate agent");
+        assert_eq!(
+            a.on_behalf_of.as_deref(),
+            Some("alice@example.com"),
+            "on_behalf_of can be set for human tokens too"
+        );
     }
 }

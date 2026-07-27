@@ -147,7 +147,14 @@ impl Drop for AuditScope {
         let actor_type = match self.attribution.actor_type {
             ActorType::Human => "human",
             ActorType::Agent => "agent",
+            ActorType::Unknown => "unknown",
         };
+
+        // Read the recorded source rather than guessing from the values. A
+        // client-asserted provider is indistinguishable from a token-verified
+        // one by inspection, so inferring here would label a caller's claim as
+        // server-verified (mecmcp#52).
+        let provenance_source = self.attribution.provenance_source;
 
         // Emit flat attribution fields.
         let model_id = self
@@ -183,6 +190,7 @@ impl Drop for AuditScope {
             request_id = %self.attribution.request_id,
             caller = %self.attribution.principal,
             actor_type = %actor_type,
+            provenance_source = %provenance_source,
             model_id = %model_id,
             session_id = %session_id,
             client_name = %client_name,
@@ -221,7 +229,7 @@ mod tests {
             provider: None,
             provider_tier: None,
             on_behalf_of: None,
-            actor_type: mecmcp_auth::ActorType::Human,
+            actor_type: mecmcp_auth::ActorType::Unknown,
         }
     }
 
@@ -398,13 +406,15 @@ mod tests {
     }
 
     #[test]
-    fn human_attribution_leaves_agent_fields_empty() {
+    fn unknown_attribution_leaves_agent_fields_empty() {
         let out = run_with_capture(|| {
-            let mut a = AuditScope::from_caller(&ctx("ci"), "commit_config", "commit", vec![]);
+            let mut a =
+                AuditScope::from_caller(&ctx("legacy-token"), "commit_config", "commit", vec![]);
             a.succeed();
         });
-        assert!(out.contains("actor_type=human"));
-        // Agent fields should be present but empty when actor_type is human.
+        assert!(out.contains("actor_type=unknown"));
+        assert!(out.contains("provenance_source=none"));
+        // Agent fields should be present but empty when no provenance exists.
         assert!(out.contains("model_id="));
         assert!(out.contains("session_id="));
     }
@@ -425,6 +435,36 @@ mod tests {
         assert!(
             !out.contains("authorization=no_auth"),
             "authorization must not be no_auth for an authenticated token: {out}"
+        );
+    }
+
+    #[test]
+    fn token_verified_provenance_marks_source_as_token() {
+        let ctx: CallerCtx<NoGrant> = CallerCtx {
+            token_name: "claude-code-ops".into(),
+            devices: ScopeSet::Wildcard,
+            tools: ScopeSet::Wildcard,
+            grant: None,
+            provider: Some("anthropic".into()),
+            provider_tier: Some(mecmcp_auth::Tier::Public),
+            on_behalf_of: Some("fastrevmd@gmail.com".into()),
+            actor_type: mecmcp_auth::ActorType::Agent,
+        };
+        let out = run_with_capture(|| {
+            let mut a = AuditScope::from_caller(&ctx, "commit_config", "commit", vec!["r1".into()]);
+            a.succeed();
+        });
+        assert!(
+            out.contains("provenance_source=token"),
+            "token-verified provenance must emit provenance_source=token: {out}"
+        );
+        assert!(
+            out.contains("actor_type=agent"),
+            "actor_type must flow from token entry: {out}"
+        );
+        assert!(
+            out.contains("on_behalf_of=fastrevmd@gmail.com"),
+            "on_behalf_of must flow from token entry: {out}"
         );
     }
 }

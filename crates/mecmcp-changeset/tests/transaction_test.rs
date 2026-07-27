@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used, dead_code)]
 
 use async_trait::async_trait;
-use mecmcp_audit::{ActorType, Attribution, Principal};
+use mecmcp_audit::{ActorType, Attribution, Principal, ProvenanceSource};
 use mecmcp_changeset::{
     CommitOptions, CommitOutcome, DeviceTransaction, RollbackOutcome, RollbackRef,
 };
@@ -544,6 +544,9 @@ fn test_attribution() -> Attribution {
         on_behalf_of: Some("fastrevmd@gmail.com".into()),
         change_ref: Some("CHG0012345".into()),
         request_id: Uuid::new_v4(),
+        // Hand-built rather than derived from a token entry, so the model,
+        // provider and delegated user here are claims, not verified facts.
+        provenance_source: ProvenanceSource::Client,
     }
 }
 
@@ -555,6 +558,7 @@ fn test_human_attribution() -> Attribution {
         on_behalf_of: None,
         change_ref: Some("CHG0099999".into()),
         request_id: Uuid::new_v4(),
+        provenance_source: ProvenanceSource::Client,
     }
 }
 

@@ -11,7 +11,7 @@ mod schema;
 mod scope;
 pub mod testutil;
 
-pub use attribution::{ActorType, AgentIdentity, Attribution, Principal, Tier};
+pub use attribution::{ActorType, AgentIdentity, Attribution, Principal, ProvenanceSource, Tier};
 pub use init::{AuditConfig, AuditFormat, init_tracing};
 pub use redact::{
     AuditRedaction, FieldTransform, REDACTABLE_FIELDS, RedactError, active, install, render,
