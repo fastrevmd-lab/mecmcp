@@ -11,6 +11,8 @@ pub struct OperationLimits {
     pub max_change_sets: usize,
     /// Maximum number of actions in a single change set.
     pub max_actions_per_set: usize,
+    /// Maximum serialized size of a single change set in bytes.
+    pub max_change_set_bytes: u64,
     /// Maximum serialized size of the state file in bytes.
     pub max_state_bytes: u64,
 }
@@ -21,7 +23,8 @@ impl Default for OperationLimits {
             max_operations: 1024,
             max_change_sets: 1024,
             max_actions_per_set: 64,
-            max_state_bytes: 8 * 1024 * 1024,
+            max_change_set_bytes: 256 * 1024, // 256KB per change set
+            max_state_bytes: 8 * 1024 * 1024, // 8MB total state file
         }
     }
 }

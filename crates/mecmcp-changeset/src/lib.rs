@@ -16,7 +16,10 @@ pub mod types;
 
 pub use lifecycle::{ChangeSetState, LifecycleState};
 pub use persistence::{ChangesetState, PersistenceError, read_state, validate_state, write_state};
-pub use records::{ChangeSetRecord, OperationRecord};
+pub use records::{
+    ChangeSetRecord, OperationRecord, RecordError, change_set_digest, mutation_policy_signature,
+    require_operation_fingerprint, require_operation_policy, validate_change_set_actions,
+};
 pub use transaction::{
     CommitOptions, CommitOutcome, DeviceTransaction, RollbackOutcome, RollbackRef,
 };
