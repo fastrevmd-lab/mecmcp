@@ -2,10 +2,9 @@
 
 use crate::{
     ChangeSetRecord, OperationRecord,
-    digest::{bytes_hex, validate_fingerprint},
+    digest::{compute_approval_digest, compute_waiver_digest, validate_fingerprint},
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
@@ -213,12 +212,7 @@ pub fn validate_state(state: &ChangesetState) -> Result<(), PersistenceError> {
                 )
             } else {
                 // Waived approval in lab mode
-                compute_waived_approval_digest(
-                    id,
-                    &record.digest,
-                    &record.owner,
-                    approval.approved_at_unix,
-                )
+                compute_waiver_digest(id, &record.digest, &record.owner, approval.approved_at_unix)
             };
 
             if expected_approval_digest != approval.digest {
@@ -323,55 +317,4 @@ fn validate_operation_id(value: &str) -> Result<(), PersistenceError> {
             "value must contain exactly 64 hexadecimal characters",
         ))
     }
-}
-
-/// Computes an approval digest binding the approval act to the plan.
-///
-/// The approval digest covers `(change_set_id, plan_digest, owner, approver, approved_at)`.
-/// This makes the approval itself tamper-evident: anyone editing the state file to swap
-/// the approver or mask a self-approval will invalidate the digest.
-fn compute_approval_digest(
-    change_set_id: &str,
-    plan_digest: &str,
-    owner: &str,
-    approver: &str,
-    approved_at_unix: u64,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(change_set_id.as_bytes());
-    hasher.update(b"|");
-    hasher.update(plan_digest.as_bytes());
-    hasher.update(b"|");
-    hasher.update(owner.as_bytes());
-    hasher.update(b"|");
-    hasher.update(approver.as_bytes());
-    hasher.update(b"|");
-    hasher.update(approved_at_unix.to_string().as_bytes());
-
-    format!("sha256:{}", bytes_hex(&hasher.finalize()))
-}
-
-/// Computes a waiver digest for lab-mode approvals without a second principal.
-///
-/// The waiver digest covers `(change_set_id, plan_digest, owner, approved_at, "lab-mode-waived")`.
-/// The literal marker makes the digest fundamentally different from a genuine approval digest,
-/// preventing any confusion or masking of self-approval attempts.
-fn compute_waived_approval_digest(
-    change_set_id: &str,
-    plan_digest: &str,
-    owner: &str,
-    approved_at_unix: u64,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(change_set_id.as_bytes());
-    hasher.update(b"|");
-    hasher.update(plan_digest.as_bytes());
-    hasher.update(b"|");
-    hasher.update(owner.as_bytes());
-    hasher.update(b"|");
-    hasher.update(approved_at_unix.to_string().as_bytes());
-    hasher.update(b"|");
-    hasher.update(b"lab-mode-waived");
-
-    format!("sha256:{}", bytes_hex(&hasher.finalize()))
 }

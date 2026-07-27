@@ -2,12 +2,11 @@
 
 use crate::{
     coordinator::{ChangesetCoordinator, CoordinatorError},
-    digest::{bytes_hex, change_set_digest, validate_digest},
+    digest::{change_set_digest, compute_approval_digest, compute_waiver_digest, validate_digest},
     lifecycle::ChangeSetState,
     records::{ApprovalRecord, ChangeSetRecord, WaiverRecord},
 };
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Output from change-set lifecycle operations.
@@ -296,12 +295,8 @@ impl ChangesetCoordinator {
         }
 
         // Compute waiver digest: (change_set_id, plan_digest, owner, waived_at, "lab-mode-waived")
-        let waiver_digest = compute_waiver_digest(
-            &change_set_id,
-            &record.digest,
-            &record.owner,
-            now,
-        );
+        let waiver_digest =
+            compute_waiver_digest(&change_set_id, &record.digest, &record.owner, now);
 
         record.state = ChangeSetState::Approved;
         record.approver = None;
@@ -349,61 +344,9 @@ impl ChangesetCoordinator {
     }
 }
 
-/// Computes an approval digest binding the approval act to the plan.
-///
-/// The approval digest covers `(change_set_id, plan_digest, owner, approver, approved_at)`.
-/// This makes the approval itself tamper-evident: anyone editing the state file to swap
-/// the approver or mask a self-approval will invalidate the digest.
-fn compute_approval_digest(
-    change_set_id: &str,
-    plan_digest: &str,
-    owner: &str,
-    approver: &str,
-    approved_at_unix: u64,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(change_set_id.as_bytes());
-    hasher.update(b"|");
-    hasher.update(plan_digest.as_bytes());
-    hasher.update(b"|");
-    hasher.update(owner.as_bytes());
-    hasher.update(b"|");
-    hasher.update(approver.as_bytes());
-    hasher.update(b"|");
-    hasher.update(approved_at_unix.to_string().as_bytes());
-
-    format!("sha256:{}", bytes_hex(&hasher.finalize()))
-}
-
-/// Computes a waiver digest binding the lab-mode waiver to the plan.
-///
-/// The waiver digest covers `(change_set_id, plan_digest, owner, waived_at, "lab-mode-waived")`.
-/// This makes the waiver tamper-evident while remaining distinct from genuine two-person
-/// approvals: it includes no approver, and the sentinel value makes it impossible to
-/// confuse with an approval digest.
-fn compute_waiver_digest(
-    change_set_id: &str,
-    plan_digest: &str,
-    owner: &str,
-    waived_at_unix: u64,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(change_set_id.as_bytes());
-    hasher.update(b"|");
-    hasher.update(plan_digest.as_bytes());
-    hasher.update(b"|");
-    hasher.update(owner.as_bytes());
-    hasher.update(b"|");
-    hasher.update(waived_at_unix.to_string().as_bytes());
-    hasher.update(b"|");
-    hasher.update(b"lab-mode-waived");
-
-    format!("sha256:{}", bytes_hex(&hasher.finalize()))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::digest::compute_approval_digest;
 
     #[test]
     fn test_approval_digest_is_deterministic() {
