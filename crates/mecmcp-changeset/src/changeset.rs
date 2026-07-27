@@ -50,7 +50,7 @@ impl From<ChangeSetRecord> for ChangeSetOutput {
 /// # Errors
 ///
 /// Returns an error if the system clock is set before the Unix epoch.
-fn now_unix() -> Result<u64, CoordinatorError> {
+pub(crate) fn now_unix() -> Result<u64, CoordinatorError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
