@@ -292,6 +292,51 @@ unblocks the database-backed inventory that 4,000 devices requires.
 **Exit:** both servers load their existing `devices.json` unchanged through the
 trait; `rustpanosmcp` gains connection pooling and per-device in-flight caps.
 
+**Completed 2026-07-26**, released as `phase4-v0.1.7`. Findings worth carrying
+forward:
+
+- **Two of this plan's premises did not match the tree**, found by measuring
+  before writing. The stated exit — "`rustpanosmcp` gains connection pooling and
+  per-device in-flight caps" — was **already satisfied**: `PanosClient` is a
+  pooled per-device client holding an `Arc<Semaphore>`, with
+  `pool_max_idle_per_host` configured. And "lift connection leasing" conflated
+  two mechanisms: junos's `device_lease.rs` is *cross-process* kernel file
+  locking so a long-running upgrade cannot be raced by another process, while
+  panos's semaphore is *in-process* concurrency limiting. Only the file lock was
+  extracted.
+
+- **The authorisation models are not interchangeable, and nearly were.**
+  `mecmcp-policy` is a fail-open glob blocklist: unmatched input is allowed.
+  `rustpanosmcp`'s `validate_write_xpath` is a fail-closed prefix allowlist: an
+  XPath must sit under a configured root. Adopting the engine for mutations
+  would have silently widened what a mutation token reaches. It is used for
+  read-only tools only, additively.
+
+- **The `Inventory` trait shipped unimplementable.** `FileInventory::get`
+  returned `Err` unconditionally and `policy` returned `None`, because
+  `-> Result<&D, _>` cannot be honoured by anything with interior mutability —
+  which hot reload requires. Every test used the concrete type, so nothing
+  caught it. Fixed in v0.1.7 by returning owned values, plus a test that calls
+  through `&dyn Inventory`.
+
+  The same area hid a latent panic: the sync trait called
+  `tokio::RwLock::blocking_read()`, which panics inside an async context, while
+  the inherent accessors awaited the same lock. Now `std::sync::RwLock`
+  throughout.
+
+- **"Wired" is not the same as "used".** Both server tasks declared a new
+  dependency without consuming it, and both reported success with green CI —
+  junos never imported `mecmcp-inventory`, panos never called `mecmcp-policy`.
+  A later attempt "used" the loader by calling it, discarding the result, and
+  parsing the file a second time locally. **Dead code is the signal:** if
+  replacing an implementation leaves nothing for clippy to flag as unused, it
+  was added alongside rather than substituted.
+
+- **Schema convergence (#27) stayed out of scope deliberately**, and should stay
+  out until the trait has consumers. A converged schema is now a second
+  `Inventory` implementation rather than a flag day against four live
+  deployments.
+
 ### Phase 5 — `mecmcp-changeset`
 
 Generalise `mutation.rs` behind `DeviceTransaction` and implement the trait for
