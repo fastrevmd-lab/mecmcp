@@ -11,7 +11,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// arguments. Invalid protocol input is left for rmcp to diagnose.
 ///
 /// `target_keys` defines which argument field names are recognized as containing
-/// device targets. Junos uses `["router", "router_name", "routers", "router_names"]`;
+/// device targets. Junos uses `["device", "device_name", "devices", "device_names"]`
+/// (with deprecated aliases `["router", "router_name", "routers", "router_names"]`);
 /// PAN-OS uses `["device", "devices"]`.
 pub fn extract_targets(body: &[u8], target_keys: &[String]) -> Vec<String> {
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
@@ -230,12 +231,12 @@ mod tests {
 
     #[test]
     fn junos_keys_extract_from_single_and_batched_calls() {
-        let junos_keys = keys(&["router", "router_name", "routers", "router_names"]);
+        let junos_keys = keys(&["device", "device_name", "devices", "device_names"]);
         let body = br#"[
-            {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"one","arguments":{"router":"r4"}}},
-            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"two","arguments":{"router_name":"r3"}}},
-            {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"three","arguments":{"routers":["r2","r1"]}}},
-            {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"four","arguments":{"router_names":"r5"}}}
+            {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"one","arguments":{"device":"r4"}}},
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"two","arguments":{"device_name":"r3"}}},
+            {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"three","arguments":{"devices":["r2","r1"]}}},
+            {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"four","arguments":{"device_names":"r5"}}}
         ]"#;
 
         assert_eq!(
@@ -257,26 +258,27 @@ mod tests {
 
     #[test]
     fn cross_key_isolation_junos_ignores_panos_and_vice_versa() {
-        let junos_keys = keys(&["router", "router_name", "routers", "router_names"]);
+        let junos_keys = keys(&["device", "device_name", "devices", "device_names"]);
         let panos_keys = keys(&["device", "devices"]);
-        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{"router":"r1","device":"d1"}}}"#;
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{"device":"both","device_name":"d1"}}}"#;
 
-        assert_eq!(extract_targets(body, &junos_keys), vec!["r1"]);
-        assert_eq!(extract_targets(body, &panos_keys), vec!["d1"]);
+        // Both use "device" so we get both values
+        assert_eq!(extract_targets(body, &junos_keys), vec!["both", "d1"]);
+        assert_eq!(extract_targets(body, &panos_keys), vec!["both"]);
     }
 
     #[test]
     fn deduplicates_exact_names_and_sorts_them() {
-        let junos_keys = keys(&["router", "router_name", "routers", "router_names"]);
-        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"batch","arguments":{"router":"b","router_name":"a","routers":["b","a","c"]}}}"#;
+        let junos_keys = keys(&["device", "device_name", "devices", "device_names"]);
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"batch","arguments":{"device":"b","device_name":"a","devices":["b","a","c"]}}}"#;
         assert_eq!(extract_targets(body, &junos_keys), vec!["a", "b", "c"]);
     }
 
     #[test]
     fn ignores_non_tools_calls_nested_keys_invalid_types_and_malformed_json() {
-        let junos_keys = keys(&["router", "router_name", "routers", "router_names"]);
-        let non_tool = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"arguments":{"router":"r1"}}}"#;
-        let nested = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{"payload":{"router":"nested"},"router":17,"routers":[false,42]}}}"#;
+        let junos_keys = keys(&["device", "device_name", "devices", "device_names"]);
+        let non_tool = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"arguments":{"device":"r1"}}}"#;
+        let nested = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{"payload":{"device":"nested"},"device":17,"devices":[false,42]}}}"#;
 
         assert!(extract_targets(non_tool, &junos_keys).is_empty());
         assert!(extract_targets(nested, &junos_keys).is_empty());
@@ -285,8 +287,8 @@ mod tests {
 
     #[test]
     fn preserves_exact_case_and_whitespace() {
-        let junos_keys = keys(&["router", "router_name", "routers", "router_names"]);
-        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{"routers":["SRX-1","srx-1"," srx-1 "]}}}"#;
+        let junos_keys = keys(&["device", "device_name", "devices", "device_names"]);
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{"devices":["SRX-1","srx-1"," srx-1 "]}}}"#;
         assert_eq!(
             extract_targets(body, &junos_keys),
             vec![" srx-1 ", "SRX-1", "srx-1"]

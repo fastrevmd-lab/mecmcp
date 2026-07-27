@@ -37,9 +37,9 @@ pub enum EntryError {
 
 /// One digest-only token entry.
 ///
-/// Field names are canonical (`digest`, `devices`); the aliases accept the
-/// spellings `rustjunosmcp` wrote before extraction so deployed `tokens.json`
-/// files load unchanged.
+/// Field names are canonical (`digest`, `devices`). Aliases accept the
+/// spellings rustjunosmcp wrote before extraction (`hash` for digest,
+/// `routers` for devices) so deployed `tokens.json` files load unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenEntry<G: Grant = NoGrant> {
     /// Operator-facing, non-secret token name. Used for audit attribution.

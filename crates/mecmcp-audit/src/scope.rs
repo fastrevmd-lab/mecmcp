@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn stdio_caller_is_no_auth() {
         let out = run_with_capture(|| {
-            let mut a = AuditScope::stdio("get_router_list", "read", vec![]);
+            let mut a = AuditScope::stdio("get_device_list", "read", vec![]);
             a.succeed();
         });
         assert!(out.contains("caller=stdio"));
@@ -290,33 +290,33 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             let mut ok = AuditScope::from_caller(
                 &caller,
-                "get_router_list",
+                "get_device_list",
                 "read",
-                vec!["secret-router".into()],
+                vec!["secret-device".into()],
             );
             ok.succeed();
 
             let mut error = AuditScope::from_caller(
                 &caller,
-                "get_router_list",
+                "get_device_list",
                 "read",
-                vec!["secret-router".into()],
+                vec!["secret-device".into()],
             );
             error.fail("secret-error-text");
 
             let mut denied = AuditScope::from_caller(
                 &caller,
-                "get_router_list",
+                "get_device_list",
                 "read",
-                vec!["secret-router".into()],
+                vec!["secret-device".into()],
             );
             denied.deny("tool_scope");
 
             let _unsettled = AuditScope::from_caller(
                 &caller,
-                "get_router_list",
+                "get_device_list",
                 "read",
-                vec!["secret-router".into()],
+                vec!["secret-device".into()],
             );
         });
 
@@ -327,7 +327,7 @@ mod tests {
                 text.lines().any(|line| {
                     line.starts_with("mecmcp_tool_duration_seconds_bucket{")
                         && line.contains("server=\"test\"")
-                        && line.contains("tool=\"get_router_list\"")
+                        && line.contains("tool=\"get_device_list\"")
                         && line.contains(&format!("result=\"{result}\""))
                 }),
                 "missing {result} in:\n{text}"
@@ -335,10 +335,10 @@ mod tests {
         }
         for forbidden in [
             "secret-token-name",
-            "secret-router",
+            "secret-device",
             "secret-error-text",
             "caller=",
-            "router=",
+            "device=",
             "error=",
         ] {
             assert!(!text.contains(forbidden), "leaked {forbidden} in:\n{text}");
