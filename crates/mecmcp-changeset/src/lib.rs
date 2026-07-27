@@ -1,0 +1,19 @@
+//! Fingerprint-bound change-set lifecycle for multi-vendor device automation.
+//!
+//! This crate provides two-person change control with digest-bound approval, indeterminate
+//! recovery, and atomic persistence. It generalizes the PAN-OS mutation lifecycle behind
+//! a vendor-agnostic trait so both PAN-OS and Junos can use the same workflow.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+pub mod digest;
+pub mod lifecycle;
+pub mod persistence;
+pub mod records;
+pub mod types;
+
+pub use lifecycle::{ChangeSetState, LifecycleState};
+pub use persistence::{ChangesetState, PersistenceError, read_state, validate_state, write_state};
+pub use records::{ChangeSetRecord, OperationRecord};
+pub use types::{Fingerprint, FingerprintError, OperationId, OperationIdError, OperationLimits};
