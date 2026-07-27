@@ -80,11 +80,39 @@ pub struct ChangeSetRecord {
     /// Lifecycle state of the change set.
     pub state: ChangeSetState,
     /// Principal who approved this change set (distinct from owner).
+    ///
+    /// Legacy field for backward compatibility. New records store approval data
+    /// in the `approval` field. This field is populated from `approval.approver`
+    /// when present, or directly when loading legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approver: Option<String>,
+    /// Tamper-evident approval record.
+    ///
+    /// Stores the approver, timestamp, and digest over `(change_set_id, plan_digest,
+    /// owner, approver, approved_at)`. Missing on legacy records created before the
+    /// approval-digest feature; present on all new approvals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalRecord>,
     /// Unix timestamp when the approval expires.
     pub expires_at_unix: u64,
     /// Operation identifier created when this change set was applied.
     pub operation_id: Option<String>,
+}
+
+/// Approval record stored on a change set after successful approval.
+///
+/// This record makes the approval tamper-evident: the digest binds the approver
+/// to the plan digest, owner, and timestamp. Editing any of these fields in the
+/// state file invalidates the digest and causes validation to fail on load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalRecord {
+    /// Principal who approved this change set (must be distinct from owner).
+    pub approver: String,
+    /// Unix timestamp when the approval was granted.
+    pub approved_at_unix: u64,
+    /// Tamper-evident digest over `(change_set_id, plan_digest, owner, approver, approved_at)`.
+    pub digest: String,
 }
 
 /// Error type for record validation failures.
@@ -97,6 +125,18 @@ pub struct RecordError {
 impl RecordError {
     fn new(field: &'static str, message: String) -> Self {
         Self { field, message }
+    }
+
+    /// Returns the field name associated with this error.
+    #[must_use]
+    pub fn field(&self) -> &'static str {
+        self.field
+    }
+
+    /// Returns the error message.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 

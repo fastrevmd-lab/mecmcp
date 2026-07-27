@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 mecmcp-audit = { version = "0.2.0", path = "../mecmcp-audit" }
 async-trait  = { workspace = true }
+hex          = "0.4"
 serde        = { workspace = true }
 serde_json   = { workspace = true, features = ["preserve_order"] }
 sha2         = { workspace = true }
