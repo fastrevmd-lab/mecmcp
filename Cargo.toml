@@ -1,5 +1,5 @@
 [workspace]
-members  = ["crates/mecmcp-auth", "crates/mecmcp-audit", "crates/mecmcp-transport", "crates/mecmcp-runtime"]
+members  = ["crates/mecmcp-auth", "crates/mecmcp-audit", "crates/mecmcp-transport", "crates/mecmcp-runtime", "crates/mecmcp-policy", "crates/mecmcp-inventory", "crates/mecmcp-device"]
 resolver = "2"
 
 [workspace.package]
@@ -12,8 +12,10 @@ authors      = ["fastrevmd-lab"]
 
 [workspace.dependencies]
 arc-swap   = "1"
+async-trait = "0.1"
 chrono     = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 getrandom  = "0.4"
+globset    = "0.4"
 hmac       = "0.13"
 metrics    = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
@@ -24,6 +26,7 @@ sha2       = "0.11"
 subtle     = "2"
 tempfile   = "3"
 thiserror  = "2"
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 tracing    = "0.1"
 tracing-journald = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

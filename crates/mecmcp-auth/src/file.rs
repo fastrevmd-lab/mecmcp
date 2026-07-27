@@ -289,7 +289,6 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
             source: StoreError::Entry(crate::entry::EntryError::Invalid(error.to_string())),
         })?;
 
-        let created_at = Utc::now();
         let entries: Vec<TokenEntry<G>> = current
             .entries()
             .iter()
@@ -300,7 +299,13 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
                         digest: new_digest.clone(),
                         devices: entry.devices.clone(),
                         tools: entry.tools.clone(),
-                        created_at,
+                        // Preserved, not regenerated. Rotation replaces the
+                        // secret; it does not create a new credential. Resetting
+                        // this would erase when the token was first issued, so a
+                        // quarterly-rotated token would always look new — and
+                        // "how long has this credential existed" is exactly the
+                        // question an audit asks.
+                        created_at: entry.created_at,
                         expires_at: entry.expires_at,
                         grant: entry.grant.clone(),
                     }
