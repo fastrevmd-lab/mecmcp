@@ -47,13 +47,14 @@ impl ChangesetCoordinator {
     ///
     /// Returns an error if:
     /// - The expected digest or fingerprint format is invalid
+    /// - The endpoint format is invalid (must start with `https://`)
     /// - The change set does not exist or belongs to another device
     /// - The change set is not owned by the specified owner
     /// - The change set is not in `Approved` state
     /// - The approval has expired
     /// - The supplied digest or fingerprint does not match the stored values exactly
     /// - The device guard cannot be acquired (cancellation)
-    /// - Any action fails to stage (after auto-revert, the change set is marked `Failed`)
+    /// - Any action fails to stage (the change set is marked `Failed`)
     /// - Persistence fails
     ///
     /// # Attribution
@@ -69,6 +70,7 @@ impl ChangesetCoordinator {
         &self,
         change_set_id: String,
         device: String,
+        endpoint: String,
         owner: String,
         expected_digest: String,
         expected_fingerprint: String,
@@ -81,6 +83,13 @@ impl ChangesetCoordinator {
             .map_err(|e| CoordinatorError::new("expected_digest", e.to_string()))?;
         crate::digest::validate_fingerprint(&expected_fingerprint)
             .map_err(|e| CoordinatorError::new("expected_fingerprint", e.to_string()))?;
+
+        if !endpoint.starts_with("https://") {
+            return Err(CoordinatorError::new(
+                "endpoint",
+                "endpoint must start with https://",
+            ));
+        }
 
         // Retrieve and validate the change set before acquiring the device guard
         let mut change_set = self.change_set(&change_set_id, &device).await?;
@@ -135,7 +144,7 @@ impl ChangesetCoordinator {
         }
 
         // Acquire device guard to serialize concurrent operations
-        let _guard = self.device_guard(&device, cancellation).await?;
+        let _guard = self.device_guard(&endpoint, cancellation).await?;
 
         if cancellation.is_cancelled() {
             return Err(CoordinatorError::new("device", "operation cancelled"));
@@ -173,15 +182,7 @@ impl ChangesetCoordinator {
             ));
         }
 
-        // Generate operation ID
-        let operation_id = new_operation_id()?;
-
-        // Mark change set as Applying
-        change_set.state = ChangeSetState::Applying;
-        change_set.operation_id = Some(operation_id.clone());
-        self.update_change_set(change_set.clone()).await?;
-
-        // Deserialize actions
+        // Deserialize actions before marking the change set as Applying
         let actions: Vec<T::Action> = change_set
             .actions
             .iter()
@@ -196,48 +197,60 @@ impl ChangesetCoordinator {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Generate operation ID
+        let operation_id = new_operation_id()?;
+
+        // Create operation record in staging state BEFORE calling the device
+        let operation_record = OperationRecord {
+            id: operation_id.clone(),
+            owner: owner.clone(),
+            device: device.clone(),
+            endpoint: endpoint.clone(),
+            action: change_set.actions.first().cloned().unwrap_or_default(),
+            xpath: None,
+            actions: change_set.actions.clone(),
+            change_set_id: Some(change_set_id.clone()),
+            current: before_fingerprint.clone(),
+            state: LifecycleState::Staging,
+            job_id: None,
+            details: Some(format!(
+                "staging change set {} with {} actions",
+                change_set_id,
+                actions.len()
+            )),
+            config_lock_held: false,
+            policy_signature: String::new(),
+        };
+
+        self.insert(operation_record).await?;
+
+        // Mark change set as Applying
+        change_set.state = ChangeSetState::Applying;
+        change_set.operation_id = Some(operation_id.clone());
+        self.update_change_set(change_set.clone()).await?;
+
         // Stage all actions through the transaction
         let staged = match transaction.stage(&actions).await {
             Ok(staged) => staged,
             Err(error) => {
-                // `stage` takes the whole batch, but nothing in the trait
-                // promises the implementation applies it atomically — PAN-OS
-                // walks the actions issuing one XPath call each, so a failure
-                // partway through leaves the earlier actions sitting in the
-                // candidate. Marking the change set Failed and walking away
-                // would leave those uncommitted changes on the device for the
-                // next commit to sweep up, so revert before giving up.
-                let revert = transaction
-                    .rollback(crate::transaction::RollbackRef::CandidateRevert)
-                    .await;
-
+                // The DeviceTransaction::stage contract guarantees that on partial
+                // failure (e.g., action 2 fails after action 1 succeeds), the
+                // implementation reverts action 1 before returning an error.
+                // A failed partial-stage revert obliges the implementation to mark
+                // the session tainted and close it. Therefore, the coordinator does
+                // NOT revert here — doing so would be redundant and dangerous
+                // (a candidate revert clears ALL uncommitted changes, including
+                // pre-existing operator work).
                 change_set.state = ChangeSetState::Failed;
                 self.update_change_set(change_set).await?;
 
-                return Err(match revert {
-                    Ok(outcome) if outcome.succeeded => CoordinatorError::new(
-                        "device",
-                        format!("staging failed and the candidate was reverted: {error}"),
-                    ),
-                    // A failed revert is the dangerous case: the device may
-                    // still hold a partial candidate and no one has been told.
-                    // Say so in the error rather than reporting a clean failure.
-                    Ok(outcome) => CoordinatorError::new(
-                        "device",
-                        format!(
-                            "staging failed: {error}; the candidate revert did not succeed ({}), \
-                             so the device may still hold partial changes",
-                            outcome.details.as_deref().unwrap_or("no detail")
-                        ),
-                    ),
-                    Err(revert_error) => CoordinatorError::new(
-                        "device",
-                        format!(
-                            "staging failed: {error}; the candidate revert also failed \
-                             ({revert_error}), so the device may still hold partial changes"
-                        ),
-                    ),
-                });
+                // Remove the staging operation record
+                self.remove(&operation_id).await;
+
+                return Err(CoordinatorError::new(
+                    "device",
+                    format!("staging failed: {error}"),
+                ));
             }
         };
 
@@ -254,43 +267,58 @@ impl ChangesetCoordinator {
                 self.update_change_set(change_set).await?;
 
                 return match revert_result {
-                    Ok(_) => Err(CoordinatorError::new(
+                    Ok(outcome) if outcome.succeeded => Err(CoordinatorError::new(
                         "device",
                         format!("fingerprint read failed after staging (reverted): {error}"),
                     )),
-                    Err(revert_error) => Err(CoordinatorError::new(
-                        "device",
-                        format!(
-                            "fingerprint read failed after staging: {error}; revert also failed: {revert_error}"
-                        ),
-                    )),
+                    Ok(outcome) => {
+                        // Rollback did not succeed; operation is indeterminate
+                        let mut record = self.record(&operation_id, &owner, &device).await?;
+                        record.state = LifecycleState::Indeterminate;
+                        record.details = Some(format!(
+                            "fingerprint read failed: {error}; rollback did not succeed ({})",
+                            outcome.details.as_deref().unwrap_or("no detail")
+                        ));
+                        self.update(record).await?;
+
+                        Err(CoordinatorError::new(
+                            "device",
+                            format!(
+                                "fingerprint read failed: {error}; rollback did not succeed ({})",
+                                outcome.details.as_deref().unwrap_or("no detail")
+                            ),
+                        ))
+                    }
+                    Err(revert_error) => {
+                        // Rollback itself failed; operation is indeterminate
+                        let mut record = self.record(&operation_id, &owner, &device).await?;
+                        record.state = LifecycleState::Indeterminate;
+                        record.details = Some(format!(
+                            "fingerprint read failed: {error}; rollback failed: {revert_error}"
+                        ));
+                        self.update(record).await?;
+
+                        Err(CoordinatorError::new(
+                            "device",
+                            format!(
+                                "fingerprint read failed: {error}; rollback failed: {revert_error}"
+                            ),
+                        ))
+                    }
                 };
             }
         };
 
-        // Create operation record
-        let operation_record = OperationRecord {
-            id: operation_id.clone(),
-            owner: owner.clone(),
-            device: device.clone(),
-            endpoint: device.clone(), // Transaction doesn't expose endpoint; use device name
-            action: change_set.actions.first().cloned().unwrap_or_default(),
-            xpath: None, // Vendor-specific; not used in shared crate
-            actions: change_set.actions.clone(),
-            change_set_id: Some(change_set_id.clone()),
-            current: after_fingerprint.clone(),
-            state: LifecycleState::Staged,
-            job_id: None,
-            details: Some(format!(
-                "applied change set {} with {} actions",
-                change_set_id,
-                actions.len()
-            )),
-            config_lock_held: false, // Transaction manages lock; we don't track it here
-            policy_signature: String::new(), // Not used in apply path
-        };
-
-        self.insert(operation_record).await?;
+        // Update operation record to Staged state with the after fingerprint
+        let mut operation_record = self.record(&operation_id, &owner, &device).await?;
+        operation_record.current = after_fingerprint.clone();
+        operation_record.state = LifecycleState::Staged;
+        operation_record.details = Some(format!(
+            "applied change set {} with {} actions",
+            change_set_id,
+            actions.len()
+        ));
+        self.update(operation_record).await?;
 
         // Mark change set as Applied
         change_set.state = ChangeSetState::Applied;

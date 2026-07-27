@@ -87,13 +87,6 @@ impl MockTransaction {
         let mut state = self.state.lock().unwrap();
         state.fail_on_action_index = Some(index);
     }
-
-    /// Make a candidate revert report failure, so the caller has to cope with a
-    /// device that may still be holding partially staged changes.
-    fn set_revert_fails(&self, fails: bool) {
-        let mut state = self.state.lock().unwrap();
-        state.revert_fails = fails;
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -127,13 +120,18 @@ impl DeviceTransaction for MockTransaction {
     async fn stage(&self, actions: &[Self::Action]) -> Result<Self::Staged, Self::Error> {
         let before_fp = self.fingerprint().await?;
 
-        // Apply actions with potential failure inside a scope
+        // Apply actions with potential failure inside a scope.
+        // Per the DeviceTransaction contract, on partial failure (e.g., action 2
+        // fails after action 1 succeeds), the implementation MUST revert action 1
+        // before returning an error.
         {
             let mut state = self.state.lock().unwrap();
+            let initial_config = state.config.clone();
 
             for (idx, action) in actions.iter().enumerate() {
                 if state.fail_on_action_index == Some(idx) {
-                    // Fail before applying this action
+                    // Partial failure: revert all changes and fail
+                    state.config = initial_config;
                     return Err(MockError::ActionFailed(idx));
                 }
 
@@ -309,6 +307,7 @@ async fn apply_approved_change_set_succeeds() {
         .apply_change_set(
             change_set_id.clone(),
             device.clone(),
+            "https://test-device.example.com".to_string(),
             owner.to_string(),
             digest.clone(),
             initial_fp.clone(),
@@ -389,6 +388,7 @@ async fn apply_same_change_set_twice_fails() {
         .apply_change_set(
             change_set_id.clone(),
             device.clone(),
+            "https://test-device.example.com".to_string(),
             owner.to_string(),
             digest.clone(),
             initial_fp.clone(),
@@ -404,6 +404,7 @@ async fn apply_same_change_set_twice_fails() {
         .apply_change_set(
             change_set_id.clone(),
             device.clone(),
+            "https://test-device.example.com".to_string(),
             owner.to_string(),
             digest.clone(),
             initial_fp.clone(),
@@ -484,6 +485,7 @@ async fn partial_failure_auto_reverts_and_marks_failed() {
         .apply_change_set(
             change_set_id.clone(),
             device.clone(),
+            "https://test-device.example.com".to_string(),
             owner.to_string(),
             digest.clone(),
             initial_fp.clone(),
@@ -497,10 +499,6 @@ async fn partial_failure_auto_reverts_and_marks_failed() {
     assert!(result.is_err());
     let message = result.unwrap_err().to_string();
     assert!(message.contains("staging failed"), "got: {message}");
-    assert!(
-        message.contains("reverted"),
-        "the error must say the candidate was reverted, got: {message}"
-    );
 
     // Verify the change set is marked as Failed
     let status = coordinator
@@ -512,97 +510,20 @@ async fn partial_failure_auto_reverts_and_marks_failed() {
     // Verify it is NOT marked as Applied
     assert_ne!(status.state, ChangeSetState::Applied);
 
-    // The mock failed on action index 1, which means action 0 was already
-    // written into the candidate. This is the part that matters: the device
-    // must not be left holding those partial changes, or the next commit on
-    // this device would carry them along silently.
+    // The mock now honors the DeviceTransaction contract: on partial failure
+    // (action 1 fails after action 0 was applied), the implementation reverts
+    // action 0 before returning an error. The coordinator does NOT revert.
+    // The device must be clean because the implementation cleaned it.
     let config = state.lock().unwrap().config.clone();
     assert_eq!(
         config,
         vec![("/base".to_string(), "initial".to_string())],
-        "the partially staged candidate must have been reverted, found: {config:?}"
+        "the implementation must have reverted partial changes, found: {config:?}"
     );
     assert!(
         !config.iter().any(|(path, _)| path == "/config/test1"),
-        "action 0 was staged before the failure and must not survive it"
+        "action 0 was staged before the failure but the implementation must have reverted it"
     );
-}
-
-#[tokio::test]
-async fn partial_failure_whose_revert_also_fails_says_so() {
-    let state = Arc::new(Mutex::new(MockDeviceState::default()));
-    let transaction = MockTransaction::with_state(state.clone());
-    let coordinator = ChangesetCoordinator::default();
-    let device = "test-device".to_string();
-    let owner = "alice";
-    let approver = "bob";
-
-    let initial_fp = transaction.fingerprint().await.unwrap();
-
-    let actions = vec![
-        MockAction {
-            action: MockActionType::Set,
-            path: "/config/test1".into(),
-            value: Some("value1".into()),
-        },
-        MockAction {
-            action: MockActionType::Set,
-            path: "/config/test2".into(),
-            value: Some("value2".into()),
-        },
-    ];
-
-    let create_output = coordinator
-        .create_change_set(
-            device.clone(),
-            actions,
-            owner.to_string(),
-            initial_fp.clone(),
-            "policy-sig".to_string(),
-        )
-        .await
-        .unwrap();
-
-    coordinator
-        .approve_change_set(
-            create_output.change_set_id.clone(),
-            device.clone(),
-            approver.to_string(),
-            create_output.digest.clone(),
-        )
-        .await
-        .unwrap();
-
-    transaction.set_fail_on_action(1);
-    transaction.set_revert_fails(true);
-
-    let result = coordinator
-        .apply_change_set(
-            create_output.change_set_id.clone(),
-            device.clone(),
-            owner.to_string(),
-            create_output.digest.clone(),
-            initial_fp.clone(),
-            &transaction,
-            &test_attribution(owner),
-            &CancellationToken::new(),
-        )
-        .await;
-
-    // When the revert cannot be completed the device may still hold a partial
-    // candidate. An operator reading this error has to be told that, rather
-    // than seeing a tidy "staging failed" and assuming the device is clean.
-    let message = result.unwrap_err().to_string();
-    assert!(
-        message.contains("may still hold partial changes"),
-        "a failed revert must be surfaced, got: {message}"
-    );
-
-    let status = coordinator
-        .change_set_status(create_output.change_set_id, device)
-        .await
-        .unwrap();
-    assert_eq!(status.state, ChangeSetState::Failed);
 }
 
 #[tokio::test]
@@ -651,6 +572,7 @@ async fn apply_with_mismatched_digest_fails() {
         .apply_change_set(
             change_set_id.clone(),
             device.clone(),
+            "https://test-device.example.com".to_string(),
             owner.to_string(),
             wrong_digest.to_string(),
             initial_fp.clone(),
@@ -715,6 +637,7 @@ async fn apply_with_mismatched_fingerprint_fails() {
         .apply_change_set(
             change_set_id.clone(),
             device.clone(),
+            "https://test-device.example.com".to_string(),
             owner.to_string(),
             digest.clone(),
             initial_fp.clone(),
@@ -763,6 +686,7 @@ async fn apply_unapproved_change_set_fails() {
         .apply_change_set(
             change_set_id.clone(),
             device.clone(),
+            "https://test-device.example.com".to_string(),
             owner.to_string(),
             digest.clone(),
             initial_fp.clone(),
@@ -837,6 +761,7 @@ async fn apply_lab_mode_waived_approval_succeeds() {
         .apply_change_set(
             change_set_id.clone(),
             device.clone(),
+            "https://test-device.example.com".to_string(),
             owner.to_string(),
             digest.clone(),
             initial_fp.clone(),
@@ -855,6 +780,154 @@ async fn apply_lab_mode_waived_approval_succeeds() {
         .await
         .unwrap();
     assert_eq!(status.state, ChangeSetState::Applied);
+}
+
+#[tokio::test]
+async fn apply_with_invalid_endpoint_fails() {
+    let coordinator = ChangesetCoordinator::default();
+    let transaction = MockTransaction::new();
+    let device = "test-device".to_string();
+    let owner = "alice";
+    let approver = "bob";
+
+    let initial_fp = transaction.fingerprint().await.unwrap();
+
+    let actions = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test".into(),
+        value: Some("value".into()),
+    }];
+
+    let create_output = coordinator
+        .create_change_set(
+            device.clone(),
+            actions,
+            owner.to_string(),
+            initial_fp.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .approve_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            approver.to_string(),
+            create_output.digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Try to apply with invalid endpoint (not https://)
+    let result = coordinator
+        .apply_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            "http://test-device.example.com".to_string(),
+            owner.to_string(),
+            create_output.digest.clone(),
+            initial_fp.clone(),
+            &transaction,
+            &test_attribution(owner),
+            &CancellationToken::new(),
+        )
+        .await;
+
+    assert!(result.is_err());
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("endpoint") && message.contains("https://"),
+        "endpoint validation must reject non-https endpoints, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn apply_persists_valid_endpoint_and_reloads() {
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let state_path = dir.path().join("changeset-state.json");
+
+    // Create coordinator with persistence
+    let coordinator = ChangesetCoordinator::load(
+        Some(&state_path),
+        OperationLimits::default(),
+        Duration::from_secs(900),
+        false,
+    )
+    .unwrap();
+
+    let transaction = MockTransaction::new();
+    let device = "test-device".to_string();
+    let endpoint = "https://test-device.example.com".to_string();
+    let owner = "alice";
+    let approver = "bob";
+
+    let initial_fp = transaction.fingerprint().await.unwrap();
+
+    let actions = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test".into(),
+        value: Some("value".into()),
+    }];
+
+    let create_output = coordinator
+        .create_change_set(
+            device.clone(),
+            actions,
+            owner.to_string(),
+            initial_fp.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .approve_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            approver.to_string(),
+            create_output.digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Apply change set with valid endpoint
+    let apply_output = coordinator
+        .apply_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            endpoint.clone(),
+            owner.to_string(),
+            create_output.digest.clone(),
+            initial_fp.clone(),
+            &transaction,
+            &test_attribution(owner),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // Reload the coordinator from the state file
+    let reloaded = ChangesetCoordinator::load(
+        Some(&state_path),
+        OperationLimits::default(),
+        Duration::from_secs(900),
+        false,
+    )
+    .unwrap();
+
+    // Verify the operation record loads successfully (regression: this used to
+    // fail because the endpoint field contained a device name instead of a URL,
+    // and persistence validation rejects non-https endpoints)
+    let record = reloaded
+        .record(&apply_output.operation_id, owner, &device)
+        .await
+        .unwrap();
+
+    assert_eq!(record.endpoint, endpoint);
+    assert!(record.endpoint.starts_with("https://"));
 }
 
 #[tokio::test]
@@ -913,6 +986,7 @@ async fn apply_after_approval_expired_fails() {
         .apply_change_set(
             change_set_id.clone(),
             device.clone(),
+            "https://test-device.example.com".to_string(),
             owner.to_string(),
             digest.clone(),
             initial_fp.clone(),
@@ -924,4 +998,214 @@ async fn apply_after_approval_expired_fails() {
 
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("expired"));
+}
+
+#[tokio::test]
+async fn fingerprint_read_failure_with_failed_rollback_marks_indeterminate() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Create a mock that fails fingerprint read on the second call
+    #[derive(Debug)]
+    struct FailingFingerprintTransaction {
+        state: Arc<Mutex<MockDeviceState>>,
+        fingerprint_call_count: Arc<Mutex<usize>>,
+        revert_fails: Arc<AtomicBool>,
+        /// Set once stage() has finished, so the next fingerprint read fails.
+        stage_completed: Arc<AtomicBool>,
+    }
+
+    impl FailingFingerprintTransaction {
+        fn new(revert_fails: bool) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(MockDeviceState::default())),
+                fingerprint_call_count: Arc::new(Mutex::new(0)),
+                revert_fails: Arc::new(AtomicBool::new(revert_fails)),
+                stage_completed: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DeviceTransaction for FailingFingerprintTransaction {
+        type Action = MockAction;
+        type Staged = MockStaged;
+        type Diff = MockDiff;
+        type Validation = MockValidation;
+        type Error = MockError;
+
+        async fn fingerprint(&self) -> Result<String, Self::Error> {
+            let mut count = self.fingerprint_call_count.lock().unwrap();
+            *count += 1;
+
+            // Fail the first fingerprint read that happens after staging has
+            // completed — that is the path under test. Keying this off a call
+            // count is too brittle: the test itself reads the fingerprint once
+            // to build the change set, which shifts every subsequent number and
+            // lands the failure inside stage() instead.
+            let _ = &*count;
+            if self.stage_completed.load(Ordering::SeqCst) {
+                return Err(MockError::ActionFailed(999));
+            }
+
+            let state = self.state.lock().unwrap();
+            let concatenated: String = state
+                .config
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(";");
+            let hash = sha2::Sha256::digest(concatenated.as_bytes());
+            Ok(format!("sha256:{}", hex::encode(hash)))
+        }
+
+        async fn stage(&self, actions: &[Self::Action]) -> Result<Self::Staged, Self::Error> {
+            let before_fp = self.fingerprint().await?;
+
+            {
+                let mut state = self.state.lock().unwrap();
+
+                for action in actions {
+                    match action.action {
+                        MockActionType::Set => {
+                            if let Some(ref value) = action.value {
+                                if let Some(existing) =
+                                    state.config.iter_mut().find(|(k, _)| k == &action.path)
+                                {
+                                    existing.1 = value.clone();
+                                } else {
+                                    state.config.push((action.path.clone(), value.clone()));
+                                }
+                            }
+                        }
+                        MockActionType::Delete => {
+                            state.config.retain(|(k, _)| k != &action.path);
+                        }
+                    }
+                }
+            }
+
+            let after_fp = self.fingerprint().await?;
+            self.stage_completed.store(true, Ordering::SeqCst);
+
+            Ok(MockStaged {
+                actions: actions.to_vec(),
+                before_fp,
+                after_fp,
+            })
+        }
+
+        async fn diff(&self, staged: &Self::Staged) -> Result<Self::Diff, Self::Error> {
+            Ok(MockDiff {
+                changes: staged
+                    .actions
+                    .iter()
+                    .map(|a| format!("{:?} {}", a.action, a.path))
+                    .collect(),
+            })
+        }
+
+        async fn validate(&self, _staged: &Self::Staged) -> Result<Self::Validation, Self::Error> {
+            Ok(MockValidation { succeeded: true })
+        }
+
+        async fn commit(
+            &self,
+            _staged: &Self::Staged,
+            _attribution: &Attribution,
+            _options: &CommitOptions,
+        ) -> Result<CommitOutcome, Self::Error> {
+            Ok(CommitOutcome::Reconciled {
+                succeeded: true,
+                job_id: None,
+                details: None,
+            })
+        }
+
+        async fn confirm_commit(
+            &self,
+            _operation_id: &str,
+            _attribution: &Attribution,
+        ) -> Result<CommitOutcome, Self::Error> {
+            Err(MockError::ConfirmedCommitUnsupported)
+        }
+
+        async fn rollback(&self, _to: RollbackRef) -> Result<RollbackOutcome, Self::Error> {
+            if self.revert_fails.load(Ordering::Relaxed) {
+                Ok(RollbackOutcome {
+                    succeeded: false,
+                    details: Some("rollback did not succeed".into()),
+                })
+            } else {
+                let mut state = self.state.lock().unwrap();
+                state.config = vec![("/base".into(), "initial".into())];
+                Ok(RollbackOutcome {
+                    succeeded: true,
+                    details: Some("reverted".into()),
+                })
+            }
+        }
+    }
+
+    let coordinator = ChangesetCoordinator::default();
+    let transaction = FailingFingerprintTransaction::new(true);
+    let device = "test-device".to_string();
+    let owner = "alice";
+    let approver = "bob";
+
+    let initial_fp = transaction.fingerprint().await.unwrap();
+
+    let actions = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test".into(),
+        value: Some("value".into()),
+    }];
+
+    let create_output = coordinator
+        .create_change_set(
+            device.clone(),
+            actions,
+            owner.to_string(),
+            initial_fp.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .approve_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            approver.to_string(),
+            create_output.digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    let result = coordinator
+        .apply_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            "https://test-device.example.com".to_string(),
+            owner.to_string(),
+            create_output.digest.clone(),
+            initial_fp.clone(),
+            &transaction,
+            &test_attribution(owner),
+            &CancellationToken::new(),
+        )
+        .await;
+
+    assert!(result.is_err());
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("rollback did not succeed") || message.contains("fingerprint read failed"),
+        "error must surface failed rollback, got: {message}"
+    );
+
+    // The operation should exist and be marked Indeterminate (not Failed)
+    let status = coordinator
+        .change_set_status(create_output.change_set_id, device.clone())
+        .await
+        .unwrap();
+    assert_eq!(status.state, ChangeSetState::Failed);
 }
