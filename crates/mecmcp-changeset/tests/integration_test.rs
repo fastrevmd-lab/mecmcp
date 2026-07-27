@@ -9,6 +9,34 @@ use mecmcp_changeset::{
 };
 use std::path::PathBuf;
 
+/// Stage the checked-in production fixture as a private (0600) temp file.
+///
+/// `read_state` refuses a state file that permits group/other access, which is
+/// correct for a file holding approval evidence. Git cannot preserve mode 0600,
+/// so a fresh clone checks the fixture out as 0644 and reading it in place fails
+/// in CI while passing on a developer box with a stricter umask. Copy it to a
+/// tempdir and tighten the mode first.
+fn staged_production_fixture() -> (tempfile::TempDir, PathBuf) {
+    let src: PathBuf = [
+        env!("CARGO_MANIFEST_DIR"),
+        "tests",
+        "compat",
+        "mutation-state-608.json",
+    ]
+    .iter()
+    .collect();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dst = dir.path().join("mutation-state.json");
+    std::fs::copy(&src, &dst).expect("copy fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod fixture copy");
+    }
+    (dir, dst)
+}
+
 #[test]
 fn test_lifecycle_state_serialization() {
     // Test all lifecycle states round-trip through serde
@@ -208,14 +236,7 @@ fn test_fingerprint_validation_rejects_sha512_prefix() {
 #[test]
 fn test_production_fixture_round_trip() {
     // This is THE critical test: the production file from LXC 608 must round-trip
-    let fixture_path: PathBuf = [
-        env!("CARGO_MANIFEST_DIR"),
-        "tests",
-        "compat",
-        "mutation-state-608.json",
-    ]
-    .iter()
-    .collect();
+    let (_fixture_dir, fixture_path) = staged_production_fixture();
 
     // Read the production fixture
     let state = read_state(&fixture_path, 8 * 1024 * 1024)
@@ -284,14 +305,7 @@ fn test_production_fixture_round_trip() {
 
 #[test]
 fn test_state_validation() {
-    let fixture_path: PathBuf = [
-        env!("CARGO_MANIFEST_DIR"),
-        "tests",
-        "compat",
-        "mutation-state-608.json",
-    ]
-    .iter()
-    .collect();
+    let (_fixture_dir, fixture_path) = staged_production_fixture();
 
     let state = read_state(&fixture_path, 8 * 1024 * 1024).unwrap();
 
@@ -324,14 +338,7 @@ fn test_round_trip_write_read() {
 #[test]
 fn test_tamper_detection_rejects_modified_actions() {
     // Load the production fixture
-    let fixture_path: PathBuf = [
-        env!("CARGO_MANIFEST_DIR"),
-        "tests",
-        "compat",
-        "mutation-state-608.json",
-    ]
-    .iter()
-    .collect();
+    let (_fixture_dir, fixture_path) = staged_production_fixture();
 
     // First verify the unmodified fixture loads successfully
     let original_state = read_state(&fixture_path, 8 * 1024 * 1024)
@@ -379,14 +386,7 @@ fn test_action_key_order_preserved() {
     // This test proves that preserve_order is working. Without it, serde_json::Value
     // uses BTreeMap which sorts keys alphabetically, breaking digest verification.
 
-    let fixture_path: PathBuf = [
-        env!("CARGO_MANIFEST_DIR"),
-        "tests",
-        "compat",
-        "mutation-state-608.json",
-    ]
-    .iter()
-    .collect();
+    let (_fixture_dir, fixture_path) = staged_production_fixture();
 
     // Read the production fixture
     let state = read_state(&fixture_path, 8 * 1024 * 1024).expect("production fixture must load");

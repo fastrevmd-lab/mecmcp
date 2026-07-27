@@ -8,7 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-mecmcp-audit = { path = "../mecmcp-audit" }
+mecmcp-audit = { version = "0.2.0", path = "../mecmcp-audit" }
 serde        = { workspace = true }
 serde_json   = { workspace = true, features = ["preserve_order"] }
 sha2         = { workspace = true }
