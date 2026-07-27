@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "devices": [
+    {
+      "name": "panosvm",
+      "endpoint": "https://198.51.100.20",
+      "vsys": "vsys1",
+      "api_key": {
+        "type": "env",
+        "name": "PANOS_TEST_API_KEY"
+      },
+      "tls": {
+        "type": "leaf_sha256",
+        "fingerprint": "AA:BB:CC:DD:00:00:00:00:00:00:00:00:00:00:00:FF"
+      },
+      "tags": [
+        "lab",
+        "vmid-900",
+        "read-only"
+      ],
+      "connect_timeout_secs": 10,
+      "request_timeout_secs": 30,
+      "max_concurrency": 4,
+      "max_response_bytes": 5242880
+    },
+    {
+      "name": "panosvm-writer",
+      "endpoint": "https://198.51.100.20",
+      "vsys": "vsys1",
+      "api_key": {
+        "type": "file",
+        "path": "/etc/rust-panosmcp/panos-writer.key"
+      },
+      "tls": {
+        "type": "leaf_sha256",
+        "fingerprint": "AA:BB:CC:DD:00:00:00:00:00:00:00:00:00:00:00:FF"
+      },
+      "mutation": {
+        "admin": "rust-panosmcp-api",
+        "allowed_xpath_roots": [
+          "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address"
+        ],
+        "allow_delete": true,
+        "require_config_lock": true
+      },
+      "tags": [
+        "lab",
+        "vmid-900",
+        "writer-test"
+      ],
+      "connect_timeout_secs": 10,
+      "request_timeout_secs": 30,
+      "max_concurrency": 1,
+      "max_response_bytes": 5242880
+    }
+  ]
+}

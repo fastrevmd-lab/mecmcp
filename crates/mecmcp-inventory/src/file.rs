@@ -1,4 +1,21 @@
-//! File-backed inventory implementation with dual-schema loader.
+//! File-backed inventory implementation with tri-schema loader.
+//!
+//! Transparently loads three on-disk shapes:
+//!
+//! 1. **Canonical envelope** (recommended): `{ "version": 1, "devices": {...}, "policy": {...} }`
+//!    - Devices as a map (name-indexed), optional policy at top level
+//!    - Accepts empty devices map (same as legacy Junos)
+//!
+//! 2. **Legacy PAN-OS envelope**: `{ "version": 1, "devices": [...] }`
+//!    - Devices as an array with `name` field, no policy slot
+//!    - Converted to a map during load
+//!
+//! 3. **Legacy Junos flat-map**: `{ "device-name": {...}, "_blocklist_defaults": {...} }`
+//!    - Flat map keyed by device name, optional `_blocklist_defaults` magic key
+//!    - The magic key is parsed into the policy slot and removed from devices
+//!
+//! All three normalize to the same internal representation: a name-indexed map
+//! of devices plus an optional policy payload.
 
 use crate::{Inventory, InventoryError, validate_device_name};
 use serde::Deserialize;
@@ -126,14 +143,31 @@ where
     }
 }
 
-/// Untagged enum detecting Junos flat-map vs PAN-OS versioned envelope.
+/// Untagged enum detecting canonical vs legacy schemas.
+///
+/// Discriminates three shapes:
+/// 1. Canonical: `{ "version": 1, "devices": {...}, "policy": {...} }` — map
+/// 2. Legacy PAN-OS: `{ "version": 1, "devices": [...] }` — array
+/// 3. Legacy Junos: flat map with optional `_blocklist_defaults` magic key
+///
+/// Ordering is critical: serde tries variants top to bottom, and the Junos
+/// flat-map will match anything if it comes before the versioned envelopes.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum RawInventory<D, P> {
-    /// PAN-OS: `{ "version": 1, "devices": [...] }` — must come first because
-    /// serde tries variants in order and the flat-map will match anything.
+    /// Canonical envelope: devices as a map, version required, policy optional.
+    /// Must come before PanosEnvelope because both have `version` + `devices`,
+    /// but this one's `devices` is an object while PAN-OS's is an array —
+    /// serde will try this first and fail if devices is not a map.
+    CanonicalEnvelope {
+        version: u32,
+        policy: Option<P>,
+        devices: HashMap<String, D>,
+    },
+    /// Legacy PAN-OS: `{ "version": 1, "devices": [...] }` — array of devices.
     PanosEnvelope { version: u32, devices: Vec<D> },
-    /// Junos: flat map with optional `_blocklist_defaults` magic key.
+    /// Legacy Junos: flat map with optional `_blocklist_defaults` magic key.
+    /// Must come last because it will match any JSON object.
     JunosFlat {
         #[serde(rename = "_blocklist_defaults")]
         policy: Option<P>,
@@ -150,7 +184,7 @@ trait HasName {
     fn name(&self) -> Option<&str>;
 }
 
-/// Parse both schemas and return (devices_map, global_policy).
+/// Parse all three schemas and return (devices_map, global_policy).
 fn parse_inventory<D, P>(bytes: &[u8]) -> Result<(HashMap<String, D>, Option<P>), InventoryError>
 where
     for<'de> D: Deserialize<'de> + serde::Serialize,
@@ -160,6 +194,21 @@ where
         serde_json::from_slice(bytes).map_err(|e| InventoryError::ParseError(e.to_string()))?;
 
     match raw {
+        RawInventory::CanonicalEnvelope {
+            version,
+            policy,
+            devices,
+        } => {
+            if version != 1 {
+                return Err(InventoryError::UnsupportedVersion(version));
+            }
+            // Validate all device names in the canonical envelope.
+            for name in devices.keys() {
+                validate_device_name(name)?;
+            }
+            // Canonical envelope accepts empty devices map (same as legacy Junos).
+            Ok((devices, policy))
+        }
         RawInventory::PanosEnvelope { version, devices } => {
             if version != 1 {
                 return Err(InventoryError::UnsupportedVersion(version));
@@ -187,6 +236,7 @@ where
                     return Err(InventoryError::DuplicateName(name));
                 }
             }
+            // Legacy PAN-OS has no policy slot.
             Ok((map, None))
         }
         RawInventory::JunosFlat { policy, devices } => {
@@ -195,6 +245,7 @@ where
             for name in devices.keys() {
                 validate_device_name(name)?;
             }
+            // Legacy Junos accepts empty map.
             Ok((devices, policy))
         }
     }

@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "devices": [
+    {
+      "name": "lab-fw-01",
+      "endpoint": "https://198.51.100.20",
+      "vsys": "vsys1",
+      "api_key": {
+        "type": "env",
+        "name": "PANOS_TEST_API_KEY"
+      }
+    }
+  ]
+}

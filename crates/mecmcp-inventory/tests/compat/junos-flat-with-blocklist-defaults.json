@@ -1,0 +1,19 @@
+{
+  "br1-fw": {
+    "ip": "198.51.100.10",
+    "port": 22,
+    "username": "netops",
+    "auth": {
+      "type": "ssh_key",
+      "private_key_path": "/etc/jmcp/test_key"
+    }
+  },
+  "_blocklist_defaults": {
+    "commands": [
+      "request system reboot"
+    ],
+    "config": [
+      "system root-authentication"
+    ]
+  }
+}
