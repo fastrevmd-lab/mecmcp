@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 mecmcp-audit = { version = "0.2.0", path = "../mecmcp-audit" }
+async-trait  = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true, features = ["preserve_order"] }
 sha2         = { workspace = true }
@@ -16,6 +17,11 @@ getrandom    = { workspace = true }
 tokio        = { version = "1", features = ["sync", "macros", "rt"] }
 tempfile     = { workspace = true }
 rustix       = { workspace = true }
+
+[dev-dependencies]
+hex = "0.4"
+thiserror = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true
