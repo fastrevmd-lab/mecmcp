@@ -58,8 +58,8 @@ impl ConcurrencyState {
             max_global: cfg.max_inflight_requests,
             per_token: Arc::new(DashMap::new()),
             max_per_token: cfg.max_inflight_requests_per_token,
-            per_target: TargetLimiter::new(cfg.max_inflight_requests_per_router),
-            max_per_target: cfg.max_inflight_requests_per_router,
+            per_target: TargetLimiter::new(cfg.max_inflight_requests_per_device),
+            max_per_target: cfg.max_inflight_requests_per_device,
             target_keys,
             sessions,
         }
@@ -338,10 +338,10 @@ mod tests {
 
     fn target_keys() -> Vec<String> {
         vec![
-            "router".to_owned(),
-            "router_name".to_owned(),
-            "routers".to_owned(),
-            "router_names".to_owned(),
+            "device".to_owned(),
+            "device_name".to_owned(),
+            "devices".to_owned(),
+            "device_names".to_owned(),
         ]
     }
 
@@ -372,7 +372,7 @@ mod tests {
         let cfg = LimitsConfig {
             max_inflight_requests: 0,
             max_inflight_requests_per_token: 0,
-            max_inflight_requests_per_router: 0,
+            max_inflight_requests_per_device: 0,
             max_sessions: 0,
             max_sessions_per_token: max,
             ..Default::default()
@@ -422,7 +422,7 @@ mod tests {
             &LimitsConfig {
                 max_inflight_requests: 0,
                 max_inflight_requests_per_token: 0,
-                max_inflight_requests_per_router: max_per_target,
+                max_inflight_requests_per_device: max_per_target,
                 max_sessions: 0,
                 ..Default::default()
             },
@@ -742,7 +742,7 @@ mod tests {
         let first_app = app.clone();
         let first = tokio::spawn(async move {
             first_app
-                .oneshot(tool_request(json!({"router": "r1"})))
+                .oneshot(tool_request(json!({"device": "r1"})))
                 .await
                 .unwrap()
         });
@@ -753,7 +753,7 @@ mod tests {
         let same = timeout(
             Duration::from_millis(200),
             app.clone()
-                .oneshot(tool_request(json!({"router_name": "r1"}))),
+                .oneshot(tool_request(json!({"device_name": "r1"}))),
         )
         .await
         .expect("same-target request queued instead of being shed")
@@ -777,7 +777,7 @@ mod tests {
         let other_app = app.clone();
         let other = tokio::spawn(async move {
             other_app
-                .oneshot(tool_request(json!({"router": "r2"})))
+                .oneshot(tool_request(json!({"device": "r2"})))
                 .await
                 .unwrap()
         });
@@ -808,21 +808,21 @@ mod tests {
 
         let first = app
             .clone()
-            .oneshot(tool_request(json!({"router": "r1"})))
+            .oneshot(tool_request(json!({"device": "r1"})))
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
 
         let shed = app
             .clone()
-            .oneshot(tool_request(json!({"router": "r1"})))
+            .oneshot(tool_request(json!({"device": "r1"})))
             .await
             .unwrap();
         assert_eq!(shed.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         drop(first);
         let admitted = app
-            .oneshot(tool_request(json!({"router": "r1"})))
+            .oneshot(tool_request(json!({"device": "r1"})))
             .await
             .unwrap();
         assert_eq!(admitted.status(), StatusCode::OK);
@@ -839,7 +839,7 @@ mod tests {
         let first_app = app.clone();
         let first = tokio::spawn(async move {
             first_app
-                .oneshot(tool_request(json!({"router": "r1"})))
+                .oneshot(tool_request(json!({"device": "r1"})))
                 .await
                 .unwrap()
         });
@@ -857,7 +857,7 @@ mod tests {
         let second_app = app.clone();
         let second = tokio::spawn(async move {
             second_app
-                .oneshot(tool_request(json!({"router": "r1"})))
+                .oneshot(tool_request(json!({"device": "r1"})))
                 .await
                 .unwrap()
         });
@@ -904,7 +904,7 @@ mod tests {
             max_request_body_bytes: 8,
             max_inflight_requests: 0,
             max_inflight_requests_per_token: 0,
-            max_inflight_requests_per_router: 1,
+            max_inflight_requests_per_device: 1,
             max_sessions: 0,
             ..Default::default()
         };

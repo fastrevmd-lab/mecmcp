@@ -26,7 +26,8 @@ pub struct TransportIdentity {
 
     /// Argument keys used to extract target device names from MCP request bodies.
     ///
-    /// Junos uses `["router", "router_name", "routers", "router_names"]`;
+    /// Junos uses `["device", "device_name", "devices", "device_names"]` (canonical)
+    /// or deprecated `["router", "router_name", "routers", "router_names"]`;
     /// PAN-OS uses `["device", "devices"]`.
     pub target_keys: Vec<String>,
 }
@@ -58,14 +59,14 @@ mod tests {
             "junosmcp",
             "junos",
             "rust-junosmcp",
-            ["router", "router_name", "routers", "router_names"],
+            ["device", "device_name", "devices", "device_names"],
         );
         assert_eq!(identity.metric_prefix, "junosmcp");
         assert_eq!(identity.server_label, "junos");
         assert_eq!(identity.bearer_realm, "rust-junosmcp");
         assert_eq!(
             identity.target_keys,
-            vec!["router", "router_name", "routers", "router_names"]
+            vec!["device", "device_name", "devices", "device_names"]
         );
     }
 

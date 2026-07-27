@@ -59,11 +59,15 @@ pub struct LimitsConfig {
     pub max_request_burst_per_token: u64,
     /// Max concurrent in-flight requests per target device. `0` disables.
     ///
-    /// This field's name preserves compatibility with deployed configurations
-    /// that use `max_inflight_requests_per_router`. Both spellings are
-    /// accepted via serde alias.
-    #[serde(alias = "max_inflight_requests_per_target")]
-    pub max_inflight_requests_per_router: usize,
+    /// The canonical field name is `max_inflight_requests_per_device` —
+    /// "device" is the vendor-neutral term. `max_inflight_requests_per_router`
+    /// and `max_inflight_requests_per_target` are accepted as aliases for
+    /// backward compatibility with deployed configurations.
+    #[serde(
+        alias = "max_inflight_requests_per_router",
+        alias = "max_inflight_requests_per_target"
+    )]
+    pub max_inflight_requests_per_device: usize,
     /// Max concurrent MCP sessions. `0` disables.
     pub max_sessions: usize,
     /// Max concurrent MCP sessions per bearer token. `0` disables.
@@ -84,7 +88,7 @@ impl Default for LimitsConfig {
             max_request_burst_per_ip: 0,
             max_requests_per_second_per_token: 0,
             max_request_burst_per_token: 0,
-            max_inflight_requests_per_router: 4,
+            max_inflight_requests_per_device: 4,
             max_sessions: 128,
             max_sessions_per_token: 16,
             session_idle_timeout_secs: 300,
@@ -94,6 +98,15 @@ impl Default for LimitsConfig {
 }
 
 impl LimitsConfig {
+    /// Deprecated accessor for backward compatibility. Use `max_inflight_requests_per_device` instead.
+    #[deprecated(
+        since = "0.2.0",
+        note = "renamed to max_inflight_requests_per_device; access the field directly or use the new name"
+    )]
+    pub fn max_inflight_requests_per_router(&self) -> usize {
+        self.max_inflight_requests_per_device
+    }
+
     /// Validate that configuration values are internally consistent.
     pub fn validate(&self) -> Result<(), LimitsConfigError> {
         let token_rate = self.max_requests_per_second_per_token;
@@ -148,7 +161,7 @@ impl LimitsConfig {
             max_request_burst_per_ip = self.max_request_burst_per_ip,
             max_requests_per_second_per_token = self.max_requests_per_second_per_token,
             max_request_burst_per_token = self.max_request_burst_per_token,
-            max_inflight_requests_per_router = self.max_inflight_requests_per_router,
+            max_inflight_requests_per_device = self.max_inflight_requests_per_device,
             max_sessions = self.max_sessions,
             max_sessions_per_token = self.max_sessions_per_token,
             session_idle_timeout_secs = self.session_idle_timeout_secs,
@@ -168,7 +181,7 @@ mod tests {
         assert_eq!(c.max_request_body_bytes, 10 * 1024 * 1024);
         assert_eq!(c.max_inflight_requests, 64);
         assert_eq!(c.max_inflight_requests_per_token, 16);
-        assert_eq!(c.max_inflight_requests_per_router, 4);
+        assert_eq!(c.max_inflight_requests_per_device, 4);
         assert_eq!(c.max_sessions, 128);
         assert_eq!(c.max_sessions_per_token, 16);
         assert_eq!(c.idle_timeout(), Some(Duration::from_secs(300)));
@@ -244,5 +257,67 @@ mod tests {
         };
         assert_eq!(enabled.validate(), Ok(()));
         assert!(enabled.ip_rate_limit_enabled());
+    }
+
+    #[test]
+    fn legacy_router_alias_deserializes_to_device_field() {
+        // Backward compatibility: deployed config files use max_inflight_requests_per_router
+        let json = r#"{
+            "max_request_body_bytes": 1000,
+            "max_inflight_requests": 10,
+            "max_inflight_requests_per_token": 5,
+            "max_requests_per_second_per_ip": 0,
+            "max_request_burst_per_ip": 0,
+            "max_requests_per_second_per_token": 0,
+            "max_request_burst_per_token": 0,
+            "max_inflight_requests_per_router": 3,
+            "max_sessions": 50,
+            "max_sessions_per_token": 10,
+            "session_idle_timeout_secs": 300,
+            "session_max_lifetime_secs": 3600
+        }"#;
+        let config: LimitsConfig = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(config.max_inflight_requests_per_device, 3);
+    }
+
+    #[test]
+    fn legacy_target_alias_deserializes_to_device_field() {
+        // Backward compatibility: some configs may use max_inflight_requests_per_target
+        let json = r#"{
+            "max_request_body_bytes": 1000,
+            "max_inflight_requests": 10,
+            "max_inflight_requests_per_token": 5,
+            "max_requests_per_second_per_ip": 0,
+            "max_request_burst_per_ip": 0,
+            "max_requests_per_second_per_token": 0,
+            "max_request_burst_per_token": 0,
+            "max_inflight_requests_per_target": 7,
+            "max_sessions": 50,
+            "max_sessions_per_token": 10,
+            "session_idle_timeout_secs": 300,
+            "session_max_lifetime_secs": 3600
+        }"#;
+        let config: LimitsConfig = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(config.max_inflight_requests_per_device, 7);
+    }
+
+    #[test]
+    fn canonical_device_name_deserializes() {
+        let json = r#"{
+            "max_request_body_bytes": 1000,
+            "max_inflight_requests": 10,
+            "max_inflight_requests_per_token": 5,
+            "max_requests_per_second_per_ip": 0,
+            "max_request_burst_per_ip": 0,
+            "max_requests_per_second_per_token": 0,
+            "max_request_burst_per_token": 0,
+            "max_inflight_requests_per_device": 4,
+            "max_sessions": 50,
+            "max_sessions_per_token": 10,
+            "session_idle_timeout_secs": 300,
+            "session_max_lifetime_secs": 3600
+        }"#;
+        let config: LimitsConfig = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(config.max_inflight_requests_per_device, 4);
     }
 }
