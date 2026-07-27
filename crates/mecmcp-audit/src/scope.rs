@@ -154,7 +154,7 @@ impl Drop for AuditScope {
         // client-asserted provider is indistinguishable from a token-verified
         // one by inspection, so inferring here would label a caller's claim as
         // server-verified (mecmcp#52).
-        let provenance_source = self.attribution.token_verified_fields;
+        let token_verified_fields = self.attribution.token_verified_fields;
 
         // Emit flat attribution fields.
         let model_id = self
@@ -206,7 +206,7 @@ impl Drop for AuditScope {
             request_id = %self.attribution.request_id,
             caller = %self.attribution.principal,
             actor_type = %actor_type,
-            provenance_source = %provenance_source,
+            token_verified_fields = %token_verified_fields,
             provider = %provider,
             provider_tier = %provider_tier,
             model_id = %model_id,
@@ -431,7 +431,7 @@ mod tests {
             a.succeed();
         });
         assert!(out.contains("actor_type=unknown"));
-        assert!(out.contains("provenance_source=none"));
+        assert!(out.contains("token_verified_fields=none"));
         // Agent fields should be present but empty when no provenance exists.
         assert!(out.contains("model_id="));
         assert!(out.contains("session_id="));
@@ -473,8 +473,8 @@ mod tests {
             a.succeed();
         });
         assert!(
-            out.contains("provenance_source=token"),
-            "token-verified provenance must emit provenance_source=token: {out}"
+            out.contains("token_verified_fields=actor_type,on_behalf_of,provider"),
+            "the audit event must name which fields the token bound: {out}"
         );
         assert!(
             out.contains("actor_type=agent"),

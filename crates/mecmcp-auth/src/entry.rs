@@ -192,6 +192,21 @@ impl<G: Grant> TokenEntry<G> {
         self.expires_at.is_some_and(|expiry| now >= expiry)
     }
 
+    /// The actor type this credential should be read as.
+    ///
+    /// A token carrying provider metadata but no explicit actor type is an
+    /// agent: nothing else has an LLM provider. Deriving it here rather than
+    /// demanding the operator restate it keeps the documented token shape from
+    /// issue #52 loadable, while `validate` still refuses the one combination
+    /// that contradicts itself.
+    #[must_use]
+    pub fn effective_actor_type(&self) -> ActorType {
+        if self.provider.is_some() && self.actor_type == ActorType::Unknown {
+            return ActorType::Agent;
+        }
+        self.actor_type
+    }
+
     /// Validate name, scopes, grant, and provenance.
     ///
     /// # Errors
@@ -247,10 +262,16 @@ impl<G: Grant> TokenEntry<G> {
         // produces a record that contradicts itself, and `Attribution::from_caller`
         // would build an agent identity for an actor typed as human. Reject the
         // combination rather than silently picking one side of it.
-        if self.provider.is_some() && self.actor_type != ActorType::Agent {
+        // Only an explicit contradiction is rejected. An untagged token carrying
+        // provider metadata is the shape issue #52 documents, and a hand-written
+        // tokens.json in that form must load — rejecting it would fail the whole
+        // store over a field the operator never had to state. `effective_actor_type`
+        // reads such a token as an agent, since nothing but an agent has an LLM
+        // provider.
+        if self.provider.is_some() && self.actor_type == ActorType::Human {
             return Err(EntryError::Invalid(format!(
-                "token '{}': provider metadata requires actor_type \"agent\", found {:?}",
-                self.name, self.actor_type
+                "token '{}': provider metadata contradicts actor_type \"human\"",
+                self.name
             )));
         }
         Ok(())
@@ -575,32 +596,58 @@ mod tests {
     }
 
     #[test]
-    fn provider_on_a_non_agent_token_fails_validation() {
+    fn provider_on_a_human_token_fails_validation() {
         // An LLM provider on a token typed as a human operator is a record that
         // contradicts itself, and would make from_caller build an agent identity
-        // for a human actor. Reject it rather than silently honouring one half.
-        for actor in ["human", "unknown"] {
-            let raw = format!(
-                r#"{{
-                    "name": "contradictory",
-                    "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
-                    "devices": ["*"],
-                    "tools": ["*"],
-                    "created_at_unix": 1783850400,
-                    "provider": "anthropic",
-                    "provider_tier": "public",
-                    "actor_type": "{actor}"
-                }}"#
-            );
-            let entry: TokenEntry = serde_json::from_str(&raw).expect("parse");
-            let err = entry
-                .validate()
-                .expect_err("provider on a non-agent token must be rejected")
-                .to_string();
-            assert!(
-                err.contains("requires actor_type"),
-                "actor_type {actor}: unexpected error {err}"
-            );
-        }
+        // for a human actor. Only this explicit contradiction is rejected.
+        let raw = r#"{
+            "name": "contradictory",
+            "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+            "devices": ["*"],
+            "tools": ["*"],
+            "created_at_unix": 1783850400,
+            "provider": "anthropic",
+            "provider_tier": "public",
+            "actor_type": "human"
+        }"#;
+        let entry: TokenEntry = serde_json::from_str(raw).expect("parse");
+        let err = entry
+            .validate()
+            .expect_err("provider on a human token must be rejected")
+            .to_string();
+        assert!(err.contains("contradicts"), "unexpected error {err}");
+    }
+
+    #[test]
+    fn provider_without_an_actor_type_loads_and_reads_as_agent() {
+        // This is the token shape issue #52 documents: provider and tier, no
+        // actor_type. A hand-written tokens.json in that form must load — the
+        // operator never had to state the actor type, and failing the whole
+        // store over it would be a footgun. Nothing but an agent has a provider,
+        // so it reads as one.
+        let raw = r#"{
+            "name": "claude-code-ops",
+            "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+            "devices": ["*"],
+            "tools": ["*"],
+            "created_at_unix": 1783850400,
+            "provider": "anthropic",
+            "provider_tier": "public",
+            "on_behalf_of": "fastrevmd@gmail.com"
+        }"#;
+        let entry: TokenEntry = serde_json::from_str(raw).expect("parse");
+        entry
+            .validate()
+            .expect("the documented token shape must load");
+        assert_eq!(
+            entry.actor_type,
+            ActorType::Unknown,
+            "stored value is untouched"
+        );
+        assert_eq!(
+            entry.effective_actor_type(),
+            ActorType::Agent,
+            "a provider-bearing token reads as an agent"
+        );
     }
 }

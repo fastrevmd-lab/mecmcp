@@ -135,7 +135,7 @@ impl<G: Grant> From<&TokenEntry<G>> for CallerCtx<G> {
             provider: entry.provider.clone(),
             provider_tier: entry.provider_tier,
             on_behalf_of: entry.on_behalf_of.clone(),
-            actor_type: entry.actor_type,
+            actor_type: entry.effective_actor_type(),
         }
     }
 }
