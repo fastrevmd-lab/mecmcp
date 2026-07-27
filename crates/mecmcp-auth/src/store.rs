@@ -115,6 +115,14 @@ pub struct CallerCtx<G: Grant = NoGrant> {
     pub tools: ScopeSet,
     /// Vendor-specific write authority, if any.
     pub grant: Option<G>,
+    /// Server-verified provider name, when the token declares one.
+    pub provider: Option<String>,
+    /// Server-verified provider tier, when the token declares one.
+    pub provider_tier: Option<crate::Tier>,
+    /// Server-verified human identity, when the token declares one.
+    pub on_behalf_of: Option<String>,
+    /// Server-verified actor type from the token entry.
+    pub actor_type: crate::ActorType,
 }
 
 impl<G: Grant> From<&TokenEntry<G>> for CallerCtx<G> {
@@ -124,6 +132,10 @@ impl<G: Grant> From<&TokenEntry<G>> for CallerCtx<G> {
             devices: entry.devices.clone(),
             tools: entry.tools.clone(),
             grant: entry.grant.clone(),
+            provider: entry.provider.clone(),
+            provider_tier: entry.provider_tier,
+            on_behalf_of: entry.on_behalf_of.clone(),
+            actor_type: entry.actor_type,
         }
     }
 }
@@ -238,6 +250,10 @@ mod tests {
             devices: ScopeSet::Allowlist(vec!["edge-fw".to_owned()]),
             tools: ScopeSet::Wildcard,
             grant: None,
+            provider: None,
+            provider_tier: None,
+            on_behalf_of: None,
+            actor_type: crate::ActorType::Human,
         };
         let visible =
             filter_device_names(Some(&ctx), vec!["edge-fw".to_owned(), "core-fw".to_owned()]);
@@ -260,6 +276,10 @@ mod tests {
             devices: ScopeSet::Allowlist(vec!["retired-fw".to_owned()]),
             tools: ScopeSet::Wildcard,
             grant: None,
+            provider: None,
+            provider_tier: None,
+            on_behalf_of: None,
+            actor_type: crate::ActorType::Human,
         };
         let visible = filter_device_names(Some(&ctx), vec!["edge-fw".to_owned()]);
         assert!(visible.is_empty());
@@ -274,6 +294,10 @@ mod tests {
             devices: ScopeSet::Wildcard,
             tools: ScopeSet::Wildcard,
             grant: None,
+            provider: None,
+            provider_tier: None,
+            on_behalf_of: None,
+            actor_type: crate::ActorType::Human,
         };
         let names = vec!["edge-fw".to_owned(), "core-fw".to_owned()];
         let visible = filter_device_names(Some(&ctx), names.clone());
