@@ -28,10 +28,13 @@ pub struct OperationRecord {
     /// Primary action target path (vendor-specific, optional).
     ///
     /// PAN-OS operations carry an XPath identifying the config tree node being mutated.
-    /// Junos operations have no analogous concept and omit this field.
-    /// The field name "xpath" is preserved for on-disk compatibility with the production
-    /// state file on LXC 608, but the Rust field name is vendor-neutral.
-    #[serde(rename = "xpath")]
+    /// Junos operations have no analogous concept and omit the field entirely — `None`
+    /// is skipped on serialization rather than written as `null`.
+    ///
+    /// The name is vendor-specific and deliberately so: it is the key already present in
+    /// the deployed state file, and D6 adopts that schema unchanged. Renaming the Rust
+    /// field while keeping the on-disk key was considered and rejected as a second name
+    /// for the same thing. Treat this as PAN-OS-only; nothing in this crate reads it.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub xpath: Option<String>,
