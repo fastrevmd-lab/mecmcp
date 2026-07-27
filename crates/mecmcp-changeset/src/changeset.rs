@@ -62,7 +62,7 @@ fn now_unix() -> Result<u64, CoordinatorError> {
 /// # Errors
 ///
 /// Returns an error if the system's random number generator is unavailable.
-fn new_operation_id() -> Result<String, CoordinatorError> {
+pub(crate) fn new_operation_id() -> Result<String, CoordinatorError> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|error| {
         CoordinatorError::new("operation_id", format!("RNG unavailable: {error}"))

@@ -11,6 +11,7 @@ pub mod changeset;
 pub mod coordinator;
 pub mod digest;
 pub mod lifecycle;
+pub mod operation;
 pub mod persistence;
 pub mod records;
 pub mod recovery;
@@ -20,6 +21,7 @@ pub mod types;
 pub use changeset::ChangeSetOutput;
 pub use coordinator::{ChangesetCoordinator, CoordinatorError};
 pub use lifecycle::{ChangeSetState, LifecycleState};
+pub use operation::StageOutput;
 pub use persistence::{ChangesetState, PersistenceError, read_state, validate_state, write_state};
 pub use records::{
     ApprovalRecord, ChangeSetRecord, OperationRecord, RecordError, WaiverRecord, change_set_digest,
