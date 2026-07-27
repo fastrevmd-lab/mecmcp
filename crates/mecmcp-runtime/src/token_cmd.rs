@@ -25,6 +25,10 @@ pub enum TokenCommandError {
         message: String,
     },
 
+    /// Invalid command argument.
+    #[error("{0}")]
+    InvalidArgument(String),
+
     /// I/O operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -61,15 +65,51 @@ pub fn run(
             name,
             devices,
             tools,
+            provider,
+            provider_tier,
+            on_behalf_of,
+            actor_type,
             server_pid,
         } => {
             let devices_scope = parse_scope(devices, "devices")?;
             let tools_scope = parse_scope(tools, "tools")?;
-            let secret = TokenStoreFile::<NoGrant>::add(
+
+            // Parse provider_tier if present
+            let parsed_tier = provider_tier
+                .as_ref()
+                .map(|s| match s.as_str() {
+                    "public" => Ok(mecmcp_auth::Tier::Public),
+                    "private" => Ok(mecmcp_auth::Tier::Private),
+                    other => Err(TokenCommandError::InvalidArgument(format!(
+                        "provider_tier must be 'public' or 'private', got '{other}'"
+                    ))),
+                })
+                .transpose()?;
+
+            // Parse actor_type if present
+            let parsed_actor = actor_type
+                .as_ref()
+                .map(|s| match s.as_str() {
+                    "human" => Ok(mecmcp_auth::ActorType::Human),
+                    "agent" => Ok(mecmcp_auth::ActorType::Agent),
+                    "unknown" => Ok(mecmcp_auth::ActorType::Unknown),
+                    other => Err(TokenCommandError::InvalidArgument(format!(
+                        "actor_type must be 'human', 'agent', or 'unknown', got '{other}'"
+                    ))),
+                })
+                .transpose()?;
+
+            let secret = TokenStoreFile::<NoGrant>::add_with_options(
                 &tokens_file,
                 &name,
                 devices_scope,
                 tools_scope,
+                None, // expires_at
+                None, // grant
+                provider.clone(),
+                parsed_tier,
+                on_behalf_of.clone(),
+                parsed_actor,
                 &known,
             )?;
             let mut out = std::io::stdout().lock();

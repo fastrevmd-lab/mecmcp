@@ -192,7 +192,7 @@ impl<G: Grant> TokenEntry<G> {
         self.expires_at.is_some_and(|expiry| now >= expiry)
     }
 
-    /// Validate name, scopes, and grant.
+    /// Validate name, scopes, grant, and provenance.
     ///
     /// # Errors
     /// Returns [`EntryError`] describing the first failing check.
@@ -225,6 +225,22 @@ impl<G: Grant> TokenEntry<G> {
                 name: self.name.clone(),
                 source,
             })?;
+        }
+        // Provider and provider_tier must both be present or both be absent.
+        match (&self.provider, &self.provider_tier) {
+            (Some(_), None) => {
+                return Err(EntryError::Invalid(format!(
+                    "token '{}': provider is set but provider_tier is missing",
+                    self.name
+                )));
+            }
+            (None, Some(_)) => {
+                return Err(EntryError::Invalid(format!(
+                    "token '{}': provider_tier is set but provider is missing",
+                    self.name
+                )));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -477,5 +493,72 @@ mod tests {
         let grant = entry.grant.as_ref().expect("grant present");
         assert!(grant.allows_subject("/a/b"));
         assert!(!grant.allows_subject("/a/c"));
+    }
+
+    #[test]
+    fn provider_without_tier_fails_validation() {
+        // Defect 4: a token declaring provider without provider_tier is invalid.
+        let raw = r#"{
+            "name": "incomplete",
+            "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+            "devices": ["*"],
+            "tools": ["*"],
+            "created_at_unix": 1783850400,
+            "provider": "anthropic"
+        }"#;
+        let entry: TokenEntry = serde_json::from_str(raw).expect("parse");
+        let result = entry.validate();
+        assert!(
+            result.is_err(),
+            "provider without provider_tier must fail validation"
+        );
+        let err = result.expect_err("validation should fail").to_string();
+        assert!(
+            err.contains("provider_tier is missing"),
+            "error message should mention missing provider_tier: {err}"
+        );
+    }
+
+    #[test]
+    fn provider_tier_without_provider_fails_validation() {
+        // Defect 4: a token declaring provider_tier without provider is invalid.
+        let raw = r#"{
+            "name": "incomplete",
+            "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+            "devices": ["*"],
+            "tools": ["*"],
+            "created_at_unix": 1783850400,
+            "provider_tier": "public"
+        }"#;
+        let entry: TokenEntry = serde_json::from_str(raw).expect("parse");
+        let result = entry.validate();
+        assert!(
+            result.is_err(),
+            "provider_tier without provider must fail validation"
+        );
+        let err = result.expect_err("validation should fail").to_string();
+        assert!(
+            err.contains("provider is missing"),
+            "error message should mention missing provider: {err}"
+        );
+    }
+
+    #[test]
+    fn complete_provider_pair_validates() {
+        // When both provider and provider_tier are present, validation succeeds.
+        let raw = r#"{
+            "name": "complete",
+            "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+            "devices": ["*"],
+            "tools": ["*"],
+            "created_at_unix": 1783850400,
+            "provider": "anthropic",
+            "provider_tier": "public"
+        }"#;
+        let entry: TokenEntry = serde_json::from_str(raw).expect("parse");
+        assert!(
+            entry.validate().is_ok(),
+            "complete provider pair should validate"
+        );
     }
 }

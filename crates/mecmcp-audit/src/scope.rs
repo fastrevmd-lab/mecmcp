@@ -154,7 +154,7 @@ impl Drop for AuditScope {
         // client-asserted provider is indistinguishable from a token-verified
         // one by inspection, so inferring here would label a caller's claim as
         // server-verified (mecmcp#52).
-        let provenance_source = self.attribution.provenance_source;
+        let provenance_source = self.attribution.token_verified_fields;
 
         // Emit flat attribution fields.
         let model_id = self

@@ -30,6 +30,10 @@ fn add_creates_token_and_returns_secret() {
         name: "alice".to_string(),
         devices: vec!["*".to_string()],
         tools: vec!["*".to_string()],
+        provider: None,
+        provider_tier: None,
+        on_behalf_of: None,
+        actor_type: None,
         server_pid: None,
     };
 
@@ -54,6 +58,10 @@ fn list_shows_token_metadata_not_secret() {
         name: "bob".to_string(),
         devices: vec!["device1".to_string()],
         tools: vec!["get_config".to_string()],
+        provider: None,
+        provider_tier: None,
+        on_behalf_of: None,
+        actor_type: None,
         server_pid: None,
     };
     run(add_action, &[], KNOWN_TOOLS).unwrap();
@@ -83,6 +91,10 @@ fn revoke_removes_token() {
         name: "charlie".to_string(),
         devices: vec!["*".to_string()],
         tools: vec!["*".to_string()],
+        provider: None,
+        provider_tier: None,
+        on_behalf_of: None,
+        actor_type: None,
         server_pid: None,
     };
     run(add_action, &[], KNOWN_TOOLS).unwrap();
@@ -111,6 +123,10 @@ fn rotate_changes_secret_preserves_scopes() {
         name: "diana".to_string(),
         devices: vec!["dev1".to_string(), "dev2".to_string()],
         tools: vec!["get_config".to_string()],
+        provider: None,
+        provider_tier: None,
+        on_behalf_of: None,
+        actor_type: None,
         server_pid: None,
     };
     run(add_action, &[], KNOWN_TOOLS).unwrap();
@@ -170,6 +186,10 @@ fn wildcard_mixed_with_names_rejected() {
         name: "evil".to_string(),
         devices: vec!["*".to_string(), "device1".to_string()],
         tools: vec!["*".to_string()],
+        provider: None,
+        provider_tier: None,
+        on_behalf_of: None,
+        actor_type: None,
         server_pid: None,
     };
 
@@ -193,6 +213,10 @@ fn unknown_tool_rejected() {
         name: "eve".to_string(),
         devices: vec!["*".to_string()],
         tools: vec!["no_such_tool".to_string()],
+        provider: None,
+        provider_tier: None,
+        on_behalf_of: None,
+        actor_type: None,
         server_pid: None,
     };
 
@@ -211,6 +235,10 @@ fn device_validation_when_known_devices_provided() {
         name: "frank".to_string(),
         devices: vec!["dev1".to_string()],
         tools: vec!["*".to_string()],
+        provider: None,
+        provider_tier: None,
+        on_behalf_of: None,
+        actor_type: None,
         server_pid: None,
     };
     assert!(run(valid_action, &known_devices, KNOWN_TOOLS).is_ok());
@@ -221,6 +249,10 @@ fn device_validation_when_known_devices_provided() {
         name: "george".to_string(),
         devices: vec!["unknown_dev".to_string()],
         tools: vec!["*".to_string()],
+        provider: None,
+        provider_tier: None,
+        on_behalf_of: None,
+        actor_type: None,
         server_pid: None,
     };
     assert!(run(invalid_action, &known_devices, KNOWN_TOOLS).is_err());
@@ -235,6 +267,10 @@ fn empty_device_scope_rejected() {
         name: "hannah".to_string(),
         devices: vec![],
         tools: vec!["*".to_string()],
+        provider: None,
+        provider_tier: None,
+        on_behalf_of: None,
+        actor_type: None,
         server_pid: None,
     };
 
@@ -257,6 +293,10 @@ fn empty_tool_scope_rejected() {
         name: "ivan".to_string(),
         devices: vec!["*".to_string()],
         tools: vec![],
+        provider: None,
+        provider_tier: None,
+        on_behalf_of: None,
+        actor_type: None,
         server_pid: None,
     };
 
@@ -285,6 +325,10 @@ fn signal_reload_with_valid_pid_succeeds() {
         name: "judy".to_string(),
         devices: vec!["*".to_string()],
         tools: vec!["*".to_string()],
+        provider: None,
+        provider_tier: None,
+        on_behalf_of: None,
+        actor_type: None,
         server_pid: Some(init_pid),
     };
 
@@ -315,6 +359,10 @@ fn signal_reload_with_invalid_pid_fails() {
         name: "kate".to_string(),
         devices: vec!["*".to_string()],
         tools: vec!["*".to_string()],
+        provider: None,
+        provider_tier: None,
+        on_behalf_of: None,
+        actor_type: None,
         server_pid: Some(0),
     };
 
@@ -332,6 +380,10 @@ fn signal_reload_on_non_unix_with_pid_fails() {
         name: "leo".to_string(),
         devices: vec!["*".to_string()],
         tools: vec!["*".to_string()],
+        provider: None,
+        provider_tier: None,
+        on_behalf_of: None,
+        actor_type: None,
         server_pid: Some(1234),
     };
 

@@ -61,29 +61,43 @@ impl fmt::Display for Tier {
 /// making committed changes traceable to the model and skills that generated
 /// them (SSDF provenance tracking, mecmcp#26).
 ///
+/// # Trust boundary
+///
+/// When present in an `Attribution`, the `provider` and `provider_tier` fields
+/// may be server-verified (sourced from the token entry) or client-asserted
+/// (relayed from the MCP caller). The other fields — `model_id`, `session_id`,
+/// `client_name`, `skills_used` — are ALWAYS client-asserted and can never be
+/// server-verified. The `Attribution::token_verified_fields` marker indicates
+/// whether the token-bound subset (`provider`, `provider_tier`) was read from
+/// the server's own token entry; it does NOT imply that the client-asserted
+/// fields are verified. An audit consumer must not treat `model_id` or
+/// `skills_used` as trustworthy solely because `token_verified_fields` is true.
+///
 /// # Skill naming constraint
 ///
 /// Skill names MUST NOT contain spaces — they are joined with a single space
 /// in the provenance string to maintain exactly 4 comma-separated fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentIdentity {
-    /// Model identifier (e.g. `"claude-sonnet-4-5"`).
+    /// Model identifier (e.g. `"claude-sonnet-4-5"`). ALWAYS client-asserted.
     pub model_id: String,
-    /// Agent session or run identifier.
+    /// Agent session or run identifier. ALWAYS client-asserted.
     pub session_id: String,
-    /// MCP client name or user-agent, if known.
+    /// MCP client name or user-agent, if known. ALWAYS client-asserted.
     pub client_name: Option<String>,
-    /// Provider name (e.g., "anthropic", "ollama"). Explicit data, not inferred.
+    /// Provider name (e.g., "anthropic", "ollama"). May be server-verified or
+    /// client-asserted; see `Attribution::token_verified_fields`.
     ///
     /// Defaults to `"unknown"` if absent (existing audit events without this field).
     #[serde(default = "default_provider")]
     pub provider: String,
-    /// Provider tier: public hosted vs. private/self-hosted.
+    /// Provider tier: public hosted vs. private/self-hosted. May be server-verified
+    /// or client-asserted; see `Attribution::token_verified_fields`.
     ///
     /// Defaults to `Public` if absent (existing audit events without this field).
     #[serde(default)]
     pub provider_tier: Tier,
-    /// Skills invoked during this action.
+    /// Skills invoked during this action. ALWAYS client-asserted.
     ///
     /// Defaults to an empty list (existing audit events without this field).
     #[serde(default)]
@@ -141,34 +155,50 @@ pub struct Attribution {
     pub change_ref: Option<String>,
     /// Per-request correlation ID.
     pub request_id: Uuid,
-    /// Where the provenance fields above came from.
+    /// Whether the token-bound provenance fields were server-verified.
     ///
-    /// This must be recorded, not inferred. `provider` and `actor_type` can be
+    /// This marker applies ONLY to the subset of fields that can be bound to
+    /// a server-side token entry: `actor_type`, `on_behalf_of`, and when
+    /// `agent` is present, its `provider` and `provider_tier`. It does NOT
+    /// cover `AgentIdentity`'s `model_id`, `session_id`, `client_name`, or
+    /// `skills_used` — those are ALWAYS client-asserted and can never be
+    /// server-verified.
+    ///
+    /// This must be recorded, not inferred. The token-bound fields can be
     /// populated either by the server from the token entry or by a call site
     /// relaying what the client claimed, and the resulting `Attribution` looks
     /// identical either way. An auditor reading the event needs to know which
     /// it was — that is the whole point of mecmcp#52 — so the fact is carried
     /// explicitly from the one place that knows it.
-    pub provenance_source: ProvenanceSource,
+    pub token_verified_fields: TokenVerifiedFields,
 }
 
-/// Whether an attribution's provenance was verified by the server or asserted.
+/// Whether the token-bound provenance fields were server-verified.
+///
+/// This marker indicates the trust status of ONLY the token-bound subset of
+/// an `Attribution`: `actor_type`, `on_behalf_of`, and when `agent` is present,
+/// its `provider` and `provider_tier`. It does NOT cover `AgentIdentity`'s
+/// client-asserted fields (`model_id`, `session_id`, `client_name`, `skills_used`),
+/// which are ALWAYS unverified regardless of this marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ProvenanceSource {
-    /// The server read the values from the token entry. The caller cannot forge them.
-    Token,
-    /// The values were supplied by the caller, or by a call site relaying a
+pub enum TokenVerifiedFields {
+    /// The server read the token-bound fields from the token entry. The caller
+    /// cannot forge them. This does NOT imply that `AgentIdentity`'s
+    /// client-asserted fields are verified.
+    #[serde(rename = "token")]
+    Verified,
+    /// The token-bound fields were supplied by the caller or relayed from a
     /// caller's claim. Treat them as unverified.
     Client,
-    /// No provenance was available from either source.
+    /// No token-bound provenance was available from either source.
     None,
 }
 
-impl fmt::Display for ProvenanceSource {
+impl fmt::Display for TokenVerifiedFields {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Token => write!(f, "token"),
+            Self::Verified => write!(f, "token"),
             Self::Client => write!(f, "client"),
             Self::None => write!(f, "none"),
         }
@@ -213,15 +243,22 @@ impl Attribution {
         };
 
         // The token entry is the server's own record, so anything it declared is
-        // verified by construction. A token that declared nothing gets `None` —
-        // never `Client`, because no claim was relayed here either.
-        let provenance_source = if ctx.provider.is_some()
-            || ctx.on_behalf_of.is_some()
-            || ctx.actor_type != mecmcp_auth::ActorType::Unknown
-        {
-            ProvenanceSource::Token
+        // verified by construction. Mark as verified only if at least one
+        // token-bound field was explicitly set (not defaulted). A token with
+        // provider requires provider_tier (enforced by validation), and both
+        // on_behalf_of and actor_type are Option/enum with no "implicit true".
+        // This prevents a freshly minted token with no provenance arguments from
+        // producing a `Verified` marker on the strength of defaults alone (defect #2).
+        let token_verified_fields = if ctx.provider.is_some() || ctx.on_behalf_of.is_some() {
+            // provider implies provider_tier (validated), on_behalf_of is explicit.
+            // Both are server-verified facts: the operator supplied them to token add.
+            TokenVerifiedFields::Verified
+        } else if ctx.actor_type != mecmcp_auth::ActorType::Unknown {
+            // actor_type was explicitly set (not defaulted to Unknown).
+            TokenVerifiedFields::Verified
         } else {
-            ProvenanceSource::None
+            // All token-bound fields are at their defaults; nothing was declared.
+            TokenVerifiedFields::None
         };
 
         Self {
@@ -231,7 +268,7 @@ impl Attribution {
             on_behalf_of: ctx.on_behalf_of.clone(),
             change_ref: None,
             request_id: Uuid::new_v4(),
-            provenance_source,
+            token_verified_fields,
         }
     }
 
@@ -250,7 +287,7 @@ impl Attribution {
             on_behalf_of: None,
             change_ref: None,
             request_id: Uuid::new_v4(),
-            provenance_source: ProvenanceSource::None,
+            token_verified_fields: TokenVerifiedFields::None,
         }
     }
 }
@@ -293,7 +330,7 @@ mod tests {
         // stdio path is at least as often an agent (a desktop MCP client) as a
         // human at a terminal, and recording either would be a guess.
         assert_eq!(a.actor_type, ActorType::Unknown);
-        assert_eq!(a.provenance_source, ProvenanceSource::None);
+        assert_eq!(a.token_verified_fields, TokenVerifiedFields::None);
         assert!(a.agent.is_none());
     }
 
@@ -571,5 +608,99 @@ mod tests {
             Some("alice@example.com"),
             "on_behalf_of can be set for human tokens too"
         );
+    }
+
+    #[test]
+    fn token_with_no_provenance_does_not_produce_verified_marker() {
+        // Defect 2: a token minted with no provenance arguments must NOT emit
+        // TokenVerifiedFields::Verified. The add path defaults actor_type to
+        // Unknown, and from_caller must not treat that default as server-verified.
+        let c: CallerCtx<NoGrant> = CallerCtx {
+            token_name: "automation".into(),
+            devices: ScopeSet::Wildcard,
+            tools: ScopeSet::Wildcard,
+            grant: None,
+            provider: None,
+            provider_tier: None,
+            on_behalf_of: None,
+            actor_type: mecmcp_auth::ActorType::Unknown, // defaulted, not explicit
+        };
+        let a = Attribution::from_caller(&c);
+        assert_eq!(a.actor_type, ActorType::Unknown);
+        assert_eq!(
+            a.token_verified_fields,
+            TokenVerifiedFields::None,
+            "a token with all defaults must NOT produce Verified"
+        );
+        assert!(a.agent.is_none());
+        assert!(a.on_behalf_of.is_none());
+    }
+
+    #[test]
+    fn token_with_explicit_actor_type_is_verified() {
+        // When actor_type is explicitly set (not defaulted), it's server-verified.
+        let c: CallerCtx<NoGrant> = CallerCtx {
+            token_name: "agent-token".into(),
+            devices: ScopeSet::Wildcard,
+            tools: ScopeSet::Wildcard,
+            grant: None,
+            provider: None,
+            provider_tier: None,
+            on_behalf_of: None,
+            actor_type: mecmcp_auth::ActorType::Agent, // explicit
+        };
+        let a = Attribution::from_caller(&c);
+        assert_eq!(a.actor_type, ActorType::Agent);
+        assert_eq!(
+            a.token_verified_fields,
+            TokenVerifiedFields::Verified,
+            "explicit actor_type should be verified"
+        );
+    }
+
+    #[test]
+    fn token_with_provider_is_verified() {
+        // When provider and provider_tier are set, they're server-verified.
+        let c: CallerCtx<NoGrant> = CallerCtx {
+            token_name: "agent-token".into(),
+            devices: ScopeSet::Wildcard,
+            tools: ScopeSet::Wildcard,
+            grant: None,
+            provider: Some("anthropic".into()),
+            provider_tier: Some(mecmcp_auth::Tier::Public),
+            on_behalf_of: None,
+            actor_type: mecmcp_auth::ActorType::Agent,
+        };
+        let a = Attribution::from_caller(&c);
+        assert_eq!(
+            a.token_verified_fields,
+            TokenVerifiedFields::Verified,
+            "provider and provider_tier should be verified"
+        );
+        let agent = a.agent.as_ref().expect("agent identity present");
+        assert_eq!(agent.provider, "anthropic");
+        assert_eq!(agent.provider_tier, Tier::Public);
+    }
+
+    #[test]
+    fn token_with_on_behalf_of_is_verified() {
+        // When on_behalf_of is set, it's server-verified.
+        let c: CallerCtx<NoGrant> = CallerCtx {
+            token_name: "delegated".into(),
+            devices: ScopeSet::Wildcard,
+            tools: ScopeSet::Wildcard,
+            grant: None,
+            provider: None,
+            provider_tier: None,
+            on_behalf_of: Some("alice@example.com".into()),
+            actor_type: mecmcp_auth::ActorType::Agent,
+        };
+        let a = Attribution::from_caller(&c);
+        assert_eq!(
+            a.token_verified_fields,
+            TokenVerifiedFields::Verified,
+            "on_behalf_of should be verified"
+        );
+        assert_eq!(a.on_behalf_of.as_deref(), Some("alice@example.com"));
     }
 }
