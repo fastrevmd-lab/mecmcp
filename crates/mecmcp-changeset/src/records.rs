@@ -99,20 +99,44 @@ pub struct ChangeSetRecord {
     pub operation_id: Option<String>,
 }
 
-/// Approval record stored on a change set after successful approval.
+/// Approval record stored on a change set after successful approval or waiver.
 ///
 /// This record makes the approval tamper-evident: the digest binds the approver
 /// to the plan digest, owner, and timestamp. Editing any of these fields in the
 /// state file invalidates the digest and causes validation to fail on load.
+///
+/// For waived approvals in lab mode, the `approver` field is absent and `waived`
+/// is present, making the record programmatically distinguishable from genuine
+/// two-person approvals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalRecord {
     /// Principal who approved this change set (must be distinct from owner).
-    pub approver: String,
-    /// Unix timestamp when the approval was granted.
+    ///
+    /// Present only for genuine two-person approvals; absent when waived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<String>,
+    /// Unix timestamp when the approval was granted or waived.
     pub approved_at_unix: u64,
-    /// Tamper-evident digest over `(change_set_id, plan_digest, owner, approver, approved_at)`.
+    /// Tamper-evident digest.
+    ///
+    /// For genuine approvals: `(change_set_id, plan_digest, owner, approver, approved_at)`.
+    /// For waived approvals: `(change_set_id, plan_digest, owner, approved_at, "lab-mode-waived")`.
     pub digest: String,
+    /// Waiver record, present only when approval was waived in lab mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waived: Option<WaiverRecord>,
+}
+
+/// Record of a waived approval in lab mode.
+///
+/// This explicitly documents that the approval was waived, making lab-mode
+/// records programmatically distinguishable from genuine two-person approvals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaiverRecord {
+    /// Reason for waiving approval.
+    pub reason: String,
 }
 
 /// Error type for record validation failures.

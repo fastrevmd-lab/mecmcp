@@ -202,13 +202,24 @@ pub fn validate_state(state: &ChangesetState) -> Result<(), PersistenceError> {
                 |error| PersistenceError::new(format!("approval digest invalid: {error}")),
             )?;
 
-            let expected_approval_digest = compute_approval_digest(
-                id,
-                &record.digest,
-                &record.owner,
-                &approval.approver,
-                approval.approved_at_unix,
-            );
+            let expected_approval_digest = if let Some(approver) = &approval.approver {
+                // Genuine two-person approval
+                compute_approval_digest(
+                    id,
+                    &record.digest,
+                    &record.owner,
+                    approver,
+                    approval.approved_at_unix,
+                )
+            } else {
+                // Waived approval in lab mode
+                compute_waived_approval_digest(
+                    id,
+                    &record.digest,
+                    &record.owner,
+                    approval.approved_at_unix,
+                )
+            };
 
             if expected_approval_digest != approval.digest {
                 return Err(PersistenceError::new(
@@ -336,6 +347,31 @@ fn compute_approval_digest(
     hasher.update(approver.as_bytes());
     hasher.update(b"|");
     hasher.update(approved_at_unix.to_string().as_bytes());
+
+    format!("sha256:{}", bytes_hex(&hasher.finalize()))
+}
+
+/// Computes a waiver digest for lab-mode approvals without a second principal.
+///
+/// The waiver digest covers `(change_set_id, plan_digest, owner, approved_at, "lab-mode-waived")`.
+/// The literal marker makes the digest fundamentally different from a genuine approval digest,
+/// preventing any confusion or masking of self-approval attempts.
+fn compute_waived_approval_digest(
+    change_set_id: &str,
+    plan_digest: &str,
+    owner: &str,
+    approved_at_unix: u64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(change_set_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(plan_digest.as_bytes());
+    hasher.update(b"|");
+    hasher.update(owner.as_bytes());
+    hasher.update(b"|");
+    hasher.update(approved_at_unix.to_string().as_bytes());
+    hasher.update(b"|");
+    hasher.update(b"lab-mode-waived");
 
     format!("sha256:{}", bytes_hex(&hasher.finalize()))
 }
