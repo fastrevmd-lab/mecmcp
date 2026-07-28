@@ -20,3 +20,5 @@ serde        = { workspace = true }
 serde_json   = { workspace = true }
 thiserror    = { workspace = true }
 
+[dev-dependencies]
+mecmcp-audit = { version = "0.3.6", path = "../mecmcp-audit", features = ["test-util"] }

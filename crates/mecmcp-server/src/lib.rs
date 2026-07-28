@@ -1,10 +1,12 @@
 //! Vendor-neutral adapters between `rmcp` handlers and the mecmcp foundations.
 
+mod audit;
 mod authorize;
 mod caller;
 mod result;
 mod tools;
 
+pub use audit::audit_scope;
 pub use authorize::{
     AuthorizationError, authorize_call, authorize_target, authorize_tool,
 };
