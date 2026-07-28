@@ -347,8 +347,8 @@ capability: **two-person change control on Junos**, which does not exist today.
 applied, and verified; an interrupted apply resolves through
 `resolve_persisted_operation` rather than leaving unknown state.
 
-**Junos half completed 2026-07-28**, released through `changeset-v0.3.3`. The
-PAN-OS half of the verification standard is still outstanding — see below. The
+**Completed 2026-07-28**, released through `changeset-v0.3.5`. Both halves of
+verification standard item 4 are met: Junos below, PAN-OS further down. The
 Junos exit criterion was demonstrated on a live vSRX 24.4R1.9 (`vsrx-ci`) from a
 throwaway container, LXC 610, built from merged `main`:
 
@@ -409,23 +409,37 @@ Since resolved:
   a client-supplied `owner` persisted instead.
 - The live vSRX half of the exit criterion, demonstrated above.
 
-Still outstanding:
+**PAN-OS half completed 2026-07-28**, on the live 12.1.5 lab firewall (`panosvm`,
+PA-VM, serial matching its pinned leaf certificate) from LXC 610 — not 608, which
+is `protected`, and whose credentials were not read.
 
-- **The PAN-OS half of verification standard item 4.** `rustpanosmcp` has not
-  been run against the 12.1.5 lab firewall on this code. Everything is staged
-  on LXC 610 — binary, unit on port 30032, leaf certificate pinned by SHA-256,
-  and `/root/finalize-panos.sh` — and it needs a PAN-OS API key plus the admin
-  username that key belongs to. The admin is not cosmetic: it scopes partial
-  commits and owns the config lock, so a wrong value fails confusingly at commit
-  time rather than at startup.
+The full criterion, in order: candidate fingerprint read from the device; change
+set planned by `panos-owner`; **apply refused while unapproved** (`change set
+requires independent approval before apply`); **self-approval refused at the
+transport** with `insufficient_scope`; approved by `panos-approver`; applied;
+validated (`Configuration is valid`, job 129686); committed and confirmed
+present in the **running** config; and the resulting operation resolved through
+`state resolve` to terminal `committed` with the lock released.
 
-  LXC 608 is `protected` with no standby, so it is not the deployment target and
-  its credentials were not read.
+The verification paid for itself three times over. Every finding below is a
+defect that live hardware exposed and the test suites could not:
 
-  Until that runs, Phase 5 is complete in code and merged, but **not verified to
-  the standard this document sets for every phase**. The Junos evidence does not
-  substitute: the two servers exercise different lock semantics and different
-  coordinator paths, which is exactly why the standard names both.
+- **rustpanosmcp#72** — restart recovery rewrote the state file after the
+  coordinator had loaded, so the API answered `indeterminate` while the file said
+  `staged` and the offline recovery tool refused. The operation was neither usable
+  nor resolvable, with its candidate and lock still held. Fixed by making the
+  policy a load-time parameter (`StagedRecovery`, `changeset-v0.3.5`) so one owner
+  writes both copies.
+- **rustpanosmcp#75** — PAN-OS releases the vsys config lock as part of
+  committing, so the server's explicit release afterwards fails with `not
+  currently locked` and marks the operation `Indeterminate`. **Every successful
+  commit** lands in the manual-recovery queue and blocks the next change set.
+- **rustpanosmcp#74** — a staged operation whose candidate drifts externally can
+  be neither discarded (fingerprint guard) nor resolved offline (not
+  indeterminate), and it blocks every later apply on that device.
+
+#75 in particular means the happy path is not yet operationally clean, even
+though the change-set semantics it exercises are correct.
 
 Findings worth carrying forward:
 
