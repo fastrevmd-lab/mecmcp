@@ -9,7 +9,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Recovery disposition for an indeterminate operation.
+/// Recovery disposition for an operation being resolved offline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryDisposition {
@@ -19,7 +19,7 @@ pub enum RecoveryDisposition {
     Discarded,
 }
 
-/// Output from resolving a persisted indeterminate operation.
+/// Output from resolving a persisted operation offline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedOperationOutput {
     /// Operation identifier.
@@ -36,11 +36,16 @@ pub struct ResolvedOperationOutput {
     pub details: Option<String>,
 }
 
-/// Resolve one persisted indeterminate operation after offline manual reconciliation.
+/// Resolve one persisted non-terminal operation after offline manual reconciliation.
 ///
 /// This function is designed to be called while the server is stopped, to repair state
-/// after a commit operation left an unknown outcome. The operator must have examined
-/// the device state and determined whether the commit succeeded or failed.
+/// after an operation was left unresolvable through the normal lifecycle. The operator
+/// must have examined the device and determined what is actually true there.
+///
+/// Two cases reach this: a commit that left an unknown outcome (`Indeterminate`), and
+/// an operation whose candidate was changed outside this server, which the fingerprint
+/// guard then correctly refuses to discard. Both leave a record that blocks the device,
+/// and both are settled by the same operator assertion.
 ///
 /// # Safety Gate
 ///
@@ -54,7 +59,9 @@ pub struct ResolvedOperationOutput {
 /// # Operation Requirements
 ///
 /// - The operation must exist in the persisted state
-/// - The operation must be in the [`LifecycleState::Indeterminate`] state
+/// - The operation must not already be terminal ([`LifecycleState::Committed`] or
+///   [`LifecycleState::Discarded`]); re-resolving a settled record could only
+///   overwrite a fact, not reconcile one
 /// - The state path must be absolute
 ///
 /// # State Changes
@@ -144,22 +151,46 @@ pub fn resolve_persisted_operation(
         .get_mut(operation_id)
         .ok_or_else(|| CoordinatorError::new("operation_id", "unknown persisted operation"))?;
 
-    // Must be in Indeterminate state
-    if record.state != LifecycleState::Indeterminate {
+    // Any non-terminal operation can be resolved, not only `Indeterminate`.
+    //
+    // The gate used to accept `Indeterminate` alone, on the reasoning that it is
+    // the only "unknown outcome" state. But being stuck is not unique to it: a
+    // `Staged` operation whose candidate was changed outside this server is
+    // equally unresolvable, because the fingerprint guard correctly refuses to
+    // discard against a candidate it no longer recognises and nothing else will
+    // clear the record. Since one unreconciled operation is allowed per endpoint,
+    // that record then blocks every later change on the device, and the only way
+    // out was editing the state file by hand (rustpanosmcp#74).
+    //
+    // What the operator is asserting is the same in both cases: "I have looked at
+    // the device and this is what is true." That assertion is what the exact
+    // confirmation string buys, and it is no less valid for a stuck `Staged`
+    // record than for an `Indeterminate` one.
+    //
+    // Terminal records are still refused. Re-resolving something already
+    // `Committed` or `Discarded` cannot be a reconciliation — it can only
+    // overwrite a settled fact.
+    if record.state.terminal() {
         return Err(CoordinatorError::new(
             "operation_id",
-            "only an indeterminate operation can be resolved offline",
+            format!(
+                "operation is already {}; a terminal operation cannot be resolved",
+                record.state.as_str()
+            ),
         ));
     }
 
-    // Update the record
+    // Update the record, recording which state was overridden. An operator
+    // reading this later needs to know the record was forced from `staged`
+    // rather than settled from a genuine unknown.
+    let previous = record.state.as_str().to_owned();
     record.state = match disposition {
         RecoveryDisposition::Committed => LifecycleState::Committed,
         RecoveryDisposition::Discarded => LifecycleState::Discarded,
     };
     record.config_lock_held = false;
     record.details = Some(format!(
-        "operator marked {word} after external device job/candidate/lock reconciliation"
+        "operator marked {word} from {previous} after external device job/candidate/lock reconciliation"
     ));
 
     // Build output before writing
