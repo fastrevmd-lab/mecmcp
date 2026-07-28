@@ -190,10 +190,6 @@ impl ChangesetCoordinator {
                 ));
             }
 
-            // Past this point the candidate may have been modified, whatever the
-            // outcome, so the record must survive for recovery.
-            device_touched = true;
-
             // P2-f: Persist lock-risk before the staging RPC. `device_touched` lives
             // only on the stack, so if the process dies after `stage()` takes the
             // device lock or changes the candidate, the persisted record still says
@@ -202,6 +198,15 @@ impl ChangesetCoordinator {
             // no lock is held when one may be. Persist the lock-risk now.
             record.config_lock_held = true;
             self.update(record.clone()).await?;
+
+            // Past this point the candidate may have been modified, whatever the
+            // outcome, so the record must survive for recovery. Set this AFTER the
+            // lock-risk persist succeeds: if the update fails before `transaction.stage()`
+            // is ever called, the error path should not treat the operation as unresolved.
+            // The failed update rolls back to the original `Staging` record, and without
+            // this flag being set correctly, that can leave an operation blocking the
+            // endpoint whose ID was never returned to any caller.
+            device_touched = true;
 
             // Stage the transaction
             let staged = transaction
@@ -287,6 +292,20 @@ impl ChangesetCoordinator {
 
         // Re-read the record after acquiring the guard
         let record = self.record(operation_id, owner, device).await?;
+
+        // Reject states that are no longer safely staged. A diff waiting behind a
+        // commit can read `Committing` or `Committed`, and since a successful commit
+        // often leaves the candidate fingerprint unchanged, the fingerprint guard
+        // passes and `transaction.diff` runs against stale state.
+        if !matches!(
+            record.state,
+            LifecycleState::Staged | LifecycleState::Validated | LifecycleState::Failed
+        ) {
+            return Err(CoordinatorError::new(
+                "operation_id",
+                "operation is no longer in a state where diff is meaningful",
+            ));
+        }
 
         // Validate fingerprint
         let actual_fp = transaction
@@ -589,6 +608,14 @@ impl ChangesetCoordinator {
         // Acquire device guard
         let _guard = self.device_guard(&record.endpoint, cancellation).await?;
 
+        // Re-check cancellation after acquiring the guard. If cancellation fires while
+        // waiting and the endpoint lock becomes free at the same moment, the guard can
+        // take the ready-lock branch. Without this re-check, the method proceeds to a
+        // destructive rollback despite being cancelled.
+        if cancellation.is_cancelled() {
+            return Err(CoordinatorError::new("device", "operation cancelled"));
+        }
+
         // P1-a-discard: Re-read state after acquiring the guard. Discard reads a
         // `Validated` record, then waits behind `commit_operation`. The commit
         // persists `Committed`; discard proceeds with its stale record, and because
@@ -620,6 +647,17 @@ impl ChangesetCoordinator {
 
         require_operation_fingerprint(&record, expected_fingerprint, &actual_fp)
             .map_err(|e| CoordinatorError::new(e.field(), e.message().to_owned()))?;
+
+        // Persist an in-flight state before issuing the rollback RPC. If the process
+        // exits after the rollback request reaches the device but before the await
+        // returns, the persisted record would still be `Staged`, `Validated`, or
+        // `Failed`. Restart recovery ignores those states — and if the revert actually
+        // succeeded, the changed candidate fingerprint blocks any retry of discard, so
+        // the operation and a possibly-held lock have no route to recovery. Persist an
+        // in-progress record BEFORE the rollback call, then settle it afterwards.
+        record.state = LifecycleState::Indeterminate;
+        record.details = Some("rollback in progress".to_owned());
+        self.update(record.clone()).await?;
 
         // Rollback the candidate
         let rollback_result = transaction.rollback(RollbackRef::CandidateRevert).await;
