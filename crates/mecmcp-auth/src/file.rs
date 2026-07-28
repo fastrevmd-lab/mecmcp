@@ -497,6 +497,24 @@ pub fn write_atomic<G: Grant + serde::Serialize>(
         path: path.to_path_buf(),
         source,
     })?;
+    // Preserve the destination's owner across the replacement.
+    //
+    // The atomic write replaces the file, so without this the new file is owned
+    // by whoever ran the command. An operator minting a token as root — which is
+    // exactly what the install instructions tell them to do — would hand the
+    // service a tokens.json it cannot read, and the server then refuses to start
+    // with a permission error that does not name ownership as the cause. It is
+    // on the first-run path of every deployment.
+    //
+    // Best-effort by design: if the destination does not exist there is nothing
+    // to preserve, and if we lack the privilege to chown we are almost certainly
+    // already running as the owning user, so the file is correct anyway.
+    #[cfg(unix)]
+    if let Ok(existing) = std::fs::metadata(path) {
+        use std::os::unix::fs::MetadataExt;
+        let _ = std::os::unix::fs::chown(temp.path(), Some(existing.uid()), Some(existing.gid()));
+    }
+
     temp.persist(path).map_err(|error| FileError::Io {
         path: path.to_path_buf(),
         source: error.error,
