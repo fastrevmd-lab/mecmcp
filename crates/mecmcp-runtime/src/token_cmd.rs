@@ -34,6 +34,91 @@ pub enum TokenCommandError {
     Io(#[from] std::io::Error),
 }
 
+/// The four `token add` provenance flags, parsed and reconciled.
+///
+/// Ready to hand straight to `TokenStoreFile::add_with_options`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provenance {
+    /// Provider name, passed through unchanged.
+    pub provider: Option<String>,
+    /// Parsed provider tier.
+    pub provider_tier: Option<mecmcp_auth::Tier>,
+    /// The human on whose behalf the credential acts, passed through unchanged.
+    pub on_behalf_of: Option<String>,
+    /// Actor type, derived from `provider` when the caller omitted it.
+    pub actor_type: Option<mecmcp_auth::ActorType>,
+}
+
+/// Parse and reconcile the provenance flags accepted by `token add`.
+///
+/// Consumers that cannot route through [`run`] — because they carry extra
+/// fields such as mutation grants or expiry — call this directly so the
+/// reconciliation rules live in exactly one place. Duplicating them per server
+/// is how the two servers drift apart on what a token means.
+///
+/// # Errors
+///
+/// Returns [`TokenCommandError::InvalidArgument`] if a tier or actor type is
+/// unrecognised, or if `--actor-type unknown` is combined with `--provider`.
+pub fn parse_provenance(
+    provider: Option<String>,
+    provider_tier: Option<String>,
+    on_behalf_of: Option<String>,
+    actor_type: Option<String>,
+) -> Result<Provenance, TokenCommandError> {
+    let parsed_tier = provider_tier
+        .as_ref()
+        .map(|s| match s.as_str() {
+            "public" => Ok(mecmcp_auth::Tier::Public),
+            "private" => Ok(mecmcp_auth::Tier::Private),
+            other => Err(TokenCommandError::InvalidArgument(format!(
+                "provider_tier must be 'public' or 'private', got '{other}'"
+            ))),
+        })
+        .transpose()?;
+
+    let parsed_actor = actor_type
+        .as_ref()
+        .map(|s| match s.as_str() {
+            "human" => Ok(mecmcp_auth::ActorType::Human),
+            "agent" => Ok(mecmcp_auth::ActorType::Agent),
+            "unknown" => Ok(mecmcp_auth::ActorType::Unknown),
+            other => Err(TokenCommandError::InvalidArgument(format!(
+                "actor_type must be 'human', 'agent', or 'unknown', got '{other}'"
+            ))),
+        })
+        .transpose()?;
+
+    // Declaring an LLM provider is only meaningful for an agent, and a token
+    // entry carrying provider metadata with any other actor type is rejected at
+    // validation. Derive it rather than making the operator pass --actor-type
+    // agent to satisfy a rule they cannot see, but never override an actor type
+    // they stated explicitly.
+    let parsed_actor = match (parsed_actor, provider.as_ref()) {
+        (None, Some(_)) => Some(mecmcp_auth::ActorType::Agent),
+        // Here — and only here — an omitted flag is distinguishable from an
+        // explicit `unknown`. On disk both deserialize to `Unknown`, so silently
+        // deriving `Agent` would override a choice the operator actually made.
+        // Refuse instead of guessing.
+        (Some(mecmcp_auth::ActorType::Unknown), Some(_)) => {
+            return Err(TokenCommandError::InvalidArgument(
+                "--actor-type unknown cannot be combined with --provider: a provider \
+                 belongs to an agent. Pass --actor-type agent, or omit the flag to have \
+                 it derived."
+                    .to_owned(),
+            ));
+        }
+        (existing, _) => existing,
+    };
+
+    Ok(Provenance {
+        provider,
+        provider_tier: parsed_tier,
+        on_behalf_of,
+        actor_type: parsed_actor,
+    })
+}
+
 /// Execute a token management command.
 ///
 /// # Arguments
@@ -74,52 +159,7 @@ pub fn run(
             let devices_scope = parse_scope(devices, "devices")?;
             let tools_scope = parse_scope(tools, "tools")?;
 
-            // Parse provider_tier if present
-            let parsed_tier = provider_tier
-                .as_ref()
-                .map(|s| match s.as_str() {
-                    "public" => Ok(mecmcp_auth::Tier::Public),
-                    "private" => Ok(mecmcp_auth::Tier::Private),
-                    other => Err(TokenCommandError::InvalidArgument(format!(
-                        "provider_tier must be 'public' or 'private', got '{other}'"
-                    ))),
-                })
-                .transpose()?;
-
-            // Parse actor_type if present
-            let parsed_actor = actor_type
-                .as_ref()
-                .map(|s| match s.as_str() {
-                    "human" => Ok(mecmcp_auth::ActorType::Human),
-                    "agent" => Ok(mecmcp_auth::ActorType::Agent),
-                    "unknown" => Ok(mecmcp_auth::ActorType::Unknown),
-                    other => Err(TokenCommandError::InvalidArgument(format!(
-                        "actor_type must be 'human', 'agent', or 'unknown', got '{other}'"
-                    ))),
-                })
-                .transpose()?;
-
-            // Declaring an LLM provider is only meaningful for an agent, and a
-            // token entry carrying provider metadata with any other actor type is
-            // rejected at validation. Derive it rather than making the operator
-            // pass --actor-type agent to satisfy a rule they cannot see, but never
-            // override an actor type they stated explicitly.
-            let parsed_actor = match (parsed_actor, provider.as_ref()) {
-                (None, Some(_)) => Some(mecmcp_auth::ActorType::Agent),
-                // Here — and only here — an omitted flag is distinguishable from
-                // an explicit `unknown`. On disk both deserialize to `Unknown`,
-                // so silently deriving `Agent` would override a choice the
-                // operator actually made. Refuse instead of guessing.
-                (Some(mecmcp_auth::ActorType::Unknown), Some(_)) => {
-                    return Err(TokenCommandError::InvalidArgument(
-                        "--actor-type unknown cannot be combined with --provider: a provider \
-                         belongs to an agent. Pass --actor-type agent, or omit the flag to have \
-                         it derived."
-                            .to_owned(),
-                    ));
-                }
-                (existing, _) => existing,
-            };
+            let provenance = parse_provenance(provider, provider_tier, on_behalf_of, actor_type)?;
 
             let secret = TokenStoreFile::<NoGrant>::add_with_options(
                 &tokens_file,
@@ -128,10 +168,10 @@ pub fn run(
                 tools_scope,
                 None, // expires_at
                 None, // grant
-                provider.clone(),
-                parsed_tier,
-                on_behalf_of.clone(),
-                parsed_actor,
+                provenance.provider,
+                provenance.provider_tier,
+                provenance.on_behalf_of,
+                provenance.actor_type,
                 &known,
             )?;
             let mut out = std::io::stdout().lock();
@@ -263,6 +303,69 @@ fn signal_reload(pid: Option<i32>) -> Result<(), TokenCommandError> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provenance_derives_agent_from_a_provider() {
+        let parsed = parse_provenance(
+            Some("anthropic".to_owned()),
+            Some("private".to_owned()),
+            Some("mharman".to_owned()),
+            None,
+        )
+        .expect("valid provenance");
+
+        assert_eq!(parsed.provider_tier, Some(mecmcp_auth::Tier::Private));
+        assert_eq!(
+            parsed.actor_type,
+            Some(mecmcp_auth::ActorType::Agent),
+            "a provider implies an agent, so the operator should not have to say so"
+        );
+    }
+
+    #[test]
+    fn provenance_preserves_an_explicit_actor_type() {
+        let parsed = parse_provenance(
+            None,
+            None,
+            Some("reviewer".to_owned()),
+            Some("human".to_owned()),
+        )
+        .expect("valid provenance");
+
+        assert_eq!(parsed.actor_type, Some(mecmcp_auth::ActorType::Human));
+        assert_eq!(parsed.provider, None);
+    }
+
+    #[test]
+    fn provenance_refuses_unknown_actor_type_with_a_provider() {
+        // `unknown` and an omitted flag both deserialize to `Unknown` on disk,
+        // so deriving `Agent` here would silently overwrite a stated choice.
+        let err = parse_provenance(
+            Some("anthropic".to_owned()),
+            Some("private".to_owned()),
+            None,
+            Some("unknown".to_owned()),
+        )
+        .expect_err("unknown + provider must be refused");
+
+        assert!(
+            matches!(err, TokenCommandError::InvalidArgument(ref m) if m.contains("--actor-type agent")),
+            "the error should name the fix, got: {err}"
+        );
+    }
+
+    #[test]
+    fn provenance_rejects_an_unrecognised_tier() {
+        let err = parse_provenance(
+            Some("anthropic".to_owned()),
+            Some("secret".to_owned()),
+            None,
+            None,
+        )
+        .expect_err("an unrecognised tier must be refused");
+
+        assert!(matches!(err, TokenCommandError::InvalidArgument(ref m) if m.contains("public")));
+    }
 
     #[test]
     fn wildcard_is_exclusive() {
