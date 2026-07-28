@@ -231,7 +231,7 @@ impl ChangesetCoordinator {
     ///
     /// Returns an error if:
     /// - The operation store is full after evicting terminal records
-    /// - The endpoint already has an active or unreconciled operation
+    /// - The device already has an active or unreconciled operation
     /// - Persistence fails
     pub async fn insert(&self, record: OperationRecord) -> Result<(), CoordinatorError> {
         let mut state = self.state.lock().await;
@@ -250,15 +250,16 @@ impl ChangesetCoordinator {
             ));
         }
 
-        // Enforce one active operation per endpoint
+        // Enforce one active operation per device (keyed on trusted device name,
+        // not endpoint, because a device can have multiple valid addresses).
         if state
             .operations
             .values()
-            .any(|existing| existing.endpoint == record.endpoint && !existing.state.terminal())
+            .any(|existing| existing.device == record.device && !existing.state.terminal())
         {
             return Err(CoordinatorError::new(
                 "operation_id",
-                "the endpoint already has an active or unreconciled operation",
+                "the device already has an active or unreconciled operation",
             ));
         }
 

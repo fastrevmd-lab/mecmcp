@@ -107,6 +107,7 @@ impl ChangesetCoordinator {
         endpoint: &str,
         transaction: &T,
         actions: &[T::Action],
+        primary_action_discriminator: &str,
         policy_signature: &str,
         cancellation: &CancellationToken,
     ) -> Result<StageOutput<T::Staged>, CoordinatorError> {
@@ -118,12 +119,12 @@ impl ChangesetCoordinator {
             ));
         }
 
-        // Canonicalize endpoint before using it as the device guard key.
-        // This ensures `https://host` and `https://host/` map to the same guard.
+        // Canonicalize and validate the endpoint
         let canonical_endpoint = canonicalize_endpoint(endpoint)?;
 
-        // Acquire device guard
-        let _guard = self.device_guard(&canonical_endpoint, cancellation).await?;
+        // Acquire device guard keyed on device name. Two valid addresses for one device
+        // (e.g., management IP and DNS name) would otherwise take different locks.
+        let _guard = self.device_guard(device, cancellation).await?;
 
         if cancellation.is_cancelled() {
             return Err(CoordinatorError::new("device", "operation cancelled"));
@@ -144,8 +145,7 @@ impl ChangesetCoordinator {
             owner: owner.to_owned(),
             device: device.to_owned(),
             endpoint: canonical_endpoint.clone(),
-            action: serde_json::to_value(&actions[0])
-                .map_err(|e| CoordinatorError::new("actions", e.to_string()))?,
+            action: serde_json::Value::String(primary_action_discriminator.to_owned()),
             xpath: None,
             actions: actions
                 .iter()
@@ -230,7 +230,22 @@ impl ChangesetCoordinator {
                 record.current = after_fp.clone();
                 record.state = LifecycleState::Staged;
                 record.config_lock_held = true; // Assume lock held after successful stage
-                self.update(record).await?;
+
+                // If persistence fails after stage() succeeded, the device has been modified
+                // and possibly locked, but the final state update fails. Keep the operation
+                // as Indeterminate rather than dropping it or leaving a stale Staging record.
+                if let Err(persist_error) = self.update(record.clone()).await {
+                    // Persist as Indeterminate with the pre-stage fingerprint and lock held.
+                    // This ensures recovery can find and reconcile the operation.
+                    record.state = LifecycleState::Indeterminate;
+                    record.current = expected_fingerprint.to_owned(); // Restore pre-stage fingerprint
+                    record.details = Some(format!(
+                        "staging succeeded but final persistence failed: {persist_error}"
+                    ));
+                    record.config_lock_held = true;
+                    let _ = self.update(record).await; // Best-effort
+                    return Err(persist_error);
+                }
 
                 Ok(StageOutput {
                     operation_id,
@@ -249,7 +264,10 @@ impl ChangesetCoordinator {
                 ));
                 record.config_lock_held = true;
                 let _ = self.update(record).await; // Persist best-effort
-                Err(error)
+                Err(CoordinatorError::new(
+                    "transaction",
+                    format!("{error} (operation {operation_id} requires manual reconciliation)"),
+                ))
             }
             Err(error) => {
                 // Nothing reached the device — a fingerprint read that failed, or
@@ -288,7 +306,7 @@ impl ChangesetCoordinator {
         let record = self.record(operation_id, owner, device).await?;
 
         // Acquire device guard to serialize with commit and validation
-        let _guard = self.device_guard(&record.endpoint, cancellation).await?;
+        let _guard = self.device_guard(&record.device, cancellation).await?;
 
         // Re-read the record after acquiring the guard
         let record = self.record(operation_id, owner, device).await?;
@@ -359,7 +377,7 @@ impl ChangesetCoordinator {
         }
 
         // Acquire device guard
-        let _guard = self.device_guard(&record.endpoint, cancellation).await?;
+        let _guard = self.device_guard(&record.device, cancellation).await?;
 
         // P1-b-validate: Re-read state after acquiring guard. Two validations starting
         // from `Staged` both pass the pre-lock check; the second uses its stale record
@@ -438,7 +456,15 @@ impl ChangesetCoordinator {
     ) -> Result<CommitOutcome, CoordinatorError> {
         // P1-e: Acquire guard before reading record to prevent concurrent commits
         let record = self.record(operation_id, owner, device).await?;
-        let _guard = self.device_guard(&record.endpoint, cancellation).await?;
+        let _guard = self.device_guard(&record.device, cancellation).await?;
+
+        // Re-check cancellation after acquiring the guard. If cancellation fires while
+        // waiting and the endpoint lock becomes free at the same moment, the guard can
+        // take the ready-lock branch. Without this re-check, the commit RPC may be sent
+        // despite being cancelled.
+        if cancellation.is_cancelled() {
+            return Err(CoordinatorError::new("device", "operation cancelled"));
+        }
 
         // Re-check state after acquiring guard
         let mut record = self.record(operation_id, owner, device).await?;
@@ -606,7 +632,7 @@ impl ChangesetCoordinator {
         }
 
         // Acquire device guard
-        let _guard = self.device_guard(&record.endpoint, cancellation).await?;
+        let _guard = self.device_guard(&record.device, cancellation).await?;
 
         // Re-check cancellation after acquiring the guard. If cancellation fires while
         // waiting and the endpoint lock becomes free at the same moment, the guard can
@@ -723,6 +749,12 @@ impl ChangesetCoordinator {
                      so the configuration lock state is unchanged"
                         .to_owned(),
                 );
+                // Persist the unresolved state before returning error
+                self.update(record).await?;
+                return Err(CoordinatorError::new(
+                    "transaction",
+                    "candidate reverted but the configuration lock state could not be verified; manual reconciliation required",
+                ));
             }
             Err(error) => {
                 // The revert landed but the unlock did not. That is not a clean

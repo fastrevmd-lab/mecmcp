@@ -286,6 +286,7 @@ async fn test_version_2_written_when_new_fields_present() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             "policy123",
             &CancellationToken::new(),
         )
@@ -363,6 +364,7 @@ async fn test_canonicalized_endpoints_share_guard() {
             "https://device.example.com/",
             &transaction,
             &actions,
+            "set",
             "policy123",
             &CancellationToken::new(),
         )
@@ -378,6 +380,7 @@ async fn test_canonicalized_endpoints_share_guard() {
             "https://device.example.com",
             &transaction,
             &actions,
+            "set",
             "policy123",
             &CancellationToken::new(),
         )
@@ -433,14 +436,15 @@ async fn test_discard_stays_indeterminate_until_unlock() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             "policy123",
             &CancellationToken::new(),
         )
         .await
         .unwrap();
 
-    // Discard the operation
-    coordinator
+    // Discard the operation - should fail because unlock is unsupported (Round 5 Finding 4)
+    let result = coordinator
         .discard_operation(
             &output.operation_id,
             "device1",
@@ -449,8 +453,17 @@ async fn test_discard_stays_indeterminate_until_unlock() {
             &transaction,
             &CancellationToken::new(),
         )
-        .await
-        .unwrap();
+        .await;
+
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("configuration lock state could not be verified"),
+        "Expected lock verification error, got: {}",
+        error
+    );
 
     // Verify the record is Indeterminate, not Discarded
     let record = coordinator
@@ -503,6 +516,7 @@ async fn test_discard_becomes_terminal_when_unlock_released() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             "policy123",
             &CancellationToken::new(),
         )
@@ -570,6 +584,7 @@ async fn test_rollback_error_becomes_indeterminate() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             "policy123",
             &CancellationToken::new(),
         )
@@ -643,6 +658,7 @@ async fn test_diff_serializes_with_commit() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             "policy123",
             &CancellationToken::new(),
         )

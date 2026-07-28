@@ -82,8 +82,10 @@ pub struct OperationRecord {
 /// unresolved operation tomorrow morning.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedAttribution {
-    /// Rendered principal — a token name, or the unauthenticated marker.
-    pub principal: String,
+    /// Principal variant and value. Stores the discriminator so the audit record
+    /// can distinguish an authenticated token from an unauthenticated request,
+    /// even when both render to the same string (e.g., a token named "stdio").
+    pub principal: PersistedPrincipal,
     /// Whether the actor was a human, an agent, or undeclared.
     pub actor_type: String,
     /// The human the actor was acting for, when the credential declared one.
@@ -100,6 +102,20 @@ pub struct PersistedAttribution {
     /// this field existed have no agent identity, and must still load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<PersistedAgentIdentity>,
+}
+
+/// Durable projection of [`mecmcp_audit::Principal`].
+///
+/// Preserves the discriminator so an audit record can distinguish
+/// `Principal::Token("stdio")` from `Principal::Unauthenticated` (both render
+/// to "stdio", but only one is an authenticated credential).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "type", content = "value")]
+pub enum PersistedPrincipal {
+    /// Authenticated bearer token, identified by name.
+    Token(String),
+    /// Unauthenticated request (stdio or local socket with no auth).
+    Unauthenticated,
 }
 
 /// Durable projection of `mecmcp_audit::AgentIdentity`.
@@ -123,7 +139,10 @@ pub struct PersistedAgentIdentity {
 impl From<&mecmcp_audit::Attribution> for PersistedAttribution {
     fn from(attribution: &mecmcp_audit::Attribution) -> Self {
         Self {
-            principal: attribution.principal.to_string(),
+            principal: match &attribution.principal {
+                mecmcp_audit::Principal::Token(name) => PersistedPrincipal::Token(name.clone()),
+                mecmcp_audit::Principal::Unauthenticated => PersistedPrincipal::Unauthenticated,
+            },
             // Rendered via Debug so a new actor-type variant lands here as its
             // own name rather than being silently folded into an existing one.
             actor_type: format!("{:?}", attribution.actor_type).to_lowercase(),

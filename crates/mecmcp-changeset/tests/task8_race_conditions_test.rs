@@ -356,6 +356,7 @@ async fn p1_issue1_discard_rereads_after_guard() {
             TEST_ENDPOINT,
             &*transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
@@ -471,6 +472,7 @@ async fn p1_issue2_validate_rereads_after_guard() {
             TEST_ENDPOINT,
             &*transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
@@ -569,6 +571,7 @@ async fn p1_issue3_discard_persists_before_unlock() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
@@ -643,6 +646,7 @@ async fn p1_issue4_unsupported_unlock_becomes_indeterminate() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
@@ -657,8 +661,8 @@ async fn p1_issue4_unsupported_unlock_becomes_indeterminate() {
     record.state = LifecycleState::Failed;
     coordinator.update(record).await.unwrap();
 
-    // Discard
-    coordinator
+    // Discard - should fail because unlock is unsupported (Round 5 Finding 4)
+    let result = coordinator
         .discard_operation(
             &stage_output.operation_id,
             device,
@@ -667,8 +671,17 @@ async fn p1_issue4_unsupported_unlock_becomes_indeterminate() {
             &transaction,
             &cancellation,
         )
-        .await
-        .unwrap();
+        .await;
+
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("configuration lock state could not be verified"),
+        "Expected lock verification error, got: {}",
+        error
+    );
 
     // Verify record is Indeterminate (not Discarded) because lock cannot be released
     let record = coordinator
@@ -716,6 +729,7 @@ async fn p2_issue5_stage_validates_fingerprint_early() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
@@ -766,6 +780,7 @@ async fn p2_issue6_stage_persists_lock_risk() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
@@ -818,6 +833,7 @@ async fn p2_issue7_failed_commit_preserves_lock() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
@@ -914,6 +930,7 @@ async fn p2_issue8_confirmed_commit_persists_deadline() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
@@ -1009,6 +1026,7 @@ async fn p2_issue9_attribution_includes_agent_identity() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )

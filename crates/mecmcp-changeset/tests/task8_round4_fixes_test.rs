@@ -323,6 +323,7 @@ async fn test_discard_persists_before_rollback() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             "policy123",
             &CancellationToken::new(),
         )
@@ -371,8 +372,9 @@ async fn test_discard_persists_before_rollback() {
         "should persist indeterminate state before rollback completes"
     );
 
-    // Let the discard complete
-    discard_task.await.unwrap().unwrap();
+    // Let the discard complete - it should fail (Round 5 Finding 4)
+    let result = discard_task.await.unwrap();
+    assert!(result.is_err());
 }
 
 // ============================================================================
@@ -405,6 +407,7 @@ async fn test_discard_cancellation_after_guard_acquisition() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             "policy123",
             &CancellationToken::new(),
         )
@@ -474,6 +477,7 @@ async fn test_diff_rejects_committed_state() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             "policy123",
             &CancellationToken::new(),
         )
@@ -564,6 +568,7 @@ async fn test_stage_device_touched_after_lock_persist() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             "policy123",
             &CancellationToken::new(),
         )

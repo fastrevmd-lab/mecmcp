@@ -337,6 +337,7 @@ async fn happy_path_stage_diff_validate_commit() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
@@ -461,6 +462,7 @@ async fn commit_with_indeterminate_outcome() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
@@ -546,6 +548,7 @@ async fn discard_after_failed_validation() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
@@ -560,8 +563,8 @@ async fn discard_after_failed_validation() {
     record.state = LifecycleState::Failed;
     coordinator.update(record).await.unwrap();
 
-    // Discard the operation
-    let after_fp = coordinator
+    // Discard the operation - should fail because unlock is unsupported
+    let result = coordinator
         .discard_operation(
             &stage_output.operation_id,
             device,
@@ -570,11 +573,18 @@ async fn discard_after_failed_validation() {
             &transaction,
             &cancellation,
         )
-        .await
-        .unwrap();
+        .await;
 
-    // Verify the fingerprint changed back
-    assert_ne!(after_fp, stage_output.after_fingerprint);
+    // Verify the discard failed (Round 5 Finding 4: unresolved discard must not return success)
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("configuration lock state could not be verified"),
+        "Expected lock verification error, got: {}",
+        error
+    );
 
     // Verify operation is in Indeterminate state (P1 Issue 4 fix)
     // When unlock() returns Unsupported and the rollback did not release the lock,
@@ -631,6 +641,7 @@ async fn discard_clears_the_lock_when_the_transaction_can_unlock() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
@@ -694,6 +705,7 @@ async fn diff_validate_commit_reject_fingerprint_mismatch() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
@@ -758,6 +770,7 @@ async fn operation_id_ownership_validation() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
@@ -806,6 +819,7 @@ async fn discard_rejects_invalid_states() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
@@ -882,6 +896,7 @@ async fn commit_rejects_non_validated_operation() {
             TEST_ENDPOINT,
             &transaction,
             &actions,
+            "set",
             policy_sig,
             &cancellation,
         )
