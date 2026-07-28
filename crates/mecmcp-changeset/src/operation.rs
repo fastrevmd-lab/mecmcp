@@ -369,6 +369,14 @@ impl ChangesetCoordinator {
         // Acquire device guard to serialize with commit and validation
         let _guard = self.device_guard(&record.device, cancellation).await?;
 
+        // `device_guard` can return the guard at the same moment the token fires:
+        // `tokio::select!` may take the ready-lock branch. Re-check before issuing
+        // any device RPC. A diff only reads, so this is not about damage — it is
+        // that an inconsistent rule gets copied into the next method someone adds.
+        if cancellation.is_cancelled() {
+            return Err(CoordinatorError::new("device", "operation cancelled"));
+        }
+
         // Re-read the record after acquiring the guard
         let record = self.record(operation_id, owner, device).await?;
 
@@ -439,6 +447,14 @@ impl ChangesetCoordinator {
 
         // Acquire device guard
         let _guard = self.device_guard(&record.device, cancellation).await?;
+
+        // `device_guard` can return the guard at the same moment the token fires:
+        // `tokio::select!` may take the ready-lock branch. Re-check before issuing
+        // any device RPC — `<validate>` / `<commit-check>` is not destructive, but
+        // it is still work sent to a device the caller has stopped waiting on.
+        if cancellation.is_cancelled() {
+            return Err(CoordinatorError::new("device", "operation cancelled"));
+        }
 
         // P1-b-validate: Re-read state after acquiring guard. Two validations starting
         // from `Staged` both pass the pre-lock check; the second uses its stale record
@@ -556,6 +572,28 @@ impl ChangesetCoordinator {
         // which recovery.rs also writes — one field with two writers would
         // silently lose whichever wrote first.
         record.attribution = Some(crate::records::PersistedAttribution::from(attribution));
+
+        // Everything above — the fingerprint read and the attribution write — is
+        // awaited, so cancellation can have fired during any of it while nothing
+        // has been sent to the device. Check here, before `Committing`, because
+        // past this point a cancellation is recorded as `Indeterminate`.
+        //
+        // That distinction is the point: `Indeterminate` means "the commit may
+        // have reached the device and someone must go and look". Recording it for
+        // an operation that provably never left this process is safe but
+        // pessimistic, and it puts an entry needing no recovery into the manual
+        // recovery queue. Filling that queue with false entries is how a real one
+        // gets overlooked.
+        // The record is left exactly as it is: still `Staged`, with the candidate
+        // sitting on the device. Dropping it here would strand that candidate with
+        // no record pointing at it, which is worse than the false recovery entry
+        // this check exists to avoid. The caller can retry the commit or discard.
+        if cancellation.is_cancelled() {
+            return Err(CoordinatorError::new(
+                "device",
+                "operation cancelled before the commit was sent; the operation is still staged",
+            ));
+        }
 
         // Transition to Committing
         record.state = LifecycleState::Committing;
