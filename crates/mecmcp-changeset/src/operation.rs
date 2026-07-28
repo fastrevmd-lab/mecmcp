@@ -14,6 +14,55 @@ use mecmcp_audit::Attribution;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+/// Canonicalizes an endpoint URL to a consistent form for use as a device guard key.
+///
+/// This function:
+/// - Validates the URL starts with `https://`
+/// - Lowercases the scheme and host
+/// - Removes trailing slashes from the path
+/// - Rejects malformed URLs
+///
+/// # Errors
+///
+/// Returns an error if the endpoint is not a valid HTTPS URL.
+fn canonicalize_endpoint(endpoint: &str) -> Result<String, CoordinatorError> {
+    if !endpoint.starts_with("https://") && !endpoint.starts_with("HTTPS://") {
+        return Err(CoordinatorError::new(
+            "endpoint",
+            "endpoint must start with https://",
+        ));
+    }
+
+    // Parse the URL to validate structure
+    let url = url::Url::parse(endpoint)
+        .map_err(|e| CoordinatorError::new("endpoint", format!("invalid endpoint URL: {e}")))?;
+
+    if url.scheme() != "https" {
+        return Err(CoordinatorError::new(
+            "endpoint",
+            "endpoint must use https scheme",
+        ));
+    }
+
+    // Rebuild with normalized components
+    let host = url
+        .host_str()
+        .ok_or_else(|| CoordinatorError::new("endpoint", "endpoint must contain a valid host"))?;
+
+    let mut canonical = format!("https://{}", host.to_lowercase());
+
+    if let Some(port) = url.port() {
+        canonical.push_str(&format!(":{port}"));
+    }
+
+    let path = url.path().trim_end_matches('/');
+    if !path.is_empty() && path != "/" {
+        canonical.push_str(path);
+    }
+
+    Ok(canonical)
+}
+
 /// Output from staging a single operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageOutput<S> {
@@ -69,16 +118,12 @@ impl ChangesetCoordinator {
             ));
         }
 
-        // P1-f: Validate endpoint format
-        if !endpoint.starts_with("https://") {
-            return Err(CoordinatorError::new(
-                "endpoint",
-                "endpoint must start with https://",
-            ));
-        }
+        // Canonicalize endpoint before using it as the device guard key.
+        // This ensures `https://host` and `https://host/` map to the same guard.
+        let canonical_endpoint = canonicalize_endpoint(endpoint)?;
 
         // Acquire device guard
-        let _guard = self.device_guard(endpoint, cancellation).await?;
+        let _guard = self.device_guard(&canonical_endpoint, cancellation).await?;
 
         if cancellation.is_cancelled() {
             return Err(CoordinatorError::new("device", "operation cancelled"));
@@ -98,7 +143,7 @@ impl ChangesetCoordinator {
             id: operation_id.clone(),
             owner: owner.to_owned(),
             device: device.to_owned(),
-            endpoint: endpoint.to_owned(),
+            endpoint: canonical_endpoint.clone(),
             action: serde_json::to_value(&actions[0])
                 .map_err(|e| CoordinatorError::new("actions", e.to_string()))?,
             xpath: None,
@@ -223,6 +268,7 @@ impl ChangesetCoordinator {
     /// - The operation does not exist or is not owned by this principal and device
     /// - The operation's fingerprint no longer matches the device state
     /// - The transaction's `diff()` method fails
+    #[allow(clippy::too_many_arguments)]
     pub async fn diff_operation<T: DeviceTransaction>(
         &self,
         operation_id: &str,
@@ -231,8 +277,15 @@ impl ChangesetCoordinator {
         expected_fingerprint: &str,
         transaction: &T,
         staged: &T::Staged,
+        cancellation: &CancellationToken,
     ) -> Result<T::Diff, CoordinatorError> {
         // Retrieve and validate the operation record
+        let record = self.record(operation_id, owner, device).await?;
+
+        // Acquire device guard to serialize with commit and validation
+        let _guard = self.device_guard(&record.endpoint, cancellation).await?;
+
+        // Re-read the record after acquiring the guard
         let record = self.record(operation_id, owner, device).await?;
 
         // Validate fingerprint
@@ -569,32 +622,45 @@ impl ChangesetCoordinator {
             .map_err(|e| CoordinatorError::new(e.field(), e.message().to_owned()))?;
 
         // Rollback the candidate
-        let rollback_result = transaction
-            .rollback(RollbackRef::CandidateRevert)
-            .await
-            .map_err(|e| CoordinatorError::new("transaction", e.to_string()))?;
+        let rollback_result = transaction.rollback(RollbackRef::CandidateRevert).await;
 
-        if !rollback_result.succeeded {
-            record.state = LifecycleState::Failed;
-            record.details = rollback_result.details.clone();
-            self.update(record).await?;
-            return Err(CoordinatorError::new(
-                "transaction",
-                rollback_result
-                    .details
-                    .unwrap_or_else(|| "rollback failed".to_owned()),
-            ));
+        match rollback_result {
+            Ok(outcome) if outcome.succeeded => {
+                // Rollback succeeded; proceed to unlock
+            }
+            Ok(outcome) => {
+                // Rollback failed cleanly; the device rejected it
+                record.state = LifecycleState::Failed;
+                record.details = outcome.details.clone();
+                self.update(record).await?;
+                return Err(CoordinatorError::new(
+                    "transaction",
+                    outcome
+                        .details
+                        .unwrap_or_else(|| "rollback failed".to_owned()),
+                ));
+            }
+            Err(e) => {
+                // Rollback error is ambiguous: the device may have performed the revert
+                // but the response was lost or timed out. The candidate fingerprint has
+                // changed by now, so every retry fails the fingerprint guard, and neither
+                // restart nor manual recovery handles `Staged`/`Failed` states — only
+                // `Indeterminate`. Record the uncertainty.
+                record.state = LifecycleState::Indeterminate;
+                record.details = Some(format!("rollback outcome unknown: {e}"));
+                self.update(record).await?;
+                return Err(CoordinatorError::new("transaction", e.to_string()));
+            }
         }
 
-        // P1-c-persist: Persist rollback completion before the next await. If the
-        // process exits after rollback succeeds but while `unlock()` or the
-        // fingerprint call is still awaiting, disk still says `Staged`/`Failed`.
-        // Restart recovery does not convert those, and the reverted candidate no
-        // longer matches the stored fingerprint, so every retry is blocked with no
-        // recovery path. Persist an in-progress or indeterminate record before the
-        // next await.
-        record.state = LifecycleState::Discarded;
-        record.details = Some("candidate reverted".to_owned());
+        // P1-c-persist: Persist rollback completion as non-terminal until unlock is
+        // established. If the process exits after rollback succeeds but before
+        // `unlock()` completes, a terminal `Discarded` state with `config_lock_held
+        // = true` would leave a held lock with no recovery path: terminal records
+        // are ignored by restart recovery, are evictable, and do not block another
+        // operation. Persist an in-progress state first.
+        record.state = LifecycleState::Indeterminate;
+        record.details = Some("candidate reverted; verifying lock release".to_owned());
         self.update(record.clone()).await?;
 
         // P1-c: Attempt to unlock via rollback; if that doesn't release the lock,
@@ -602,16 +668,17 @@ impl ChangesetCoordinator {
         match transaction.unlock().await {
             Ok(crate::transaction::UnlockOutcome::Released) => {
                 record.config_lock_held = false;
+                record.state = LifecycleState::Discarded;
+                record.details = Some("candidate reverted".to_owned());
             }
             Ok(crate::transaction::UnlockOutcome::Unsupported) => {
                 // P1-d: An unreleased lock must not end terminal. When `unlock()`
                 // returns the default `Unsupported` and the rollback did not release
-                // the lock, the method keeps `config_lock_held = true` but returns
-                // success with state `Discarded`. `Discarded` is terminal and
+                // the lock, the method keeps `config_lock_held = true` but would
+                // return success with state `Discarded`. `Discarded` is terminal and
                 // evictable, another discard is refused, and offline recovery only
                 // accepts `Indeterminate` — so the held lock has no route to
-                // resolution. Treat that outcome as `Indeterminate` unless lock
-                // release was actually established.
+                // resolution. Keep the state as `Indeterminate`.
                 record.state = LifecycleState::Indeterminate;
                 record.details = Some(
                     "candidate reverted; the transaction offers no explicit unlock, \

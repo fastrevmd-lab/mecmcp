@@ -114,7 +114,7 @@ pub fn read_state(path: &Path, max_state_bytes: u64) -> Result<ChangesetState, P
     let on_disk: OnDiskChangesetState = serde_json::from_slice(&bytes)
         .map_err(|error| PersistenceError::new(format!("invalid changeset state JSON: {error}")))?;
 
-    if on_disk.version != 1 {
+    if on_disk.version != 1 && on_disk.version != 2 {
         return Err(PersistenceError::new(format!(
             "unsupported changeset state version {}",
             on_disk.version
@@ -233,6 +233,9 @@ pub fn validate_state(state: &ChangesetState) -> Result<(), PersistenceError> {
 
 /// Writes the changeset state to disk atomically.
 ///
+/// Writes version 2 if any operation record contains `attribution` or
+/// `rollback_deadline_unix`, otherwise writes version 1 for backward compatibility.
+///
 /// # Errors
 ///
 /// Returns an error if serialization fails, the file is too large, or the write operation fails.
@@ -245,8 +248,19 @@ pub fn write_state(
         .parent()
         .ok_or_else(|| PersistenceError::new("changeset state path has no parent"))?;
 
+    // Determine schema version: write version 2 if any operation has the new fields
+    let version = if state
+        .operations
+        .values()
+        .any(|op| op.attribution.is_some() || op.rollback_deadline_unix.is_some())
+    {
+        2
+    } else {
+        1
+    };
+
     let payload = serde_json::to_vec_pretty(&OnDiskChangesetState {
-        version: 1,
+        version,
         state: ChangesetState {
             operations: state.operations.clone(),
             change_sets: state.change_sets.clone(),

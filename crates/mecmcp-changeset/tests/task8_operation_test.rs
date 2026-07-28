@@ -363,6 +363,7 @@ async fn happy_path_stage_diff_validate_commit() {
             &stage_output.after_fingerprint,
             &transaction,
             &stage_output.staged,
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -715,6 +716,7 @@ async fn diff_validate_commit_reject_fingerprint_mismatch() {
             &stage_output.after_fingerprint,
             &transaction,
             &stage_output.staged,
+            &CancellationToken::new(),
         )
         .await;
 
