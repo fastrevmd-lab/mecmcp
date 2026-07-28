@@ -226,6 +226,23 @@ impl ChangesetCoordinator {
         Ok(record.clone())
     }
 
+    /// Snapshot of every persisted operation.
+    ///
+    /// Exists for vendor-specific recovery that has to run *after* [`load`](Self::load):
+    /// the coordinator promotes non-terminal operations to `Indeterminate` on load
+    /// because a staged candidate generally cannot survive a restart, but a vendor
+    /// whose device holds the candidate independently can legitimately restore them.
+    ///
+    /// Such a pass must go through [`update`](Self::update) on these records rather
+    /// than rewriting the state file directly. Editing the file behind a loaded
+    /// coordinator leaves the two permanently divergent — the API answers from
+    /// memory while the offline recovery tool reads the file — and the affected
+    /// operation can then be neither used nor resolved (rustpanosmcp#72).
+    pub async fn operations(&self) -> Vec<OperationRecord> {
+        let state = self.state.lock().await;
+        state.operations.values().cloned().collect()
+    }
+
     /// Inserts a new operation record.
     ///
     /// If the operation store is at capacity, terminal records are evicted first.
