@@ -246,3 +246,36 @@ fn round_trip_through_write_atomic_does_not_mutate_untagged_tokens() {
     let file: TokenStoreFile = TokenStoreFile::load(&path).expect("reload after write");
     assert_eq!(file.store().len(), 2);
 }
+
+/// A rewrite must not change who owns the token file.
+///
+/// `write_atomic` replaces the file, so without owner preservation the
+/// replacement belongs to whoever ran the command. Minting a token as root —
+/// which is what the install instructions say to do — would leave the service
+/// unable to read its own tokens.json, and it then refuses to start with a
+/// permission error that never mentions ownership.
+///
+/// Running as root this asserts the real behaviour. Running as an ordinary user
+/// there is only one uid available, so it degrades to asserting the write does
+/// not *change* the owner, which is still the property that matters.
+#[test]
+#[cfg(unix)]
+fn rewrite_preserves_the_token_file_owner() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("tokens.json");
+
+    mecmcp_auth::write_atomic::<mecmcp_auth::NoGrant>(&path, &[], 1).expect("initial write");
+    let before = std::fs::metadata(&path).expect("stat before");
+
+    // Rewrite so this is a genuine replacement rather than a no-op.
+    mecmcp_auth::write_atomic::<mecmcp_auth::NoGrant>(&path, &[], 1).expect("rewrite");
+
+    let after = std::fs::metadata(&path).expect("stat after");
+    assert_eq!(
+        (before.uid(), before.gid()),
+        (after.uid(), after.gid()),
+        "an atomic rewrite must leave the token file's owner unchanged"
+    );
+}
