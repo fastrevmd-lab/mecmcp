@@ -8,7 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-mecmcp-audit = { version = "0.3.0", path = "../mecmcp-audit" }
+mecmcp-audit = { version = "0.3.1", path = "../mecmcp-audit" }
 async-trait  = { workspace = true }
 hex          = "0.4"
 serde        = { workspace = true }

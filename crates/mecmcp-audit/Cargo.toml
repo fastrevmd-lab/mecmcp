@@ -12,7 +12,7 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
-mecmcp-auth = { version = "0.3.0", path = "../mecmcp-auth" }
+mecmcp-auth = { version = "0.3.1", path = "../mecmcp-auth" }
 hmac        = { workspace = true }
 metrics     = { workspace = true }
 serde       = { workspace = true }
