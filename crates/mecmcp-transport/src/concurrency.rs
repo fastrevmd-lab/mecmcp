@@ -321,7 +321,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use tokio::sync::{Barrier, Notify};
+    use tokio::sync::{Barrier, Notify, Semaphore};
     use tokio::time::timeout;
     use tower::ServiceExt as _; // oneshot
 
@@ -406,7 +406,54 @@ mod tests {
             .unwrap()
     }
 
-    fn blocking_post_router(release: Arc<Notify>, entered: Arc<Notify>) -> Router {
+    /// The mechanism behind mecmcp#86, pinned deterministically.
+    ///
+    /// The CI failures could not be reproduced locally — the old code passed
+    /// forty consecutive runs under deliberate CPU load — because the losing
+    /// window is a few instructions wide and depends on the runner's scheduling.
+    /// So rather than chase the symptom, this pins the primitive's semantics,
+    /// which is what the fix actually relies on.
+    ///
+    /// `notify_waiters` stores nothing: a notification sent before a task
+    /// registers is gone forever, and that task then waits indefinitely. A
+    /// `Semaphore` permit persists, so the same ordering is harmless. In the
+    /// middleware tests the "task" is a request handler that has signalled
+    /// `entered` but not yet reached its await.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn notify_waiters_is_lost_when_nobody_is_registered_yet_but_a_permit_is_not() {
+        // Notify: the wake-up happens before anyone waits, and is dropped.
+        let notify = Arc::new(Notify::new());
+        notify.notify_waiters();
+        let missed = timeout(Duration::from_millis(150), notify.notified())
+            .await
+            .is_err();
+        assert!(
+            missed,
+            "notify_waiters must not be observable by a later waiter; if this ever \
+             passes, the flaky-test fix rests on a false premise"
+        );
+
+        // Semaphore: the same ordering, and the permit is still there.
+        let release = Arc::new(Semaphore::new(0));
+        release.add_permits(1);
+        let acquired = timeout(Duration::from_millis(150), release.acquire_owned())
+            .await
+            .expect("a permit granted before the waiter arrived must still be available");
+        acquired.expect("semaphore closed").forget();
+    }
+
+    /// A handler that announces entry, then blocks until `release` grants a permit.
+    ///
+    /// `release` is a `Semaphore` rather than a `Notify` deliberately.
+    /// `Notify::notify_waiters` wakes only tasks already registered and stores
+    /// nothing, so a handler that had signalled `entered` but not yet reached its
+    /// await would miss the wake-up entirely and block until the test timed out.
+    /// That window is tiny and load-dependent, which is exactly why it surfaced as
+    /// a flaky CI failure rather than a reproducible one (mecmcp#86).
+    ///
+    /// Semaphore permits persist, so the test cannot lose the race however the two
+    /// tasks interleave.
+    fn blocking_post_router(release: Arc<Semaphore>, entered: Arc<Notify>) -> Router {
         Router::new().route(
             "/mcp",
             post(move || {
@@ -414,7 +461,11 @@ mod tests {
                 let entered = entered.clone();
                 async move {
                     entered.notify_one();
-                    release.notified().await;
+                    release
+                        .acquire_owned()
+                        .await
+                        .expect("release semaphore closed")
+                        .forget();
                     "ok"
                 }
             }),
@@ -435,14 +486,20 @@ mod tests {
         )
     }
 
-    // A handler that blocks until `release` is notified, so we can pin permits.
-    fn blocking_router(release: Arc<Notify>) -> Router {
+    /// A handler that blocks until `release` grants a permit, so we can pin permits.
+    ///
+    /// See [`blocking_post_router`] for why this is a `Semaphore`.
+    fn blocking_router(release: Arc<Semaphore>) -> Router {
         Router::new().route(
             "/mcp",
             get(move || {
                 let release = release.clone();
                 async move {
-                    release.notified().await;
+                    release
+                        .acquire_owned()
+                        .await
+                        .expect("release semaphore closed")
+                        .forget();
                     "ok"
                 }
             }),
@@ -737,7 +794,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn per_target_sheds_same_target_and_isolates_different_target() {
-        let release = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
         let entered = Arc::new(Notify::new());
         let app = blocking_post_router(release.clone(), entered.clone()).layer(
             axum::middleware::from_fn_with_state(target_state(1), concurrency_middleware),
@@ -789,7 +846,9 @@ mod tests {
             .await
             .expect("different-target request did not enter the handler");
 
-        release.notify_waiters();
+        // Two handlers are blocked: the first-target request and the
+        // different-target one.
+        release.add_permits(2);
         let first = timeout(TEST_TIMEOUT, first)
             .await
             .expect("first request did not finish")
@@ -834,7 +893,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn aborted_request_releases_target_permit() {
-        let release = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
         let entered = Arc::new(Notify::new());
         let app = blocking_post_router(release.clone(), entered.clone()).layer(
             axum::middleware::from_fn_with_state(target_state(1), concurrency_middleware),
@@ -869,7 +928,9 @@ mod tests {
             .await
             .expect("target permit was not released after request cancellation");
 
-        release.notify_waiters();
+        // Only the replacement handler is blocked; the original request was
+        // aborted, so its handler future was dropped.
+        release.add_permits(1);
         let response = timeout(TEST_TIMEOUT, second)
             .await
             .expect("replacement request did not finish")
@@ -984,7 +1045,7 @@ mod tests {
             target_keys(),
             None,
         );
-        let release = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
         let app = blocking_router(release.clone()).layer(axum::middleware::from_fn_with_state(
             state,
             concurrency_middleware,
@@ -1010,7 +1071,7 @@ mod tests {
         assert_eq!(resp.headers().get("retry-after").unwrap(), "1");
 
         // Release the first; its permit frees.
-        release.notify_waiters();
+        release.add_permits(1);
         let first = timeout(TEST_TIMEOUT, inflight)
             .await
             .expect("global-limited request did not finish")
@@ -1035,7 +1096,7 @@ mod tests {
             target_keys(),
             None,
         );
-        let release = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
         let app = blocking_router(release.clone()).layer(axum::middleware::from_fn_with_state(
             state,
             concurrency_middleware,
@@ -1067,7 +1128,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Release both and verify "b" succeeded.
-        release.notify_waiters();
+        release.add_permits(2);
         let _ = timeout(TEST_TIMEOUT, inflight)
             .await
             .expect("token a request did not finish")
