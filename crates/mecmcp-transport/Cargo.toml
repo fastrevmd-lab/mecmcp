@@ -18,7 +18,7 @@ futures     = "0.3"
 http        = "1"
 http-body   = "1"
 http-body-util = "0.1"
-mecmcp-auth = { version = "0.2.0", path = "../mecmcp-auth" }
+mecmcp-auth = { version = "0.3.0", path = "../mecmcp-auth" }
 metrics     = { workspace = true }
 # metrics-exporter-prometheus must have default-features = false to avoid
 # pulling in rustls's aws-lc-rs backend via hyper-rustls, which conflicts with
@@ -50,7 +50,7 @@ zeroize     = "1"
 # listener and hyper-rustls, which enables rustls's aws-lc-rs backend and
 # conflicts with a consumer that pins `ring`. That broke TLS in a downstream
 # server. Keep it here, and keep default-features off.
-mecmcp-audit = { version = "0.2.0", path = "../mecmcp-audit" }
+mecmcp-audit = { version = "0.3.0", path = "../mecmcp-audit" }
 metrics-exporter-prometheus = { workspace = true }
 rcgen       = "0.13"
 # ring is dev-only for tests. The main crate uses the process-global provider
