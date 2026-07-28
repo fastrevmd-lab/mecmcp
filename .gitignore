@@ -4,6 +4,7 @@ Cargo.lock
 
 # Agent scratch: git worktrees for parallel task branches.
 /.claude/
+/.worktrees/
 
 # Never commit real authentication material, even hashed.
 tokens.json
