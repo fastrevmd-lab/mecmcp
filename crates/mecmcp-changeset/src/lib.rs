@@ -21,7 +21,7 @@ pub mod types;
 
 pub use apply::ApplyOutput;
 pub use changeset::ChangeSetOutput;
-pub use coordinator::{ChangesetCoordinator, CoordinatorError};
+pub use coordinator::{ChangesetCoordinator, CoordinatorError, StagedRecovery};
 pub use lifecycle::{ChangeSetState, LifecycleState};
 pub use operation::StageOutput;
 pub use persistence::{ChangesetState, PersistenceError, read_state, validate_state, write_state};

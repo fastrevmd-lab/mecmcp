@@ -86,6 +86,24 @@ impl Default for ChangesetCoordinator {
     }
 }
 
+/// Whether a `Staged` operation can survive a server restart.
+///
+/// The answer is a property of the vendor's staged handle, not of the change-set
+/// model, so the coordinator cannot decide it alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedRecovery {
+    /// Mark `Staged` operations `Indeterminate` on load.
+    ///
+    /// Correct where the handle is a live device session — Junos holds an open
+    /// NETCONF session and a locked candidate, both of which die with the process.
+    Discard,
+    /// Leave `Staged` operations staged on load.
+    ///
+    /// Correct where the device owns the candidate and the handle is reconstructible
+    /// from the persisted record, as on PAN-OS.
+    Retain,
+}
+
 impl ChangesetCoordinator {
     /// Loads the coordinator from disk, applying restart recovery if needed.
     ///
@@ -102,6 +120,45 @@ impl ChangesetCoordinator {
         limits: OperationLimits,
         approval_ttl: Duration,
         lab_mode: bool,
+    ) -> Result<Self, CoordinatorError> {
+        Self::load_with_recovery(
+            path,
+            limits,
+            approval_ttl,
+            lab_mode,
+            StagedRecovery::Discard,
+        )
+    }
+
+    /// Loads the coordinator, choosing how `Staged` operations survive a restart.
+    ///
+    /// [`load`](Self::load) defaults to [`StagedRecovery::Discard`], which is right
+    /// wherever the staged handle is a live device session: Junos holds an open
+    /// NETCONF session and a locked candidate that die with the process, so the
+    /// operation genuinely cannot continue.
+    ///
+    /// [`StagedRecovery::Retain`] suits a vendor whose device owns the candidate and
+    /// whose staged handle is reconstructible from the record — PAN-OS keeps the
+    /// candidate server-side and identifies it by operation id, so a restart does not
+    /// invalidate it.
+    ///
+    /// This is a parameter rather than something a consumer patches afterwards
+    /// because the fix has to land while the state is being loaded. Rewriting the
+    /// state file after construction leaves the coordinator's memory and the file
+    /// divergent — the API answering from one and the offline recovery tool reading
+    /// the other — which strands the operation beyond use or resolution
+    /// (rustpanosmcp#72).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is not absolute, the file cannot be read, or the
+    /// state is invalid.
+    pub fn load_with_recovery(
+        path: Option<&Path>,
+        limits: OperationLimits,
+        approval_ttl: Duration,
+        lab_mode: bool,
+        staged_recovery: StagedRecovery,
     ) -> Result<Self, CoordinatorError> {
         let Some(path) = path else {
             return Ok(Self {
@@ -134,6 +191,17 @@ impl ChangesetCoordinator {
         // The operator must manually reconcile the device state.
         let mut recovered = false;
         for record in state.operations.values_mut() {
+            // A `Staged` operation the vendor can genuinely resume is left alone.
+            // It must have no `job_id`: once a job exists the operation reached
+            // validation or commit, and whether that job landed is exactly the
+            // question `Indeterminate` exists to flag.
+            if staged_recovery == StagedRecovery::Retain
+                && record.state == LifecycleState::Staged
+                && record.job_id.is_none()
+            {
+                continue;
+            }
+
             if matches!(
                 record.state,
                 LifecycleState::Staging
