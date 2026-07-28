@@ -178,7 +178,8 @@ fn test_resolve_already_resolved_operation() {
     )
     .unwrap();
 
-    // Second resolution fails because operation is no longer Indeterminate
+    // Second resolution fails because the operation is now terminal. Resolving a
+    // settled record could only overwrite a fact, never reconcile one.
     let result = resolve_persisted_operation(
         &state_path,
         operation_id,
@@ -190,7 +191,11 @@ fn test_resolve_already_resolved_operation() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert_eq!(err.field(), "operation_id");
-    assert!(err.message().contains("indeterminate"));
+    assert!(
+        err.message().contains("terminal"),
+        "the error should say the record is settled, got: {}",
+        err.message()
+    );
 }
 
 #[test]
@@ -258,25 +263,44 @@ fn test_resolve_invalid_operation_id_format() {
     assert!(err.message().contains("64 hexadecimal"));
 }
 
+/// A `Staged` operation must be resolvable offline.
+///
+/// This asserted the opposite until rustpanosmcp#74: a staged operation whose
+/// candidate was changed outside the server cannot be discarded (the fingerprint
+/// guard correctly refuses) and could not be resolved either, so it blocked the
+/// device permanently and the only exit was editing the state file by hand.
 #[test]
-fn test_resolve_non_indeterminate_operation() {
+fn test_resolve_a_stuck_staged_operation() {
     let operation_id = "a000000000000000000000000000000000000000000000000000000000000009";
     let (_temp_dir, state_path) = setup_state_file(operation_id, LifecycleState::Staged);
 
-    let confirmation = format!("RESOLVED {operation_id} AS COMMITTED");
+    let confirmation = format!("RESOLVED {operation_id} AS DISCARDED");
 
-    let result = resolve_persisted_operation(
+    let output = resolve_persisted_operation(
         &state_path,
         operation_id,
-        RecoveryDisposition::Committed,
+        RecoveryDisposition::Discarded,
         &confirmation,
         OperationLimits::default(),
-    );
+    )
+    .unwrap();
 
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert_eq!(err.field(), "operation_id");
-    assert!(err.message().contains("indeterminate"));
+    assert_eq!(output.state, "discarded");
+
+    let state = read_state(&state_path, OperationLimits::default().max_state_bytes).unwrap();
+    let record = state.operations.get(operation_id).unwrap();
+    assert_eq!(record.state, LifecycleState::Discarded);
+    assert!(!record.config_lock_held, "the lock flag must be cleared");
+    // The audit trail must show the record was forced from `staged`, not settled
+    // from a genuine unknown outcome.
+    assert!(
+        record
+            .details
+            .as_deref()
+            .is_some_and(|d| d.contains("from staged")),
+        "details should name the overridden state, got: {:?}",
+        record.details
+    );
 }
 
 #[test]
