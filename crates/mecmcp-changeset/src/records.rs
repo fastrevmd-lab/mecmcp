@@ -56,6 +56,114 @@ pub struct OperationRecord {
     pub config_lock_held: bool,
     /// Policy signature at the time of staging.
     pub policy_signature: String,
+    /// Who requested the commit, captured before the device was contacted.
+    ///
+    /// Absent on operations that have not reached commit, and on records written
+    /// before this field existed — deployed state files must keep loading, so it
+    /// is optional and omitted rather than written as `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<PersistedAttribution>,
+    /// Confirmed-commit auto-rollback deadline (Junos only), as unix timestamp.
+    ///
+    /// When `AwaitingConfirmation`, the device will automatically rollback the
+    /// commit at this time unless a confirming commit is issued. Absent on
+    /// operations that do not use confirmed commit, and on records written
+    /// before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_deadline_unix: Option<u64>,
+}
+
+/// The attribution fields worth keeping in the state file.
+///
+/// [`mecmcp_audit::Attribution`] is a live request object holding types that are
+/// not serializable and values that mean nothing after a restart. This is the
+/// durable projection of it: enough to answer "who asked for this, on whose
+/// behalf, and under what change reference" when an operator finds an
+/// unresolved operation tomorrow morning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedAttribution {
+    /// Principal variant and value. Stores the discriminator so the audit record
+    /// can distinguish an authenticated token from an unauthenticated request,
+    /// even when both render to the same string (e.g., a token named "stdio").
+    pub principal: PersistedPrincipal,
+    /// Whether the actor was a human, an agent, or undeclared.
+    pub actor_type: String,
+    /// The human the actor was acting for, when the credential declared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
+    /// External change-control reference, when supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_ref: Option<String>,
+    /// Correlation id linking this record to the audit event for the request.
+    pub request_id: String,
+    /// Agent identity, when `actor_type == "agent"`. Durable projection of
+    /// `mecmcp_audit::AgentIdentity` for audit trail: model, provider, tier,
+    /// skills used. Optional for backward compatibility — records written before
+    /// this field existed have no agent identity, and must still load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<PersistedAgentIdentity>,
+}
+
+/// Durable projection of [`mecmcp_audit::Principal`].
+///
+/// Preserves the discriminator so an audit record can distinguish
+/// `Principal::Token("stdio")` from `Principal::Unauthenticated` (both render
+/// to "stdio", but only one is an authenticated credential).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "type", content = "value")]
+pub enum PersistedPrincipal {
+    /// Authenticated bearer token, identified by name.
+    Token(String),
+    /// Unauthenticated request (stdio or local socket with no auth).
+    Unauthenticated,
+}
+
+/// Durable projection of `mecmcp_audit::AgentIdentity`.
+///
+/// Captures the provenance of an agent-driven commit: which model, provider,
+/// tier, and skills generated the change. This is the contract requirement
+/// from transaction.rs: "The attribution is also serialized into the persisted
+/// operation record for audit, independent of what the device logs."
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedAgentIdentity {
+    /// Model identifier (e.g. `"claude-sonnet-4-5"`).
+    pub model_id: String,
+    /// Provider name (e.g., "anthropic", "ollama").
+    pub provider: String,
+    /// Provider tier: public hosted vs. private/self-hosted.
+    pub provider_tier: String,
+    /// Skills invoked during this action, space-separated or "none".
+    pub skills_used: String,
+}
+
+impl From<&mecmcp_audit::Attribution> for PersistedAttribution {
+    fn from(attribution: &mecmcp_audit::Attribution) -> Self {
+        Self {
+            principal: match &attribution.principal {
+                mecmcp_audit::Principal::Token(name) => PersistedPrincipal::Token(name.clone()),
+                mecmcp_audit::Principal::Unauthenticated => PersistedPrincipal::Unauthenticated,
+            },
+            // Rendered via Debug so a new actor-type variant lands here as its
+            // own name rather than being silently folded into an existing one.
+            actor_type: format!("{:?}", attribution.actor_type).to_lowercase(),
+            on_behalf_of: attribution.on_behalf_of.clone(),
+            change_ref: attribution.change_ref.clone(),
+            request_id: attribution.request_id.to_string(),
+            agent: attribution
+                .agent
+                .as_ref()
+                .map(|agent| PersistedAgentIdentity {
+                    model_id: agent.model_id.clone(),
+                    provider: agent.provider.clone(),
+                    provider_tier: agent.provider_tier.to_string(),
+                    skills_used: if agent.skills_used.is_empty() {
+                        "none".to_string()
+                    } else {
+                        agent.skills_used.join(" ")
+                    },
+                }),
+        }
+    }
 }
 
 /// Persisted change-set record.

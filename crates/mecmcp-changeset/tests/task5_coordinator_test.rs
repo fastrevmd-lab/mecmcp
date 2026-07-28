@@ -34,11 +34,16 @@ fn staged_production_fixture() -> (tempfile::TempDir, PathBuf) {
     (dir, dst)
 }
 
-fn make_operation_record(id: &str, endpoint: &str, state: LifecycleState) -> OperationRecord {
+fn make_operation_record(
+    id: &str,
+    device: &str,
+    endpoint: &str,
+    state: LifecycleState,
+) -> OperationRecord {
     OperationRecord {
         id: id.to_string(),
         owner: "test_owner".to_string(),
-        device: "test_device".to_string(),
+        device: device.to_string(),
         endpoint: endpoint.to_string(),
         action: serde_json::json!({"action": "set"}),
         xpath: None,
@@ -52,6 +57,8 @@ fn make_operation_record(id: &str, endpoint: &str, state: LifecycleState) -> Ope
         config_lock_held: false,
         policy_signature: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
             .to_string(),
+        attribution: None,
+        rollback_deadline_unix: None,
     }
 }
 
@@ -94,6 +101,7 @@ async fn test_insert_and_reload_persists_operation() {
             ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
         let operation = make_operation_record(
             "0000000000000000000000000000000000000000000000000000000000000001",
+            "test_device",
             "https://device.example.com",
             LifecycleState::Staged,
         );
@@ -130,6 +138,7 @@ async fn test_restart_recovery_marks_staging_indeterminate() {
             ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
         let operation = make_operation_record(
             "0000000000000000000000000000000000000000000000000000000000000001",
+            "test_device",
             "https://device.example.com",
             LifecycleState::Staging,
         );
@@ -250,6 +259,7 @@ async fn test_persist_failure_rolls_back_insert() {
         ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
     let operation = make_operation_record(
         "0000000000000000000000000000000000000000000000000000000000000001",
+        "test_device",
         "https://device.example.com",
         LifecycleState::Staged,
     );
@@ -292,6 +302,7 @@ async fn test_persist_failure_rolls_back_update() {
         ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
     let mut operation = make_operation_record(
         "0000000000000000000000000000000000000000000000000000000000000001",
+        "test_device",
         "https://device.example.com",
         LifecycleState::Staged,
     );
@@ -350,14 +361,16 @@ async fn test_capacity_limits_from_operation_limits() {
     let coordinator =
         ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
 
-    // Insert two operations (at capacity)
+    // Insert two operations (at capacity) for different devices
     let op1 = make_operation_record(
         "0000000000000000000000000000000000000000000000000000000000000001",
+        "device1",
         "https://device1.example.com",
         LifecycleState::Staged,
     );
     let op2 = make_operation_record(
         "0000000000000000000000000000000000000000000000000000000000000002",
+        "device2",
         "https://device2.example.com",
         LifecycleState::Staged,
     );
@@ -365,9 +378,10 @@ async fn test_capacity_limits_from_operation_limits() {
     coordinator.insert(op1).await.unwrap();
     coordinator.insert(op2).await.unwrap();
 
-    // Try to insert a third operation - should fail
+    // Try to insert a third operation - should fail due to capacity
     let op3 = make_operation_record(
         "0000000000000000000000000000000000000000000000000000000000000003",
+        "device3",
         "https://device3.example.com",
         LifecycleState::Staged,
     );
@@ -398,11 +412,13 @@ async fn test_terminal_records_evicted_at_capacity() {
     // Insert two operations in terminal states
     let op1 = make_operation_record(
         "0000000000000000000000000000000000000000000000000000000000000001",
+        "test_device",
         "https://device1.example.com",
         LifecycleState::Committed,
     );
     let op2 = make_operation_record(
         "0000000000000000000000000000000000000000000000000000000000000002",
+        "test_device",
         "https://device2.example.com",
         LifecycleState::Discarded,
     );
@@ -413,6 +429,7 @@ async fn test_terminal_records_evicted_at_capacity() {
     // Insert a third operation - should evict the terminal ones
     let op3 = make_operation_record(
         "0000000000000000000000000000000000000000000000000000000000000003",
+        "test_device",
         "https://device3.example.com",
         LifecycleState::Staged,
     );
@@ -509,6 +526,7 @@ async fn test_one_active_operation_per_endpoint() {
 
     let op1 = make_operation_record(
         "0000000000000000000000000000000000000000000000000000000000000001",
+        "test_device",
         "https://device.example.com",
         LifecycleState::Staged,
     );
@@ -517,6 +535,7 @@ async fn test_one_active_operation_per_endpoint() {
     // Try to insert a second operation on the same endpoint
     let op2 = make_operation_record(
         "0000000000000000000000000000000000000000000000000000000000000002",
+        "test_device",
         "https://device.example.com",
         LifecycleState::Staged,
     );

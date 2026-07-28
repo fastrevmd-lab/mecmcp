@@ -258,6 +258,26 @@ pub trait DeviceTransaction: Send + Sync {
     ///   `Archive(N)` on PAN-OS).
     async fn rollback(&self, to: RollbackRef) -> Result<RollbackOutcome, Self::Error>;
 
+    /// Release the device configuration lock, if this implementation holds one.
+    ///
+    /// Reverting a candidate is not the same as releasing the lock — on PAN-OS
+    /// the commit lock survives a revert — so a coordinator that cleared its
+    /// `config_lock_held` flag after a rollback would be recording something it
+    /// never verified, and the device would stay locked against every later
+    /// change while the state file said otherwise.
+    ///
+    /// The default returns [`UnlockOutcome::Unsupported`] so existing
+    /// implementations keep compiling; a caller receiving it must leave the
+    /// recorded lock state alone rather than assume the lock is gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the device is unreachable or refuses the unlock. The
+    /// caller should treat that as an unresolved operation, not a clean discard.
+    async fn unlock(&self) -> Result<UnlockOutcome, Self::Error> {
+        Ok(UnlockOutcome::Unsupported)
+    }
+
     /// Issue a confirming commit after a confirmed commit (Junos only).
     ///
     /// When [`commit()`](Self::commit) with `CommitOptions { confirm_timeout: Some(N) }`
@@ -420,6 +440,19 @@ pub enum CommitOutcome {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<String>,
     },
+}
+
+/// Result of asking a transaction to release the device configuration lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnlockOutcome {
+    /// The lock was released. The coordinator may record it as no longer held.
+    Released,
+    /// This implementation offers no explicit unlock, so nothing can be said
+    /// about the lock. The coordinator must NOT record the lock as released:
+    /// on PAN-OS a candidate revert leaves the commit lock in place, and a
+    /// state file claiming otherwise sends an operator looking in the wrong
+    /// place when the next change is blocked.
+    Unsupported,
 }
 
 /// Rollback outcome.

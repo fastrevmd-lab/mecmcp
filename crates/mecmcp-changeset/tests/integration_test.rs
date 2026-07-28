@@ -98,9 +98,9 @@ fn test_version_rejection() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state_path = temp_dir.path().join("state.json");
 
-    // Write a state file with version 2
+    // Write a state file with version 3 (unsupported)
     let invalid_version = serde_json::json!({
-        "version": 2,
+        "version": 3,
         "state": {
             "operations": {},
             "change_sets": {}
@@ -123,7 +123,7 @@ fn test_version_rejection() {
     assert!(result.is_err());
     let error_message = result.unwrap_err().to_string();
     assert!(
-        error_message.contains("unsupported changeset state version 2"),
+        error_message.contains("unsupported changeset state version 3"),
         "Expected version error, got: {error_message}"
     );
 }

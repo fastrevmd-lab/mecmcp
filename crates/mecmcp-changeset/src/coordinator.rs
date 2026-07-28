@@ -231,7 +231,7 @@ impl ChangesetCoordinator {
     ///
     /// Returns an error if:
     /// - The operation store is full after evicting terminal records
-    /// - The endpoint already has an active or unreconciled operation
+    /// - The device already has an active or unreconciled operation
     /// - Persistence fails
     pub async fn insert(&self, record: OperationRecord) -> Result<(), CoordinatorError> {
         let mut state = self.state.lock().await;
@@ -250,16 +250,29 @@ impl ChangesetCoordinator {
             ));
         }
 
-        // Enforce one active operation per endpoint
-        if state
-            .operations
-            .values()
-            .any(|existing| existing.endpoint == record.endpoint && !existing.state.terminal())
-        {
-            return Err(CoordinatorError::new(
-                "operation_id",
-                "the endpoint already has an active or unreconciled operation",
-            ));
+        // Enforce one active operation per device or endpoint. Two inventory names
+        // can legitimately resolve to the same endpoint (management IP + DNS name),
+        // and if both passed the device-only check, two operations could mutate
+        // one candidate concurrently. Reject when EITHER the device name matches
+        // OR the canonical endpoint matches.
+        for existing in state.operations.values() {
+            if existing.state.terminal() {
+                continue;
+            }
+            // Check device match
+            if existing.device == record.device {
+                return Err(CoordinatorError::new(
+                    "operation_id",
+                    "the device already has an active or unreconciled operation",
+                ));
+            }
+            // Check canonical endpoint match
+            if existing.endpoint == record.endpoint {
+                return Err(CoordinatorError::new(
+                    "operation_id",
+                    "the device already has an active or unreconciled operation",
+                ));
+            }
         }
 
         let id = record.id.clone();
