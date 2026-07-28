@@ -151,7 +151,14 @@ pub fn validate_state(state: &ChangesetState) -> Result<(), PersistenceError> {
         validate_fingerprint(&record.current).map_err(|error| {
             PersistenceError::new(format!("operation fingerprint invalid: {error}"))
         })?;
-        if !record.endpoint.starts_with("https://") || record.actions.is_empty() {
+        // The endpoint identifies a device; it is not required to be HTTPS.
+        // PAN-OS's management interface genuinely is an HTTPS XML API, but Junos
+        // is NETCONF over SSH and has no HTTPS endpoint at all. Demanding the
+        // scheme forced a vendor to persist a false address to satisfy a
+        // validator, which is the class of fabrication this crate exists to
+        // avoid. What the field must be is a stable, parseable device
+        // identifier — that is what makes it usable as a guard key (#69).
+        if url::Url::parse(&record.endpoint).is_err() || record.actions.is_empty() {
             return Err(PersistenceError::new(
                 "changeset state operation is missing endpoint/action metadata",
             ));

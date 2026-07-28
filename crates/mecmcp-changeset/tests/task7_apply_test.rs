@@ -844,7 +844,7 @@ async fn apply_with_invalid_endpoint_fails() {
         .apply_change_set(
             create_output.change_set_id.clone(),
             device.clone(),
-            "http://test-device.example.com".to_string(),
+            "not a url".to_string(),
             owner.to_string(),
             create_output.digest.clone(),
             initial_fp.clone(),
@@ -859,8 +859,70 @@ async fn apply_with_invalid_endpoint_fails() {
     assert!(result.is_err());
     let message = result.unwrap_err().to_string();
     assert!(
-        message.contains("endpoint") && message.contains("https://"),
-        "endpoint validation must reject non-https endpoints, got: {message}"
+        message.contains("endpoint"),
+        "an unparseable endpoint must be rejected, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn apply_accepts_a_non_https_vendor_endpoint() {
+    // The endpoint identifies a device and is used as a guard key; it is never
+    // dialled. Junos is NETCONF over SSH and has no HTTPS endpoint, so demanding
+    // that scheme forced it to persist a false address to pass validation (#69).
+    let coordinator = ChangesetCoordinator::default();
+    let transaction = MockTransaction::new();
+    let device = "test-device".to_string();
+    let owner = "alice";
+    let approver = "bob";
+
+    let initial_fp = transaction.fingerprint().await.unwrap();
+    let actions = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test".into(),
+        value: Some("value".into()),
+    }];
+
+    let created = coordinator
+        .create_change_set(
+            device.clone(),
+            actions,
+            owner.to_string(),
+            initial_fp.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .approve_change_set(
+            created.change_set_id.clone(),
+            device.clone(),
+            approver.to_string(),
+            created.digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    let result = coordinator
+        .apply_change_set(
+            created.change_set_id.clone(),
+            device.clone(),
+            "junos://10.0.0.1:830".to_string(),
+            owner.to_string(),
+            created.digest.clone(),
+            initial_fp.clone(),
+            &transaction,
+            "merge",
+            None,
+            &test_attribution(owner),
+            &CancellationToken::new(),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "a parseable non-https vendor endpoint must be accepted, got: {:?}",
+        result.err()
     );
 }
 
