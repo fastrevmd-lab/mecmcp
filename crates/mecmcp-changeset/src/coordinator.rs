@@ -127,12 +127,19 @@ impl ChangesetCoordinator {
             ChangesetState::default()
         };
 
-        // Restart recovery: mark in-flight operations as indeterminate
+        // Restart recovery: mark in-flight operations as indeterminate.
+        // `Staged` is included because the opaque `T::Staged` handle only exists
+        // in memory and cannot be reconstructed after a restart. Without the handle,
+        // the operation cannot proceed through diff/validate/commit or be discarded.
+        // The operator must manually reconcile the device state.
         let mut recovered = false;
         for record in state.operations.values_mut() {
             if matches!(
                 record.state,
-                LifecycleState::Staging | LifecycleState::Validating | LifecycleState::Committing
+                LifecycleState::Staging
+                    | LifecycleState::Staged
+                    | LifecycleState::Validating
+                    | LifecycleState::Committing
             ) {
                 record.state = LifecycleState::Indeterminate;
                 record.details = Some(

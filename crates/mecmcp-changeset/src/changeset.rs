@@ -50,7 +50,7 @@ impl From<ChangeSetRecord> for ChangeSetOutput {
 /// # Errors
 ///
 /// Returns an error if the system clock is set before the Unix epoch.
-fn now_unix() -> Result<u64, CoordinatorError> {
+pub(crate) fn now_unix() -> Result<u64, CoordinatorError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -95,7 +95,7 @@ impl ChangesetCoordinator {
         actions: Vec<A>,
         owner: String,
         expected_fingerprint: String,
-        _policy_signature: String,
+        policy_signature: String,
     ) -> Result<ChangeSetOutput, CoordinatorError> {
         crate::digest::validate_fingerprint(&expected_fingerprint)
             .map_err(|e| CoordinatorError::new("expected_candidate_fingerprint", e.to_string()))?;
@@ -131,6 +131,7 @@ impl ChangesetCoordinator {
             approval: None,
             expires_at_unix: now.saturating_add(self.approval_ttl().as_secs()),
             operation_id: None,
+            policy_signature,
         };
 
         self.insert_change_set(record.clone()).await?;

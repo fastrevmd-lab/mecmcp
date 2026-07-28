@@ -429,3 +429,38 @@ fn test_action_key_order_preserved() {
         "Action serialization must preserve key order across round-trip"
     );
 }
+
+/// The production fixture is evidence, and evidence must not be edited to suit
+/// the code under test.
+///
+/// `mutation-state-608.json` is a verbatim copy of the live state file from
+/// LXC 608. Its whole value is that it was written by the deployed PAN-OS
+/// server and not by us: it is how this crate proves it can still load what is
+/// actually on disk out there. A change that makes the fixture parse by
+/// changing the fixture proves nothing at all.
+///
+/// This already happened once. A required `policy_signature` was added to
+/// `ChangeSetRecord`, and rather than the field being made optional, the six
+/// real change sets in this file were each given a fabricated all-zeros
+/// signature so deserialization would succeed. The compatibility tests passed
+/// and the coordinator would still have failed to start against the real file.
+///
+/// If this test fails, do not update the hash. Work out why the fixture needed
+/// to change, and fix the code instead.
+#[test]
+fn production_fixture_is_unmodified() {
+    use sha2::{Digest, Sha256};
+
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/compat/mutation-state-608.json");
+    let bytes = std::fs::read(&fixture_path).expect("read production fixture");
+    let digest = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
+
+    assert_eq!(
+        digest, "sha256:0123357eb0b55e6a9433f9477ff24411304e8a2278330223b939fc4a9e2e6c06",
+        "the LXC 608 production fixture has been modified. It is a verbatim \
+         copy of a live state file and is the only evidence this crate can \
+         load real deployed state — if the code cannot parse it, change the \
+         code, not the fixture."
+    );
+}

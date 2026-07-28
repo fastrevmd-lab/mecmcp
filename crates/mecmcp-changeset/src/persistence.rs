@@ -248,12 +248,21 @@ pub fn write_state(
         .parent()
         .ok_or_else(|| PersistenceError::new("changeset state path has no parent"))?;
 
-    // Determine schema version: write version 2 if any operation has the new fields
-    let version = if state
+    // Write version 2 only when a record actually carries a field the version-1
+    // reader does not know. Both record types are `deny_unknown_fields`, so a
+    // previous binary handed an unexpected key rejects the WHOLE file, not one
+    // record — and rolling a release back is a documented step in these servers'
+    // deploy procedure. A deployment that uses none of these fields keeps
+    // producing files the older binary reads.
+    let operations_need_v2 = state
         .operations
         .values()
-        .any(|op| op.attribution.is_some() || op.rollback_deadline_unix.is_some())
-    {
+        .any(|op| op.attribution.is_some() || op.rollback_deadline_unix.is_some());
+    let change_sets_need_v2 = state
+        .change_sets
+        .values()
+        .any(|cs| !cs.policy_signature.is_empty());
+    let version = if operations_need_v2 || change_sets_need_v2 {
         2
     } else {
         1

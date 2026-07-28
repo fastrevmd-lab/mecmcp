@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod apply;
 pub mod changeset;
 pub mod coordinator;
 pub mod digest;
@@ -18,6 +19,7 @@ pub mod recovery;
 pub mod transaction;
 pub mod types;
 
+pub use apply::ApplyOutput;
 pub use changeset::ChangeSetOutput;
 pub use coordinator::{ChangesetCoordinator, CoordinatorError};
 pub use lifecycle::{ChangeSetState, LifecycleState};

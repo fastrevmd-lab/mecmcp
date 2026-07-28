@@ -1,0 +1,297 @@
+{
+  "version": 1,
+  "state": {
+    "operations": {
+      "12b8f2abd38559f06c5fe0227e91e6a50c47284ea64b48ac412256abb8654814": {
+        "id": "12b8f2abd38559f06c5fe0227e91e6a50c47284ea64b48ac412256abb8654814",
+        "owner": "lab-change-writer",
+        "device": "panosvm-writer",
+        "endpoint": "https://198.51.100.20",
+        "action": "set",
+        "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+        "actions": [
+          {
+            "action": "set",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+            "element": "<entry name=\"v020-commit-1783727757\"><ip-netmask>192.0.2.203</ip-netmask><description>rust-panosmcp v0.2.0 smoke</description></entry>",
+            "destructive_confirmation": null
+          }
+        ],
+        "change_set_id": "e9c2899388674cc6e217762a9b860210010580ad7b8e625ba389f43af8b3285e",
+        "current": "sha256:2ae192bb36edb56a2bcb547b54e5fe87566a6ecf9107d18901a76ad831ceaedf",
+        "state": "committed",
+        "job_id": "88879",
+        "details": "Partial changes to commit: changes to configuration by administrators: rust-panosmcp-api",
+        "config_lock_held": false,
+        "policy_signature": "sha256:1775c53ee96aec8e1841a5e6a9facc62ad4cbb229b782bcb314d5934eb75151f"
+      },
+      "2a3b1f77ab4eebc5ef6833dbc7118af06f88b832d515ce8915e90a888fb2c0ec": {
+        "id": "2a3b1f77ab4eebc5ef6833dbc7118af06f88b832d515ce8915e90a888fb2c0ec",
+        "owner": "lab-change-writer",
+        "device": "panosvm-writer",
+        "endpoint": "https://198.51.100.20",
+        "action": "delete",
+        "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address/entry[@name='rust-panosmcp-v021-a']",
+        "actions": [
+          {
+            "action": "delete",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address/entry[@name='rust-panosmcp-v021-a']",
+            "element": null,
+            "destructive_confirmation": "DELETE /config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address/entry[@name='rust-panosmcp-v021-a']"
+          },
+          {
+            "action": "delete",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address/entry[@name='rust-panosmcp-v021-b']",
+            "element": null,
+            "destructive_confirmation": "DELETE /config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address/entry[@name='rust-panosmcp-v021-b']"
+          }
+        ],
+        "change_set_id": "3a850a5f2051d4dec6ee19ce5d7f2585ea1bd36658cc400a1a9e990cf0241262",
+        "current": "sha256:f8469cad470f9744328747b5c516f256e0785f563076e42f56a772b180198187",
+        "state": "committed",
+        "job_id": "88996",
+        "details": "Partial changes to commit: changes to configuration by administrators: rust-panosmcp-api",
+        "config_lock_held": false,
+        "policy_signature": "sha256:1775c53ee96aec8e1841a5e6a9facc62ad4cbb229b782bcb314d5934eb75151f"
+      },
+      "52bb10d5bc6318e89c2dca0951b48016f2d5b5b071b5ab7843dc9c9c941748a1": {
+        "id": "52bb10d5bc6318e89c2dca0951b48016f2d5b5b071b5ab7843dc9c9c941748a1",
+        "owner": "lab-change-writer",
+        "device": "panosvm-writer",
+        "endpoint": "https://198.51.100.20",
+        "action": "set",
+        "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+        "actions": [
+          {
+            "action": "set",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+            "element": "<entry name=\"rust-panosmcp-v021-discard\"><ip-netmask>198.51.100.243</ip-netmask></entry>",
+            "destructive_confirmation": null
+          }
+        ],
+        "change_set_id": "5ec3151eb953cf74c1de314bdf4a9af3fb5497cb5ae13c7a016788843fcaa4b4",
+        "current": "sha256:f8469cad470f9744328747b5c516f256e0785f563076e42f56a772b180198187",
+        "state": "discarded",
+        "job_id": "89018",
+        "details": null,
+        "config_lock_held": false,
+        "policy_signature": "sha256:1775c53ee96aec8e1841a5e6a9facc62ad4cbb229b782bcb314d5934eb75151f"
+      },
+      "5b70334a54834381d20fe0b66c0f61cf9954ff93ff088b7591396c322cb2ff39": {
+        "id": "5b70334a54834381d20fe0b66c0f61cf9954ff93ff088b7591396c322cb2ff39",
+        "owner": "lab-change-writer",
+        "device": "panosvm-writer",
+        "endpoint": "https://198.51.100.20",
+        "action": "delete",
+        "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address/entry[@name='v020-commit-1783727757']",
+        "actions": [
+          {
+            "action": "delete",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address/entry[@name='v020-commit-1783727757']",
+            "element": null,
+            "destructive_confirmation": "DELETE /config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address/entry[@name='v020-commit-1783727757']"
+          }
+        ],
+        "change_set_id": "fd142a1c9c79b6c0e2286af2306efde286d8aedeb59c699d4bed252f50a9a65c",
+        "current": "sha256:f8469cad470f9744328747b5c516f256e0785f563076e42f56a772b180198187",
+        "state": "committed",
+        "job_id": "88885",
+        "details": "Partial changes to commit: changes to configuration by administrators: rust-panosmcp-api",
+        "config_lock_held": false,
+        "policy_signature": "sha256:1775c53ee96aec8e1841a5e6a9facc62ad4cbb229b782bcb314d5934eb75151f"
+      },
+      "b7827dec86a1aa69ad4321a90b23b1c20d70abf5cf7ef48f39d5a3552d5fd983": {
+        "id": "b7827dec86a1aa69ad4321a90b23b1c20d70abf5cf7ef48f39d5a3552d5fd983",
+        "owner": "lab-change-writer",
+        "device": "panosvm-writer",
+        "endpoint": "https://198.51.100.20",
+        "action": "set",
+        "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+        "actions": [
+          {
+            "action": "set",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+            "element": "<entry name=\"rust-panosmcp-v021-a\"><ip-netmask>198.51.100.241</ip-netmask></entry>",
+            "destructive_confirmation": null
+          },
+          {
+            "action": "set",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+            "element": "<entry name=\"rust-panosmcp-v021-b\"><ip-netmask>198.51.100.242</ip-netmask></entry>",
+            "destructive_confirmation": null
+          }
+        ],
+        "change_set_id": "6753f58e8858069c4850f0fa52e5ef60a3596072c18b6470d556eb075441a3ce",
+        "current": "sha256:d56de415737b1d0be9e62192385300b5e39f86af0269fbb5bf0f28743b45c290",
+        "state": "committed",
+        "job_id": "88990",
+        "details": "Partial changes to commit: changes to configuration by administrators: rust-panosmcp-api",
+        "config_lock_held": false,
+        "policy_signature": "sha256:1775c53ee96aec8e1841a5e6a9facc62ad4cbb229b782bcb314d5934eb75151f"
+      },
+      "c8d5e5b5726d835d98beda398768b911d4041139fb2ff8d82e6c2c4fb76407fd": {
+        "id": "c8d5e5b5726d835d98beda398768b911d4041139fb2ff8d82e6c2c4fb76407fd",
+        "owner": "lab-change-writer",
+        "device": "panosvm-writer",
+        "endpoint": "https://198.51.100.20",
+        "action": "set",
+        "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+        "actions": [
+          {
+            "action": "set",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+            "element": "<entry name=\"v020-discard-a-1783727757\"><ip-netmask>192.0.2.201</ip-netmask><description>rust-panosmcp v0.2.0 smoke</description></entry>",
+            "destructive_confirmation": null
+          },
+          {
+            "action": "set",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+            "element": "<entry name=\"v020-discard-b-1783727757\"><ip-netmask>192.0.2.202</ip-netmask><description>rust-panosmcp v0.2.0 smoke</description></entry>",
+            "destructive_confirmation": null
+          }
+        ],
+        "change_set_id": "49b676c81843a90b04078172fbbe3d00362497f3da969984ff38dbad80000b45",
+        "current": "sha256:f8469cad470f9744328747b5c516f256e0785f563076e42f56a772b180198187",
+        "state": "discarded",
+        "job_id": "88873",
+        "details": null,
+        "config_lock_held": true,
+        "policy_signature": "sha256:1775c53ee96aec8e1841a5e6a9facc62ad4cbb229b782bcb314d5934eb75151f"
+      }
+    },
+    "change_sets": {
+      "3a850a5f2051d4dec6ee19ce5d7f2585ea1bd36658cc400a1a9e990cf0241262": {
+        "id": "3a850a5f2051d4dec6ee19ce5d7f2585ea1bd36658cc400a1a9e990cf0241262",
+        "owner": "lab-change-writer",
+        "device": "panosvm-writer",
+        "expected_candidate_fingerprint": "sha256:d56de415737b1d0be9e62192385300b5e39f86af0269fbb5bf0f28743b45c290",
+        "actions": [
+          {
+            "action": "delete",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address/entry[@name='rust-panosmcp-v021-a']",
+            "element": null,
+            "destructive_confirmation": "DELETE /config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address/entry[@name='rust-panosmcp-v021-a']"
+          },
+          {
+            "action": "delete",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address/entry[@name='rust-panosmcp-v021-b']",
+            "element": null,
+            "destructive_confirmation": "DELETE /config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address/entry[@name='rust-panosmcp-v021-b']"
+          }
+        ],
+        "digest": "sha256:62b17b6a990e7f071b96a4e1aae09a04f4bda34967c5d721a47547ec25cdf7aa",
+        "state": "applied",
+        "approver": "lab-change-reviewer",
+        "expires_at_unix": 1783733470,
+        "operation_id": "2a3b1f77ab4eebc5ef6833dbc7118af06f88b832d515ce8915e90a888fb2c0ec"
+      },
+      "49b676c81843a90b04078172fbbe3d00362497f3da969984ff38dbad80000b45": {
+        "id": "49b676c81843a90b04078172fbbe3d00362497f3da969984ff38dbad80000b45",
+        "owner": "lab-change-writer",
+        "device": "panosvm-writer",
+        "expected_candidate_fingerprint": "sha256:f8469cad470f9744328747b5c516f256e0785f563076e42f56a772b180198187",
+        "actions": [
+          {
+            "action": "set",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+            "element": "<entry name=\"v020-discard-a-1783727757\"><ip-netmask>192.0.2.201</ip-netmask><description>rust-panosmcp v0.2.0 smoke</description></entry>",
+            "destructive_confirmation": null
+          },
+          {
+            "action": "set",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+            "element": "<entry name=\"v020-discard-b-1783727757\"><ip-netmask>192.0.2.202</ip-netmask><description>rust-panosmcp v0.2.0 smoke</description></entry>",
+            "destructive_confirmation": null
+          }
+        ],
+        "digest": "sha256:06e0144be7181937a438645cc5856d30c8d09f3a9f15ff6794ad85328bb8223a",
+        "state": "applied",
+        "approver": "lab-change-reviewer",
+        "expires_at_unix": 1783728660,
+        "operation_id": "c8d5e5b5726d835d98beda398768b911d4041139fb2ff8d82e6c2c4fb76407fd"
+      },
+      "5ec3151eb953cf74c1de314bdf4a9af3fb5497cb5ae13c7a016788843fcaa4b4": {
+        "id": "5ec3151eb953cf74c1de314bdf4a9af3fb5497cb5ae13c7a016788843fcaa4b4",
+        "owner": "lab-change-writer",
+        "device": "panosvm-writer",
+        "expected_candidate_fingerprint": "sha256:f8469cad470f9744328747b5c516f256e0785f563076e42f56a772b180198187",
+        "actions": [
+          {
+            "action": "set",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+            "element": "<entry name=\"rust-panosmcp-v021-discard\"><ip-netmask>198.51.100.243</ip-netmask></entry>",
+            "destructive_confirmation": null
+          }
+        ],
+        "digest": "sha256:69286f12198ff3c70728cb53d522f987ddfe5553207be96744a5c3522c99c2f5",
+        "state": "applied",
+        "approver": "lab-change-reviewer",
+        "expires_at_unix": 1783734404,
+        "operation_id": "52bb10d5bc6318e89c2dca0951b48016f2d5b5b071b5ab7843dc9c9c941748a1"
+      },
+      "6753f58e8858069c4850f0fa52e5ef60a3596072c18b6470d556eb075441a3ce": {
+        "id": "6753f58e8858069c4850f0fa52e5ef60a3596072c18b6470d556eb075441a3ce",
+        "owner": "lab-change-writer",
+        "device": "panosvm-writer",
+        "expected_candidate_fingerprint": "sha256:f8469cad470f9744328747b5c516f256e0785f563076e42f56a772b180198187",
+        "actions": [
+          {
+            "action": "set",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+            "element": "<entry name=\"rust-panosmcp-v021-a\"><ip-netmask>198.51.100.241</ip-netmask></entry>",
+            "destructive_confirmation": null
+          },
+          {
+            "action": "set",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+            "element": "<entry name=\"rust-panosmcp-v021-b\"><ip-netmask>198.51.100.242</ip-netmask></entry>",
+            "destructive_confirmation": null
+          }
+        ],
+        "digest": "sha256:5d31a4653cbf856dbbaa653f0c52ff985f1b27165e1be588af740ccabb5d652b",
+        "state": "applied",
+        "approver": "lab-change-reviewer",
+        "expires_at_unix": 1783733293,
+        "operation_id": "b7827dec86a1aa69ad4321a90b23b1c20d70abf5cf7ef48f39d5a3552d5fd983"
+      },
+      "e9c2899388674cc6e217762a9b860210010580ad7b8e625ba389f43af8b3285e": {
+        "id": "e9c2899388674cc6e217762a9b860210010580ad7b8e625ba389f43af8b3285e",
+        "owner": "lab-change-writer",
+        "device": "panosvm-writer",
+        "expected_candidate_fingerprint": "sha256:f8469cad470f9744328747b5c516f256e0785f563076e42f56a772b180198187",
+        "actions": [
+          {
+            "action": "set",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address",
+            "element": "<entry name=\"v020-commit-1783727757\"><ip-netmask>192.0.2.203</ip-netmask><description>rust-panosmcp v0.2.0 smoke</description></entry>",
+            "destructive_confirmation": null
+          }
+        ],
+        "digest": "sha256:59d42b9f0be0f9cc4971ff198c6c9084ac8e6f5cc9b5c8441ac795f172e3c21c",
+        "state": "applied",
+        "approver": "lab-change-reviewer",
+        "expires_at_unix": 1783728715,
+        "operation_id": "12b8f2abd38559f06c5fe0227e91e6a50c47284ea64b48ac412256abb8654814"
+      },
+      "fd142a1c9c79b6c0e2286af2306efde286d8aedeb59c699d4bed252f50a9a65c": {
+        "id": "fd142a1c9c79b6c0e2286af2306efde286d8aedeb59c699d4bed252f50a9a65c",
+        "owner": "lab-change-writer",
+        "device": "panosvm-writer",
+        "expected_candidate_fingerprint": "sha256:2ae192bb36edb56a2bcb547b54e5fe87566a6ecf9107d18901a76ad831ceaedf",
+        "actions": [
+          {
+            "action": "delete",
+            "xpath": "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address/entry[@name='v020-commit-1783727757']",
+            "element": null,
+            "destructive_confirmation": "DELETE /config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/address/entry[@name='v020-commit-1783727757']"
+          }
+        ],
+        "digest": "sha256:f53f5bfcff0230375d655af6926c6ba0295d9a5943b0cdf7e9554730edd4b358",
+        "state": "applied",
+        "approver": "lab-change-reviewer",
+        "expires_at_unix": 1783728923,
+        "operation_id": "5b70334a54834381d20fe0b66c0f61cf9954ff93ff088b7591396c322cb2ff39"
+      }
+    }
+  }
+}
