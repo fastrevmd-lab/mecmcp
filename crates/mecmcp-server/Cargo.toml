@@ -1,0 +1,22 @@
+[package]
+name        = "mecmcp-server"
+description = "Vendor-neutral rmcp server adapters for mechub MCP servers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+http         = "1"
+mecmcp-audit = { version = "0.3.6", path = "../mecmcp-audit" }
+mecmcp-auth  = { version = "0.3.6", path = "../mecmcp-auth" }
+rmcp         = { version = "2", default-features = false }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+
