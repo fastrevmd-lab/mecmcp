@@ -347,6 +347,68 @@ capability: **two-person change control on Junos**, which does not exist today.
 applied, and verified; an interrupted apply resolves through
 `resolve_persisted_operation` rather than leaving unknown state.
 
+**Status 2026-07-28: the shared crate is complete and released as
+`changeset-v0.3.0`. Vendor adoption is in flight and the exit criterion is not
+met.**
+
+Done and merged:
+
+- `mecmcp-changeset` in full — records, `DeviceTransaction`, coordinator with
+  restart recovery, validation, the approval gate with tamper-evident
+  approvals, change-set apply, the single-operation lifecycle, indeterminate
+  recovery, and the lab-mode waiver. Plus token-bound provenance (#52) and
+  the crate README.
+- PAN-OS: `DeviceTransaction` for `PanosClient`, and the first method
+  (`candidate_fingerprint`) reading through it.
+
+Verified against the live deployment: `/var/lib/rust-panosmcp/mutation-state.json`
+on LXC 608 loads with the new reader — six operations, six change sets, every
+approver distinct from its owner. That is half the exit criterion, checked
+read-only against the real container rather than against the fixture.
+
+Not done:
+
+- The rest of the PAN-OS `mutation.rs` migration (rustpanosmcp#65). A first
+  attempt migrated all seven single-operation methods at once, compiled clean,
+  passed every unit test, and broke four of the five integration tests —
+  including one it was scoped not to touch. Reverted. The approach that works
+  is one method at a time with the full suite green before and after, which is
+  how `candidate_fingerprint` landed.
+- The Junos change-set tools (rustjunosmcp#228). Committed but **unmerged and
+  not deployable**: as first written they did not enforce two-person control —
+  the authenticated identity was discarded and a client-supplied `owner`
+  persisted instead — and could not apply at all. Fixes are in on the branch;
+  the review gate has not yet returned a trustworthy verdict on them.
+- The live vSRX half of the exit criterion. Needs a build deployed to LXC 609,
+  which is `protected` and has no standby, so it is a deliberate operator
+  decision rather than something to do in passing.
+
+Findings worth carrying forward:
+
+- **A green suite is not evidence the thing works.** Every serious defect this
+  phase surfaced — a state file the coordinator would refuse to reload, an
+  `action` encoding the deployed reader cannot parse, tools that did not
+  actually enforce two-person control — passed `fmt`, `clippy -D warnings` and
+  the full test suite. They lived in the space the tests did not reach:
+  persistence enabled, an authenticated caller, a failing commit outcome.
+- **Check the pass count, not the failure count.** A workspace that fails to
+  compile reports zero passes *and* zero failures, which reads as success if
+  you only look for failures. This cost time twice.
+- **"Pre-existing and unrelated" is worth thirty seconds of checking.** It was
+  claimed three times about breakage the change itself had caused; stashing and
+  re-running settled it each time.
+- **Do not edit the evidence.** A required field was made to pass by adding a
+  fabricated value to the six real LXC 608 change sets in the compatibility
+  fixture. The suite went green over a change that would have stopped the
+  coordinator starting. `production_fixture_is_unmodified` now pins its
+  SHA-256, and the real file has since been confirmed to match.
+- **Say `Indeterminate` when you mean it.** The recurring defect class was
+  records asserting more certainty than the code established: a waiver written
+  as an approver, a lock flag cleared without unlocking, a dropped commit
+  future reported as `Detached`, a failed write returned as success. For a
+  crate whose product is a state file an operator trusts at 3am, that is the
+  failure that matters.
+
 ### Phase 6+ — scale and multi-vendor
 
 Driven by [`ROADMAP.md`](ROADMAP.md): blast-radius guards, staged rollout, drift
