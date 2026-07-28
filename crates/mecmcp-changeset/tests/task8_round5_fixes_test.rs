@@ -143,6 +143,7 @@ async fn test_primary_action_discriminator() {
             &transaction,
             &actions,
             "set", // Primary action discriminator
+            None,
             "sha256:policy",
             &cancellation,
         )
@@ -206,6 +207,7 @@ async fn test_commit_cancellation_after_guard() {
             &transaction,
             &actions,
             "set",
+            None,
             "sha256:policy",
             &cancellation,
         )
@@ -310,6 +312,7 @@ async fn test_post_stage_persistence_failure() {
             &transaction,
             &actions,
             "set",
+            None,
             "sha256:policy",
             &cancellation,
         )
@@ -364,6 +367,7 @@ async fn test_discard_unsupported_unlock_returns_error() {
             &transaction,
             &actions,
             "set",
+            None,
             "sha256:policy",
             &cancellation,
         )
@@ -441,6 +445,7 @@ async fn test_device_guard_keys_on_device_name() {
             &transaction,
             &actions,
             "set",
+            None,
             "sha256:policy",
             &cancellation,
         )
@@ -458,6 +463,7 @@ async fn test_device_guard_keys_on_device_name() {
             &transaction,
             &actions,
             "set",
+            None,
             "sha256:policy",
             &cancellation,
         )
@@ -511,6 +517,7 @@ async fn test_principal_variant_persisted() {
             &transaction,
             &actions,
             "set",
+            None,
             "sha256:policy",
             &cancellation,
         )
@@ -586,6 +593,7 @@ async fn test_principal_variant_persisted() {
             &transaction2,
             &actions,
             "set",
+            None,
             "sha256:policy",
             &cancellation,
         )
@@ -736,6 +744,7 @@ async fn test_stage_failure_includes_operation_id() {
             &transaction,
             &actions,
             "set",
+            None,
             "sha256:policy",
             &cancellation,
         )

@@ -357,6 +357,7 @@ async fn p1_issue1_discard_rereads_after_guard() {
             &*transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )
@@ -473,6 +474,7 @@ async fn p1_issue2_validate_rereads_after_guard() {
             &*transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )
@@ -572,6 +574,7 @@ async fn p1_issue3_discard_persists_before_unlock() {
             &transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )
@@ -647,6 +650,7 @@ async fn p1_issue4_unsupported_unlock_becomes_indeterminate() {
             &transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )
@@ -730,6 +734,7 @@ async fn p2_issue5_stage_validates_fingerprint_early() {
             &transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )
@@ -781,6 +786,7 @@ async fn p2_issue6_stage_persists_lock_risk() {
             &transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )
@@ -834,6 +840,7 @@ async fn p2_issue7_failed_commit_preserves_lock() {
             &transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )
@@ -931,6 +938,7 @@ async fn p2_issue8_confirmed_commit_persists_deadline() {
             &transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )
@@ -1027,6 +1035,7 @@ async fn p2_issue9_attribution_includes_agent_identity() {
             &transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )

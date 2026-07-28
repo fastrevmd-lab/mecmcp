@@ -250,17 +250,29 @@ impl ChangesetCoordinator {
             ));
         }
 
-        // Enforce one active operation per device (keyed on trusted device name,
-        // not endpoint, because a device can have multiple valid addresses).
-        if state
-            .operations
-            .values()
-            .any(|existing| existing.device == record.device && !existing.state.terminal())
-        {
-            return Err(CoordinatorError::new(
-                "operation_id",
-                "the device already has an active or unreconciled operation",
-            ));
+        // Enforce one active operation per device or endpoint. Two inventory names
+        // can legitimately resolve to the same endpoint (management IP + DNS name),
+        // and if both passed the device-only check, two operations could mutate
+        // one candidate concurrently. Reject when EITHER the device name matches
+        // OR the canonical endpoint matches.
+        for existing in state.operations.values() {
+            if existing.state.terminal() {
+                continue;
+            }
+            // Check device match
+            if existing.device == record.device {
+                return Err(CoordinatorError::new(
+                    "operation_id",
+                    "the device already has an active or unreconciled operation",
+                ));
+            }
+            // Check canonical endpoint match
+            if existing.endpoint == record.endpoint {
+                return Err(CoordinatorError::new(
+                    "operation_id",
+                    "the device already has an active or unreconciled operation",
+                ));
+            }
         }
 
         let id = record.id.clone();

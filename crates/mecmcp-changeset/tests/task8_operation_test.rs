@@ -338,6 +338,7 @@ async fn happy_path_stage_diff_validate_commit() {
             &transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )
@@ -463,6 +464,7 @@ async fn commit_with_indeterminate_outcome() {
             &transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )
@@ -549,6 +551,7 @@ async fn discard_after_failed_validation() {
             &transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )
@@ -642,6 +645,7 @@ async fn discard_clears_the_lock_when_the_transaction_can_unlock() {
             &transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )
@@ -706,6 +710,7 @@ async fn diff_validate_commit_reject_fingerprint_mismatch() {
             &transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )
@@ -771,6 +776,7 @@ async fn operation_id_ownership_validation() {
             &transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )
@@ -820,6 +826,7 @@ async fn discard_rejects_invalid_states() {
             &transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )
@@ -897,6 +904,7 @@ async fn commit_rejects_non_validated_operation() {
             &transaction,
             &actions,
             "set",
+            None,
             policy_sig,
             &cancellation,
         )

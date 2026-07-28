@@ -287,6 +287,7 @@ async fn test_version_2_written_when_new_fields_present() {
             &transaction,
             &actions,
             "set",
+            None,
             "policy123",
             &CancellationToken::new(),
         )
@@ -365,6 +366,7 @@ async fn test_canonicalized_endpoints_share_guard() {
             &transaction,
             &actions,
             "set",
+            None,
             "policy123",
             &CancellationToken::new(),
         )
@@ -381,6 +383,7 @@ async fn test_canonicalized_endpoints_share_guard() {
             &transaction,
             &actions,
             "set",
+            None,
             "policy123",
             &CancellationToken::new(),
         )
@@ -437,6 +440,7 @@ async fn test_discard_stays_indeterminate_until_unlock() {
             &transaction,
             &actions,
             "set",
+            None,
             "policy123",
             &CancellationToken::new(),
         )
@@ -517,6 +521,7 @@ async fn test_discard_becomes_terminal_when_unlock_released() {
             &transaction,
             &actions,
             "set",
+            None,
             "policy123",
             &CancellationToken::new(),
         )
@@ -585,6 +590,7 @@ async fn test_rollback_error_becomes_indeterminate() {
             &transaction,
             &actions,
             "set",
+            None,
             "policy123",
             &CancellationToken::new(),
         )
@@ -659,6 +665,7 @@ async fn test_diff_serializes_with_commit() {
             &transaction,
             &actions,
             "set",
+            None,
             "policy123",
             &CancellationToken::new(),
         )

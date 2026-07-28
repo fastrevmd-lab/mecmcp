@@ -108,6 +108,7 @@ impl ChangesetCoordinator {
         transaction: &T,
         actions: &[T::Action],
         primary_action_discriminator: &str,
+        vendor_primary_target: Option<&str>,
         policy_signature: &str,
         cancellation: &CancellationToken,
     ) -> Result<StageOutput<T::Staged>, CoordinatorError> {
@@ -146,7 +147,7 @@ impl ChangesetCoordinator {
             device: device.to_owned(),
             endpoint: canonical_endpoint.clone(),
             action: serde_json::Value::String(primary_action_discriminator.to_owned()),
-            xpath: None,
+            xpath: vendor_primary_target.map(|s| s.to_owned()),
             actions: actions
                 .iter()
                 .map(|a| {
@@ -235,16 +236,22 @@ impl ChangesetCoordinator {
                 // and possibly locked, but the final state update fails. Keep the operation
                 // as Indeterminate rather than dropping it or leaving a stale Staging record.
                 if let Err(persist_error) = self.update(record.clone()).await {
-                    // Persist as Indeterminate with the pre-stage fingerprint and lock held.
-                    // This ensures recovery can find and reconcile the operation.
+                    // Persist as Indeterminate with the known post-stage fingerprint and lock held.
+                    // The `after_fp` is already known from stage() — persisting it instead of the
+                    // pre-stage expected_fingerprint gives manual reconciliation the correct state.
                     record.state = LifecycleState::Indeterminate;
-                    record.current = expected_fingerprint.to_owned(); // Restore pre-stage fingerprint
+                    record.current = after_fp.clone(); // Keep the post-stage fingerprint
                     record.details = Some(format!(
                         "staging succeeded but final persistence failed: {persist_error}"
                     ));
                     record.config_lock_held = true;
                     let _ = self.update(record).await; // Best-effort
-                    return Err(persist_error);
+                    return Err(CoordinatorError::new(
+                        "state",
+                        format!(
+                            "{persist_error} (operation {operation_id} requires manual reconciliation)"
+                        ),
+                    ));
                 }
 
                 Ok(StageOutput {
@@ -573,6 +580,11 @@ impl ChangesetCoordinator {
                 record.job_id = job_id.clone();
                 record.details = details.clone();
                 record.rollback_deadline_unix = Some(rollback_deadline_unix);
+                // Clear the lock flag: the transaction contract guarantees a successful
+                // confirmed commit releases the candidate lock (the commit succeeded
+                // provisionally and no longer holds the lock). Leaving `config_lock_held`
+                // set would record a lock as held when it is not.
+                record.config_lock_held = false;
                 // Keep in Committing state until confirmed
                 self.update(record).await?;
                 Ok(CommitOutcome::AwaitingConfirmation {
