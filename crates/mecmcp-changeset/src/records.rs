@@ -206,6 +206,12 @@ pub struct ChangeSetRecord {
     /// Operation identifier created when this change set was applied.
     pub operation_id: Option<String>,
     /// Policy signature at the time of change-set creation.
+    ///
+    /// Absent on records written before this field existed. The deployed LXC 608
+    /// state file carries `policy_signature` on operations but NOT on change
+    /// sets, so this must default rather than be required — a required field
+    /// here stops the coordinator loading its own state file after an upgrade.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub policy_signature: String,
 }
 
