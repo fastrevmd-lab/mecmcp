@@ -29,6 +29,8 @@ fn make_operation_record(id: &str, state: LifecycleState) -> OperationRecord {
         config_lock_held: true,
         policy_signature: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
             .to_string(),
+        attribution: None,
+        rollback_deadline_unix: None,
     }
 }
 

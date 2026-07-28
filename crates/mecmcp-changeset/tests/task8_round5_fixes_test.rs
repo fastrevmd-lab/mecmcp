@@ -237,6 +237,7 @@ async fn test_commit_cancellation_after_guard() {
         change_ref: None,
         request_id: uuid::Uuid::new_v4(),
         agent: None,
+        token_verified_fields: mecmcp_audit::TokenVerifiedFields::none(),
     };
 
     // Commit should fail with cancellation error
@@ -545,6 +546,7 @@ async fn test_principal_variant_persisted() {
         change_ref: None,
         request_id: uuid::Uuid::new_v4(),
         agent: None,
+        token_verified_fields: mecmcp_audit::TokenVerifiedFields::none(),
     };
 
     coordinator
@@ -620,6 +622,7 @@ async fn test_principal_variant_persisted() {
         change_ref: None,
         request_id: uuid::Uuid::new_v4(),
         agent: None,
+        token_verified_fields: mecmcp_audit::TokenVerifiedFields::none(),
     };
 
     coordinator

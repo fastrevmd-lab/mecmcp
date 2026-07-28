@@ -528,6 +528,7 @@ async fn test_awaiting_confirmation_clears_lock_flag() {
         change_ref: None,
         request_id: uuid::Uuid::new_v4(),
         agent: None,
+        token_verified_fields: mecmcp_audit::TokenVerifiedFields::none(),
     };
 
     let outcome = coordinator
