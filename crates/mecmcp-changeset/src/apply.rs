@@ -28,20 +28,19 @@ fn canonicalize_endpoint(endpoint: &str) -> Result<String, CoordinatorError> {
     let url = url::Url::parse(endpoint)
         .map_err(|e| CoordinatorError::new("endpoint", format!("invalid endpoint URL: {e}")))?;
 
-    // Check the parsed scheme (case-insensitive per RFC 3986)
-    if url.scheme() != "https" {
-        return Err(CoordinatorError::new(
-            "endpoint",
-            "endpoint must use https:// scheme",
-        ));
-    }
+    // Any scheme is accepted. This value identifies a device and is used as a
+    // guard key; it is not dialled. PAN-OS supplies an HTTPS management URL,
+    // Junos a NETCONF-over-SSH address, and requiring `https` forced the latter
+    // to persist a false endpoint to pass validation (#69). What matters is
+    // that it parses, has a host, and canonicalizes stably so two spellings of
+    // one device cannot take separate locks.
 
     // Rebuild with normalized components
     let host = url
         .host_str()
         .ok_or_else(|| CoordinatorError::new("endpoint", "endpoint must contain a valid host"))?;
 
-    let mut canonical = format!("https://{}", host.to_lowercase());
+    let mut canonical = format!("{}://{}", url.scheme(), host.to_lowercase());
 
     if let Some(port) = url.port() {
         canonical.push_str(&format!(":{port}"));

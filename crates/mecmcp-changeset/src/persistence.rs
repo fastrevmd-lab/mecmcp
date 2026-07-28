@@ -151,7 +151,14 @@ pub fn validate_state(state: &ChangesetState) -> Result<(), PersistenceError> {
         validate_fingerprint(&record.current).map_err(|error| {
             PersistenceError::new(format!("operation fingerprint invalid: {error}"))
         })?;
-        if !record.endpoint.starts_with("https://") || record.actions.is_empty() {
+        // The endpoint identifies a device; it is not required to be HTTPS.
+        // PAN-OS's management interface genuinely is an HTTPS XML API, but Junos
+        // is NETCONF over SSH and has no HTTPS endpoint at all. Demanding the
+        // scheme forced a vendor to persist a false address to satisfy a
+        // validator, which is the class of fabrication this crate exists to
+        // avoid. What the field must be is a stable, parseable device
+        // identifier — that is what makes it usable as a guard key (#69).
+        if url::Url::parse(&record.endpoint).is_err() || record.actions.is_empty() {
             return Err(PersistenceError::new(
                 "changeset state operation is missing endpoint/action metadata",
             ));
@@ -262,7 +269,15 @@ pub fn write_state(
         .change_sets
         .values()
         .any(|cs| !cs.policy_signature.is_empty());
-    let version = if operations_need_v2 || change_sets_need_v2 {
+    // A non-HTTPS endpoint is a version-2 record too. It is not a new *field*,
+    // but the version-1 reader validated `starts_with("https://")` and would
+    // reject the whole file over it — which is the same practical consequence
+    // the version gate exists to prevent, so it gets the same treatment (#69).
+    let endpoints_need_v2 = state
+        .operations
+        .values()
+        .any(|op| !op.endpoint.starts_with("https://"));
+    let version = if operations_need_v2 || change_sets_need_v2 || endpoints_need_v2 {
         2
     } else {
         1
