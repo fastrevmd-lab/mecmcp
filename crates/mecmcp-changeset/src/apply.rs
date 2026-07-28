@@ -24,21 +24,15 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Returns an error if the endpoint is not a valid HTTPS URL.
 fn canonicalize_endpoint(endpoint: &str) -> Result<String, CoordinatorError> {
-    if !endpoint.starts_with("https://") && !endpoint.starts_with("HTTPS://") {
-        return Err(CoordinatorError::new(
-            "endpoint",
-            "endpoint must start with https://",
-        ));
-    }
-
     // Parse the URL to validate structure
     let url = url::Url::parse(endpoint)
         .map_err(|e| CoordinatorError::new("endpoint", format!("invalid endpoint URL: {e}")))?;
 
+    // Check the parsed scheme (case-insensitive per RFC 3986)
     if url.scheme() != "https" {
         return Err(CoordinatorError::new(
             "endpoint",
-            "endpoint must use https scheme",
+            "endpoint must use https:// scheme",
         ));
     }
 
@@ -73,6 +67,15 @@ pub struct ApplyOutput<S> {
     /// Vendor-specific staged handle returned by the transaction.
     #[serde(skip)]
     pub staged: S,
+    /// The change-set state actually persisted, which is not always `Applied`.
+    ///
+    /// The device staging can succeed and the final record write still fail. The
+    /// staged handle has to be returned regardless — dropping it would strand the
+    /// operation with no way to commit or discard — so the caller is handed the
+    /// handle plus the truth about what reached disk. Anything other than
+    /// `Applied` here means the device changed and the record did not, and the
+    /// operation needs resolving before the change set is treated as done.
+    pub recorded_state: ChangeSetState,
 }
 
 impl ChangesetCoordinator {
@@ -241,6 +244,10 @@ impl ChangesetCoordinator {
             ));
         }
 
+        // Remembered so a failed final write can report what is really on disk
+        // rather than claiming a state that was never persisted.
+        let change_set_state_before_apply = change_set.state;
+
         // Capture the before fingerprint
         let before_fingerprint = transaction
             .fingerprint()
@@ -254,26 +261,6 @@ impl ChangesetCoordinator {
                 format!(
                     "device fingerprint changed: expected {}, found {}",
                     expected_fingerprint, before_fingerprint
-                ),
-            ));
-        }
-
-        // CRITICAL: The in-process guard cannot exclude external sessions (other processes,
-        // SSH, GUI). Between the fingerprint read above and the stage() call below, another
-        // session could mutate the candidate. To narrow the window, re-read the fingerprint
-        // immediately before staging and compare. This is not true atomicity — that requires
-        // a device-side lock held across the check — but it detects drift that happens in
-        // the (now much smaller) window.
-        let pre_stage_fingerprint = transaction.fingerprint().await.map_err(|e| {
-            CoordinatorError::new("device", format!("pre-stage fingerprint failed: {e}"))
-        })?;
-
-        if pre_stage_fingerprint != expected_fingerprint {
-            return Err(CoordinatorError::new(
-                "expected_fingerprint",
-                format!(
-                    "device fingerprint changed between check and stage: expected {}, found {}",
-                    expected_fingerprint, pre_stage_fingerprint
                 ),
             ));
         }
@@ -329,6 +316,44 @@ impl ChangesetCoordinator {
             return Err(error);
         }
 
+        // CRITICAL: The in-process guard cannot exclude external sessions (other processes,
+        // SSH, GUI). Between the fingerprint read above and the stage() call below, another
+        // session could mutate the candidate. To narrow the window, re-read the fingerprint
+        // immediately before staging and compare. This is not true atomicity — that requires
+        // a device-side lock held across the check — but it detects drift that happens in
+        // the (now much smaller) window. This check is placed AFTER all persistence operations
+        // (operation reservation + change-set Applying write) to ensure those bookkeeping steps
+        // cannot themselves introduce a window where an external session could race.
+        let pre_stage_fingerprint = transaction.fingerprint().await.map_err(|e| {
+            CoordinatorError::new("device", format!("pre-stage fingerprint failed: {e}"))
+        })?;
+
+        if pre_stage_fingerprint != expected_fingerprint {
+            return Err(CoordinatorError::new(
+                "expected_fingerprint",
+                format!(
+                    "device fingerprint changed between check and stage: expected {}, found {}",
+                    expected_fingerprint, pre_stage_fingerprint
+                ),
+            ));
+        }
+
+        // Persist the risk that stage() may acquire a device lock. If the process exits
+        // after stage() acquires a lock but before it returns, the record on disk must
+        // reflect that a lock may be held so restart recovery can flag it for manual
+        // inspection. Set config_lock_held to true BEFORE calling stage() rather than
+        // after, so a crash during stage() leaves the risk persisted.
+        let mut pre_stage_record = self.record(&operation_id, &owner, &device).await?;
+        pre_stage_record.config_lock_held = true;
+        if let Err(persist_error) = self.update(pre_stage_record).await {
+            // Persistence failed before we called stage(), so no lock has been acquired.
+            // Remove the operation reservation and fail the apply.
+            self.remove(&operation_id).await;
+            change_set.state = ChangeSetState::Failed;
+            let _ = self.update_change_set(change_set).await;
+            return Err(persist_error);
+        }
+
         // Stage all actions through the transaction
         let staged = match transaction.stage(&actions).await {
             Ok(staged) => staged,
@@ -341,11 +366,19 @@ impl ChangesetCoordinator {
                 // NOT revert here — doing so would be redundant and dangerous
                 // (a candidate revert clears ALL uncommitted changes, including
                 // pre-existing operator work).
-                change_set.state = ChangeSetState::Failed;
-                self.update_change_set(change_set).await?;
 
-                // Remove the staging operation record
+                // Mark change set as Failed. The stage contract is all-or-none, so nothing
+                // is on the device and the operation reservation must be removed regardless
+                // of whether this bookkeeping succeeds.
+                change_set.state = ChangeSetState::Failed;
+                let changeset_update_result = self.update_change_set(change_set).await;
+
+                // Remove the staging operation record unconditionally. If the change-set
+                // update failed, we still remove the operation so the endpoint is unblocked.
                 self.remove(&operation_id).await;
+
+                // Return the first error we encountered
+                changeset_update_result?;
 
                 return Err(CoordinatorError::new(
                     "device",
@@ -364,18 +397,19 @@ impl ChangesetCoordinator {
                 // 2. Both Junos rollback-0 and PAN-OS partial admin revert clear more
                 //    than just this change set — they would destroy unrelated operator work.
                 //
-                // Instead, mark the operation as Indeterminate and leave the change set
-                // as Failed. The operator must inspect the device and decide whether to
-                // commit or revert manually.
-                change_set.state = ChangeSetState::Failed;
-                self.update_change_set(change_set).await?;
-
+                // Mark the operation as Indeterminate FIRST, before updating the change set,
+                // so if the change-set update fails we still have the operation state recorded.
                 let mut record = self.record(&operation_id, &owner, &device).await?;
                 record.state = LifecycleState::Indeterminate;
                 record.details = Some(format!(
                     "fingerprint read failed after staging: {error}; staged changes remain on device"
                 ));
                 self.update(record).await?;
+
+                // Then mark the change set as Failed. Treat this as secondary: if it errors,
+                // the operation state is already recorded correctly.
+                change_set.state = ChangeSetState::Failed;
+                let _ = self.update_change_set(change_set).await;
 
                 return Err(CoordinatorError::new(
                     "device",
@@ -415,20 +449,28 @@ impl ChangesetCoordinator {
             return Err(persist_error);
         }
 
-        // Mark change set as Applied. On failure, the operation is already Staged,
-        // so we leave it terminal and mark the change set as Failed.
+        // Mark the change set Applied. If that write fails the handle must still
+        // reach the caller — returning `Err` would drop the only `T::Staged`, and
+        // `Staged` is non-terminal and not converted by restart recovery, so the
+        // endpoint would stay blocked with nothing able to commit or discard it.
+        //
+        // But the caller must not be told this was a clean apply. Rewriting the
+        // record to `Failed` would be worse than saying nothing: staging DID
+        // succeed on the device, so `Failed` asserts something untrue, and the
+        // write would go through the same persistence layer that just failed.
+        // Report what is actually on disk and let the caller decide.
         change_set.state = ChangeSetState::Applied;
-        if let Err(persist_error) = self.update_change_set(change_set.clone()).await {
-            change_set.state = ChangeSetState::Failed;
-            let _ = self.update_change_set(change_set).await;
-            return Err(persist_error);
-        }
+        let recorded_state = match self.update_change_set(change_set.clone()).await {
+            Ok(()) => ChangeSetState::Applied,
+            Err(_) => change_set_state_before_apply,
+        };
 
         Ok(ApplyOutput {
             operation_id,
             before_fingerprint,
             after_fingerprint,
             staged,
+            recorded_state,
         })
     }
 }

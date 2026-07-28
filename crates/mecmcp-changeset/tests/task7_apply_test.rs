@@ -320,6 +320,9 @@ async fn apply_approved_change_set_succeeds() {
 
     // Verify operation ID is set
     assert!(!apply_output.operation_id.is_empty());
+    // The reported state must match what was actually persisted, so a caller
+    // cannot read a successful return as "recorded" when the final write failed.
+    assert_eq!(apply_output.recorded_state, ChangeSetState::Applied);
     assert_ne!(
         apply_output.before_fingerprint,
         apply_output.after_fingerprint
@@ -1661,4 +1664,79 @@ async fn finding_8_expire_after_guard_wait() {
 
     // The fix ensures that expiration is detected and the change set is transitioned
     // to Expired whether it happens before or after acquiring the guard.
+}
+
+// ============================================================================
+// Tests for third review round findings
+// ============================================================================
+
+#[tokio::test]
+async fn finding_6_accept_case_insensitive_scheme() {
+    let coordinator = ChangesetCoordinator::default();
+    let transaction = MockTransaction::new();
+    let device = "test-device".to_string();
+    let owner = "alice";
+    let approver = "bob";
+
+    let initial_fp = transaction.fingerprint().await.unwrap();
+
+    let actions = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test".into(),
+        value: Some("value".into()),
+    }];
+
+    let create_output = coordinator
+        .create_change_set(
+            device.clone(),
+            actions,
+            owner.to_string(),
+            initial_fp.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .approve_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            approver.to_string(),
+            create_output.digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Apply with HTTPS:// (uppercase scheme)
+    let result = coordinator
+        .apply_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            "HTTPS://test-device.example.com".to_string(),
+            owner.to_string(),
+            create_output.digest.clone(),
+            initial_fp.clone(),
+            &transaction,
+            &test_attribution(owner),
+            &CancellationToken::new(),
+        )
+        .await;
+
+    // Should succeed (URL schemes are case-insensitive per RFC 3986)
+    assert!(
+        result.is_ok(),
+        "canonicalize_endpoint must accept case-insensitive schemes"
+    );
+
+    let apply_output = result.unwrap();
+    let record = coordinator
+        .record(&apply_output.operation_id, owner, &device)
+        .await
+        .unwrap();
+
+    // The canonicalized endpoint is normalized to lowercase
+    assert_eq!(
+        record.endpoint, "https://test-device.example.com",
+        "canonicalized endpoint must have lowercase scheme"
+    );
 }
