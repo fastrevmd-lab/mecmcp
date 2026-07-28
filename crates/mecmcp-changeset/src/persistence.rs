@@ -269,7 +269,15 @@ pub fn write_state(
         .change_sets
         .values()
         .any(|cs| !cs.policy_signature.is_empty());
-    let version = if operations_need_v2 || change_sets_need_v2 {
+    // A non-HTTPS endpoint is a version-2 record too. It is not a new *field*,
+    // but the version-1 reader validated `starts_with("https://")` and would
+    // reject the whole file over it — which is the same practical consequence
+    // the version gate exists to prevent, so it gets the same treatment (#69).
+    let endpoints_need_v2 = state
+        .operations
+        .values()
+        .any(|op| !op.endpoint.starts_with("https://"));
+    let version = if operations_need_v2 || change_sets_need_v2 || endpoints_need_v2 {
         2
     } else {
         1
