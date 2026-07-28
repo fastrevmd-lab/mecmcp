@@ -258,6 +258,48 @@ pub trait DeviceTransaction: Send + Sync {
     ///   `Archive(N)` on PAN-OS).
     async fn rollback(&self, to: RollbackRef) -> Result<RollbackOutcome, Self::Error>;
 
+    /// Whether this implementation wants a device configuration lock held
+    /// across a coordinator operation.
+    ///
+    /// The default is `false`: a vendor with no lock concept, or one whose
+    /// deployment has not enabled locking, is unchanged. When this returns
+    /// `true` the coordinator calls [`lock()`](Self::lock) before reading the
+    /// fingerprint and [`unlock()`](Self::unlock) once the operation finishes.
+    fn requires_config_lock(&self) -> bool {
+        false
+    }
+
+    /// Acquire the device configuration lock.
+    ///
+    /// # Scope
+    ///
+    /// The lock is held for **one coordinator operation** — the
+    /// fingerprint-read through staging window — and not across a change set's
+    /// whole lifecycle. That limit is not a simplification: on Junos the lock
+    /// is bound to the NETCONF session, so it cannot outlive it, and promising
+    /// callers more than one operation's worth of protection would be a claim
+    /// the implementation cannot keep.
+    ///
+    /// What it does close is the race this exists for. Without it, another
+    /// session — a second MCP process, an operator at the CLI, Panorama — can
+    /// move the candidate between the fingerprint check and staging, and the
+    /// actions land on a state nobody approved. The coordinator's in-process
+    /// mutex serialises only this server's own callers.
+    ///
+    /// The default is a no-op `Ok(())` so implementations that do not lock keep
+    /// compiling. Pair it with [`requires_config_lock()`](Self::requires_config_lock):
+    /// returning `false` from that method means this is never called.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the device is unreachable, or if the lock is already
+    /// held by another administrator. A refused lock must fail the operation
+    /// rather than proceed unlocked — proceeding is the exact condition the
+    /// lock was requested to prevent.
+    async fn lock(&self, _comment: &str) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Release the device configuration lock, if this implementation holds one.
     ///
     /// Reverting a candidate is not the same as releasing the lock — on PAN-OS
