@@ -242,6 +242,7 @@ fn test_attribution(principal: &str) -> Attribution {
         on_behalf_of: Some("fastrevmd@gmail.com".into()),
         change_ref: Some("CHG0012345".into()),
         request_id: Uuid::new_v4(),
+        token_verified_fields: mecmcp_audit::TokenVerifiedFields::none(),
     }
 }
 
@@ -312,6 +313,8 @@ async fn apply_approved_change_set_succeeds() {
             digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -396,6 +399,8 @@ async fn apply_same_change_set_twice_fails() {
             digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -412,6 +417,8 @@ async fn apply_same_change_set_twice_fails() {
             digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -493,6 +500,8 @@ async fn partial_failure_auto_reverts_and_marks_failed() {
             digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -580,6 +589,8 @@ async fn apply_with_mismatched_digest_fails() {
             wrong_digest.to_string(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -645,6 +656,8 @@ async fn apply_with_mismatched_fingerprint_fails() {
             digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -694,6 +707,8 @@ async fn apply_unapproved_change_set_fails() {
             digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -769,6 +784,8 @@ async fn apply_lab_mode_waived_approval_succeeds() {
             digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -832,6 +849,8 @@ async fn apply_with_invalid_endpoint_fails() {
             create_output.digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -906,6 +925,8 @@ async fn apply_persists_valid_endpoint_and_reloads() {
             create_output.digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -994,6 +1015,8 @@ async fn apply_after_approval_expired_fails() {
             digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -1193,6 +1216,8 @@ async fn fingerprint_read_failure_with_failed_rollback_marks_indeterminate() {
             create_output.digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -1269,6 +1294,8 @@ async fn finding_1_canonicalize_endpoint_key() {
             create_output.digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -1334,6 +1361,8 @@ async fn finding_1_reject_malformed_endpoint() {
             create_output.digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -1402,6 +1431,8 @@ async fn finding_2_persist_policy_signature() {
             create_output.digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -1478,6 +1509,8 @@ async fn finding_3_persist_config_lock_held() {
             create_output.digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -1649,6 +1682,8 @@ async fn finding_8_expire_after_guard_wait() {
             digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -1729,6 +1764,8 @@ async fn finding_1_serialize_by_device_not_endpoint() {
             create_output1.digest.clone(),
             initial_fp.clone(),
             &transaction1,
+            "set",
+            None,
             &attribution1,
             &cancellation1,
         )
@@ -1775,6 +1812,8 @@ async fn finding_1_serialize_by_device_not_endpoint() {
             create_output2.digest.clone(),
             after_fp1.clone(),
             &transaction2,
+            "set",
+            None,
             &test_attribution(owner2),
             &CancellationToken::new(),
         )
@@ -1971,6 +2010,8 @@ async fn finding_2_cleanup_reservation_on_pre_stage_check_abort() {
             create_output.digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -2035,6 +2076,8 @@ async fn finding_2_cleanup_reservation_on_pre_stage_check_abort() {
             create_output2.digest.clone(),
             initial_fp.clone(),
             &transaction2,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -2100,6 +2143,8 @@ async fn finding_3_recorded_state_reports_actual_persisted_state() {
             create_output.digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -2226,6 +2271,8 @@ async fn finding_4_reject_legacy_plan_with_empty_policy_signature() {
             digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -2281,6 +2328,8 @@ async fn finding_4_reject_legacy_plan_with_empty_policy_signature() {
             create_output2.digest.clone(),
             initial_fp.clone(),
             &transaction2,
+            "set",
+            None,
             &test_attribution(owner2),
             &CancellationToken::new(),
         )
@@ -2343,6 +2392,8 @@ async fn finding_6_accept_case_insensitive_scheme() {
             create_output.digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )

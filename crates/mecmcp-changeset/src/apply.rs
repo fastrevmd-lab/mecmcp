@@ -141,6 +141,8 @@ impl ChangesetCoordinator {
         expected_digest: String,
         expected_fingerprint: String,
         transaction: &T,
+        primary_action_discriminator: &str,
+        vendor_primary_target: Option<&str>,
         _attribution: &Attribution,
         cancellation: &CancellationToken,
     ) -> Result<ApplyOutput<T::Staged>, CoordinatorError> {
@@ -308,8 +310,14 @@ impl ChangesetCoordinator {
             owner: owner.clone(),
             device: device.clone(),
             endpoint: endpoint.clone(),
-            action: change_set.actions.first().cloned().unwrap_or_default(),
-            xpath: None,
+            // The deployed v1 record stores the vendor's discriminator string here
+            // ("set"/"delete") with the full object in `actions`, and the vendor's
+            // primary target in `xpath`. Both are vendor-shaped, so this crate takes
+            // them rather than guessing them from `actions[0]` — writing the whole
+            // object here produced a v1 file the deployed PAN-OS reader could not
+            // parse. Matches `stage_operation`.
+            action: serde_json::Value::String(primary_action_discriminator.to_owned()),
+            xpath: vendor_primary_target.map(|s| s.to_owned()),
             actions: change_set.actions.clone(),
             change_set_id: Some(change_set_id.clone()),
             current: before_fingerprint.clone(),
@@ -322,6 +330,8 @@ impl ChangesetCoordinator {
             )),
             config_lock_held: false,
             policy_signature: change_set.policy_signature.clone(),
+            attribution: None,
+            rollback_deadline_unix: None,
         };
 
         self.insert(operation_record).await?;

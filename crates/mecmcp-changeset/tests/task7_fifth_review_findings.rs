@@ -213,6 +213,7 @@ fn test_attribution(principal: &str) -> Attribution {
         on_behalf_of: Some("fastrevmd@gmail.com".into()),
         change_ref: Some("CHG0012345".into()),
         request_id: Uuid::new_v4(),
+        token_verified_fields: mecmcp_audit::TokenVerifiedFields::none(),
     }
 }
 
@@ -401,6 +402,8 @@ async fn finding_1_lock_risk_persisted_before_drift_check() {
             create_output.digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -521,6 +524,8 @@ async fn finding_2_operation_record_write_failure_returns_handle() {
             create_output.digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -595,6 +600,8 @@ async fn finding_3_staged_converted_to_indeterminate_on_restart() {
             create_output.digest.clone(),
             initial_fp.clone(),
             &transaction,
+            "set",
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
