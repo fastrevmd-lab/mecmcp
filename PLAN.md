@@ -347,14 +347,21 @@ capability: **two-person change control on Junos**, which does not exist today.
 applied, and verified; an interrupted apply resolves through
 `resolve_persisted_operation` rather than leaving unknown state.
 
-**Completed 2026-07-28**, released through `changeset-v0.3.1`. The exit
-criterion was demonstrated on a live vSRX 24.4R1.9 (`vsrx-ci`) from a
+**Junos half completed 2026-07-28**, released through `changeset-v0.3.3`. The
+PAN-OS half of the verification standard is still outstanding — see below. The
+Junos exit criterion was demonstrated on a live vSRX 24.4R1.9 (`vsrx-ci`) from a
 throwaway container, LXC 610, built from merged `main`:
 
 ```
-0   2026-07-28 17:52:27 UTC by netconf via netconf
-    no-change-ref by lab-change-writer (unknown) on-behalf-of=self
+0   2026-07-28 18:33:02 UTC by netconf via netconf
+    no-change-ref by phase5-owner (agent) on-behalf-of=mharman via anthropic-private
 ```
+
+An earlier revision of this file quoted the 17:52 entry from the same log as the
+evidence. That line reads `by lab-change-writer (unknown) on-behalf-of=self`,
+which is the *defect*, not the demonstration: `token add` discarded the
+provenance flags (rustjunosmcp#233). The line above is the same flow after the
+fix, on the same device.
 
 Fingerprint read from the real candidate, change set planned by one token,
 **self-approval refused at the transport with `insufficient_scope`**, approved
@@ -374,30 +381,51 @@ Done and merged:
   approvals, change-set apply, the single-operation lifecycle, indeterminate
   recovery, and the lab-mode waiver. Plus token-bound provenance (#52) and
   the crate README.
-- PAN-OS: `DeviceTransaction` for `PanosClient`, and the first method
-  (`candidate_fingerprint`) reading through it.
+- PAN-OS: `DeviceTransaction` for `PanosClient`, and `MutationCoordinator`
+  replaced by the shared `ChangesetCoordinator`.
+- The device-lock primitive (#60): `requires_config_lock()` and `lock()` pairing
+  with `unlock()`, with the coordinator ordering acquire → fingerprint → stage.
+  **In the trait only** — neither vendor overrides it yet, so runtime behaviour
+  is unchanged and the race is not closed on the wire. See #80.
+- Cancellation re-checks across the lifecycle methods (#63).
 
 Verified against the live deployment: `/var/lib/rust-panosmcp/mutation-state.json`
 on LXC 608 loads with the new reader — six operations, six change sets, every
 approver distinct from its owner. That is half the exit criterion, checked
 read-only against the real container rather than against the fixture.
 
-Not done:
+Since resolved:
 
-- The rest of the PAN-OS `mutation.rs` migration (rustpanosmcp#65). A first
-  attempt migrated all seven single-operation methods at once, compiled clean,
-  passed every unit test, and broke four of the five integration tests —
-  including one it was scoped not to touch. Reverted. The approach that works
-  is one method at a time with the full suite green before and after, which is
-  how `candidate_fingerprint` landed.
-- The Junos change-set tools (rustjunosmcp#228). Committed but **unmerged and
-  not deployable**: as first written they did not enforce two-person control —
-  the authenticated identity was discarded and a client-supplied `owner`
-  persisted instead — and could not apply at all. Fixes are in on the branch;
-  the review gate has not yet returned a trustworthy verdict on them.
-- The live vSRX half of the exit criterion. Needs a build deployed to LXC 609,
-  which is `protected` and has no standby, so it is a deliberate operator
-  decision rather than something to do in passing.
+- The rest of the PAN-OS `mutation.rs` migration. A first attempt migrated all
+  seven single-operation methods at once, compiled clean, passed every unit
+  test, and broke four of the five integration tests — including one it was
+  scoped not to touch. Reverted. The approach that worked was one method at a
+  time with the full suite green before and after. Landed as rustpanosmcp#67
+  and #68 — and #68 sat unpushed on a local branch for a day while this file
+  already recorded the phase as complete, which is the failure this section now
+  guards against.
+- The Junos change-set tools (rustjunosmcp#228), merged after the two-person
+  control defect was fixed — the authenticated identity was being discarded and
+  a client-supplied `owner` persisted instead.
+- The live vSRX half of the exit criterion, demonstrated above.
+
+Still outstanding:
+
+- **The PAN-OS half of verification standard item 4.** `rustpanosmcp` has not
+  been run against the 12.1.5 lab firewall on this code. Everything is staged
+  on LXC 610 — binary, unit on port 30032, leaf certificate pinned by SHA-256,
+  and `/root/finalize-panos.sh` — and it needs a PAN-OS API key plus the admin
+  username that key belongs to. The admin is not cosmetic: it scopes partial
+  commits and owns the config lock, so a wrong value fails confusingly at commit
+  time rather than at startup.
+
+  LXC 608 is `protected` with no standby, so it is not the deployment target and
+  its credentials were not read.
+
+  Until that runs, Phase 5 is complete in code and merged, but **not verified to
+  the standard this document sets for every phase**. The Junos evidence does not
+  substitute: the two servers exercise different lock semantics and different
+  coordinator paths, which is exactly why the standard names both.
 
 Findings worth carrying forward:
 
