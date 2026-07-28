@@ -122,6 +122,18 @@ pub enum TokenAction {
         /// Comma-separated tool names, or '*' for all.
         #[arg(long, value_delimiter = ',')]
         tools: Vec<String>,
+        /// Provider name (e.g., "anthropic", "ollama"). Optional.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Provider tier: "public" or "private". Required if provider is set.
+        #[arg(long)]
+        provider_tier: Option<String>,
+        /// The human on whose behalf this credential acts. Optional.
+        #[arg(long)]
+        on_behalf_of: Option<String>,
+        /// Actor type: "human", "agent", or "unknown". Optional.
+        #[arg(long)]
+        actor_type: Option<String>,
         /// Send SIGHUP to this pid after writing.
         #[arg(long)]
         server_pid: Option<i32>,

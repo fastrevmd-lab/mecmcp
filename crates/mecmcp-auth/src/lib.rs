@@ -12,7 +12,7 @@ pub mod token;
 
 pub mod file;
 
-pub use entry::{EntryError, MAX_TOKEN_NAME, TokenEntry};
+pub use entry::{ActorType, EntryError, MAX_TOKEN_NAME, Tier, TokenEntry};
 pub use file::{FileError, KnownNames, TokenStoreFile, write_atomic};
 pub use grant::{Grant, GrantError, NoAction, NoGrant};
 pub use scope::{MAX_SCOPE_NAMES, ScopeError, ScopeSet};

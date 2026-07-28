@@ -203,3 +203,46 @@ fn writing_a_deployed_file_preserves_its_envelope_version() {
         assert_eq!(envelope.version, 2);
     }
 }
+
+#[test]
+fn round_trip_through_write_atomic_does_not_mutate_untagged_tokens() {
+    use mecmcp_auth::{KnownNames, NoGrant, TokenStoreFile};
+
+    let (_dir, path) = staged("junos-tokens.json");
+    let original = std::fs::read_to_string(&path).expect("read original");
+
+    // The junos fixture contains "claude-desktop" which has no actor_type.
+    // Prove the original doesn't already have the field.
+    assert!(
+        !original.contains("actor_type"),
+        "precondition: fixture must not already contain actor_type"
+    );
+
+    // Perform a write operation that rewrites the entire file.
+    let devices = [
+        "edge-fw".to_owned(),
+        "core-fw".to_owned(),
+        "dc-fw".to_owned(),
+    ];
+    let known = KnownNames {
+        devices: Some(&devices),
+        tools: &[
+            "get_junos_config",
+            "execute_junos_command",
+            "get_router_list",
+        ],
+    };
+    TokenStoreFile::<NoGrant>::set_scopes(&path, "readonly-observer", None, None, &known)
+        .expect("set_scopes rewrites the file");
+
+    // Read it back and prove actor_type was NOT added.
+    let rewritten = std::fs::read_to_string(&path).expect("read rewritten");
+    assert!(
+        !rewritten.contains("actor_type"),
+        "rewritten file must not gain actor_type field on untagged tokens:\n{rewritten}"
+    );
+
+    // Ensure the file still loads correctly.
+    let file: TokenStoreFile = TokenStoreFile::load(&path).expect("reload after write");
+    assert_eq!(file.store().len(), 2);
+}

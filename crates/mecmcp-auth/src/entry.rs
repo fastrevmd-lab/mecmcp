@@ -5,9 +5,59 @@ use crate::scope::{ScopeError, ScopeSet};
 use crate::token::TokenDigest;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Maximum length of an operator-facing token name.
 pub const MAX_TOKEN_NAME: usize = 128;
+
+/// LLM provider tier: public hosted vs. private/self-hosted deployment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    /// Publicly hosted LLM service (e.g., Anthropic's public API).
+    #[default]
+    Public,
+    /// Private or self-hosted LLM deployment.
+    Private,
+}
+
+impl fmt::Display for Tier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Tier::Public => write!(f, "public"),
+            Tier::Private => write!(f, "private"),
+        }
+    }
+}
+
+/// The type of actor performing an action.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActorType {
+    /// A human operator directly invoking a tool.
+    Human,
+    /// An autonomous agent (LLM-driven or otherwise) acting under delegation.
+    Agent,
+    /// Actor type is unknown (untagged legacy token).
+    ///
+    /// This is the default for tokens that predated this field. Recording
+    /// `Unknown` in audit trails is truthful: the token entry declared neither
+    /// `Human` nor `Agent`, so the server cannot know. Defaulting to `Human`
+    /// would fabricate a fact, violating the principle from issue #54 that
+    /// audit provenance must never invent an actor to satisfy a schema.
+    #[default]
+    Unknown,
+}
+
+/// Default actor type for tokens that don't declare one.
+///
+/// Returns `Unknown` rather than `Human` or `Agent` because:
+/// - The token entry provides no data, so the server cannot know which it is
+/// - Recording `Human` for an untagged agent token would fabricate a fact
+/// - Issue #54 mandates that audit provenance never invents an actor
+fn default_actor_type() -> ActorType {
+    ActorType::Unknown
+}
 
 /// Rejection reason for a malformed token entry.
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +130,45 @@ pub struct TokenEntry<G: Grant = NoGrant> {
         skip_serializing_if = "Option::is_none"
     )]
     pub grant: Option<G>,
+
+    /// Provider name (e.g., "anthropic", "ollama").
+    ///
+    /// Server-verified provenance field. When present, the server populates
+    /// `AgentIdentity.provider` from this value rather than accepting it
+    /// from the client. Absent for human-operator tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
+    /// Provider tier: public hosted vs. private/self-hosted.
+    ///
+    /// Server-verified provenance field. Absent for human-operator tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_tier: Option<crate::Tier>,
+
+    /// The human on whose behalf this credential acts.
+    ///
+    /// Server-verified provenance field. Populated for agent tokens acting
+    /// under delegation (e.g., "fastrevmd@gmail.com"). May also be set for
+    /// human-operator tokens to record the identity the token represents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
+
+    /// Whether this credential belongs to a human operator or an agent.
+    ///
+    /// Server-verified provenance field. Defaults to `Unknown` when absent,
+    /// preserving the truthfulness of audit trails: an untagged token provides
+    /// no data, so the server cannot assert `Human` or `Agent` without
+    /// fabricating a fact (issue #54).
+    #[serde(
+        default = "default_actor_type",
+        skip_serializing_if = "is_default_actor_type"
+    )]
+    pub actor_type: ActorType,
+}
+
+/// Predicate for `skip_serializing_if` on `actor_type`.
+fn is_default_actor_type(t: &ActorType) -> bool {
+    matches!(t, ActorType::Unknown)
 }
 
 fn wildcard() -> ScopeSet {
@@ -103,7 +192,28 @@ impl<G: Grant> TokenEntry<G> {
         self.expires_at.is_some_and(|expiry| now >= expiry)
     }
 
-    /// Validate name, scopes, and grant.
+    /// The actor type this credential should be read as.
+    ///
+    /// A token carrying provider metadata but no explicit actor type is an
+    /// agent: nothing else has an LLM provider. Deriving it here rather than
+    /// demanding the operator restate it keeps the documented token shape from
+    /// issue #52 loadable, while `validate` still refuses the one combination
+    /// that contradicts itself.
+    ///
+    /// Note the ambiguity this cannot resolve: `actor_type` deserializes to
+    /// `Unknown` whether the key was omitted or written explicitly as
+    /// `"unknown"`, so a hand-edited file declaring both a provider and an
+    /// explicit `unknown` is read as an agent. The CLI refuses that combination
+    /// at the point where the two are distinguishable.
+    #[must_use]
+    pub fn effective_actor_type(&self) -> ActorType {
+        if self.provider.is_some() && self.actor_type == ActorType::Unknown {
+            return ActorType::Agent;
+        }
+        self.actor_type
+    }
+
+    /// Validate name, scopes, grant, and provenance.
     ///
     /// # Errors
     /// Returns [`EntryError`] describing the first failing check.
@@ -136,6 +246,53 @@ impl<G: Grant> TokenEntry<G> {
                 name: self.name.clone(),
                 source,
             })?;
+        }
+        // Provider and provider_tier must both be present or both be absent.
+        match (&self.provider, &self.provider_tier) {
+            (Some(_), None) => {
+                return Err(EntryError::Invalid(format!(
+                    "token '{}': provider is set but provider_tier is missing",
+                    self.name
+                )));
+            }
+            (None, Some(_)) => {
+                return Err(EntryError::Invalid(format!(
+                    "token '{}': provider_tier is set but provider is missing",
+                    self.name
+                )));
+            }
+            _ => {}
+        }
+        // An LLM provider only means something for an agent. Allowing a token to
+        // declare `provider: anthropic` while claiming to be a human operator
+        // produces a record that contradicts itself, and `Attribution::from_caller`
+        // would build an agent identity for an actor typed as human. Reject the
+        // combination rather than silently picking one side of it.
+        // Only an explicit contradiction is rejected. An untagged token carrying
+        // provider metadata is the shape issue #52 documents, and a hand-written
+        // tokens.json in that form must load — rejecting it would fail the whole
+        // store over a field the operator never had to state. `effective_actor_type`
+        // reads such a token as an agent, since nothing but an agent has an LLM
+        // provider.
+        // Blank provenance is worse than absent: `Some("")` reads as declared, so
+        // `from_caller` marks the field token-verified and the audit event then
+        // carries a verified-but-empty provider or delegated user.
+        for (field, value) in [
+            ("provider", self.provider.as_deref()),
+            ("on_behalf_of", self.on_behalf_of.as_deref()),
+        ] {
+            if value.is_some_and(|v| v.trim().is_empty()) {
+                return Err(EntryError::Invalid(format!(
+                    "token '{}': {field} is present but empty",
+                    self.name
+                )));
+            }
+        }
+        if self.provider.is_some() && self.actor_type == ActorType::Human {
+            return Err(EntryError::Invalid(format!(
+                "token '{}': provider metadata contradicts actor_type \"human\"",
+                self.name
+            )));
         }
         Ok(())
     }
@@ -325,6 +482,37 @@ mod tests {
     }
 
     #[test]
+    fn existing_tokens_without_provenance_fields_load_with_defaults() {
+        // HARD CONSTRAINT: tokens.json is deployed on LXC 600, 601, 608, 609.
+        // This test proves existing files load unchanged with safe defaults.
+        // Written FIRST, must fail before defaults are added, then pass.
+        let raw = r#"{
+            "name": "lab",
+            "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+            "devices": ["*"],
+            "tools": ["*"],
+            "created_at_unix": 1783850400
+        }"#;
+        let entry: TokenEntry = serde_json::from_str(raw).expect("parse existing token");
+        assert_eq!(entry.name, "lab");
+        // All new fields default to None or Human
+        assert!(entry.provider.is_none(), "provider defaults to None");
+        assert!(
+            entry.provider_tier.is_none(),
+            "provider_tier defaults to None"
+        );
+        assert!(
+            entry.on_behalf_of.is_none(),
+            "on_behalf_of defaults to None"
+        );
+        assert_eq!(
+            entry.actor_type,
+            ActorType::Unknown,
+            "actor_type defaults to Unknown (untagged legacy token provides no data)"
+        );
+    }
+
+    #[test]
     fn a_grant_type_without_default_can_be_deserialized() {
         // Guards the public contract: a consumer's write-authority type must not
         // be forced to answer "what is the default write authority?".
@@ -357,5 +545,158 @@ mod tests {
         let grant = entry.grant.as_ref().expect("grant present");
         assert!(grant.allows_subject("/a/b"));
         assert!(!grant.allows_subject("/a/c"));
+    }
+
+    #[test]
+    fn provider_without_tier_fails_validation() {
+        // Defect 4: a token declaring provider without provider_tier is invalid.
+        let raw = r#"{
+            "name": "incomplete",
+            "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+            "devices": ["*"],
+            "tools": ["*"],
+            "created_at_unix": 1783850400,
+            "provider": "anthropic"
+        }"#;
+        let entry: TokenEntry = serde_json::from_str(raw).expect("parse");
+        let result = entry.validate();
+        assert!(
+            result.is_err(),
+            "provider without provider_tier must fail validation"
+        );
+        let err = result.expect_err("validation should fail").to_string();
+        assert!(
+            err.contains("provider_tier is missing"),
+            "error message should mention missing provider_tier: {err}"
+        );
+    }
+
+    #[test]
+    fn provider_tier_without_provider_fails_validation() {
+        // Defect 4: a token declaring provider_tier without provider is invalid.
+        let raw = r#"{
+            "name": "incomplete",
+            "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+            "devices": ["*"],
+            "tools": ["*"],
+            "created_at_unix": 1783850400,
+            "provider_tier": "public"
+        }"#;
+        let entry: TokenEntry = serde_json::from_str(raw).expect("parse");
+        let result = entry.validate();
+        assert!(
+            result.is_err(),
+            "provider_tier without provider must fail validation"
+        );
+        let err = result.expect_err("validation should fail").to_string();
+        assert!(
+            err.contains("provider is missing"),
+            "error message should mention missing provider: {err}"
+        );
+    }
+
+    #[test]
+    fn complete_provider_pair_validates() {
+        // Both provider and provider_tier present, on an agent token: valid.
+        let raw = r#"{
+            "name": "complete",
+            "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+            "devices": ["*"],
+            "tools": ["*"],
+            "created_at_unix": 1783850400,
+            "provider": "anthropic",
+            "provider_tier": "public",
+            "actor_type": "agent"
+        }"#;
+        let entry: TokenEntry = serde_json::from_str(raw).expect("parse");
+        assert!(
+            entry.validate().is_ok(),
+            "complete provider pair on an agent token should validate"
+        );
+    }
+
+    #[test]
+    fn provider_on_a_human_token_fails_validation() {
+        // An LLM provider on a token typed as a human operator is a record that
+        // contradicts itself, and would make from_caller build an agent identity
+        // for a human actor. Only this explicit contradiction is rejected.
+        let raw = r#"{
+            "name": "contradictory",
+            "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+            "devices": ["*"],
+            "tools": ["*"],
+            "created_at_unix": 1783850400,
+            "provider": "anthropic",
+            "provider_tier": "public",
+            "actor_type": "human"
+        }"#;
+        let entry: TokenEntry = serde_json::from_str(raw).expect("parse");
+        let err = entry
+            .validate()
+            .expect_err("provider on a human token must be rejected")
+            .to_string();
+        assert!(err.contains("contradicts"), "unexpected error {err}");
+    }
+
+    #[test]
+    fn blank_provenance_values_fail_validation() {
+        // `Some("")` reads as declared, so it would be marked token-verified and
+        // emitted as a verified-but-empty field. Absent and blank are different
+        // things and only one of them is legitimate.
+        for (field, extra) in [
+            ("provider", r#""provider": "  ", "provider_tier": "public""#),
+            ("on_behalf_of", r#""on_behalf_of": """#),
+        ] {
+            let raw = format!(
+                r#"{{
+                    "name": "blank",
+                    "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+                    "devices": ["*"],
+                    "tools": ["*"],
+                    "created_at_unix": 1783850400,
+                    {extra}
+                }}"#
+            );
+            let entry: TokenEntry = serde_json::from_str(&raw).expect("parse");
+            let err = entry
+                .validate()
+                .expect_err("blank provenance must be rejected")
+                .to_string();
+            assert!(err.contains(field), "expected {field} in error, got {err}");
+            assert!(err.contains("empty"), "unexpected error {err}");
+        }
+    }
+
+    #[test]
+    fn provider_without_an_actor_type_loads_and_reads_as_agent() {
+        // This is the token shape issue #52 documents: provider and tier, no
+        // actor_type. A hand-written tokens.json in that form must load — the
+        // operator never had to state the actor type, and failing the whole
+        // store over it would be a footgun. Nothing but an agent has a provider,
+        // so it reads as one.
+        let raw = r#"{
+            "name": "claude-code-ops",
+            "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+            "devices": ["*"],
+            "tools": ["*"],
+            "created_at_unix": 1783850400,
+            "provider": "anthropic",
+            "provider_tier": "public",
+            "on_behalf_of": "fastrevmd@gmail.com"
+        }"#;
+        let entry: TokenEntry = serde_json::from_str(raw).expect("parse");
+        entry
+            .validate()
+            .expect("the documented token shape must load");
+        assert_eq!(
+            entry.actor_type,
+            ActorType::Unknown,
+            "stored value is untouched"
+        );
+        assert_eq!(
+            entry.effective_actor_type(),
+            ActorType::Agent,
+            "a provider-bearing token reads as an agent"
+        );
     }
 }

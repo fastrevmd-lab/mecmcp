@@ -74,6 +74,10 @@ mod tests {
             devices: ScopeSet::Wildcard,
             tools: ScopeSet::Wildcard,
             grant: None,
+            provider: None,
+            provider_tier: None,
+            on_behalf_of: None,
+            actor_type: mecmcp_auth::ActorType::Human,
         }
     }
 

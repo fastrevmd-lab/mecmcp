@@ -25,6 +25,10 @@ pub enum TokenCommandError {
         message: String,
     },
 
+    /// Invalid command argument.
+    #[error("{0}")]
+    InvalidArgument(String),
+
     /// I/O operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -61,15 +65,73 @@ pub fn run(
             name,
             devices,
             tools,
+            provider,
+            provider_tier,
+            on_behalf_of,
+            actor_type,
             server_pid,
         } => {
             let devices_scope = parse_scope(devices, "devices")?;
             let tools_scope = parse_scope(tools, "tools")?;
-            let secret = TokenStoreFile::<NoGrant>::add(
+
+            // Parse provider_tier if present
+            let parsed_tier = provider_tier
+                .as_ref()
+                .map(|s| match s.as_str() {
+                    "public" => Ok(mecmcp_auth::Tier::Public),
+                    "private" => Ok(mecmcp_auth::Tier::Private),
+                    other => Err(TokenCommandError::InvalidArgument(format!(
+                        "provider_tier must be 'public' or 'private', got '{other}'"
+                    ))),
+                })
+                .transpose()?;
+
+            // Parse actor_type if present
+            let parsed_actor = actor_type
+                .as_ref()
+                .map(|s| match s.as_str() {
+                    "human" => Ok(mecmcp_auth::ActorType::Human),
+                    "agent" => Ok(mecmcp_auth::ActorType::Agent),
+                    "unknown" => Ok(mecmcp_auth::ActorType::Unknown),
+                    other => Err(TokenCommandError::InvalidArgument(format!(
+                        "actor_type must be 'human', 'agent', or 'unknown', got '{other}'"
+                    ))),
+                })
+                .transpose()?;
+
+            // Declaring an LLM provider is only meaningful for an agent, and a
+            // token entry carrying provider metadata with any other actor type is
+            // rejected at validation. Derive it rather than making the operator
+            // pass --actor-type agent to satisfy a rule they cannot see, but never
+            // override an actor type they stated explicitly.
+            let parsed_actor = match (parsed_actor, provider.as_ref()) {
+                (None, Some(_)) => Some(mecmcp_auth::ActorType::Agent),
+                // Here — and only here — an omitted flag is distinguishable from
+                // an explicit `unknown`. On disk both deserialize to `Unknown`,
+                // so silently deriving `Agent` would override a choice the
+                // operator actually made. Refuse instead of guessing.
+                (Some(mecmcp_auth::ActorType::Unknown), Some(_)) => {
+                    return Err(TokenCommandError::InvalidArgument(
+                        "--actor-type unknown cannot be combined with --provider: a provider \
+                         belongs to an agent. Pass --actor-type agent, or omit the flag to have \
+                         it derived."
+                            .to_owned(),
+                    ));
+                }
+                (existing, _) => existing,
+            };
+
+            let secret = TokenStoreFile::<NoGrant>::add_with_options(
                 &tokens_file,
                 &name,
                 devices_scope,
                 tools_scope,
+                None, // expires_at
+                None, // grant
+                provider.clone(),
+                parsed_tier,
+                on_behalf_of.clone(),
+                parsed_actor,
                 &known,
             )?;
             let mut out = std::io::stdout().lock();

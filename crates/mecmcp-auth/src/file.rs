@@ -199,14 +199,17 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
         tools: ScopeSet,
         known: &KnownNames<'_>,
     ) -> Result<TokenSecret, FileError> {
-        Self::add_with_options(path, name, devices, tools, None, None, known)
+        Self::add_with_options(
+            path, name, devices, tools, None, None, None, None, None, None, known,
+        )
     }
 
-    /// Add one token with optional expiry and grant.
+    /// Add one token with optional expiry, grant, and provenance.
     ///
     /// # Errors
     /// Returns [`FileError`] if the name already exists, if the scopes reference
     /// unknown devices or tools, or on I/O or validation failure.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_with_options(
         path: &Path,
         name: &str,
@@ -214,6 +217,10 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
         tools: ScopeSet,
         expires_at: Option<DateTime<Utc>>,
         grant: Option<G>,
+        provider: Option<String>,
+        provider_tier: Option<crate::Tier>,
+        on_behalf_of: Option<String>,
+        actor_type: Option<crate::ActorType>,
         known: &KnownNames<'_>,
     ) -> Result<TokenSecret, FileError> {
         use crate::token::TokenSecret;
@@ -245,6 +252,10 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
             created_at: Utc::now(),
             expires_at,
             grant,
+            provider,
+            provider_tier,
+            on_behalf_of,
+            actor_type: actor_type.unwrap_or(crate::ActorType::Unknown),
         });
 
         let updated = TokenStore::try_new(entries).map_err(|source| FileError::Store {
@@ -308,6 +319,10 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
                         created_at: entry.created_at,
                         expires_at: entry.expires_at,
                         grant: entry.grant.clone(),
+                        provider: entry.provider.clone(),
+                        provider_tier: entry.provider_tier,
+                        on_behalf_of: entry.on_behalf_of.clone(),
+                        actor_type: entry.actor_type,
                     }
                 } else {
                     entry.clone()
@@ -370,6 +385,10 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
                         created_at: entry.created_at,
                         expires_at: entry.expires_at,
                         grant: entry.grant.clone(),
+                        provider: entry.provider.clone(),
+                        provider_tier: entry.provider_tier,
+                        on_behalf_of: entry.on_behalf_of.clone(),
+                        actor_type: entry.actor_type,
                     }
                 } else {
                     entry.clone()
@@ -894,6 +913,10 @@ mod tests {
             ScopeSet::Allowlist(vec!["get_junos_config".to_owned()]),
             expires_at,
             None,
+            None,
+            None,
+            None,
+            None,
             &known,
         )
         .expect("add");
@@ -1197,6 +1220,10 @@ mod tests {
             ScopeSet::Wildcard,
             expires_at,
             None,
+            None,
+            None,
+            None,
+            None,
             &known,
         )
         .expect("add");
@@ -1489,6 +1516,10 @@ mod tests {
             ScopeSet::Allowlist(vec!["get_junos_config".to_owned()]),
             expires_at,
             None,
+            None,
+            None,
+            None,
+            None,
             &known,
         )
         .expect("add");
@@ -1562,6 +1593,10 @@ mod tests {
             ScopeSet::Wildcard,
             None,
             Some(grant.clone()),
+            None,
+            None,
+            None,
+            None,
             &known,
         )
         .expect("add");
@@ -1821,6 +1856,10 @@ mod tests {
             created_at: DateTime::from_timestamp(1_783_850_400, 0).expect("timestamp"),
             expires_at: None,
             grant: None,
+            provider: None,
+            provider_tier: None,
+            on_behalf_of: None,
+            actor_type: crate::ActorType::Human,
         };
         let entries = vec![entry];
 
