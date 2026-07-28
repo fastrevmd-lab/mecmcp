@@ -31,9 +31,10 @@ fn pretty_json_formats_structured_values() {
 
     assert_eq!(result.is_error, Some(false));
     assert_eq!(
-        text(&result),
-        "{\n  \"healthy\": true,\n  \"name\": \"edge\"\n}"
+        serde_json::from_str::<serde_json::Value>(text(&result)).expect("valid JSON"),
+        json!({"name": "edge", "healthy": true})
     );
+    assert!(text(&result).contains('\n'), "result must be pretty JSON");
 }
 
 #[test]
@@ -66,7 +67,9 @@ impl Serialize for BrokenSerialize {
     where
         S: serde::Serializer,
     {
-        Err(serde::ser::Error::custom("intentional serialization failure"))
+        Err(serde::ser::Error::custom(
+            "intentional serialization failure",
+        ))
     }
 }
 

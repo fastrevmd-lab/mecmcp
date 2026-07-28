@@ -41,4 +41,3 @@ fn authenticated_and_stdio_scopes_keep_distinct_principals() {
     assert!(stdio.contains("authorization=no_auth"));
     assert!(stdio.contains("actor_type=unknown"));
 }
-

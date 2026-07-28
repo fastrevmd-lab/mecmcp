@@ -17,9 +17,7 @@ pub enum AuthorizationError {
     ///
     /// The display text deliberately does not reveal whether the target exists
     /// in inventory.
-    #[error(
-        "token '{token}' is not authorized for the requested target (tool '{tool}')"
-    )]
+    #[error("token '{token}' is not authorized for the requested target (tool '{tool}')")]
     TargetNotInScope {
         /// Non-secret token name.
         token: String,

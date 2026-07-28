@@ -74,13 +74,10 @@ fn target_scope_denial_does_not_claim_whether_target_exists() {
         ScopeSet::Allowlist(vec!["edge-a".to_owned()]),
     );
 
-    let error = authorize_target(Some(&caller), "show_facts", "edge-b")
-        .expect_err("target must be denied");
+    let error =
+        authorize_target(Some(&caller), "show_facts", "edge-b").expect_err("target must be denied");
 
-    assert!(matches!(
-        error,
-        AuthorizationError::TargetNotInScope { .. }
-    ));
+    assert!(matches!(error, AuthorizationError::TargetNotInScope { .. }));
     assert_eq!(
         error.to_string(),
         "token 'automation' is not authorized for the requested target (tool 'show_facts')"
@@ -118,8 +115,10 @@ fn advertised_tools_use_the_same_write_aware_predicate() {
         vec!["show_facts"]
     );
 
-    let unfiltered =
-        filter_tools_for_scope::<NoGrant>(vec![tool("show_facts"), tool("change_config")], None, WRITE_TOOLS);
+    let unfiltered = filter_tools_for_scope::<NoGrant>(
+        vec![tool("show_facts"), tool("change_config")],
+        None,
+        WRITE_TOOLS,
+    );
     assert_eq!(unfiltered.len(), 2);
 }
-
