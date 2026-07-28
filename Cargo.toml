@@ -1,9 +1,9 @@
 [workspace]
-members  = ["crates/mecmcp-auth", "crates/mecmcp-audit", "crates/mecmcp-changeset", "crates/mecmcp-transport", "crates/mecmcp-runtime", "crates/mecmcp-policy", "crates/mecmcp-inventory", "crates/mecmcp-device"]
+members  = ["crates/mecmcp-auth", "crates/mecmcp-audit", "crates/mecmcp-changeset", "crates/mecmcp-transport", "crates/mecmcp-runtime", "crates/mecmcp-policy", "crates/mecmcp-inventory", "crates/mecmcp-device", "crates/mecmcp-server"]
 resolver = "2"
 
 [workspace.package]
-version      = "0.3.6"
+version      = "0.3.7"
 edition      = "2024"
 rust-version = "1.88"
 license      = "MIT"

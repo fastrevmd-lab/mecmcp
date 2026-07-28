@@ -35,8 +35,10 @@ apply) and the modern crate hygiene. Neither benefits from the other.
 
 ## Status
 
-**Planning.** No crates published yet. This repo currently holds the analysis
-and the extraction plan; code lands per the phases in [`PLAN.md`](PLAN.md).
+**Shared foundations implemented.** Authentication, audit, transport, runtime,
+policy, inventory, device coordination, change control, and the common `rmcp`
+server adapter are implemented in this repository. See [`PLAN.md`](PLAN.md) for
+extraction evidence and the remaining scale roadmap.
 
 ## Documents
 
@@ -60,6 +62,7 @@ and the extraction plan; code lands per the phases in [`PLAN.md`](PLAN.md).
 | `mecmcp-inventory` | Device registry as a trait — file today, database and NetBox later | both (generalized) |
 | `mecmcp-device` | Connection lease/pool, per-device concurrency, cancellation, timeouts | rustjunosmcp |
 | `mecmcp-changeset` | Plan → digest → approve → apply → verify, two-principal enforcement, indeterminate recovery | rustpanosmcp `mutation.rs` |
+| `mecmcp-server` | `rmcp` caller extraction, scope authorization, tool filtering, bounded result conversion, audit-scope construction | both server binaries |
 | `mecmcp-intent` | Vendor-neutral policy/object model with per-vendor rendering | new — see ROADMAP |
 
 Vendor servers keep their protocol adapters, XML parsers, and vendor workflows.

@@ -104,6 +104,7 @@ is the contract once a phase is released.
 | `mecmcp-inventory` | `Inventory` trait, file-backed impl, name/address validators, atomic write, hot-reload; generic over a vendor device payload | generalised from both | `mecmcp-policy` |
 | `mecmcp-device` | `Transport` trait, connection lease/pool, per-device in-flight cap, cancellation, timeouts | `rust-junosmcp-core` `device_lease`/`device_manager`/`cancel` | `mecmcp-inventory` |
 | `mecmcp-changeset` | `DeviceTransaction` trait; plan → digest → approve → apply → verify; two-principal enforcement; persisted lifecycle; indeterminate recovery; idempotency keys | `rust-panosmcp-core/mutation.rs` | `mecmcp-auth`, `mecmcp-audit` |
+| `mecmcp-server` | `rmcp` caller extraction, tool/target authorization, scope-filtered tool advertisement, bounded result conversion, audit-scope construction | both server binaries | `mecmcp-auth`, `mecmcp-audit` |
 | `mecmcp-intent` | Vendor-neutral policy/object model, per-vendor rendering | new — see [`ROADMAP.md`](ROADMAP.md) | — |
 
 ### The two load-bearing traits
