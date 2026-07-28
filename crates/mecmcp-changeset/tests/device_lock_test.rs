@@ -10,8 +10,8 @@
 use async_trait::async_trait;
 use mecmcp_audit::Attribution;
 use mecmcp_changeset::{
-    ChangesetCoordinator, CommitOptions, CommitOutcome, DeviceTransaction, OperationLimits,
-    RollbackOutcome, RollbackRef, UnlockOutcome,
+    ChangesetCoordinator, CommitOptions, CommitOutcome, DeviceTransaction, LifecycleState,
+    OperationLimits, RollbackOutcome, RollbackRef, UnlockOutcome,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -140,14 +140,18 @@ impl DeviceTransaction for RecordingTransaction {
     }
 }
 
-fn coordinator() -> ChangesetCoordinator {
+fn coordinator_at(path: Option<&std::path::Path>) -> ChangesetCoordinator {
     ChangesetCoordinator::load(
-        None,
+        path,
         OperationLimits::default(),
         Duration::from_secs(900),
         false,
     )
     .unwrap()
+}
+
+fn coordinator() -> ChangesetCoordinator {
+    coordinator_at(None)
 }
 
 async fn stage(
@@ -250,5 +254,96 @@ async fn a_held_lock_is_released_when_the_candidate_has_already_moved() {
     assert!(
         !calls.contains(&"stage"),
         "nothing may be staged after a failed fingerprint check: {calls:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Restart recovery policy (rustpanosmcp#72)
+// ---------------------------------------------------------------------------
+
+/// `Discard` is the default and must keep demoting staged operations: Junos's
+/// staged handle is a live NETCONF session that does not survive the process.
+/// `Retain` must leave them alone for a vendor whose device owns the candidate.
+///
+/// Both policies must write memory and file consistently. The bug this replaces
+/// fixed only the file, so the API answered `indeterminate` while the offline
+/// recovery tool read `staged` and refused to act.
+#[tokio::test]
+async fn staged_recovery_policy_decides_whether_a_restart_demotes_an_operation() {
+    use mecmcp_changeset::{
+        StagedRecovery,
+        persistence::{read_state, write_state},
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+
+    let transaction = RecordingTransaction::new(false);
+    let coordinator = coordinator_at(Some(&path));
+    let fingerprint = transaction.fingerprint().await.unwrap();
+    let out = coordinator
+        .stage_operation(
+            "device-a",
+            "owner-a",
+            &fingerprint,
+            TEST_ENDPOINT,
+            &transaction,
+            &[Action {
+                name: "one".to_owned(),
+            }],
+            "set",
+            None,
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    drop(coordinator);
+
+    let limits = OperationLimits::default();
+
+    // Default policy: the restart demotes it.
+    let discarded =
+        ChangesetCoordinator::load(Some(&path), limits, Duration::from_secs(900), false).unwrap();
+    let record = discarded
+        .record(&out.operation_id, "owner-a", "device-a")
+        .await
+        .unwrap();
+    assert_eq!(record.state, LifecycleState::Indeterminate);
+    // Memory and file must agree, which is the property that was broken.
+    let on_disk = read_state(&path, limits.max_state_bytes).unwrap();
+    assert_eq!(
+        on_disk.operations[&out.operation_id].state,
+        LifecycleState::Indeterminate,
+        "the file must match what the API reports"
+    );
+
+    // Put it back to Staged and reload with Retain.
+    let mut state = read_state(&path, limits.max_state_bytes).unwrap();
+    state.operations.get_mut(&out.operation_id).unwrap().state = LifecycleState::Staged;
+    write_state(&path, &state, limits.max_state_bytes).unwrap();
+
+    let retained = ChangesetCoordinator::load_with_recovery(
+        Some(&path),
+        limits,
+        Duration::from_secs(900),
+        false,
+        StagedRecovery::Retain,
+    )
+    .unwrap();
+    let record = retained
+        .record(&out.operation_id, "owner-a", "device-a")
+        .await
+        .unwrap();
+    assert_eq!(
+        record.state,
+        LifecycleState::Staged,
+        "Retain must leave a resumable staged operation alone"
+    );
+    let on_disk = read_state(&path, limits.max_state_bytes).unwrap();
+    assert_eq!(
+        on_disk.operations[&out.operation_id].state,
+        LifecycleState::Staged,
+        "the file must match what the API reports"
     );
 }
