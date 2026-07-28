@@ -1667,6 +1667,632 @@ async fn finding_8_expire_after_guard_wait() {
 }
 
 // ============================================================================
+// Tests for fourth review round findings
+// ============================================================================
+
+#[tokio::test]
+async fn finding_1_serialize_by_device_not_endpoint() {
+    // Finding 1: Serialize by the trusted device identity, not the caller's endpoint.
+    // Two legitimately different aliases or paths for the same inventory device produce
+    // different endpoint strings, so a second apply can slip past the active-operation
+    // check and stage onto the same candidate if we key by endpoint. This test verifies
+    // that different endpoints for the same device cannot bypass serialization.
+    let coordinator = ChangesetCoordinator::default();
+    let state = Arc::new(Mutex::new(MockDeviceState::default()));
+    let transaction1 = MockTransaction::with_state(state.clone());
+    let transaction2 = MockTransaction::with_state(state.clone());
+    let device = "test-device".to_string();
+    let owner1 = "alice";
+    let owner2 = "bob";
+    let approver1 = "charlie";
+    let approver2 = "dave";
+
+    let initial_fp = transaction1.fingerprint().await.unwrap();
+
+    // Create and approve two change sets for the same device
+    let actions1 = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test1".into(),
+        value: Some("value1".into()),
+    }];
+
+    let create_output1 = coordinator
+        .create_change_set(
+            device.clone(),
+            actions1,
+            owner1.to_string(),
+            initial_fp.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .approve_change_set(
+            create_output1.change_set_id.clone(),
+            device.clone(),
+            approver1.to_string(),
+            create_output1.digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Apply the first change set with one endpoint
+    let cancellation1 = CancellationToken::new();
+    let attribution1 = test_attribution(owner1);
+    let apply1_result = coordinator
+        .apply_change_set(
+            create_output1.change_set_id.clone(),
+            device.clone(),
+            "https://test-device.example.com".to_string(),
+            owner1.to_string(),
+            create_output1.digest.clone(),
+            initial_fp.clone(),
+            &transaction1,
+            &attribution1,
+            &cancellation1,
+        )
+        .await
+        .unwrap();
+    let after_fp1 = apply1_result.after_fingerprint.clone();
+
+    // Create and approve a second change set for the same device
+    let actions2 = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test2".into(),
+        value: Some("value2".into()),
+    }];
+
+    let create_output2 = coordinator
+        .create_change_set(
+            device.clone(),
+            actions2,
+            owner2.to_string(),
+            after_fp1.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .approve_change_set(
+            create_output2.change_set_id.clone(),
+            device.clone(),
+            approver2.to_string(),
+            create_output2.digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Try to apply the second change set with a DIFFERENT endpoint (DNS name vs IP)
+    // but for the SAME device. This should fail because the device has an active operation.
+    let result = coordinator
+        .apply_change_set(
+            create_output2.change_set_id.clone(),
+            device.clone(),
+            "https://192.0.2.1".to_string(), // Different endpoint for same device
+            owner2.to_string(),
+            create_output2.digest.clone(),
+            after_fp1.clone(),
+            &transaction2,
+            &test_attribution(owner2),
+            &CancellationToken::new(),
+        )
+        .await;
+
+    // Should fail with "device already has an active operation"
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("device") && err_msg.contains("active"),
+        "must reject concurrent operations on the same device via different endpoints, got: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn finding_2_cleanup_reservation_on_pre_stage_check_abort() {
+    // Finding 2: Clean up the reservation when the pre-stage check aborts.
+    // When the final pre-stage fingerprint call errors or detects drift, the operation
+    // has already been inserted as `Staging` and the change set persisted as `Applying`.
+    // Returning there leaves a non-terminal reservation blocking the device until a
+    // restart. The fix removes the operation and restores or terminally fails the
+    // change set before returning.
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Create a mock that fails fingerprint read on the pre-stage check (third call)
+    #[derive(Debug)]
+    struct FailingPreStageTransaction {
+        state: Arc<Mutex<MockDeviceState>>,
+        fingerprint_call_count: Arc<Mutex<usize>>,
+        fail_pre_stage: Arc<AtomicBool>,
+    }
+
+    impl FailingPreStageTransaction {
+        fn new() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(MockDeviceState::default())),
+                fingerprint_call_count: Arc::new(Mutex::new(0)),
+                fail_pre_stage: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn set_fail_pre_stage(&self) {
+            self.fail_pre_stage.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl DeviceTransaction for FailingPreStageTransaction {
+        type Action = MockAction;
+        type Staged = MockStaged;
+        type Diff = MockDiff;
+        type Validation = MockValidation;
+        type Error = MockError;
+
+        async fn fingerprint(&self) -> Result<String, Self::Error> {
+            let mut count = self.fingerprint_call_count.lock().unwrap();
+            *count += 1;
+
+            // Fail on the third call (pre-stage check) if requested
+            if *count >= 3 && self.fail_pre_stage.load(Ordering::SeqCst) {
+                return Err(MockError::ActionFailed(999));
+            }
+
+            let state = self.state.lock().unwrap();
+            let concatenated: String = state
+                .config
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(";");
+            let hash = sha2::Sha256::digest(concatenated.as_bytes());
+            Ok(format!("sha256:{}", hex::encode(hash)))
+        }
+
+        async fn stage(&self, actions: &[Self::Action]) -> Result<Self::Staged, Self::Error> {
+            let before_fp = self.fingerprint().await?;
+            {
+                let mut state = self.state.lock().unwrap();
+                for action in actions {
+                    match action.action {
+                        MockActionType::Set => {
+                            if let Some(ref value) = action.value {
+                                if let Some(existing) =
+                                    state.config.iter_mut().find(|(k, _)| k == &action.path)
+                                {
+                                    existing.1 = value.clone();
+                                } else {
+                                    state.config.push((action.path.clone(), value.clone()));
+                                }
+                            }
+                        }
+                        MockActionType::Delete => {
+                            state.config.retain(|(k, _)| k != &action.path);
+                        }
+                    }
+                }
+            } // MutexGuard dropped here
+            let after_fp = self.fingerprint().await?;
+            Ok(MockStaged {
+                actions: actions.to_vec(),
+                before_fp,
+                after_fp,
+            })
+        }
+
+        async fn diff(&self, staged: &Self::Staged) -> Result<Self::Diff, Self::Error> {
+            Ok(MockDiff {
+                changes: staged
+                    .actions
+                    .iter()
+                    .map(|a| format!("{:?} {}", a.action, a.path))
+                    .collect(),
+            })
+        }
+
+        async fn validate(&self, _staged: &Self::Staged) -> Result<Self::Validation, Self::Error> {
+            Ok(MockValidation { succeeded: true })
+        }
+
+        async fn commit(
+            &self,
+            _staged: &Self::Staged,
+            _attribution: &Attribution,
+            _options: &CommitOptions,
+        ) -> Result<CommitOutcome, Self::Error> {
+            Ok(CommitOutcome::Reconciled {
+                succeeded: true,
+                job_id: None,
+                details: None,
+            })
+        }
+
+        async fn confirm_commit(
+            &self,
+            _operation_id: &str,
+            _attribution: &Attribution,
+        ) -> Result<CommitOutcome, Self::Error> {
+            Err(MockError::ConfirmedCommitUnsupported)
+        }
+
+        async fn rollback(&self, _to: RollbackRef) -> Result<RollbackOutcome, Self::Error> {
+            Ok(RollbackOutcome {
+                succeeded: true,
+                details: None,
+            })
+        }
+    }
+
+    let coordinator = ChangesetCoordinator::default();
+    let transaction = FailingPreStageTransaction::new();
+    let device = "test-device".to_string();
+    let owner = "alice";
+    let approver = "bob";
+
+    let initial_fp = transaction.fingerprint().await.unwrap();
+
+    let actions = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test".into(),
+        value: Some("value".into()),
+    }];
+
+    let create_output = coordinator
+        .create_change_set(
+            device.clone(),
+            actions,
+            owner.to_string(),
+            initial_fp.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .approve_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            approver.to_string(),
+            create_output.digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Configure the mock to fail on the pre-stage check
+    transaction.set_fail_pre_stage();
+
+    // Apply the change set
+    let result = coordinator
+        .apply_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            "https://test-device.example.com".to_string(),
+            owner.to_string(),
+            create_output.digest.clone(),
+            initial_fp.clone(),
+            &transaction,
+            &test_attribution(owner),
+            &CancellationToken::new(),
+        )
+        .await;
+
+    // Should fail
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("pre-stage fingerprint failed"),
+        "must report pre-stage check failure, got: {err_msg}"
+    );
+
+    // Verify the change set is Failed (not Applying)
+    let status = coordinator
+        .change_set_status(create_output.change_set_id.clone(), device.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        status.state,
+        ChangeSetState::Failed,
+        "change set must be marked Failed when pre-stage check aborts"
+    );
+
+    // Verify the operation was removed (device is unblocked)
+    // Try to create and apply another change set — it should succeed if the device is unblocked
+    let actions2 = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test2".into(),
+        value: Some("value2".into()),
+    }];
+
+    let create_output2 = coordinator
+        .create_change_set(
+            device.clone(),
+            actions2,
+            owner.to_string(),
+            initial_fp.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .approve_change_set(
+            create_output2.change_set_id.clone(),
+            device.clone(),
+            approver.to_string(),
+            create_output2.digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    // This should succeed because the first operation was cleaned up
+    let transaction2 = MockTransaction::new();
+    let result2 = coordinator
+        .apply_change_set(
+            create_output2.change_set_id.clone(),
+            device.clone(),
+            "https://test-device.example.com".to_string(),
+            owner.to_string(),
+            create_output2.digest.clone(),
+            initial_fp.clone(),
+            &transaction2,
+            &test_attribution(owner),
+            &CancellationToken::new(),
+        )
+        .await;
+
+    assert!(
+        result2.is_ok(),
+        "device must be unblocked after pre-stage check cleanup"
+    );
+}
+
+#[tokio::test]
+async fn finding_3_recorded_state_reports_actual_persisted_state() {
+    // Finding 3: `recorded_state` reports a state that was never persisted.
+    // On a failed final `Applied` write it used to report the pre-apply value (`Approved`),
+    // but the earlier update already persisted `Applying`, and `update_change_set` rolls
+    // its attempt back to that. The fix reports `Applying` (what is really on disk).
+    //
+    // This test is difficult to trigger without a mock persistence layer, so we verify
+    // the logic by inspecting the code path. The test ensures that a successful apply
+    // reports `Applied`, and documents the expected behavior on failure.
+    let coordinator = ChangesetCoordinator::default();
+    let transaction = MockTransaction::new();
+    let device = "test-device".to_string();
+    let owner = "alice";
+    let approver = "bob";
+
+    let initial_fp = transaction.fingerprint().await.unwrap();
+
+    let actions = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test".into(),
+        value: Some("value".into()),
+    }];
+
+    let create_output = coordinator
+        .create_change_set(
+            device.clone(),
+            actions,
+            owner.to_string(),
+            initial_fp.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .approve_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            approver.to_string(),
+            create_output.digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    let apply_output = coordinator
+        .apply_change_set(
+            create_output.change_set_id.clone(),
+            device.clone(),
+            "https://test-device.example.com".to_string(),
+            owner.to_string(),
+            create_output.digest.clone(),
+            initial_fp.clone(),
+            &transaction,
+            &test_attribution(owner),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // On success, recorded_state must be Applied
+    assert_eq!(
+        apply_output.recorded_state,
+        ChangeSetState::Applied,
+        "recorded_state must report Applied on successful apply"
+    );
+
+    // The change set on disk must also be Applied
+    let change_set = coordinator
+        .change_set(&create_output.change_set_id, &device)
+        .await
+        .unwrap();
+    assert_eq!(
+        change_set.state,
+        ChangeSetState::Applied,
+        "persisted change set must be Applied"
+    );
+}
+
+#[tokio::test]
+async fn finding_4_reject_legacy_plan_with_empty_policy_signature() {
+    // Finding 4: Reject legacy plans with no policy signature before staging.
+    // A pre-upgrade change set has `policy_signature = ""` (the field is now
+    // `#[serde(default)]`), so apply creates a staged operation that the existing
+    // `require_operation_policy` guard will then reject against any non-empty current
+    // signature. Such a plan is allowed to mutate the device but can never proceed
+    // through the guarded lifecycle. The fix rejects it before staging with a clear
+    // error, rather than letting it touch the device and strand.
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let state_path = dir.path().join("changeset-state.json");
+
+    let transaction = MockTransaction::new();
+    let device = "test-device".to_string();
+    let owner = "alice";
+    let approver = "bob";
+
+    let initial_fp = transaction.fingerprint().await.unwrap();
+
+    // Compute the correct digest for the test data
+    let actions = serde_json::json!([
+        {
+            "action": "set",
+            "path": "/config/test",
+            "value": "value"
+        }
+    ]);
+    let digest =
+        mecmcp_changeset::change_set_digest(owner, &device, &initial_fp, &[actions[0].clone()])
+            .unwrap();
+
+    // Manually create a legacy approved change set with EMPTY policy_signature
+    let legacy_state = serde_json::json!({
+        "version": 1,
+        "state": {
+            "operations": {},
+            "change_sets": {
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+                    "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "owner": owner,
+                    "device": device,
+                    "expected_candidate_fingerprint": initial_fp,
+                    "actions": actions,
+                    "digest": digest,
+                    "state": "approved",
+                    "approver": approver,
+                    "expires_at_unix": 9999999999u64,
+                    "operation_id": null,
+                    // policy_signature is OMITTED (defaults to "")
+                }
+            }
+        }
+    });
+
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&legacy_state).unwrap(),
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // Reload the coordinator
+    let coordinator = ChangesetCoordinator::load(
+        Some(&state_path),
+        OperationLimits::default(),
+        Duration::from_secs(900),
+        false,
+    )
+    .unwrap();
+
+    // Verify the legacy record loaded
+    let change_set = coordinator
+        .change_set(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &device,
+        )
+        .await
+        .unwrap();
+    assert_eq!(change_set.state, ChangeSetState::Approved);
+    assert!(
+        change_set.policy_signature.is_empty(),
+        "legacy change set has empty policy_signature"
+    );
+
+    // Try to apply the legacy change set
+    let result = coordinator
+        .apply_change_set(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            device.clone(),
+            "https://test-device.example.com".to_string(),
+            owner.to_string(),
+            digest.clone(),
+            initial_fp.clone(),
+            &transaction,
+            &test_attribution(owner),
+            &CancellationToken::new(),
+        )
+        .await;
+
+    // Should fail with a clear error before staging
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("policy signature") || err_msg.contains("before policy signatures"),
+        "must reject legacy plans with empty policy signature, got: {err_msg}"
+    );
+
+    // Verify the device is unblocked (no operation was created).
+    // The legacy change set is still Approved (can't be replaced by the same owner),
+    // but we can verify the device is unblocked by creating a change set as a different owner.
+    let owner2 = "charlie";
+    let approver2 = "dave";
+    let actions2 = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/config/test2".into(),
+        value: Some("value2".into()),
+    }];
+
+    let create_output2 = coordinator
+        .create_change_set(
+            device.clone(),
+            actions2,
+            owner2.to_string(),
+            initial_fp.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .approve_change_set(
+            create_output2.change_set_id.clone(),
+            device.clone(),
+            approver2.to_string(),
+            create_output2.digest.clone(),
+        )
+        .await
+        .unwrap();
+
+    let transaction2 = MockTransaction::new();
+    let result2 = coordinator
+        .apply_change_set(
+            create_output2.change_set_id.clone(),
+            device.clone(),
+            "https://test-device.example.com".to_string(),
+            owner2.to_string(),
+            create_output2.digest.clone(),
+            initial_fp.clone(),
+            &transaction2,
+            &test_attribution(owner2),
+            &CancellationToken::new(),
+        )
+        .await;
+
+    assert!(
+        result2.is_ok(),
+        "device must be unblocked after rejecting legacy plan"
+    );
+}
+
+// ============================================================================
 // Tests for third review round findings
 // ============================================================================
 

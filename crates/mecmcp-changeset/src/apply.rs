@@ -210,8 +210,11 @@ impl ChangesetCoordinator {
             ));
         }
 
-        // Acquire device guard to serialize concurrent operations
-        let _guard = self.device_guard(&endpoint, cancellation).await?;
+        // Acquire device guard to serialize concurrent operations.
+        // Use the change-set's device field (trusted inventory identity) as the guard key,
+        // not the caller-supplied endpoint. Two different endpoints for the same device
+        // (e.g., DNS name vs IP, or two DNS names) must serialize through the same guard.
+        let _guard = self.device_guard(&device, cancellation).await?;
 
         if cancellation.is_cancelled() {
             return Err(CoordinatorError::new("device", "operation cancelled"));
@@ -246,7 +249,8 @@ impl ChangesetCoordinator {
 
         // Remembered so a failed final write can report what is really on disk
         // rather than claiming a state that was never persisted.
-        let change_set_state_before_apply = change_set.state;
+        // (Not currently used, but left for clarity about the intent.)
+        let _change_set_state_before_apply = change_set.state;
 
         // Capture the before fingerprint
         let before_fingerprint = transaction
@@ -262,6 +266,21 @@ impl ChangesetCoordinator {
                     "device fingerprint changed: expected {}, found {}",
                     expected_fingerprint, before_fingerprint
                 ),
+            ));
+        }
+
+        // Reject legacy plans with empty policy signature before staging.
+        // A pre-upgrade change set has `policy_signature = ""` (the field is now
+        // `#[serde(default)]`), so apply would create a staged operation that the
+        // existing `require_operation_policy` guard will then reject against any
+        // non-empty current signature. Such a plan is allowed to mutate the device
+        // but can never proceed through the guarded lifecycle. Reject it before
+        // staging with a clear error, rather than letting it touch the device and
+        // strand.
+        if change_set.policy_signature.is_empty() {
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                "change set created before policy signatures were tracked; cannot apply",
             ));
         }
 
@@ -324,11 +343,28 @@ impl ChangesetCoordinator {
         // the (now much smaller) window. This check is placed AFTER all persistence operations
         // (operation reservation + change-set Applying write) to ensure those bookkeeping steps
         // cannot themselves introduce a window where an external session could race.
-        let pre_stage_fingerprint = transaction.fingerprint().await.map_err(|e| {
-            CoordinatorError::new("device", format!("pre-stage fingerprint failed: {e}"))
-        })?;
+        let pre_stage_fingerprint = match transaction.fingerprint().await {
+            Ok(fp) => fp,
+            Err(e) => {
+                // Fingerprint read failed before staging — the operation was inserted as Staging
+                // and the change set marked Applying, but stage() was never called and the device
+                // was never touched. Remove the operation and restore or terminally fail the
+                // change set before returning.
+                self.remove(&operation_id).await;
+                change_set.state = ChangeSetState::Failed;
+                let _ = self.update_change_set(change_set.clone()).await;
+                return Err(CoordinatorError::new(
+                    "device",
+                    format!("pre-stage fingerprint failed: {e}"),
+                ));
+            }
+        };
 
         if pre_stage_fingerprint != expected_fingerprint {
+            // Drift detected before staging — clean up the reservation and fail the change set.
+            self.remove(&operation_id).await;
+            change_set.state = ChangeSetState::Failed;
+            let _ = self.update_change_set(change_set.clone()).await;
             return Err(CoordinatorError::new(
                 "expected_fingerprint",
                 format!(
@@ -462,7 +498,12 @@ impl ChangesetCoordinator {
         change_set.state = ChangeSetState::Applied;
         let recorded_state = match self.update_change_set(change_set.clone()).await {
             Ok(()) => ChangeSetState::Applied,
-            Err(_) => change_set_state_before_apply,
+            Err(_) => {
+                // The final Applied write failed. The earlier update already persisted
+                // `Applying`, and `update_change_set` rolls its attempt back to that.
+                // Report what is really on disk (Applying), not the pre-apply value.
+                ChangeSetState::Applying
+            }
         };
 
         Ok(ApplyOutput {
