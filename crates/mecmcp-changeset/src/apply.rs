@@ -363,14 +363,41 @@ impl ChangesetCoordinator {
             return Err(persist_error);
         }
 
-        // CRITICAL: The in-process guard cannot exclude external sessions (other processes,
-        // SSH, GUI). Between the fingerprint read below and the stage() call, another
-        // session could mutate the candidate. To narrow the window, re-read the fingerprint
-        // immediately before staging and compare. This is not true atomicity — that requires
-        // a device-side lock held across the check — but it detects drift that happens in
-        // the (now much smaller) window. The pre-stage fingerprint read and the stage() call
-        // must be adjacent with NO persistence operations in between, so an external mutation
-        // cannot slip through during a write.
+        // Take the device lock, if this implementation has one. The lock-risk is
+        // already persisted above, so a crash between here and the record write
+        // still leaves the risk visible to restart recovery.
+        let device_lock_acquired = if transaction.requires_config_lock() {
+            if let Err(lock_error) = transaction
+                .lock(&format!("mecmcp change set {change_set_id}"))
+                .await
+            {
+                // Nothing has been staged and no lock is held, so this is a clean
+                // failure — but the record says a lock may be held, so clear that
+                // before dropping the reservation.
+                self.remove(&operation_id).await;
+                change_set.state = ChangeSetState::Failed;
+                let _ = self.update_change_set(change_set).await;
+                return Err(CoordinatorError::new(
+                    "config_lock",
+                    format!("could not acquire the device configuration lock: {lock_error}"),
+                ));
+            }
+            true
+        } else {
+            false
+        };
+
+        // The in-process guard cannot exclude external sessions (other processes, SSH,
+        // GUI). Between the fingerprint read below and the stage() call, another session
+        // could mutate the candidate.
+        //
+        // When the implementation takes a device lock (above), that window is genuinely
+        // closed. When it does not — `requires_config_lock()` is false — re-reading the
+        // fingerprint immediately before staging is the best available mitigation: it is
+        // not atomicity, but it detects drift in the much smaller remaining window. The
+        // pre-stage fingerprint read and the stage() call must be adjacent with NO
+        // persistence operations in between, so an external mutation cannot slip through
+        // during a write.
         let pre_stage_fingerprint = match transaction.fingerprint().await {
             Ok(fp) => fp,
             Err(e) => {
@@ -378,6 +405,9 @@ impl ChangesetCoordinator {
                 // and the change set marked Applying, but stage() was never called and the device
                 // was never touched. Remove the operation and restore or terminally fail the
                 // change set before returning.
+                if device_lock_acquired {
+                    let _ = transaction.unlock().await; // Best-effort; nothing was staged.
+                }
                 self.remove(&operation_id).await;
                 change_set.state = ChangeSetState::Failed;
                 let _ = self.update_change_set(change_set.clone()).await;
@@ -390,6 +420,11 @@ impl ChangesetCoordinator {
 
         if pre_stage_fingerprint != expected_fingerprint {
             // Drift detected before staging — clean up the reservation and fail the change set.
+            // With a device lock held this should be unreachable for external mutation; it
+            // still fires when the candidate moved before the lock was taken.
+            if device_lock_acquired {
+                let _ = transaction.unlock().await; // Best-effort; nothing was staged.
+            }
             self.remove(&operation_id).await;
             change_set.state = ChangeSetState::Failed;
             let _ = self.update_change_set(change_set.clone()).await;

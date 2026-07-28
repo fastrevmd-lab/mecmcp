@@ -175,8 +175,34 @@ impl ChangesetCoordinator {
         // operations that need no recovery, which is how a real one gets missed.
         let mut device_touched = false;
 
+        // Whether this call took a device-side lock, so the error paths know
+        // whether there is one to release.
+        let mut device_lock_acquired = false;
+
         // Stage the operation
         let stage_result: Result<_, CoordinatorError> = async {
+            // Take the device lock before reading the fingerprint. The check and
+            // the staging are only atomic against other sessions while a
+            // device-side lock is held: the coordinator's own guard serialises
+            // this process and nothing else, so without this an operator at the
+            // CLI or a second MCP process can move the candidate in between, and
+            // the actions land on a state nobody approved.
+            if transaction.requires_config_lock() {
+                // Persist the lock risk *before* acquiring, for the same reason
+                // the pre-stage persist below exists: if the process dies between
+                // taking the lock and recording it, a stored `false` tells the
+                // operator no lock is held when one is. Claiming a lock that was
+                // never taken costs a no-op unlock; the reverse strands the device.
+                record.config_lock_held = true;
+                self.update(record.clone()).await?;
+
+                transaction
+                    .lock(&format!("mecmcp operation {operation_id}"))
+                    .await
+                    .map_err(|e| CoordinatorError::new("config_lock", e.to_string()))?;
+                device_lock_acquired = true;
+            }
+
             // Capture before fingerprint
             let before_fp = transaction
                 .fingerprint()
@@ -281,6 +307,34 @@ impl ChangesetCoordinator {
                 // a candidate that had already moved. There is no uncertainty to
                 // record, so drop the reservation instead of leaving an operation
                 // an operator would have to resolve by hand for no reason.
+                //
+                // A lock taken on the way in must come back off first, though.
+                // Dropping the reservation while the device stays locked is the
+                // worst of both: no record anyone can find, and a device that
+                // refuses every later change.
+                if device_lock_acquired
+                    && !matches!(
+                        transaction.unlock().await,
+                        Ok(crate::transaction::UnlockOutcome::Released)
+                    )
+                {
+                    // The unlock did not confirm a release, so the lock may still
+                    // be held and the record is the only thing that can say so.
+                    // Keep it rather than dropping it.
+                    record.state = LifecycleState::Indeterminate;
+                    record.details = Some(format!(
+                        "staging failed and the device lock could not be confirmed released: {error}"
+                    ));
+                    record.config_lock_held = true;
+                    let _ = self.update(record).await; // Best-effort
+                    return Err(CoordinatorError::new(
+                        "config_lock",
+                        format!(
+                            "{error} (operation {operation_id} may still hold the device lock)"
+                        ),
+                    ));
+                }
+
                 self.remove(&operation_id).await;
                 Err(error)
             }
