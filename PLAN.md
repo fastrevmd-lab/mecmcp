@@ -347,9 +347,25 @@ capability: **two-person change control on Junos**, which does not exist today.
 applied, and verified; an interrupted apply resolves through
 `resolve_persisted_operation` rather than leaving unknown state.
 
-**Status 2026-07-28: the shared crate is complete and released as
-`changeset-v0.3.0`. Vendor adoption is in flight and the exit criterion is not
-met.**
+**Completed 2026-07-28**, released through `changeset-v0.3.1`. The exit
+criterion was demonstrated on a live vSRX 24.4R1.9 (`vsrx-ci`) from a
+throwaway container, LXC 610, built from merged `main`:
+
+```
+0   2026-07-28 17:52:27 UTC by netconf via netconf
+    no-change-ref by lab-change-writer (unknown) on-behalf-of=self
+```
+
+Fingerprint read from the real candidate, change set planned by one token,
+**self-approval refused at the transport with `insufficient_scope`**, approved
+by a second token, applied, committed, and the attribution present in
+`show system commit`.
+
+The failed run before it was worth as much as the success. An invalid Junos
+payload produced `state: failed` rather than applied, `operations: 0` so no
+stranded reservation blocking the device, an unchanged candidate fingerprint —
+the all-or-none staging contract holding against real hardware — and
+`version: 2` on disk, the rollback-safety escalation firing correctly.
 
 Done and merged:
 
