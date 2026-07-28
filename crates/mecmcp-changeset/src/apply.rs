@@ -335,14 +335,33 @@ impl ChangesetCoordinator {
             return Err(error);
         }
 
+        // Persist the risk that stage() may acquire a device lock. If the process exits
+        // after stage() acquires a lock but before it returns, the record on disk must
+        // reflect that a lock may be held so restart recovery can flag it for manual
+        // inspection. Set config_lock_held to true BEFORE the pre-stage fingerprint check
+        // and the stage() call, so a crash during stage() leaves the risk persisted.
+        // This must be the LAST persistence write before stage() to minimize the window
+        // where an external session could mutate the candidate between the fingerprint
+        // check and the stage() call.
+        let mut pre_stage_record = self.record(&operation_id, &owner, &device).await?;
+        pre_stage_record.config_lock_held = true;
+        if let Err(persist_error) = self.update(pre_stage_record).await {
+            // Persistence failed before we called stage(), so no lock has been acquired.
+            // Remove the operation reservation and fail the apply.
+            self.remove(&operation_id).await;
+            change_set.state = ChangeSetState::Failed;
+            let _ = self.update_change_set(change_set).await;
+            return Err(persist_error);
+        }
+
         // CRITICAL: The in-process guard cannot exclude external sessions (other processes,
-        // SSH, GUI). Between the fingerprint read above and the stage() call below, another
+        // SSH, GUI). Between the fingerprint read below and the stage() call, another
         // session could mutate the candidate. To narrow the window, re-read the fingerprint
         // immediately before staging and compare. This is not true atomicity — that requires
         // a device-side lock held across the check — but it detects drift that happens in
-        // the (now much smaller) window. This check is placed AFTER all persistence operations
-        // (operation reservation + change-set Applying write) to ensure those bookkeeping steps
-        // cannot themselves introduce a window where an external session could race.
+        // the (now much smaller) window. The pre-stage fingerprint read and the stage() call
+        // must be adjacent with NO persistence operations in between, so an external mutation
+        // cannot slip through during a write.
         let pre_stage_fingerprint = match transaction.fingerprint().await {
             Ok(fp) => fp,
             Err(e) => {
@@ -372,22 +391,6 @@ impl ChangesetCoordinator {
                     expected_fingerprint, pre_stage_fingerprint
                 ),
             ));
-        }
-
-        // Persist the risk that stage() may acquire a device lock. If the process exits
-        // after stage() acquires a lock but before it returns, the record on disk must
-        // reflect that a lock may be held so restart recovery can flag it for manual
-        // inspection. Set config_lock_held to true BEFORE calling stage() rather than
-        // after, so a crash during stage() leaves the risk persisted.
-        let mut pre_stage_record = self.record(&operation_id, &owner, &device).await?;
-        pre_stage_record.config_lock_held = true;
-        if let Err(persist_error) = self.update(pre_stage_record).await {
-            // Persistence failed before we called stage(), so no lock has been acquired.
-            // Remove the operation reservation and fail the apply.
-            self.remove(&operation_id).await;
-            change_set.state = ChangeSetState::Failed;
-            let _ = self.update_change_set(change_set).await;
-            return Err(persist_error);
         }
 
         // Stage all actions through the transaction
@@ -470,33 +473,33 @@ impl ChangesetCoordinator {
         // a lock may be held. Later discard/commit operations must attempt to release it.
         operation_record.config_lock_held = true;
 
-        // Persist the operation update. On failure, mark the operation as Indeterminate
-        // rather than leaving it in Staging — the device candidate is changed but we
-        // cannot confirm the persisted state matches.
-        if let Err(persist_error) = self.update(operation_record.clone()).await {
+        // Persist the operation update. If that write fails, the handle must still
+        // reach the caller — returning `Err` would drop the only `T::Staged`, and
+        // the operation would remain in Staging (or be marked Indeterminate on
+        // restart), possibly holding a device lock, with no handle able to commit
+        // or discard it. The same rationale that applies to the change-set write
+        // below applies here: return the handle regardless of persistence outcome.
+        if let Err(_persist_error) = self.update(operation_record.clone()).await {
+            // The Staged record write failed. The earlier config_lock_held write
+            // succeeded, so the on-disk state is Staging with config_lock_held=true.
+            // Try to mark it Indeterminate so restart recovery flags it, but if
+            // that also fails, restart recovery will convert Staging to Indeterminate.
             operation_record.state = LifecycleState::Indeterminate;
-            operation_record.details = Some(format!(
-                "staging succeeded but state persistence failed: {persist_error}"
-            ));
-            // Try once more to persist the indeterminate state; if this also fails,
-            // the operation remains Staging in memory and will be marked Indeterminate
-            // on restart.
+            operation_record.details = Some(
+                "staging succeeded but Staged record persistence failed; handle returned"
+                    .to_owned(),
+            );
             let _ = self.update(operation_record).await;
-            return Err(persist_error);
+            // Fall through and return the handle. The operation state on disk is
+            // either Staging (with config_lock_held=true) or Indeterminate, and
+            // restart recovery will convert either to Indeterminate if needed.
         }
 
         // Mark the change set Applied. If that write fails the handle must still
-        // reach the caller — returning `Err` would drop the only `T::Staged`, and
-        // `Staged` is non-terminal and not converted by restart recovery, so the
-        // endpoint would stay blocked with nothing able to commit or discard it.
-        //
-        // But the caller must not be told this was a clean apply. Rewriting the
-        // record to `Failed` would be worse than saying nothing: staging DID
-        // succeed on the device, so `Failed` asserts something untrue, and the
-        // write would go through the same persistence layer that just failed.
-        // Report what is actually on disk and let the caller decide.
+        // reach the caller — the rationale is the same as above. Report what is
+        // actually on disk and let the caller decide.
         change_set.state = ChangeSetState::Applied;
-        let recorded_state = match self.update_change_set(change_set.clone()).await {
+        let change_set_state_on_disk = match self.update_change_set(change_set.clone()).await {
             Ok(()) => ChangeSetState::Applied,
             Err(_) => {
                 // The final Applied write failed. The earlier update already persisted
@@ -506,12 +509,18 @@ impl ChangesetCoordinator {
             }
         };
 
+        // The recorded_state field reports the change-set state as persisted, not
+        // the operation state. If the operation write failed but the change-set
+        // write succeeded, the caller sees Applied and must check the operation
+        // state separately if needed. Both failed-write branches return the handle,
+        // so the caller can commit or discard regardless of persistence outcome.
+
         Ok(ApplyOutput {
             operation_id,
             before_fingerprint,
             after_fingerprint,
             staged,
-            recorded_state,
+            recorded_state: change_set_state_on_disk,
         })
     }
 }

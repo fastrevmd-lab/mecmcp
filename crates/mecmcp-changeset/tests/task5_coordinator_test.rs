@@ -113,7 +113,9 @@ async fn test_insert_and_reload_persists_operation() {
     let coordinator =
         ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
 
-    // Verify the operation persisted
+    // Verify the operation persisted and was converted to Indeterminate on restart.
+    // Staged operations cannot be recovered because the opaque handle only exists
+    // in memory and cannot be reconstructed after a restart.
     let record = coordinator
         .record(
             "0000000000000000000000000000000000000000000000000000000000000001",
@@ -122,7 +124,11 @@ async fn test_insert_and_reload_persists_operation() {
         )
         .await
         .unwrap();
-    assert_eq!(record.state, LifecycleState::Staged);
+    assert_eq!(
+        record.state,
+        LifecycleState::Indeterminate,
+        "Staged must be converted to Indeterminate on restart"
+    );
 }
 
 #[tokio::test]
