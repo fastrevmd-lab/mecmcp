@@ -87,6 +87,49 @@ first.
 **Debian 13 (trixie), unprivileged, `nesting=1`.** All three are requirements,
 not defaults — see below.
 
+### The change-set CLI is identical on every server
+
+An operator who learns one mecmcp server must not have to relearn the next.
+These three flags mean the same thing, are spelled the same way, and behave the
+same way on every server — including ones not written yet:
+
+| Flag | Meaning |
+|---|---|
+| `--lab-mode` | Run without two-person control; change sets are approved on creation |
+| `--state-file` | Absolute path to the change-set and operation state file |
+| `--approval-timeout-secs` | How long an approval stays valid |
+
+This was not free. The same three concepts previously appeared as
+`--changeset-state-file` and `--changeset-approval-timeout-secs` on Junos,
+`--state-file` on PAN-OS, and a hardcoded constant with no flag at all for the
+approval TTL — three presentations of three concepts across two servers
+(mecmcp#94). Renaming carried the old spellings as aliases rather than breaking
+deployments.
+
+Adding a vendor server means adopting these names, not inventing better ones.
+
+#### `--lab-mode` never fabricates an approver
+
+A waived change set records `approver: null` alongside
+`approval_waiver: "lab-mode"`. Both fields are required: `approver: null` alone
+means *both* "nobody has approved this yet" and "approved without review", and
+an operator or SIEM has to tell those apart.
+
+Do not encode the waiver as a sentinel string inside `approver`. A token named
+that string would then be indistinguishable from a genuine waiver in every log
+line — the same defect this project already hit with `"stdio"` as a principal
+sentinel, recorded in PLAN.md.
+
+The waiver is applied automatically at creation, not through a separate tool.
+Starting the service with the flag is already the deliberate decision to run
+without a second reviewer, and the digest confirmation a waive call would carry
+is already enforced by apply, which is what touches the device. The operator's
+flow stays plan-then-apply, identical to production.
+
+A server started in lab mode must warn at startup: a relaxed security control
+should be visible where someone will see it, not inferred from flags typed weeks
+ago.
+
 ### Runtime dependencies must be declared, not inherited from the template
 
 A server's runtime dependencies are part of its packaging contract. State them
