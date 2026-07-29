@@ -28,6 +28,17 @@ pub struct ChangeSetOutput {
     pub expires_at_unix: u64,
     /// Number of actions in the change set.
     pub action_count: usize,
+    /// Why approval was waived, when it was.
+    ///
+    /// `None` on an ordinary change set. `Some("lab-mode")` when a single-operator
+    /// server approved it without a second principal.
+    ///
+    /// `approver` alone cannot carry this: it is `None` both for a change set
+    /// still awaiting approval and for one that was waived, and those are very
+    /// different facts. A reader — operator or SIEM — needs to tell "nobody has
+    /// approved this yet" from "this was deliberately approved without review".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_waiver: Option<String>,
 }
 
 impl From<ChangeSetRecord> for ChangeSetOutput {
@@ -41,6 +52,11 @@ impl From<ChangeSetRecord> for ChangeSetOutput {
             approver: record.approver,
             expires_at_unix: record.expires_at_unix,
             action_count: record.actions.len(),
+            approval_waiver: record
+                .approval
+                .as_ref()
+                .and_then(|approval| approval.waived.as_ref())
+                .map(|waiver| waiver.reason.clone()),
         }
     }
 }
