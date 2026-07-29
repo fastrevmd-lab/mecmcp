@@ -87,6 +87,48 @@ first.
 **Debian 13 (trixie), unprivileged, `nesting=1`.** All three are requirements,
 not defaults — see below.
 
+### Runtime dependencies must be declared, not inherited from the template
+
+A server's runtime dependencies are part of its packaging contract. State them
+and have the installer ensure them; do not rely on whatever the chosen template
+happens to include.
+
+| Server | Needs | Why |
+|---|---|---|
+| both | `curl`, `ca-certificates` | the documented endpoint verification |
+| Junos | `openssh-client`, `tar` | `transfer_file`, `fetch_file` and `collect_jtac_support_bundle` spawn `ssh`, `scp` and `tar` |
+| PAN-OS | — | talks HTTPS and spawns nothing |
+
+The Junos row is the cautionary one. `ssh`, `scp` and `tar` are present in
+Debian's **standard** LXC template, so those tools worked from the first
+install and nobody wrote the requirement down. That was luck of template
+choice: on a minimal template they are absent and three tools fail at runtime,
+having installed and started cleanly.
+
+`curl` is the same failure with the opposite outcome — the Debian 13 standard
+template does *not* ship it, so the README's own first verification step could
+not run on a fresh container (mecmcp#33).
+
+### Adding `curl` to an LXC is fine; adding it to an image is not
+
+The asymmetry is deliberate.
+
+An LXC is a full operating system with a shell and a package manager already
+present. Adding `curl` changes nothing an attacker could not do anyway, and it
+makes the documented verification work.
+
+A container image is minimal on purpose. `curl` is exactly the pivot tool
+§1 cites as the reason for distroless: a process holding firewall credentials
+should not ship an HTTP client for an attacker to use after an RCE. PAN-OS is
+distroless and cannot accept one at all.
+
+So verify an image without adding anything to it:
+
+- `docker run --rm <image> --version` proves the binary runs
+- check the endpoint **from the host**, against the published port
+- keep a `HEALTHCHECK` that needs no HTTP client — junos's `CMD kill -0 1`
+  proves the process is alive, which is the right shape
+
 ### `nesting=1` is required on Debian 13, not optional
 
 Earlier guidance here said "only where the repo genuinely needs it". That is
