@@ -6,7 +6,6 @@ use axum::Router;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
-use mecmcp_auth::CallerCtx;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -233,19 +232,18 @@ async fn rate_limit_middleware(
         return rate_limited_response("ip_rate", retry_after_secs);
     }
 
-    if let Some(caller) = request.extensions().get::<CallerCtx>() {
-        let token = caller.token_name.clone();
-        if let RateDecision::Limited { retry_after_secs } = state.check_token(&token, now) {
-            tracing::warn!(
-                limit = "token_rate",
-                token = %token,
-                rate = state.token_rate_per_second,
-                burst = state.token_burst,
-                retry_after_secs,
-                "request rate limited by token"
-            );
-            return rate_limited_response("token_rate", retry_after_secs);
-        }
+    if let Some(token) = crate::caller::token_name(request.extensions()).map(str::to_owned)
+        && let RateDecision::Limited { retry_after_secs } = state.check_token(&token, now)
+    {
+        tracing::warn!(
+            limit = "token_rate",
+            token = %token,
+            rate = state.token_rate_per_second,
+            burst = state.token_burst,
+            retry_after_secs,
+            "request rate limited by token"
+        );
+        return rate_limited_response("token_rate", retry_after_secs);
     }
 
     next.run(request).await

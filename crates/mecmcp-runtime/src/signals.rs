@@ -37,6 +37,29 @@ where
     Ok(())
 }
 
+/// SIGHUP handler that awaits each callback before receiving the next signal.
+///
+/// This is appropriate for atomic reload workflows whose individual steps
+/// must not overlap.
+///
+/// # Errors
+///
+/// Returns an error if the SIGHUP listener cannot be registered.
+#[cfg(unix)]
+pub fn install_hup_handler_async<F, Fut>(callback: F) -> std::io::Result<()>
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut hup = signal(SignalKind::hangup())?;
+    tokio::spawn(async move {
+        while hup.recv().await.is_some() {
+            callback().await;
+        }
+    });
+    Ok(())
+}
+
 /// No-op on non-Unix platforms.
 ///
 /// # Errors
@@ -50,10 +73,27 @@ where
     Ok(())
 }
 
+/// No-op async SIGHUP handler on non-Unix platforms.
+///
+/// # Errors
+///
+/// Always returns `Ok(())` on non-Unix platforms.
+#[cfg(not(unix))]
+pub fn install_hup_handler_async<F, Fut>(_callback: F) -> std::io::Result<()>
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    static SIGNAL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[cfg(unix)]
     #[tokio::test]
@@ -64,6 +104,7 @@ mod tests {
         };
         use std::time::Duration;
 
+        let _signal_test_guard = SIGNAL_TEST_LOCK.lock().await;
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
 
@@ -99,6 +140,48 @@ mod tests {
             2,
             "callback should have been invoked twice"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_hup_callbacks_are_awaited_serially() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+
+        let _signal_test_guard = SIGNAL_TEST_LOCK.lock().await;
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        install_hup_handler_async({
+            let active = active.clone();
+            let maximum = maximum.clone();
+            let completed = completed.clone();
+            move || {
+                let active = active.clone();
+                let maximum = maximum.clone();
+                let completed = completed.clone();
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        })
+        .expect("async handler");
+
+        let pid = rustix::process::Pid::from_raw(std::process::id() as i32).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::HUP).expect("first HUP");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        rustix::process::kill_process(pid, rustix::process::Signal::HUP).expect("second HUP");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(not(unix))]

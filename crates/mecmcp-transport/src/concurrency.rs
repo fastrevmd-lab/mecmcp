@@ -16,7 +16,6 @@ use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::LengthLimitError;
-use mecmcp_auth::CallerCtx;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -98,9 +97,8 @@ pub async fn concurrency_middleware(
     }
 
     if state.max_per_token > 0
-        && let Some(ctx) = req.extensions().get::<CallerCtx>()
+        && let Some(token) = crate::caller::token_name(req.extensions()).map(str::to_owned)
     {
-        let token = ctx.token_name.clone();
         let sem = state.token_sem(&token);
         match sem.try_acquire_owned() {
             Ok(p) => permits.push(p),
@@ -120,10 +118,11 @@ pub async fn concurrency_middleware(
     }
 
     if session_creating
-        && let (Some(tracker), Some(ctx)) =
-            (state.sessions.as_ref(), req.extensions().get::<CallerCtx>())
+        && let (Some(tracker), Some(token)) = (
+            state.sessions.as_ref(),
+            crate::caller::token_name(req.extensions()).map(str::to_owned),
+        )
     {
-        let token = ctx.token_name.clone();
         match tracker.try_reserve_token(token.clone()) {
             Ok(reservation) => token_session_reservation = reservation,
             Err(capacity) => {
@@ -210,6 +209,10 @@ async fn inspect_target_devices(
 ) -> Result<(Request, Vec<String>), Response> {
     if req.method() != Method::POST {
         return Ok((req, Vec::new()));
+    }
+    if let Some(body) = req.extensions().get::<crate::auth::BufferedRequestBody>() {
+        let targets = extract_targets(&body.0, target_keys);
+        return Ok((req, targets));
     }
 
     let (parts, body) = req.into_parts();

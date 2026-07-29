@@ -12,7 +12,8 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
-axum        = { version = "0.8", default-features = false, features = ["tokio"] }
+axum        = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
 dashmap     = "6.1"
 futures     = "0.3"
 http        = "1"
@@ -38,7 +39,7 @@ rustls-pki-types = { version = "1", default-features = false }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 thiserror   = { workspace = true }
-tokio       = { version = "1", features = ["time", "sync"] }
+tokio       = { version = "1", features = ["net", "time", "sync"] }
 tokio-util  = { version = "0.7", default-features = false, features = ["rt"] }
 tower-http  = { version = "0.6", features = ["limit"] }
 tracing     = { workspace = true }
