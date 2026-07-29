@@ -531,3 +531,54 @@ async fn test_waiving_after_ttl_expires_is_refused() {
 
     assert_eq!(status.state, ChangeSetState::Expired);
 }
+
+/// A waived change set must say *why* it is approved without an approver.
+///
+/// `approver: None` is ambiguous on its own — it means both "nobody has
+/// approved this yet" and "this was deliberately approved without review", and
+/// those are very different facts to an operator or a SIEM (mecmcp#94).
+#[tokio::test]
+async fn a_waived_change_set_reports_the_waiver_reason() {
+    let (_dir, coordinator) = setup_coordinator(true);
+
+    let actions = vec![TestAction {
+        action: "set".to_string(),
+        target: "/test/path".to_string(),
+    }];
+
+    let created = coordinator
+        .create_change_set(
+            "device-a".to_string(),
+            actions,
+            "alice".to_string(),
+            test_fingerprint(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .expect("create");
+
+    assert_eq!(
+        created.approval_waiver, None,
+        "a change set still awaiting approval must not look waived"
+    );
+
+    let waived = coordinator
+        .waive_approval(
+            created.change_set_id.clone(),
+            "device-a".to_string(),
+            "alice".to_string(),
+            created.digest.clone(),
+        )
+        .await
+        .expect("waive");
+
+    assert_eq!(
+        waived.approver, None,
+        "no approver may be fabricated for a waived change set"
+    );
+    assert_eq!(
+        waived.approval_waiver.as_deref(),
+        Some("lab-mode"),
+        "the waiver reason must reach the caller, not only the state file"
+    );
+}
