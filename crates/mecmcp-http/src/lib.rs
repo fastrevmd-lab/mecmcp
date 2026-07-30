@@ -351,7 +351,41 @@ impl HttpRequest {
         Ok(self)
     }
 
+    /// Add a header whose value is raw bytes.
+    ///
+    /// The outbound counterpart to [`HttpResponse::header`]. Without it the
+    /// conditional-request round trip is impossible: an `ETag` may legally
+    /// contain non-UTF-8 obs-text, and echoing it back in `If-Match` through a
+    /// `&str` setter would either fail or alter the bytes.
+    ///
+    /// # Errors
+    /// Returns [`HttpError::InvalidHeaderName`] if the name is invalid,
+    /// [`HttpError::FramingHeaderNotAllowed`] if it is a framing header, or
+    /// [`HttpError::InvalidHeaderValue`] if the bytes are not a legal field
+    /// value.
+    ///
+    /// # Examples
+    /// ```
+    /// use mecmcp_http::{HttpRequest, Method};
+    ///
+    /// let request = HttpRequest::new(Method::Put, "https://api.example.com/thing")?
+    ///     .header_bytes("If-Match", b"\"opaque-etag\"")?;
+    /// # Ok::<(), mecmcp_http::HttpError>(())
+    /// ```
+    pub fn header_bytes(mut self, name: &str, value: &[u8]) -> Result<Self, HttpError> {
+        let header_name = parse_header_name(name)?;
+        let header_value =
+            HeaderValue::from_bytes(value).map_err(|_| HttpError::InvalidHeaderValue {
+                name: name.to_owned(),
+            })?;
+        self.headers.push((header_name, header_value));
+        Ok(self)
+    }
+
     /// Set the request body.
+    ///
+    /// `Content-Length` is derived from this — see
+    /// [`HttpError::FramingHeaderNotAllowed`].
     ///
     /// # Examples
     /// ```
@@ -724,6 +758,15 @@ impl HttpClient {
             // Retry policy belongs to the consumer (see README), so this crate
             // makes exactly one wire attempt and lets the caller decide.
             .retry(reqwest::retry::never())
+            // Dropping reqwest's "http2" feature is NOT an HTTP/1 guarantee for a
+            // library: Cargo features unify across the whole graph, so any other
+            // crate in the consumer's binary depending on reqwest with defaults
+            // switches h2 back on here, and reqwest would then advertise it in
+            // ALPN. This call is the actual enforcement; the absent feature is
+            // supply-chain hygiene on top. Exactly the shape of the aws-lc-rs
+            // problem in decision D4 — a feature is a property of the build, not
+            // of this crate.
+            .http1_only()
             .no_proxy()
             .connect_timeout(config.connect_timeout)
             // Deliberately no `.timeout()`. The whole-request deadline in `send`
@@ -2282,6 +2325,133 @@ mod tests {
         // Genuinely not UTF-8: declines rather than corrupting.
         assert_eq!(response.header_str("x-binary"), None);
         assert_eq!(response.header("x-binary"), Some(&b"\xC3\x28"[..]));
+    }
+
+    /// The client must not negotiate HTTP/2 even when the peer offers it.
+    ///
+    /// This is the guarantee, not the absent Cargo feature: feature unification
+    /// can switch `reqwest/http2` back on from anywhere in the consumer's build.
+    /// The server here advertises h2 first in ALPN, so a client that offered h2
+    /// would negotiate it.
+    #[tokio::test]
+    async fn http2_is_never_negotiated_even_when_offered() {
+        let (cert_pem, mut server_config) = tls_material();
+        // h2 first, so it wins if the client offers it at all.
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let (listener, port) = bind_local().await;
+        let negotiated = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        {
+            let negotiated = Arc::clone(&negotiated);
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(stream).await.unwrap();
+                if let Some(protocol) = tls.get_ref().1.alpn_protocol() {
+                    *negotiated.lock().await = protocol.to_vec();
+                }
+                read_request_head(&mut tls).await;
+                let _ = tls
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                let _ = tls.flush().await;
+            });
+        }
+
+        let client = client_trusting(cert_pem);
+        let response = client
+            .send(HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        assert_eq!(
+            negotiated.lock().await.as_slice(),
+            b"http/1.1",
+            "the client negotiated a protocol other than HTTP/1.1"
+        );
+    }
+
+    /// The conditional-request round trip #177 exists for, end to end.
+    ///
+    /// A non-UTF-8 `ETag` comes back from one response and goes out again in
+    /// `If-Match`, byte for byte. Without a raw-byte request setter this is
+    /// impossible, however faithful the response side is.
+    #[tokio::test]
+    async fn non_utf8_etag_round_trips_into_if_match() {
+        let etag: &[u8] = b"\"\xC3\x28\xFF\"";
+
+        let (cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+        let echoed = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        {
+            let echoed = Arc::clone(&echoed);
+            tokio::spawn(async move {
+                // First request: hand out the ETag.
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(stream).await.unwrap();
+                read_request_head(&mut tls).await;
+                let mut response = b"HTTP/1.1 200 OK\r\nETag: ".to_vec();
+                response.extend_from_slice(etag);
+                response.extend_from_slice(b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = tls.write_all(&response).await;
+                let _ = tls.flush().await;
+                drop(tls);
+
+                // Second request: capture whatever If-Match arrives.
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(stream).await.unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while tls.read_exact(&mut byte).await.is_ok() {
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                *echoed.lock().await = head;
+                let _ = tls
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                let _ = tls.flush().await;
+            });
+        }
+
+        let client = client_trusting(cert_pem);
+        let url = format!("https://localhost:{port}/thing");
+
+        let first = client
+            .send(HttpRequest::new(Method::Get, &url).unwrap())
+            .await
+            .unwrap();
+        let received = first.header("etag").expect("ETag present").to_vec();
+        assert_eq!(received, etag, "the ETag must survive the response side");
+
+        let second = client
+            .send(
+                HttpRequest::new(Method::Put, &url)
+                    .unwrap()
+                    .header_bytes("If-Match", &received)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), 204);
+
+        // The bytes that actually went on the wire.
+        let head = echoed.lock().await.clone();
+        let mut expected = b"if-match: ".to_vec();
+        expected.extend_from_slice(etag);
+        let lowered: Vec<u8> = head.iter().map(|byte| byte.to_ascii_lowercase()).collect();
+        assert!(
+            lowered
+                .windows(expected.len())
+                .any(|window| window == expected.as_slice()),
+            "If-Match did not carry the original bytes"
+        );
     }
 
     #[test]
