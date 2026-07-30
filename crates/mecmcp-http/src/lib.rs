@@ -407,14 +407,29 @@ fn safe_url(url: &reqwest::Url) -> String {
     safe.to_string()
 }
 
+/// Every URL component that can carry a credential.
+///
+/// Enumerated in one place on purpose. This was fixed three times in a row as
+/// separate one-off cases — userinfo, then query, then fragment — because each
+/// fix addressed the instance rather than the category. Anything added here must
+/// be handled by both [`safe_url`] and [`redact_unparsed_url`].
+///
+/// - **userinfo** (`user:pass@`) — HTTP basic auth in a URL.
+/// - **query** (`?api_key=…`) — signed URLs and query-based API keys.
+/// - **fragment** (`#access_token=…`) — the OAuth implicit flow.
+///
+/// The path is deliberately *not* redacted: it is structural, and losing it
+/// would leave errors with nothing actionable in them.
+const CREDENTIAL_BEARING_DELIMITERS: [char; 2] = ['?', '#'];
+
 /// Redact a URL string that could **not** be parsed.
 ///
-/// Deliberately blunt, in two directions: everything up to and including the
-/// last `@` is dropped, and anything from the first `?` onward is dropped too.
-/// A structural scan cannot be trusted here, because the input is by definition
-/// malformed — `https//user:secret@example.com` (one missing colon) has no
-/// `://` for an authority to start after, and an earlier version of this
-/// function returned such input verbatim and leaked the password.
+/// Deliberately blunt: everything up to and including the last `@` is dropped,
+/// and everything from the first `?` or `#` onward with it. A structural scan
+/// cannot be trusted here, because the input is by definition malformed —
+/// `https//user:secret@example.com` (one missing colon) has no `://` for an
+/// authority to start after, and an earlier version of this function returned
+/// such input verbatim and leaked the password.
 ///
 /// Over-redacting an error message costs a little debuggability. Under-redacting
 /// costs a credential. So when in doubt this cuts.
@@ -423,8 +438,8 @@ fn redact_unparsed_url(raw: &str) -> String {
         Some(at) => format!("[redacted]{}", &raw[at..]),
         None => raw.to_owned(),
     };
-    match after_userinfo.find('?') {
-        Some(query) => format!("{}?[redacted]", &after_userinfo[..query]),
+    match after_userinfo.find(CREDENTIAL_BEARING_DELIMITERS) {
+        Some(cut) => format!("{}[redacted]", &after_userinfo[..cut]),
         None => after_userinfo,
     }
 }
@@ -1400,6 +1415,9 @@ mod tests {
             format!("https//user:{CANARY}@example.com"),
             format!("{CANARY}@example.com"), // no scheme at all
             format!("https:/user:{CANARY}@example.com"), // single slash
+            // Unparseable *and* fragment-bearing: no '@', no '?' to cut at.
+            format!("https://exa mple.com/#access_token={CANARY}"),
+            format!("https://exa mple.com/?api_key={CANARY}"),
         ];
 
         for candidate in candidates {
@@ -1450,7 +1468,18 @@ mod tests {
         // A query credential has no '@' to cut at, so the query goes too.
         assert_eq!(
             redact_unparsed_url("https//host?api_key=SEKRIT"),
-            "https//host?[redacted]"
+            "https//host[redacted]"
+        );
+        // Fragment credentials — the OAuth implicit flow — have neither an '@'
+        // nor a '?' to cut at.
+        assert_eq!(
+            redact_unparsed_url("https://exa mple.com/#access_token=SEKRIT"),
+            "https://exa mple.com/[redacted]"
+        );
+        // Both present: the earliest delimiter wins.
+        assert_eq!(
+            redact_unparsed_url("h ttp://host/p?a=SEKRIT#b=SEKRIT"),
+            "h ttp://host/p[redacted]"
         );
     }
 
