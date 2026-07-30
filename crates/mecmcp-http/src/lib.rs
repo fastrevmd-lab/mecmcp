@@ -5,12 +5,12 @@
 //! deadlines. Designed for outbound API calls where credential leakage and
 //! resource exhaustion are the primary concerns.
 //!
-//! ## Phase 2a scope
+//! ## Response bodies are bounded while they stream
 //!
-//! This crate deliberately ships **no response body API**. Phase 2b will add
-//! streaming response-size enforcement in a separate PR, so the streaming
-//! limit gets its own review pass rather than riding along at the end of a
-//! large diff.
+//! `max_response_bytes` is enforced against the running total as each chunk
+//! arrives. `Content-Length` is a claim by the peer, so it is used only to fail
+//! *earlier* and never as the enforcement — an endpoint can omit it entirely
+//! under chunked transfer encoding, or send one value and stream another.
 //!
 //! ## What this crate does not own
 //!
@@ -139,6 +139,11 @@ pub struct HttpClientConfig {
     pub pool_max_idle_per_host: usize,
     /// User-Agent header value.
     pub user_agent: String,
+    /// Maximum response body accepted, in bytes.
+    ///
+    /// Enforced while the body streams in, not from `Content-Length` — see
+    /// [`HttpError::ResponseTooLarge`].
+    pub max_response_bytes: usize,
     /// Additional root certificates in PEM format (additive trust only).
     ///
     /// Each string is a PEM-encoded certificate. There is **no** API to disable
@@ -155,6 +160,7 @@ impl Default for HttpClientConfig {
             max_concurrent_requests: 8,
             pool_idle_timeout: Duration::from_secs(90),
             pool_max_idle_per_host: 4,
+            max_response_bytes: 8 * 1024 * 1024,
             user_agent: format!("mecmcp-http/{}", env!("CARGO_PKG_VERSION")),
             extra_root_certificates: Vec::new(),
         }
@@ -494,6 +500,70 @@ impl std::fmt::Display for SafeUrl {
 /// would leave errors with nothing actionable in them.
 const CREDENTIAL_BEARING_DELIMITERS: [char; 2] = ['?', '#'];
 
+/// Read a response body, enforcing `limit` **as the bytes arrive**.
+///
+/// The only path in this crate that produces a response body. `reqwest`'s
+/// `bytes()` and `text()` are never called anywhere, and must not be: they
+/// buffer the whole body first, so a limit applied to their result has already
+/// let an unbounded allocation happen.
+///
+/// `Content-Length` is a claim by the peer, so it is used only to fail *earlier*
+/// — never as the enforcement. A hostile endpoint can declare 10 bytes and
+/// stream gigabytes, or omit the header entirely under `Transfer-Encoding:
+/// chunked`. The running total is therefore checked against every chunk, and
+/// checked *before* the chunk is appended, so over-limit bytes are never held.
+async fn read_body_within_limit(
+    response: &mut reqwest::Response,
+    limit: usize,
+    url: &SafeUrl,
+) -> Result<Vec<u8>, HttpError> {
+    // Fail fast on an honest oversized declaration, without reading a byte.
+    // Only ever an optimisation: a lie here is caught by the loop below.
+    if response
+        .content_length()
+        .is_some_and(|declared| declared > limit as u64)
+    {
+        return Err(HttpError::ResponseTooLarge {
+            limit,
+            url: url.clone(),
+        });
+    }
+
+    // Deliberately not pre-allocated from `Content-Length`: reserving what the
+    // peer claims hands it an allocation primitive.
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|error| HttpError::BodyRead {
+                url: url.clone(),
+                detail: describe_with_causes(&error.without_url()),
+            })?;
+        let Some(chunk) = chunk else { break };
+
+        // Checked before the append, and with `checked_add` so a pathological
+        // length cannot wrap past the comparison.
+        //
+        // Caveat worth keeping honest: moving this check *after* the append
+        // survives mutation testing, because hyper hands out frames bounded by
+        // its own read buffer, so no single chunk is large enough for the
+        // difference to be observable. Before-append is still the right order —
+        // it does not depend on that buffering behaviour staying true — but it
+        // rests on review, not on a test.
+        let would_be = body.len().checked_add(chunk.len());
+        if would_be.is_none_or(|total| total > limit) {
+            return Err(HttpError::ResponseTooLarge {
+                limit,
+                url: url.clone(),
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
+}
+
 /// Render an error together with its source chain.
 ///
 /// `reqwest::Error`'s `Display` prints only the top-level kind — after
@@ -559,6 +629,7 @@ pub struct HttpClient {
     inner: reqwest::Client,
     semaphore: Arc<Semaphore>,
     request_timeout: Duration,
+    max_response_bytes: usize,
 }
 
 impl HttpClient {
@@ -602,6 +673,12 @@ impl HttpClient {
         if config.max_concurrent_requests == 0 {
             return Err(HttpError::ConfigValidation {
                 field: "max_concurrent_requests".to_owned(),
+                detail: "must be greater than zero".to_owned(),
+            });
+        }
+        if config.max_response_bytes == 0 {
+            return Err(HttpError::ConfigValidation {
+                field: "max_response_bytes".to_owned(),
                 detail: "must be greater than zero".to_owned(),
             });
         }
@@ -706,6 +783,7 @@ impl HttpClient {
             inner,
             semaphore: Arc::new(Semaphore::new(config.max_concurrent_requests)),
             request_timeout: config.request_timeout,
+            max_response_bytes: config.max_response_bytes,
         })
     }
 
@@ -764,7 +842,7 @@ impl HttpClient {
             // Send the request. Connect failures are classified separately: an
             // unreachable or untrusted endpoint is an operator problem, and
             // lumping it in with a mid-request failure loses that.
-            let response = req.send().await.map_err(|error| {
+            let mut response = req.send().await.map_err(|error| {
                 let is_connect = error.is_connect();
                 // `without_url` first: reqwest's Display appends the *raw* URL,
                 // query and all, which is where a signed-URL credential lives.
@@ -779,23 +857,30 @@ impl HttpClient {
                 }
             })?;
 
-            // Build HttpResponse
             let status = response.status().as_u16();
-            // Lossy rather than skipping non-UTF-8 values: dropping the entry
-            // would make a header that is present look absent to `header()`,
-            // which is a worse failure than a replacement character.
-            let headers = response
-                .headers()
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.to_string(),
-                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                    )
-                })
-                .collect();
+            // Headers are kept as raw bytes. Converting here — lossily or by
+            // skipping — corrupts legal non-UTF-8 field values such as an opaque
+            // ETag, and a caller echoing that into If-Match would then send
+            // different bytes (#177).
+            let headers = response.headers().clone();
 
-            Ok::<HttpResponse, HttpError>(HttpResponse { status, headers })
+            // Note this read happens INSIDE the deadline and while the
+            // concurrency permit is still held. Both matter: a body trickled one
+            // byte at a time would otherwise run forever, and releasing the
+            // permit at the headers would let any number of body reads exceed
+            // `max_concurrent_requests`.
+            let body = read_body_within_limit(
+                &mut response,
+                self.max_response_bytes,
+                &url_for_diagnostics,
+            )
+            .await?;
+
+            Ok::<HttpResponse, HttpError>(HttpResponse {
+                status,
+                headers,
+                body,
+            })
         })
         .await;
 
@@ -815,80 +900,64 @@ impl HttpClient {
 /// phase 2b with streaming response-size enforcement.
 pub struct HttpResponse {
     status: u16,
-    headers: Vec<(String, String)>,
+    headers: reqwest::header::HeaderMap,
+    body: Vec<u8>,
 }
 
 impl HttpResponse {
-    /// Get the HTTP status code.
-    ///
-    /// # Examples
-    /// ```
-    /// # use mecmcp_http::{HttpClient, HttpClientConfig, HttpRequest, Method};
-    /// # async fn example() -> Result<(), mecmcp_http::HttpError> {
-    /// # let client = HttpClient::new(HttpClientConfig::default())?;
-    /// # let request = HttpRequest::new(Method::Get, "https://api.example.com/")?;
-    /// let response = client.send(request).await?;
-    /// assert_eq!(response.status(), 200);
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// The HTTP status code.
     #[must_use]
     pub fn status(&self) -> u16 {
         self.status
     }
 
-    /// Get a header value by name (case-insensitive).
+    /// The response body.
     ///
-    /// # Examples
-    /// ```
-    /// # use mecmcp_http::{HttpClient, HttpClientConfig, HttpRequest, Method};
-    /// # async fn example() -> Result<(), mecmcp_http::HttpError> {
-    /// # let client = HttpClient::new(HttpClientConfig::default())?;
-    /// # let request = HttpRequest::new(Method::Get, "https://api.example.com/")?;
-    /// let response = client.send(request).await?;
-    /// if let Some(content_type) = response.header("Content-Type") {
-    ///     println!("Content-Type: {content_type}");
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Bounded by `max_response_bytes`, enforced while the body streamed in.
+    ///
+    /// Frequently a credential in its own right — a token exchange, a login, a
+    /// key rotation — so it is never printed by `Debug` and never appears in an
+    /// error.
     #[must_use]
-    pub fn header(&self, name: &str) -> Option<&str> {
-        let name_lower = name.to_lowercase();
-        self.headers
-            .iter()
-            .find(|(k, _)| k.to_lowercase() == name_lower)
-            .map(|(_, v)| v.as_str())
+    pub fn body(&self) -> &[u8] {
+        &self.body
     }
 
-    /// Get all headers as name-value pairs.
+    /// A header value as raw bytes, looked up case-insensitively.
     ///
-    /// # Examples
-    /// ```
-    /// # use mecmcp_http::{HttpClient, HttpClientConfig, HttpRequest, Method};
-    /// # async fn example() -> Result<(), mecmcp_http::HttpError> {
-    /// # let client = HttpClient::new(HttpClientConfig::default())?;
-    /// # let request = HttpRequest::new(Method::Get, "https://api.example.com/")?;
-    /// let response = client.send(request).await?;
-    /// for (name, value) in response.headers() {
-    ///     println!("{name}: {value}");
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Bytes rather than `&str` on purpose: a legal field value need not be
+    /// UTF-8, and converting would corrupt an opaque `ETag` a caller intends to
+    /// echo back in `If-Match` (#177).
     #[must_use]
-    pub fn headers(&self) -> &[(String, String)] {
-        &self.headers
+    pub fn header(&self, name: &str) -> Option<&[u8]> {
+        self.headers.get(name).map(HeaderValue::as_bytes)
+    }
+
+    /// A header value as a string, or `None` if it is absent or not UTF-8.
+    #[must_use]
+    pub fn header_str(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).and_then(|value| value.to_str().ok())
+    }
+
+    /// Every header, as name and raw bytes.
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
     }
 }
 
 impl std::fmt::Debug for HttpResponse {
+    /// Status, header **names**, and body **length** only.
+    ///
+    /// Never a header value (`Set-Cookie` and friends) and never a body byte —
+    /// a token-exchange response is the credential.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Hand-written Debug: status and header NAMES only, never values
-        let header_names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        let header_names: Vec<&str> = self.headers.keys().map(HeaderName::as_str).collect();
         f.debug_struct("HttpResponse")
             .field("status", &self.status)
             .field("headers", &header_names)
+            .field("body_bytes", &self.body.len())
             .finish()
     }
 }
@@ -1008,6 +1077,25 @@ pub enum HttpError {
         /// The target, redacted. See [`SafeUrl`].
         url: SafeUrl,
         /// Detail about the connection failure.
+        detail: String,
+    },
+    /// The response body exceeded `max_response_bytes`.
+    ///
+    /// Reports the limit, never the bytes seen — a body can itself be a
+    /// credential.
+    #[error("response from {url} exceeded the {limit}-byte limit")]
+    ResponseTooLarge {
+        /// The configured limit.
+        limit: usize,
+        /// The target, redacted. See [`SafeUrl`].
+        url: SafeUrl,
+    },
+    /// The response body could not be read.
+    #[error("failed to read response body from {url}: {detail}")]
+    BodyRead {
+        /// The target, redacted. See [`SafeUrl`].
+        url: SafeUrl,
+        /// Detail about the failure.
         detail: String,
     },
     /// The underlying HTTP request failed.
@@ -1172,7 +1260,7 @@ mod tests {
 
         let response = client.send(request).await.unwrap();
         assert_eq!(response.status(), 200);
-        assert_eq!(response.header("x-test-header"), Some("test-value"));
+        assert_eq!(response.header_str("x-test-header"), Some("test-value"));
     }
 
     #[tokio::test]
@@ -1284,7 +1372,7 @@ mod tests {
         let response = client.send(request).await.unwrap();
         assert_eq!(response.status(), 302);
         assert_eq!(
-            response.header("location"),
+            response.header_str("location"),
             Some("https://nonexistent.invalid/")
         );
     }
@@ -1810,6 +1898,309 @@ mod tests {
     /// hyper's HTTP/1 encoder panics in debug builds when it disagrees with the
     /// body, and in release builds desynchronises a pooled connection that a
     /// later request will reuse.
+    /// A body inside the limit must round-trip byte-exactly.
+    #[tokio::test]
+    async fn body_under_the_limit_round_trips() {
+        let (cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+        serve(
+            listener,
+            server_config,
+            "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world",
+            1,
+        );
+
+        let client = client_trusting(cert_pem);
+        let response = client
+            .send(HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body(), b"hello world");
+    }
+
+    /// The core acceptance criterion: a chunked response declares no length, so
+    /// the running total is the only thing that can bound it.
+    ///
+    /// The server streams **forever**. That is what makes this decisive rather
+    /// than a race: an implementation that buffered the body and measured
+    /// afterwards could never return at all, so the 5-second test-side timeout
+    /// below fails it. The client's own deadline is set to 60s precisely so that
+    /// it cannot be what rescues the test — only the streaming limit can.
+    #[tokio::test]
+    async fn endless_chunked_body_is_stopped_by_the_streaming_limit() {
+        const LIMIT: usize = 4096;
+
+        let (cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            read_request_head(&mut tls).await;
+            // No Content-Length: the peer never says how much is coming.
+            if tls
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let payload = vec![b'x'; 256];
+            let header = format!("{:x}\r\n", payload.len());
+            loop {
+                if tls.write_all(header.as_bytes()).await.is_err()
+                    || tls.write_all(&payload).await.is_err()
+                    || tls.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        let client = build_client(HttpClientConfig {
+            extra_root_certificates: vec![cert_pem],
+            max_response_bytes: LIMIT,
+            // Deliberately far longer than the test's own timeout.
+            request_timeout: Duration::from_secs(60),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.send(
+                HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap(),
+            ),
+        )
+        .await
+        .expect("send did not return — the body was being buffered, not bounded while streaming");
+
+        let error = outcome.unwrap_err();
+        assert!(
+            matches!(error, HttpError::ResponseTooLarge { limit: LIMIT, .. }),
+            "expected a size rejection, got {error:?}"
+        );
+    }
+
+    /// An honest oversized `Content-Length` is rejected without reading a body.
+    #[tokio::test]
+    async fn oversized_content_length_is_rejected_before_reading() {
+        let (cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+        let body_written = Arc::new(AtomicUsize::new(0));
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        {
+            let body_written = Arc::clone(&body_written);
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(stream).await.unwrap();
+                read_request_head(&mut tls).await;
+                let _ = tls
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                // Give the client a moment to reject on the header alone.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let payload = vec![b'y'; 1024 * 1024];
+                if tls.write_all(&payload).await.is_ok() {
+                    body_written.store(payload.len(), Ordering::SeqCst);
+                }
+            });
+        }
+
+        let client = build_client(HttpClientConfig {
+            extra_root_certificates: vec![cert_pem],
+            max_response_bytes: 4096,
+            request_timeout: Duration::from_secs(10),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let error = client
+            .send(HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, HttpError::ResponseTooLarge { .. }),
+            "got {error:?}"
+        );
+    }
+
+    /// A body trickled forever must hit the whole-request deadline.
+    ///
+    /// If the body read sat outside the deadline, this would hang rather than
+    /// fail — the slow-loris case.
+    #[tokio::test]
+    async fn trickled_body_hits_the_deadline() {
+        let (cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            read_request_head(&mut tls).await;
+            let _ = tls
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            // One byte at a time, forever, never sending the terminating chunk.
+            loop {
+                if tls.write_all(b"1\r\nz\r\n").await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        let client = build_client(HttpClientConfig {
+            extra_root_certificates: vec![cert_pem],
+            max_response_bytes: 1024 * 1024,
+            request_timeout: Duration::from_millis(400),
+            connect_timeout: Duration::from_secs(30),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let error = client
+            .send(HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, HttpError::Timeout { .. }),
+            "a trickled body must hit the deadline, got {error:?}"
+        );
+    }
+
+    /// The concurrency permit must be held until the body is read.
+    ///
+    /// Releasing it when the headers arrive would let any number of body reads
+    /// run at once, which is the interesting half of the limit.
+    #[tokio::test]
+    async fn permit_is_held_until_the_body_is_read() {
+        let (cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+
+        let in_body_phase = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        {
+            let in_body_phase = Arc::clone(&in_body_phase);
+            let peak = Arc::clone(&peak);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let acceptor = acceptor.clone();
+                    let in_body_phase = Arc::clone(&in_body_phase);
+                    let peak = Arc::clone(&peak);
+                    tokio::spawn(async move {
+                        let Ok(mut tls) = acceptor.accept(stream).await else {
+                            return;
+                        };
+                        read_request_head(&mut tls).await;
+                        // Headers first, body later: the window in which a
+                        // prematurely released permit would show up.
+                        let _ = tls
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                            .await;
+                        let current = in_body_phase.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(current, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        let _ = tls.write_all(b"done").await;
+                        in_body_phase.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            });
+        }
+
+        let client = Arc::new(
+            build_client(HttpClientConfig {
+                extra_root_certificates: vec![cert_pem],
+                max_concurrent_requests: 1,
+                request_timeout: Duration::from_secs(20),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let client = Arc::clone(&client);
+            let url = format!("https://localhost:{port}/");
+            handles.push(tokio::spawn(async move {
+                client
+                    .send(HttpRequest::new(Method::Get, &url).unwrap())
+                    .await
+                    .unwrap()
+                    .body()
+                    .to_vec()
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.await.unwrap(), b"done");
+        }
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "a second body read overlapped the first — the permit was released at the headers"
+        );
+    }
+
+    /// #177: a legal non-UTF-8 header value must survive byte-exactly.
+    #[tokio::test]
+    async fn non_utf8_header_value_survives_intact() {
+        let (cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+
+        // obs-text (0x80-0xFF) is legal in a field value. An opaque ETag is the
+        // realistic case; a caller echoes it into If-Match.
+        let raw = b"HTTP/1.1 200 OK\r\nETag: \"\xC3\x28\xFF\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            read_request_head(&mut tls).await;
+            let _ = tls.write_all(raw).await;
+            let _ = tls.flush().await;
+        });
+
+        let client = client_trusting(cert_pem);
+        let response = client
+            .send(HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap())
+            .await
+            .unwrap();
+
+        let etag = response.header("etag").expect("ETag should be present");
+        assert_eq!(
+            etag, b"\"\xC3\x28\xFF\"",
+            "the bytes must survive; lossy conversion would replace them with U+FFFD"
+        );
+        // It is not UTF-8, so the string accessor declines rather than corrupting.
+        assert_eq!(response.header_str("etag"), None);
+    }
+
+    #[test]
+    fn zero_max_response_bytes_is_rejected() {
+        let error = build_client(HttpClientConfig {
+            max_response_bytes: 0,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, HttpError::ConfigValidation { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("max_response_bytes"));
+    }
+
     #[test]
     fn framing_headers_are_rejected() {
         for name in ["Content-Length", "content-length", "Transfer-Encoding"] {
@@ -2039,12 +2430,16 @@ mod tests {
 
     #[test]
     fn response_debug_shows_header_names_not_values() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "set-cookie",
+            HeaderValue::from_str(&format!("session={CANARY}")).unwrap(),
+        );
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
         let response = HttpResponse {
             status: 200,
-            headers: vec![
-                ("set-cookie".to_owned(), format!("session={CANARY}")),
-                ("content-type".to_owned(), "application/json".to_owned()),
-            ],
+            headers,
+            body: format!("{{\"token\":\"{CANARY}\"}}").into_bytes(),
         };
         let rendered = format!("{response:?}");
         assert!(rendered.contains("set-cookie"));
@@ -2058,12 +2453,25 @@ mod tests {
 
     #[test]
     fn header_lookup_is_case_insensitive() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
         let response = HttpResponse {
             status: 200,
-            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            headers,
+            body: Vec::new(),
         };
-        assert_eq!(response.header("Content-Type"), Some("application/json"));
-        assert_eq!(response.header("CONTENT-TYPE"), Some("application/json"));
+        assert_eq!(
+            response.header_str("Content-Type"),
+            Some("application/json")
+        );
+        assert_eq!(
+            response.header_str("CONTENT-TYPE"),
+            Some("application/json")
+        );
+        assert_eq!(
+            response.header("Content-Type"),
+            Some(&b"application/json"[..])
+        );
         assert_eq!(response.header("missing"), None);
     }
 }
