@@ -238,8 +238,12 @@ impl HttpRequest {
 
     /// Add a header to the request.
     ///
+    /// Framing headers (`Content-Length`, `Transfer-Encoding`) are rejected —
+    /// those are derived from [`HttpRequest::body`].
+    ///
     /// # Errors
-    /// Returns [`HttpError::InvalidHeaderName`] if the name is invalid, or
+    /// Returns [`HttpError::InvalidHeaderName`] if the name is invalid,
+    /// [`HttpError::FramingHeaderNotAllowed`] if it is a framing header, or
     /// [`HttpError::InvalidHeaderValue`] if the value is invalid.
     ///
     /// # Examples
@@ -520,15 +524,33 @@ fn describe_with_causes(error: &dyn std::error::Error) -> String {
     description
 }
 
+/// Headers that describe how the body is framed on the wire.
+///
+/// These are derived from the body, never supplied by a caller. A
+/// `Content-Length` that disagrees with `body.len()` panics hyper's HTTP/1
+/// encoder in debug builds, and in release builds sends the caller's length with
+/// the whole body — desynchronising a pooled connection that later requests will
+/// reuse.
+const FRAMING_HEADERS: [&str; 2] = ["content-length", "transfer-encoding"];
+
 /// Parse and validate a header name.
 ///
 /// Validating here rather than letting `reqwest` reject it means a typo fails at
 /// construction with the name in hand, instead of surfacing later as an opaque
 /// transport error.
 fn parse_header_name(name: &str) -> Result<HeaderName, HttpError> {
-    HeaderName::try_from(name).map_err(|_| HttpError::InvalidHeaderName {
+    let parsed = HeaderName::try_from(name).map_err(|_| HttpError::InvalidHeaderName {
         name: name.to_owned(),
-    })
+    })?;
+
+    // `HeaderName` is already lowercase, so this comparison is total.
+    if FRAMING_HEADERS.contains(&parsed.as_str()) {
+        return Err(HttpError::FramingHeaderNotAllowed {
+            name: parsed.as_str().to_owned(),
+        });
+    }
+
+    Ok(parsed)
 }
 
 /// An HTTP client with hardened defaults.
@@ -911,6 +933,15 @@ pub enum HttpError {
     #[error("invalid header name '{name}'")]
     InvalidHeaderName {
         /// The invalid header name.
+        name: String,
+    },
+    /// A framing header was supplied by the caller.
+    ///
+    /// `Content-Length` and `Transfer-Encoding` are derived from the body. A
+    /// caller-supplied value that disagrees with it corrupts the connection.
+    #[error("header '{name}' is set from the request body and cannot be supplied")]
+    FramingHeaderNotAllowed {
+        /// The rejected header name.
         name: String,
     },
     /// A header value is invalid.
@@ -1771,6 +1802,41 @@ mod tests {
         assert!(
             lowered.contains("certificate") || lowered.contains("tls") || lowered.contains("cert"),
             "a TLS rejection should say so, got: {rendered}"
+        );
+    }
+
+    /// A caller-supplied `Content-Length` corrupts the connection.
+    ///
+    /// hyper's HTTP/1 encoder panics in debug builds when it disagrees with the
+    /// body, and in release builds desynchronises a pooled connection that a
+    /// later request will reuse.
+    #[test]
+    fn framing_headers_are_rejected() {
+        for name in ["Content-Length", "content-length", "Transfer-Encoding"] {
+            let error = HttpRequest::new(Method::Post, "https://example.com/")
+                .unwrap()
+                .header(name, "999999")
+                .unwrap_err();
+            assert!(
+                matches!(error, HttpError::FramingHeaderNotAllowed { .. }),
+                "{name} should be rejected, got {error:?}"
+            );
+        }
+
+        // A secret header must not be a way around it either.
+        let secret = secret_holding("12345");
+        let error = HttpRequest::new(Method::Post, "https://example.com/")
+            .unwrap()
+            .secret_header("Content-Length", &secret)
+            .unwrap_err();
+        assert!(matches!(error, HttpError::FramingHeaderNotAllowed { .. }));
+
+        // Ordinary headers still work.
+        assert!(
+            HttpRequest::new(Method::Post, "https://example.com/")
+                .unwrap()
+                .header("Content-Type", "application/json")
+                .is_ok()
         );
     }
 
