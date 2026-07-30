@@ -139,7 +139,6 @@ impl Default for HttpClientConfig {
 }
 
 /// An HTTP request ready to be sent.
-#[derive(Debug)]
 pub struct HttpRequest {
     method: reqwest::Method,
     url: reqwest::Url,
@@ -173,14 +172,27 @@ impl HttpRequest {
     /// # Ok::<(), mecmcp_http::HttpError>(())
     /// ```
     pub fn new(method: Method, url: &str) -> Result<Self, HttpError> {
-        let parsed = reqwest::Url::parse(url).map_err(|e| HttpError::InvalidUrl {
-            url: url.to_owned(),
-            detail: e.to_string(),
+        // Redacted even on the parse-failure path: a URL too malformed to parse
+        // can still carry a readable password, and this error embeds the raw
+        // string because there is nothing structured left to report.
+        let parsed = reqwest::Url::parse(url).map_err(|error| HttpError::InvalidUrl {
+            url: redact_userinfo(url),
+            detail: error.to_string(),
         })?;
+
+        // Userinfo is checked FIRST, before the scheme and host checks. Both of
+        // those errors embed the URL, so testing them earlier would leak the
+        // password for something as ordinary as `http://user:pass@host/` —
+        // exactly the disclosure this check exists to prevent.
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(HttpError::UrlHasEmbeddedCredentials {
+                host: parsed.host_str().unwrap_or_default().to_owned(),
+            });
+        }
 
         if parsed.scheme() != "https" {
             return Err(HttpError::InsecureScheme {
-                url: url.to_owned(),
+                url: redact_userinfo(url),
                 scheme: parsed.scheme().to_owned(),
             });
         }
@@ -189,15 +201,7 @@ impl HttpRequest {
         // is a defensive backstop rather than the primary check.
         if parsed.host_str().is_none_or(str::is_empty) {
             return Err(HttpError::MissingHost {
-                url: url.to_owned(),
-            });
-        }
-
-        // Reject userinfo before the URL is ever rendered into an error or trace.
-        // Redacting it here rather than echoing it is the whole point.
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(HttpError::UrlHasEmbeddedCredentials {
-                host: parsed.host_str().unwrap_or_default().to_owned(),
+                url: redact_userinfo(url),
             });
         }
 
@@ -328,6 +332,55 @@ impl HttpRequest {
     }
 }
 
+impl std::fmt::Debug for HttpRequest {
+    /// Metadata only — never the body, never a header value.
+    ///
+    /// A request body is frequently a credential in its own right: a token
+    /// exchange, a login payload, a key-rotation call. Deriving `Debug` would
+    /// print those bytes in full, so only the length is reported. Header values
+    /// are omitted for the same reason — `set_sensitive` protects the ones routed
+    /// through [`HttpRequest::secret_header`], but a caller can always put
+    /// something sensitive through plain [`HttpRequest::header`].
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let header_names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method.as_str())
+            .field("url", &self.url.as_str())
+            .field("headers", &header_names)
+            .field("body_bytes", &self.body.as_ref().map_or(0, Vec::len))
+            .finish()
+    }
+}
+
+/// Replace any `userinfo@` segment in a URL string with `[redacted]@`.
+///
+/// Operates on the raw text rather than a parsed `Url` so it also works on input
+/// that failed to parse — which is where a credential is most likely to survive
+/// into an error message.
+fn redact_userinfo(raw: &str) -> String {
+    let Some(scheme_end) = raw.find("://") else {
+        return raw.to_owned();
+    };
+    let authority_start = scheme_end + "://".len();
+    let authority_end = raw[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(raw.len(), |offset| authority_start + offset);
+
+    let authority = &raw[authority_start..authority_end];
+    // `rfind`: userinfo may itself contain a percent-encoded '@', and the last
+    // one is the true separator.
+    let Some(at) = authority.rfind('@') else {
+        return raw.to_owned();
+    };
+
+    let mut redacted = String::with_capacity(raw.len());
+    redacted.push_str(&raw[..authority_start]);
+    redacted.push_str("[redacted]");
+    redacted.push_str(&authority[at..]);
+    redacted.push_str(&raw[authority_end..]);
+    redacted
+}
+
 /// Parse and validate a header name.
 ///
 /// Validating here rather than letting `reqwest` reject it means a typo fails at
@@ -426,6 +479,17 @@ impl HttpClient {
                 let der = entry.map_err(|error| HttpError::InvalidRootCertificate {
                     index,
                     detail: error.to_string(),
+                })?;
+                // `reqwest::Certificate::from_der` does not parse the
+                // certificate, it only wraps the bytes. Parse it here so that
+                // valid base64 carrying malformed DER is reported against the
+                // entry that caused it, rather than surfacing later from
+                // `builder.build()` with no index attached.
+                webpki::anchor_from_trusted_cert(&der).map_err(|error| {
+                    HttpError::InvalidRootCertificate {
+                        index,
+                        detail: error.to_string(),
+                    }
                 })?;
                 let cert = reqwest::Certificate::from_der(&der).map_err(|error| {
                     HttpError::InvalidRootCertificate {
@@ -1194,6 +1258,99 @@ mod tests {
         assert!(!rendered.contains(CANARY), "password leaked: {rendered}");
         assert!(!rendered.contains("user"), "username leaked: {rendered}");
         assert!(rendered.contains("example.com"));
+    }
+
+    /// No rejection path may echo a URL password, whichever check fires.
+    ///
+    /// The userinfo check originally ran *after* the scheme and host checks, so
+    /// `http://user:pass@host/` was rejected as an insecure scheme with the full
+    /// URL — password included — in the message.
+    #[test]
+    fn no_url_rejection_path_echoes_embedded_credentials() {
+        let candidates = [
+            format!("http://user:{CANARY}@example.com/"), // insecure scheme
+            format!("ftp://user:{CANARY}@example.com/"),  // other scheme
+            format!("https://user:{CANARY}@example.com/"), // https, userinfo only
+            format!("https://user:{CANARY}@exa mple.com/"), // unparseable
+            format!("http://user:{CANARY}@[bad/"),        // unparseable, insecure
+            format!("https://{CANARY}@example.com/"),     // username only, no password
+        ];
+
+        for candidate in candidates {
+            let error = HttpRequest::new(Method::Get, &candidate).unwrap_err();
+            let rendered = error.to_string();
+            assert!(
+                !rendered.contains(CANARY),
+                "credential leaked via {error:?}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_userinfo_preserves_everything_else() {
+        assert_eq!(
+            redact_userinfo("https://user:pw@example.com/a/b?q=1#f"),
+            "https://[redacted]@example.com/a/b?q=1#f"
+        );
+        // No userinfo, no change.
+        assert_eq!(
+            redact_userinfo("https://example.com/a?q=@1"),
+            "https://example.com/a?q=@1"
+        );
+        // An '@' in the path must not be mistaken for a userinfo separator.
+        assert_eq!(
+            redact_userinfo("https://example.com/mail@host"),
+            "https://example.com/mail@host"
+        );
+        // Not a URL at all.
+        assert_eq!(redact_userinfo("nonsense"), "nonsense");
+    }
+
+    #[test]
+    fn request_debug_omits_body_and_header_values() {
+        let secret = secret_holding(CANARY);
+        let request = HttpRequest::new(Method::Post, "https://example.com/token")
+            .unwrap()
+            .bearer_auth(&secret)
+            .unwrap()
+            .header("X-Trace", "trace-value-visible")
+            .unwrap()
+            .body(format!(r#"{{"client_secret":"{CANARY}"}}"#).into_bytes());
+
+        let rendered = format!("{request:?}");
+        assert!(
+            !rendered.contains(CANARY),
+            "body or header leaked via Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains("trace-value-visible"),
+            "header value leaked via Debug: {rendered}"
+        );
+        // Metadata still has to be useful for debugging.
+        assert!(rendered.contains("authorization"));
+        assert!(rendered.contains("x-trace"));
+        assert!(rendered.contains("body_bytes"));
+        assert!(rendered.contains("POST"));
+    }
+
+    #[test]
+    fn malformed_der_inside_valid_pem_names_its_index() {
+        // Valid PEM framing and valid base64, but the payload is not a
+        // certificate. `reqwest::Certificate::from_der` accepts this, so without
+        // local X.509 parsing it would fail later without an index.
+        let junk_der = "-----BEGIN CERTIFICATE-----\nAAAAAAAAAAAAAAAA\n-----END CERTIFICATE-----\n";
+        let (good_pem, _) = tls_material();
+
+        let error = HttpClient::new(HttpClientConfig {
+            extra_root_certificates: vec![good_pem, junk_der.to_owned()],
+            ..Default::default()
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(error, HttpError::InvalidRootCertificate { index: 1, .. }),
+            "malformed DER should be attributed to entry 1, got {error:?}"
+        );
     }
 
     #[test]

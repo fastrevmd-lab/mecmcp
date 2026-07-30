@@ -17,6 +17,11 @@ reqwest       = { version = "0.13", default-features = false, features = ["rustl
 # Direct dependency purely to validate operator-supplied PEM eagerly — see the
 # comment in `HttpClient::new`. Already in the tree via reqwest.
 rustls-pki-types = "1"
+# Validates that a supplied root really is a parseable X.509 certificate.
+# `reqwest::Certificate::from_der` only wraps the bytes, so without this a
+# malformed root escapes to `builder.build()` and the operator loses which entry
+# was at fault. No crypto provider needed for `anchor_from_trusted_cert`.
+rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
 thiserror     = { workspace = true }
 tokio         = { version = "1", features = ["sync", "time"] }
 zeroize       = { workspace = true }
