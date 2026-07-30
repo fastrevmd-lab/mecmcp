@@ -215,7 +215,7 @@ impl HttpRequest {
 
         if parsed.scheme() != "https" {
             return Err(HttpError::InsecureScheme {
-                url: redact_parsed_url(&parsed),
+                url: safe_url(&parsed),
                 scheme: parsed.scheme().to_owned(),
             });
         }
@@ -224,7 +224,7 @@ impl HttpRequest {
         // is a defensive backstop rather than the primary check.
         if parsed.host_str().is_none_or(str::is_empty) {
             return Err(HttpError::MissingHost {
-                url: redact_parsed_url(&parsed),
+                url: safe_url(&parsed),
             });
         }
 
@@ -368,28 +368,49 @@ impl std::fmt::Debug for HttpRequest {
         let header_names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
         f.debug_struct("HttpRequest")
             .field("method", &self.method.as_str())
-            .field("url", &self.url.as_str())
+            .field("url", &safe_url(&self.url))
             .field("headers", &header_names)
             .field("body_bytes", &self.body.as_ref().map_or(0, Vec::len))
             .finish()
     }
 }
 
-/// Render a successfully parsed URL for an error message, without userinfo.
+/// Render a parsed URL for a diagnostic, with every credential-bearing part
+/// removed.
 ///
-/// Exact rather than textual: the parser has already told us where the
-/// credentials are, so there is no guessing.
-fn redact_parsed_url(url: &reqwest::Url) -> String {
+/// Strips userinfo, drops the fragment outright, and replaces every query
+/// **value** with `[redacted]` while keeping the keys. Query strings are not
+/// merely metadata: signed URLs and query-based API keys are ordinary practice,
+/// and a fragment carries the token in an OAuth implicit flow. Keys are kept
+/// because `?api_key=[redacted]&page=[redacted]` is still useful to read, and
+/// costs nothing.
+fn safe_url(url: &reqwest::Url) -> String {
     let mut safe = url.clone();
-    // Both fail only for cannot-be-a-base URLs, which cannot carry userinfo.
+    // Both setters fail only for cannot-be-a-base URLs, which carry no userinfo.
     let _ = safe.set_username("");
     let _ = safe.set_password(None);
+    safe.set_fragment(None);
+
+    if safe.query().is_some() {
+        let keys: Vec<String> = safe
+            .query_pairs()
+            .map(|(key, _)| key.into_owned())
+            .collect();
+        let mut pairs = safe.query_pairs_mut();
+        pairs.clear();
+        for key in keys {
+            pairs.append_pair(&key, "[redacted]");
+        }
+        drop(pairs);
+    }
+
     safe.to_string()
 }
 
 /// Redact a URL string that could **not** be parsed.
 ///
-/// Deliberately blunt: everything up to and including the last `@` is dropped.
+/// Deliberately blunt, in two directions: everything up to and including the
+/// last `@` is dropped, and anything from the first `?` onward is dropped too.
 /// A structural scan cannot be trusted here, because the input is by definition
 /// malformed — `https//user:secret@example.com` (one missing colon) has no
 /// `://` for an authority to start after, and an earlier version of this
@@ -398,9 +419,13 @@ fn redact_parsed_url(url: &reqwest::Url) -> String {
 /// Over-redacting an error message costs a little debuggability. Under-redacting
 /// costs a credential. So when in doubt this cuts.
 fn redact_unparsed_url(raw: &str) -> String {
-    match raw.rfind('@') {
+    let after_userinfo = match raw.rfind('@') {
         Some(at) => format!("[redacted]{}", &raw[at..]),
         None => raw.to_owned(),
+    };
+    match after_userinfo.find('?') {
+        Some(query) => format!("{}?[redacted]", &after_userinfo[..query]),
+        None => after_userinfo,
     }
 }
 
@@ -465,6 +490,14 @@ impl HttpClient {
             return Err(HttpError::ConfigValidation {
                 field: "max_concurrent_requests".to_owned(),
                 detail: "must be greater than zero".to_owned(),
+            });
+        }
+        // `Semaphore::new` panics above this bound, and a shared crate must not
+        // turn an operator's typo into a crash at service startup.
+        if config.max_concurrent_requests > Semaphore::MAX_PERMITS {
+            return Err(HttpError::ConfigValidation {
+                field: "max_concurrent_requests".to_owned(),
+                detail: format!("must not exceed {}", Semaphore::MAX_PERMITS),
             });
         }
         if config.pool_max_idle_per_host == 0 {
@@ -593,6 +626,10 @@ impl HttpClient {
     /// # }
     /// ```
     pub async fn send(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        // Computed once, up front: every error below reports it, and the raw URL
+        // must never reach any of them.
+        let url_for_diagnostics = safe_url(&request.url);
+
         // Whole-request deadline covering permit acquisition and send
         let result = tokio::time::timeout(self.request_timeout, async {
             // Acquire permit (bounded concurrency)
@@ -615,11 +652,15 @@ impl HttpClient {
             // unreachable or untrusted endpoint is an operator problem, and
             // lumping it in with a mid-request failure loses that.
             let response = req.send().await.map_err(|error| {
-                let detail = error.to_string();
-                if error.is_connect() {
-                    HttpError::Connect { detail }
+                let is_connect = error.is_connect();
+                // `without_url` first: reqwest's Display appends the *raw* URL,
+                // query and all, which is where a signed-URL credential lives.
+                let detail = error.without_url().to_string();
+                let url = url_for_diagnostics.clone();
+                if is_connect {
+                    HttpError::Connect { url, detail }
                 } else {
-                    HttpError::RequestFailed { detail }
+                    HttpError::RequestFailed { url, detail }
                 }
             })?;
 
@@ -646,6 +687,7 @@ impl HttpClient {
         match result {
             Ok(inner_result) => inner_result,
             Err(_) => Err(HttpError::Timeout {
+                url: url_for_diagnostics,
                 timeout: self.request_timeout,
             }),
         }
@@ -817,8 +859,10 @@ pub enum HttpError {
         detail: String,
     },
     /// The request timed out.
-    #[error("request timed out after {timeout:?}")]
+    #[error("request to {url} timed out after {timeout:?}")]
     Timeout {
+        /// The target, with userinfo, query values and fragment removed.
+        url: String,
         /// The timeout that was exceeded.
         timeout: Duration,
     },
@@ -835,14 +879,18 @@ pub enum HttpError {
     ///
     /// An unreachable host, a refused port, a certificate the client does not
     /// trust, or the connect timeout expiring.
-    #[error("failed to connect: {detail}")]
+    #[error("failed to connect to {url}: {detail}")]
     Connect {
+        /// The target, with userinfo, query values and fragment removed.
+        url: String,
         /// Detail about the connection failure.
         detail: String,
     },
     /// The underlying HTTP request failed.
-    #[error("HTTP request failed: {detail}")]
+    #[error("request to {url} failed: {detail}")]
     RequestFailed {
+        /// The target, with userinfo, query values and fragment removed.
+        url: String,
         /// Detail about the failure.
         detail: String,
     },
@@ -1365,16 +1413,23 @@ mod tests {
     }
 
     #[test]
-    fn redact_parsed_url_strips_userinfo_and_keeps_the_rest() {
-        let url = reqwest::Url::parse("https://user:pw@example.com/a/b?q=1#f").unwrap();
-        let rendered = redact_parsed_url(&url);
+    fn safe_url_strips_userinfo_query_values_and_fragment() {
+        let url =
+            reqwest::Url::parse("https://user:pw@example.com/a/b?api_key=SEKRIT&page=2#tok=SEKRIT")
+                .unwrap();
+        let rendered = safe_url(&url);
+
+        assert!(!rendered.contains("SEKRIT"), "{rendered}");
         assert!(!rendered.contains("pw"), "{rendered}");
         assert!(!rendered.contains("user"), "{rendered}");
-        assert!(rendered.contains("example.com/a/b?q=1#f"), "{rendered}");
+        // Structure worth keeping: host, path, and the query *keys*.
+        assert!(rendered.contains("example.com/a/b"), "{rendered}");
+        assert!(rendered.contains("api_key=%5Bredacted%5D"), "{rendered}");
+        assert!(rendered.contains("page=%5Bredacted%5D"), "{rendered}");
 
         // An '@' in the path is not userinfo and must survive untouched.
         let plain = reqwest::Url::parse("https://example.com/mail@host").unwrap();
-        assert_eq!(redact_parsed_url(&plain), "https://example.com/mail@host");
+        assert_eq!(safe_url(&plain), "https://example.com/mail@host");
     }
 
     #[test]
@@ -1392,6 +1447,11 @@ mod tests {
             "[redacted]@host/path"
         );
         assert_eq!(redact_unparsed_url("no-at-sign-here"), "no-at-sign-here");
+        // A query credential has no '@' to cut at, so the query goes too.
+        assert_eq!(
+            redact_unparsed_url("https//host?api_key=SEKRIT"),
+            "https//host?[redacted]"
+        );
     }
 
     #[test]
@@ -1438,6 +1498,106 @@ mod tests {
         assert!(
             matches!(error, HttpError::InvalidRootCertificate { index: 1, .. }),
             "malformed DER should be attributed to entry 1, got {error:?}"
+        );
+    }
+
+    /// A credential in the query string must not reach any live-send error.
+    ///
+    /// reqwest's own `Display` appends the raw URL — query included — so this
+    /// covers the path where the leak came from the dependency rather than from
+    /// this crate's own formatting.
+    #[tokio::test]
+    async fn send_errors_do_not_leak_query_credentials() {
+        // Bind then drop so the connection is refused: a Connect error, which
+        // carries reqwest's URL.
+        let (listener, port) = bind_local().await;
+        drop(listener);
+
+        let client = build_client(HttpClientConfig {
+            request_timeout: Duration::from_secs(10),
+            ..Default::default()
+        })
+        .unwrap();
+        let request = HttpRequest::new(
+            Method::Get,
+            &format!("https://localhost:{port}/v1/resource?api_key={CANARY}#frag={CANARY}"),
+        )
+        .unwrap();
+
+        let error = client.send(request).await.unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains(CANARY),
+            "query or fragment credential leaked: {rendered}"
+        );
+        // Still has to say where it was going.
+        assert!(rendered.contains("localhost"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn timeout_error_does_not_leak_query_credentials() {
+        let (cert_pem, _server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(stream);
+        });
+
+        let client = build_client(HttpClientConfig {
+            extra_root_certificates: vec![cert_pem],
+            request_timeout: Duration::from_millis(250),
+            connect_timeout: Duration::from_secs(30),
+            ..Default::default()
+        })
+        .unwrap();
+        let request = HttpRequest::new(
+            Method::Get,
+            &format!("https://localhost:{port}/hang?token={CANARY}"),
+        )
+        .unwrap();
+
+        let error = client.send(request).await.unwrap_err();
+        assert!(matches!(error, HttpError::Timeout { .. }), "{error:?}");
+        assert!(
+            !error.to_string().contains(CANARY),
+            "credential leaked: {error}"
+        );
+    }
+
+    #[test]
+    fn request_debug_does_not_leak_query_credentials() {
+        let request = HttpRequest::new(
+            Method::Get,
+            &format!("https://example.com/v1?api_key={CANARY}"),
+        )
+        .unwrap();
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains(CANARY), "{rendered}");
+    }
+
+    #[test]
+    fn concurrency_above_the_semaphore_bound_is_rejected() {
+        // `Semaphore::new` panics above this, so validation has to catch it —
+        // an operator typo must not crash service startup.
+        let error = build_client(HttpClientConfig {
+            max_concurrent_requests: usize::MAX,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, HttpError::ConfigValidation { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("max_concurrent_requests"));
+
+        // The bound itself must still be accepted.
+        assert!(
+            build_client(HttpClientConfig {
+                max_concurrent_requests: Semaphore::MAX_PERMITS,
+                ..Default::default()
+            })
+            .is_ok()
         );
     }
 
