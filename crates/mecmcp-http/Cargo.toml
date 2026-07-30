@@ -1,0 +1,43 @@
+[package]
+name        = "mecmcp-http"
+description = "Vendor-neutral hardened outbound HTTP client for mechub MCP servers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mecmcp-secret = { version = "0.3.7", path = "../mecmcp-secret" }
+# "rustls-no-provider", NOT "rustls". Decision D4: the provider is a parameter
+# the consumer picks, and reqwest's "rustls" feature would enable
+# rustls/aws-lc-rs as a Cargo feature across the whole graph. That unification is
+# how aws-lc-rs got linked into a ring build and broke TLS before — see the note
+# in mecmcp-transport/Cargo.toml. A consumer must install a CryptoProvider;
+# `HttpClient::new` checks and reports that rather than letting reqwest panic.
+reqwest       = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
+# Direct dependency only to detect a missing process-wide CryptoProvider.
+# Deliberately no provider feature here either, for the same reason.
+rustls        = { version = "0.23", default-features = false, features = ["std"] }
+# Direct dependency purely to validate operator-supplied PEM eagerly — see the
+# comment in `HttpClient::new`. Already in the tree via reqwest.
+rustls-pki-types = "1"
+# Validates that a supplied root really is a parseable X.509 certificate.
+# `reqwest::Certificate::from_der` only wraps the bytes, so without this a
+# malformed root escapes to `builder.build()` and the operator loses which entry
+# was at fault. No crypto provider needed for `anchor_from_trusted_cert`.
+rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
+thiserror     = { workspace = true }
+tokio         = { version = "1", features = ["sync", "time"] }
+zeroize       = { workspace = true }
+
+[dev-dependencies]
+rcgen        = "0.13"
+rustls       = { version = "0.23", features = ["aws-lc-rs"] }
+tempfile     = { workspace = true }
+tokio        = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
+tokio-rustls = "0.26"

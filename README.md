@@ -60,9 +60,14 @@ and the extraction plan; code lands per the phases in [`PLAN.md`](PLAN.md).
 | `mecmcp-inventory` | Device registry as a trait — file today, database and NetBox later | both (generalized) |
 | `mecmcp-device` | Connection lease/pool, per-device concurrency, cancellation, timeouts | rustjunosmcp |
 | `mecmcp-changeset` | Plan → digest → approve → apply → verify, two-principal enforcement, indeterminate recovery | rustpanosmcp `mutation.rs` |
+| `mecmcp-secret` | Outbound credential type (zeroizing, unprintable) and hardened env/file loader | new — see #90 |
+| `mecmcp-http` | Outbound HTTP client: HTTPS-only, no redirects, no proxy, bounded concurrency, whole-request deadline, sensitive headers | new — see #90 |
 | `mecmcp-intent` | Vendor-neutral policy/object model with per-vendor rendering | new — see ROADMAP |
 
 Vendor servers keep their protocol adapters, XML parsers, and vendor workflows.
+For `mecmcp-http` specifically, that means endpoint catalogs, header names, payload
+schemas, terminal job states, and retry policy stay in the product repository —
+the shared crate owns only the transport posture.
 
 ## License
 
