@@ -104,6 +104,36 @@ pub struct KnownNames<'a> {
 ///
 /// Single source of truth for supported versions, called from both read and
 /// write boundaries so the two can never drift apart.
+/// First key present in `raw` but gone after a round trip, as a dotted path.
+///
+/// Recurses through objects and positionally through arrays. Scalars are never
+/// compared — only the presence of keys matters here.
+fn first_dropped_key(raw: &serde_json::Value, round_tripped: &serde_json::Value) -> Option<String> {
+    match (raw, round_tripped) {
+        (serde_json::Value::Object(before), serde_json::Value::Object(after)) => {
+            for (key, value) in before {
+                match after.get(key) {
+                    None => return Some(key.clone()),
+                    Some(kept) => {
+                        if let Some(nested) = first_dropped_key(value, kept) {
+                            return Some(format!("{key}.{nested}"));
+                        }
+                    }
+                }
+            }
+            None
+        }
+        (serde_json::Value::Array(before), serde_json::Value::Array(after)) => before
+            .iter()
+            .zip(after.iter())
+            .enumerate()
+            .find_map(|(index, (b, a))| {
+                first_dropped_key(b, a).map(|nested| format!("[{index}].{nested}"))
+            }),
+        _ => None,
+    }
+}
+
 fn check_supported_version(version: u32, path: &Path) -> Result<(), FileError> {
     if version != 1 && version != 2 {
         return Err(FileError::Store {
@@ -179,12 +209,80 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
             })?;
 
         check_supported_version(document.version, path)?;
+        Self::reject_dropped_grant_fields(path, &body, &document)?;
 
         let store = TokenStore::try_new(document.tokens).map_err(|source| FileError::Store {
             path: path.to_path_buf(),
             source,
         })?;
         Ok((store, document.version))
+    }
+
+    /// Refuse a store holding a grant field this binary would silently drop.
+    ///
+    /// Every mutation deserializes the whole document into `G` and reserializes
+    /// it, so a field `G` does not know about disappears on the next write. If
+    /// that field encoded a *restriction* and its absence reads as permissive,
+    /// the rewrite widens the token's authority — with nothing in the output to
+    /// say so.
+    ///
+    /// `#[serde(deny_unknown_fields)]` on the grant prevents this, and
+    /// [`crate::StoredGrant`] tells implementors to use it, but a trait bound
+    /// cannot require it: the blanket impl accepts any serializable [`Grant`].
+    /// So the guarantee is enforced here instead, where it holds for every
+    /// consumer whether or not they read the docs.
+    ///
+    /// Compares only which *keys survive* the round trip, never their values, so
+    /// a grant whose serializer normalises a scalar is not flagged. Reports the
+    /// first casualty by dotted path.
+    fn reject_dropped_grant_fields(
+        path: &Path,
+        body: &str,
+        document: &TokenDocument<G>,
+    ) -> Result<(), FileError> {
+        let raw: serde_json::Value =
+            serde_json::from_str(body).map_err(|source| FileError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let Some(raw_tokens) = raw.get("tokens").and_then(serde_json::Value::as_array) else {
+            return Ok(());
+        };
+
+        let invalid = |message: String| FileError::Store {
+            path: path.to_path_buf(),
+            source: StoreError::Entry(crate::entry::EntryError::Invalid(message)),
+        };
+
+        for (index, raw_token) in raw_tokens.iter().enumerate() {
+            let Some(raw_grant) = raw_token.get("grant") else {
+                continue;
+            };
+            if raw_grant.is_null() {
+                continue;
+            }
+            let Some(entry) = document.tokens.get(index) else {
+                continue;
+            };
+            let name = entry.name.as_str();
+
+            let Some(grant) = entry.grant.as_ref() else {
+                return Err(invalid(format!(
+                    "token '{name}' carries a grant this build cannot represent;                      refusing to rewrite the file and drop it"
+                )));
+            };
+
+            let round_tripped = serde_json::to_value(grant).map_err(|error| {
+                invalid(format!("token '{name}' grant is not serializable: {error}"))
+            })?;
+
+            if let Some(field) = first_dropped_key(raw_grant, &round_tripped) {
+                return Err(invalid(format!(
+                    "token '{name}' grant has field '{field}' that this build does not                      understand and would discard on the next write. Upgrade the binary,                      or add #[serde(deny_unknown_fields)] to the grant so this fails at                      parse time"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Add one scoped token and return its one-time plaintext.

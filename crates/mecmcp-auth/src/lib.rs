@@ -14,7 +14,7 @@ pub mod file;
 
 pub use entry::{ActorType, EntryError, MAX_TOKEN_NAME, Tier, TokenEntry};
 pub use file::{FileError, KnownNames, TokenStoreFile, write_atomic};
-pub use grant::{Grant, GrantError, NoAction, NoGrant};
+pub use grant::{Grant, GrantError, NoAction, NoGrant, StoredGrant};
 pub use scope::{MAX_SCOPE_NAMES, ScopeError, ScopeSet};
 pub use store::{CallerCtx, MAX_TOKENS, StoreError, TokenStore, filter_device_names};
 pub use token::{TokenDigest, TokenError, TokenSecret};

@@ -33,6 +33,36 @@ pub trait Grant: Clone + std::fmt::Debug + Send + Sync + 'static {
     fn validate(&self) -> Result<(), GrantError>;
 }
 
+/// A [`Grant`] that can live in a persisted token store.
+///
+/// Exists so consumers can be generic over the grant type without naming serde
+/// bounds themselves. `TokenStoreFile` requires `Serialize + DeserializeOwned`
+/// on top of [`Grant`]; repeating that triple at every call site is what pushed
+/// the shared token CLI into hard-coding [`NoGrant`] instead of staying generic
+/// (mecmcp#160).
+///
+/// Blanket-implemented — do not implement this directly. Implement [`Grant`] and
+/// derive `Serialize`/`Deserialize`.
+///
+/// # Implementors must reject unknown fields
+///
+/// Annotate the grant with `#[serde(deny_unknown_fields)]`.
+///
+/// Every store mutation deserializes the whole document into `G` and
+/// reserializes it, so any field the running binary does not know about is
+/// **dropped on the next `add`, `rotate`, or `revoke`**. Without the attribute
+/// that loss is silent: an older binary managing a store written by a newer one
+/// would quietly strip the fields it did not understand. If such a field encoded
+/// a *restriction*, and the type treats its absence as permissive, the rewrite
+/// widens the token's authority.
+///
+/// With the attribute the same situation is a hard load error instead — the
+/// operator is told to upgrade rather than handed a silently weakened grant.
+/// `rustpanosmcp`'s `MutationGrant` does this; new grants must too.
+pub trait StoredGrant: Grant + Serialize + serde::de::DeserializeOwned {}
+
+impl<G> StoredGrant for G where G: Grant + Serialize + serde::de::DeserializeOwned {}
+
 /// The grant type for servers that do not yet model write authority.
 ///
 /// Permits no action and no subject, so a token carrying it can never be

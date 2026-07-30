@@ -17,6 +17,11 @@ tokio       = { version = "1", features = ["rt", "signal", "sync"] }
 tracing     = { workspace = true }
 
 [dev-dependencies]
+# Only the grant-lifecycle tests need this: they define a non-unit grant to
+# prove `run_with_grant` round-trips a real vendor grant (mecmcp#160). The
+# library itself names the bound via `mecmcp_auth::StoredGrant` and does not
+# depend on serde.
+serde    = { version = "1", features = ["derive"] }
 tempfile = { workspace = true }
 tokio    = { version = "1", features = ["macros", "rt", "time"] }
 
