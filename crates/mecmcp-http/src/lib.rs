@@ -868,6 +868,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_body_is_transmitted() {
+        let (cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+        let received = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        {
+            let received = Arc::clone(&received);
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(stream).await.unwrap();
+                read_request_head(&mut tls).await;
+                // The payload below is 21 bytes; read exactly that so the test
+                // fails on a short body rather than hanging on a long one.
+                let mut body = vec![0u8; PAYLOAD.len()];
+                let _ = tls.read_exact(&mut body).await;
+                *received.lock().await = body;
+                let _ = tls
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            });
+        }
+
+        let client = client_trusting(cert_pem);
+        let request = HttpRequest::new(Method::Post, &format!("https://localhost:{port}/submit"))
+            .unwrap()
+            .header("Content-Type", "application/json")
+            .unwrap()
+            .body(PAYLOAD.to_vec());
+
+        let response = client.send(request).await.unwrap();
+        assert_eq!(response.status(), 204);
+        assert_eq!(received.lock().await.as_slice(), PAYLOAD);
+    }
+
+    /// Body used by [`request_body_is_transmitted`].
+    const PAYLOAD: &[u8] = br#"{"phase":"2a","ok":1}"#;
+
+    #[tokio::test]
+    async fn unreachable_endpoint_is_classified_as_connect() {
+        // Bind then drop, so the port is almost certainly unbound and the
+        // connection is refused rather than timing out.
+        let (listener, port) = bind_local().await;
+        drop(listener);
+
+        let client = HttpClient::new(HttpClientConfig {
+            request_timeout: Duration::from_secs(10),
+            ..Default::default()
+        })
+        .unwrap();
+        let request = HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap();
+
+        let error = client.send(request).await.unwrap_err();
+        assert!(
+            matches!(error, HttpError::Connect { .. }),
+            "a refused connection should classify as Connect, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn untrusted_certificate_is_rejected() {
+        // The client is given no extra roots, so the self-signed server
+        // certificate must not be accepted. This is the check that would silently
+        // stop mattering if verification were ever disabled.
+        let (_cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+        serve(
+            listener,
+            server_config,
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            1,
+        );
+
+        let client = HttpClient::new(HttpClientConfig {
+            request_timeout: Duration::from_secs(10),
+            ..Default::default()
+        })
+        .unwrap();
+        let request = HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap();
+
+        assert!(
+            client.send(request).await.is_err(),
+            "an untrusted self-signed certificate must not be accepted"
+        );
+    }
+
+    #[tokio::test]
     async fn redirect_is_returned_not_followed() {
         let (cert_pem, server_config) = tls_material();
         let (listener, port) = bind_local().await;
