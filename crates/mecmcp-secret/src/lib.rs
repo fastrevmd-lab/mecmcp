@@ -578,7 +578,7 @@ fn read_hardened_file_fallback(
         });
     }
 
-    let mut file = std::fs::File::open(path).map_err(|source| SecretError::FileIo {
+    let file = std::fs::File::open(path).map_err(|source| SecretError::FileIo {
         path: path.to_path_buf(),
         source,
     })?;
@@ -598,7 +598,7 @@ fn read_hardened_file_fallback(
         });
     }
 
-    Ok(bytes)
+    Ok(SecretBytes(std::mem::take(&mut bytes)))
 }
 
 #[cfg(test)]
