@@ -4,7 +4,7 @@
 //! SIGHUP hot-reload signalling via rustix.
 
 use crate::cli::TokenAction;
-use mecmcp_auth::{KnownNames, NoGrant, ScopeSet, TokenStoreFile};
+use mecmcp_auth::{KnownNames, NoGrant, ScopeSet, StoredGrant, TokenStoreFile};
 use std::io::Write;
 use std::path::Path;
 use thiserror::Error;
@@ -135,6 +135,45 @@ pub fn run(
     known_devices: &[String],
     known_tools: &[&str],
 ) -> Result<(), TokenCommandError> {
+    run_with_grant::<NoGrant>(action, known_devices, known_tools, None)
+}
+
+/// Execute a token management command against a store carrying vendor grants.
+///
+/// [`run`] is this function pinned to [`NoGrant`]. A consumer whose store holds
+/// real grants must call this instead: the store is deserialized as `G`, so
+/// `list`, `revoke`, and `rotate` round-trip existing grants untouched. Calling
+/// [`run`] against such a store fails to deserialize (`invalid type: map,
+/// expected unit struct NoGrant`) — the grant is not lost, but it is unreadable
+/// through the shared command path, which is the whole reason this seam exists
+/// (mecmcp#160).
+///
+/// `new_grant` applies to `add` only, and only to the token being created. It is
+/// deliberately explicit rather than defaulted: a server that forgets to pass a
+/// grant should mint a token that can mutate nothing, not one that inherits some
+/// ambient default. Existing entries are never rewritten from it.
+///
+/// # Arguments
+///
+/// * `action` - The token action to perform
+/// * `known_devices` - Device names to validate against (empty slice = no validation)
+/// * `known_tools` - Tool names to validate against
+/// * `new_grant` - Grant to attach to a newly added token; `None` mints a
+///   grantless entry. Ignored by `list`, `revoke`, and `rotate`.
+///
+/// # Errors
+///
+/// Returns error if the token operation fails, scope validation fails,
+/// `new_grant` is structurally invalid, or I/O fails.
+pub fn run_with_grant<G>(
+    action: TokenAction,
+    known_devices: &[String],
+    known_tools: &[&str],
+    new_grant: Option<G>,
+) -> Result<(), TokenCommandError>
+where
+    G: StoredGrant,
+{
     let known = KnownNames {
         devices: if known_devices.is_empty() {
             None
@@ -161,13 +200,30 @@ pub fn run(
 
             let provenance = parse_provenance(provider, provider_tier, on_behalf_of, actor_type)?;
 
-            let secret = TokenStoreFile::<NoGrant>::add_with_options(
+            // Not a safety check — the store already refuses an invalid grant
+            // before writing: `add_with_options` builds a `TokenStore` (which
+            // validates each entry, and so each grant) ahead of `write_atomic`,
+            // so a malformed grant never reaches disk either way.
+            //
+            // This exists for the error the operator sees. Reaching it through
+            // the store surfaces a nested `FileError::Store { Entry { Grant } }`
+            // about a file; raising it here says "the grant you passed on the
+            // command line is invalid" and classifies it as bad input rather
+            // than a storage fault. The cost is validating twice, which is
+            // cheap, and taking precedence over scope/reference errors.
+            if let Some(grant) = new_grant.as_ref() {
+                grant.validate().map_err(|error| {
+                    TokenCommandError::InvalidArgument(format!("invalid grant: {error}"))
+                })?;
+            }
+
+            let secret = TokenStoreFile::<G>::add_with_options(
                 &tokens_file,
                 &name,
                 devices_scope,
                 tools_scope,
                 None, // expires_at
-                None, // grant
+                new_grant,
                 provenance.provider,
                 provenance.provider_tier,
                 provenance.on_behalf_of,
@@ -179,13 +235,13 @@ pub fn run(
             signal_reload(server_pid)?;
             Ok(())
         }
-        TokenAction::List { tokens_file } => list(&tokens_file),
+        TokenAction::List { tokens_file } => list::<G>(&tokens_file),
         TokenAction::Revoke {
             tokens_file,
             name,
             server_pid,
         } => {
-            let removed = TokenStoreFile::<NoGrant>::revoke(&tokens_file, &name, &known)?;
+            let removed = TokenStoreFile::<G>::revoke(&tokens_file, &name, &known)?;
             if removed {
                 eprintln!("revoked '{name}'");
             } else {
@@ -199,7 +255,7 @@ pub fn run(
             name,
             server_pid,
         } => {
-            let secret = TokenStoreFile::<NoGrant>::rotate(&tokens_file, &name, &known)?;
+            let secret = TokenStoreFile::<G>::rotate(&tokens_file, &name, &known)?;
             let mut out = std::io::stdout().lock();
             writeln!(out, "{}", secret.expose_secret())?;
             signal_reload(server_pid)?;
@@ -227,8 +283,11 @@ fn parse_scope(values: Vec<String>, field: &'static str) -> Result<ScopeSet, Tok
     Ok(ScopeSet::Allowlist(values))
 }
 
-fn list(path: &Path) -> Result<(), TokenCommandError> {
-    let store_file = TokenStoreFile::<NoGrant>::load(path)?;
+fn list<G>(path: &Path) -> Result<(), TokenCommandError>
+where
+    G: StoredGrant,
+{
+    let store_file = TokenStoreFile::<G>::load(path)?;
     let store = store_file.store();
     if store.is_empty() {
         eprintln!("(no tokens)");

@@ -396,3 +396,396 @@ fn signal_reload_on_non_unix_with_pid_fails() {
         other => panic!("expected Io(Unsupported) error, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// mecmcp#160: the shared command path must preserve consumer grant types.
+//
+// `run` is pinned to `NoGrant`, so a store holding real grants was unmanageable
+// through it — `list`, `revoke`, and `rotate` all failed while deserializing the
+// grant. `run_with_grant` is the seam; these tests hold it to the acceptance
+// criteria on the issue.
+// ---------------------------------------------------------------------------
+mod grant_lifecycle {
+    use super::{KNOWN_TOOLS, temp_tokens_file};
+    use mecmcp_auth::{Grant, GrantError, TokenStoreFile};
+    use mecmcp_runtime::{
+        cli::TokenAction,
+        token_cmd::{TokenCommandError, run, run_with_grant},
+    };
+    use serde::{Deserialize, Serialize};
+    use std::path::Path;
+
+    /// A non-unit grant, shaped like the real PAN-OS one so the test exercises a
+    /// struct-with-fields rather than something that happens to deserialize from
+    /// anything.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct TestGrant {
+        allowed_roots: Vec<String>,
+        actions: Vec<TestAction>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum TestAction {
+        Set,
+        Delete,
+    }
+
+    impl Grant for TestGrant {
+        type Action = TestAction;
+
+        fn allows_action(&self, action: Self::Action) -> bool {
+            self.actions.contains(&action)
+        }
+
+        fn allows_subject(&self, subject: &str) -> bool {
+            self.allowed_roots.iter().any(|root| subject == root)
+        }
+
+        fn validate(&self) -> Result<(), GrantError> {
+            if self.allowed_roots.is_empty() {
+                return Err(GrantError::Invalid("grant needs at least one root".into()));
+            }
+            Ok(())
+        }
+    }
+
+    fn grant() -> TestGrant {
+        TestGrant {
+            allowed_roots: vec!["/config/devices".to_owned()],
+            actions: vec![TestAction::Set, TestAction::Delete],
+        }
+    }
+
+    fn add(tokens_file: &Path, name: &str, new_grant: Option<TestGrant>) {
+        run_with_grant::<TestGrant>(
+            TokenAction::Add {
+                tokens_file: tokens_file.to_path_buf(),
+                name: name.to_owned(),
+                devices: vec!["*".to_owned()],
+                tools: vec!["get_config".to_owned()],
+                provider: None,
+                provider_tier: None,
+                on_behalf_of: None,
+                actor_type: None,
+                server_pid: None,
+            },
+            &[],
+            KNOWN_TOOLS,
+            new_grant,
+        )
+        .unwrap();
+    }
+
+    fn grant_of(tokens_file: &Path, name: &str) -> Option<TestGrant> {
+        let store_file = TokenStoreFile::<TestGrant>::load(tokens_file).unwrap();
+        store_file
+            .store()
+            .entries()
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap()
+            .grant
+            .clone()
+    }
+
+    #[test]
+    fn add_attaches_the_supplied_grant() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        add(&tokens_file, "writer", Some(grant()));
+        assert_eq!(grant_of(&tokens_file, "writer"), Some(grant()));
+    }
+
+    #[test]
+    fn add_without_a_grant_mints_a_grantless_entry() {
+        // The default must be "can mutate nothing", never an ambient grant.
+        let (_dir, tokens_file) = temp_tokens_file();
+        add(&tokens_file, "reader", None);
+        assert_eq!(grant_of(&tokens_file, "reader"), None);
+    }
+
+    #[test]
+    fn list_reads_a_grant_bearing_store() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        add(&tokens_file, "writer", Some(grant()));
+
+        run_with_grant::<TestGrant>(
+            TokenAction::List {
+                tokens_file: tokens_file.clone(),
+            },
+            &[],
+            KNOWN_TOOLS,
+            None,
+        )
+        .expect("list must not fail on a grant-bearing store");
+    }
+
+    #[test]
+    fn rotate_preserves_the_grant_and_changes_the_secret() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        add(&tokens_file, "writer", Some(grant()));
+        let before = std::fs::read_to_string(&tokens_file).unwrap();
+
+        run_with_grant::<TestGrant>(
+            TokenAction::Rotate {
+                tokens_file: tokens_file.clone(),
+                name: "writer".to_owned(),
+                server_pid: None,
+            },
+            &[],
+            KNOWN_TOOLS,
+            None,
+        )
+        .expect("rotate must not fail on a grant-bearing store");
+
+        // The grant survives; the digest does not.
+        assert_eq!(grant_of(&tokens_file, "writer"), Some(grant()));
+        assert_ne!(
+            before,
+            std::fs::read_to_string(&tokens_file).unwrap(),
+            "rotate must change the stored digest"
+        );
+    }
+
+    #[test]
+    fn revoke_works_on_a_grant_bearing_store() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        add(&tokens_file, "writer", Some(grant()));
+        add(&tokens_file, "other", Some(grant()));
+
+        run_with_grant::<TestGrant>(
+            TokenAction::Revoke {
+                tokens_file: tokens_file.clone(),
+                name: "writer".to_owned(),
+                server_pid: None,
+            },
+            &[],
+            KNOWN_TOOLS,
+            None,
+        )
+        .expect("revoke must not fail on a grant-bearing store");
+
+        let store_file = TokenStoreFile::<TestGrant>::load(&tokens_file).unwrap();
+        assert!(
+            !store_file
+                .store()
+                .entries()
+                .iter()
+                .any(|e| e.name == "writer")
+        );
+        // The survivor keeps its grant — revoke must not rewrite its neighbours.
+        assert_eq!(grant_of(&tokens_file, "other"), Some(grant()));
+    }
+
+    #[test]
+    fn adding_to_a_grant_bearing_store_leaves_existing_grants_untouched() {
+        // The acceptance criterion that actually bites: a second `add` rewrites
+        // the whole file, so an existing entry's grant must come through byte for
+        // byte rather than being dropped or re-serialized from a default.
+        let (_dir, tokens_file) = temp_tokens_file();
+        add(&tokens_file, "first", Some(grant()));
+
+        let first_before = grant_of(&tokens_file, "first");
+        add(&tokens_file, "second", None);
+
+        assert_eq!(
+            grant_of(&tokens_file, "first"),
+            first_before,
+            "adding a token must not disturb an existing grant"
+        );
+        assert_eq!(grant_of(&tokens_file, "second"), None);
+    }
+
+    #[test]
+    fn a_structurally_invalid_grant_is_rejected_before_it_reaches_disk() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        let empty = TestGrant {
+            allowed_roots: vec![],
+            actions: vec![TestAction::Set],
+        };
+
+        let result = run_with_grant::<TestGrant>(
+            TokenAction::Add {
+                tokens_file: tokens_file.clone(),
+                name: "bad".to_owned(),
+                devices: vec!["*".to_owned()],
+                tools: vec!["get_config".to_owned()],
+                provider: None,
+                provider_tier: None,
+                on_behalf_of: None,
+                actor_type: None,
+                server_pid: None,
+            },
+            &[],
+            KNOWN_TOOLS,
+            Some(empty),
+        );
+
+        match result {
+            Err(TokenCommandError::InvalidArgument(message)) => {
+                assert!(message.contains("invalid grant"), "got: {message}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        assert!(
+            !tokens_file.exists(),
+            "a rejected grant must not create a store"
+        );
+    }
+
+    #[test]
+    fn run_pinned_to_nograant_still_cannot_read_a_grant_store() {
+        // This is the reproduction from mecmcp#160, kept as a test so the
+        // behaviour is documented rather than rediscovered. `run` is not broken —
+        // it is simply the wrong entry point for a store with grants, and it fails
+        // loudly instead of silently discarding them.
+        let (_dir, tokens_file) = temp_tokens_file();
+        add(&tokens_file, "writer", Some(grant()));
+
+        let result = run(
+            TokenAction::List {
+                tokens_file: tokens_file.clone(),
+            },
+            &[],
+            KNOWN_TOOLS,
+        );
+        assert!(
+            result.is_err(),
+            "NoGrant must not silently succeed against a grant-bearing store"
+        );
+
+        // Critically, the failed read left the grant intact on disk.
+        assert_eq!(grant_of(&tokens_file, "writer"), Some(grant()));
+    }
+
+    #[test]
+    fn a_grant_field_this_binary_does_not_know_is_refused_not_dropped() {
+        // Codex review of mecmcp#160 raised this: every mutation deserializes the
+        // whole document into `G` and reserializes it, so a field unknown to this
+        // binary would be dropped on the next add/rotate/revoke. If such a field
+        // encoded a restriction whose absence reads as permissive, that rewrite
+        // widens authority — silently.
+        //
+        // `#[serde(deny_unknown_fields)]` on the grant turns that into a load
+        // error, which is why StoredGrant requires it. This test pins the
+        // fail-closed behaviour so a future grant that omits the attribute is
+        // caught here rather than in production.
+        let (_dir, tokens_file) = temp_tokens_file();
+        add(&tokens_file, "writer", Some(grant()));
+
+        // Simulate a store written by a newer binary that understands one more
+        // restriction field than this one does.
+        // The store is written pretty-printed, so match on the grant object's
+        // opening brace rather than a compact field pattern.
+        let raw = std::fs::read_to_string(&tokens_file).unwrap();
+        let doctored = raw.replace(
+            "\"grant\": {\n",
+            "\"grant\": {\n        \"max_targets\": 1,\n",
+        );
+        assert_ne!(raw, doctored, "fixture must actually inject the field");
+        std::fs::write(&tokens_file, &doctored).unwrap();
+
+        let result = TokenStoreFile::<TestGrant>::load(&tokens_file);
+        assert!(
+            result.is_err(),
+            "an unknown grant field must fail the load, not be silently dropped"
+        );
+
+        // And the file is untouched by the failed read — nothing was rewritten.
+        assert_eq!(std::fs::read_to_string(&tokens_file).unwrap(), doctored);
+    }
+
+    /// A grant that deliberately omits `#[serde(deny_unknown_fields)]`.
+    ///
+    /// This is the shape `StoredGrant`'s docs tell consumers not to write. Codex
+    /// review of mecmcp#160 made the point that documentation is not enforcement
+    /// and a trait bound cannot express the attribute, so the store enforces the
+    /// guarantee instead. This type exists to prove that — it is the
+    /// non-compliant consumer, and it must still fail closed.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct LaxGrant {
+        allowed_roots: Vec<String>,
+    }
+
+    impl Grant for LaxGrant {
+        type Action = TestAction;
+
+        fn allows_action(&self, _action: Self::Action) -> bool {
+            true
+        }
+
+        fn allows_subject(&self, subject: &str) -> bool {
+            self.allowed_roots.iter().any(|root| subject == root)
+        }
+
+        fn validate(&self) -> Result<(), GrantError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_grant_without_deny_unknown_fields_still_fails_closed() {
+        let (_dir, tokens_file) = temp_tokens_file();
+
+        run_with_grant::<LaxGrant>(
+            TokenAction::Add {
+                tokens_file: tokens_file.clone(),
+                name: "lax".to_owned(),
+                devices: vec!["*".to_owned()],
+                tools: vec!["get_config".to_owned()],
+                provider: None,
+                provider_tier: None,
+                on_behalf_of: None,
+                actor_type: None,
+                server_pid: None,
+            },
+            &[],
+            KNOWN_TOOLS,
+            Some(LaxGrant {
+                allowed_roots: vec!["/config/devices".to_owned()],
+            }),
+        )
+        .unwrap();
+
+        // A newer binary added a restriction this build has never heard of.
+        let raw = std::fs::read_to_string(&tokens_file).unwrap();
+        let doctored = raw.replace(
+            "\"grant\": {\n",
+            "\"grant\": {\n        \"max_targets\": 1,\n",
+        );
+        assert_ne!(raw, doctored, "fixture must actually inject the field");
+        std::fs::write(&tokens_file, &doctored).unwrap();
+
+        // `LaxGrant` would happily deserialize this and drop `max_targets` on the
+        // next write. The store must refuse rather than silently narrow-then-widen.
+        let load = TokenStoreFile::<LaxGrant>::load(&tokens_file);
+        let error = load.expect_err("a droppable grant field must fail the load");
+        let rendered = format!("{error}");
+        assert!(
+            rendered.contains("max_targets"),
+            "the error must name the field at risk, got: {rendered}"
+        );
+
+        // And every mutating path is closed too, not just load.
+        let rotate = run_with_grant::<LaxGrant>(
+            TokenAction::Rotate {
+                tokens_file: tokens_file.clone(),
+                name: "lax".to_owned(),
+                server_pid: None,
+            },
+            &[],
+            KNOWN_TOOLS,
+            None,
+        );
+        assert!(
+            rotate.is_err(),
+            "rotate must not rewrite a file whose grant it would truncate"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&tokens_file).unwrap(),
+            doctored,
+            "the file must be left exactly as found"
+        );
+    }
+}
