@@ -1,0 +1,29 @@
+[package]
+name        = "mecmcp-http"
+description = "Vendor-neutral hardened outbound HTTP client for mechub MCP servers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mecmcp-secret = { version = "0.3.7", path = "../mecmcp-secret" }
+reqwest       = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+# Direct dependency purely to validate operator-supplied PEM eagerly — see the
+# comment in `HttpClient::new`. Already in the tree via reqwest.
+rustls-pki-types = "1"
+thiserror     = { workspace = true }
+tokio         = { version = "1", features = ["sync", "time"] }
+zeroize       = { workspace = true }
+
+[dev-dependencies]
+rcgen        = "0.13"
+rustls       = { version = "0.23", features = ["aws-lc-rs"] }
+tempfile     = { workspace = true }
+tokio        = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
+tokio-rustls = "0.26"
