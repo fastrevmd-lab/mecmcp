@@ -6,7 +6,7 @@
 
 use std::env;
 use std::path::Path;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// An outbound credential. Zeroized on drop.
 ///
@@ -26,6 +26,41 @@ impl OutboundSecret {
     }
 }
 
+/// The bytes of a file that may contain credentials. Zeroized on drop.
+///
+/// Implements neither `Clone`, `Debug`, `Display`, nor `Serialize`, exactly as
+/// [`OutboundSecret`] does, so it cannot reach a log by accident.
+///
+/// A plain `Zeroizing<Vec<u8>>` would not do: it forwards `Vec`'s `Debug`, so a
+/// single `tracing::debug!(?bytes)` — or a `#[derive(Debug)]` on any struct
+/// holding one — prints the whole file. The documents this reader is for include
+/// `devices.json`, which carries device credentials in plaintext.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct SecretBytes(Vec<u8>);
+
+impl SecretBytes {
+    /// Expose the bytes for parsing.
+    ///
+    /// Named to be conspicuous at call sites and greppable in review, matching
+    /// [`OutboundSecret::expose`].
+    #[must_use]
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Number of bytes read.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the file was empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Limits applied when loading a secret.
 #[derive(Debug, Clone, Copy)]
 pub struct SecretLimits {
@@ -36,6 +71,80 @@ pub struct SecretLimits {
 impl Default for SecretLimits {
     fn default() -> Self {
         Self { max_bytes: 8192 }
+    }
+}
+
+/// Limits applied when reading a hardened **file**, as opposed to a single
+/// secret.
+///
+/// The default is far larger than [`SecretLimits`] because the two describe
+/// different things. A credential is a few hundred bytes; a `tokens.json` or
+/// `devices.json` is a document that grows with the deployment. Sizing a
+/// document against the secret default is a live hazard, not a theoretical one:
+/// LXC 609's `tokens.json` measured 7614 bytes against `SecretLimits`' 8192, so
+/// a handful more tokens would have taken the server down with what looks like a
+/// corruption error.
+#[derive(Debug, Clone, Copy)]
+pub struct FileLimits {
+    /// Maximum number of bytes to accept.
+    pub max_bytes: usize,
+}
+
+impl Default for FileLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: 1024 * 1024,
+        }
+    }
+}
+
+/// Read a file with the full hardening [`load_from_file`] applies, returning the
+/// raw bytes.
+///
+/// This is the single implementation of the symlink / regular-file / mode /
+/// owner / size checks in the workspace. Anything reading a
+/// credential-adjacent file should come through here rather than growing its
+/// own copy — three divergent copies of one check is how
+/// [`load_from_file`]'s guarantees quietly stop applying somewhere.
+///
+/// Unlike [`load_from_file`] this makes no assumptions about the contents: no
+/// UTF-8 requirement, no newline stripping, no empty rejection. Callers parsing
+/// JSON want the bytes exactly as stored.
+///
+/// **Unix:** opens once with `O_NOFOLLOW`, validates the descriptor with
+/// `fstat`, and reads from that same descriptor. TOCTOU-safe.
+///
+/// **Non-Unix:** path-based checks that are **advisory only** — see
+/// [`load_from_file`].
+///
+/// Ownership must match the effective uid, except that **root is permitted**:
+/// uid 0 can `chown` and read the file anyway, so refusing it would break
+/// ordinary `sudo` operator workflows without adding protection.
+///
+/// The returned buffer zeroizes on drop, since a token file is as sensitive as
+/// a token.
+///
+/// # Errors
+/// Returns [`SecretError`] if any check fails or on I/O error.
+///
+/// # Examples
+/// ```no_run
+/// use mecmcp_secret::{read_hardened_file, FileLimits};
+/// use std::path::Path;
+///
+/// let bytes = read_hardened_file(Path::new("/etc/example/tokens.json"), FileLimits::default())?;
+/// // Parse `bytes.expose()` with whatever the caller uses; nothing was altered.
+/// assert!(!bytes.is_empty());
+/// # Ok::<(), mecmcp_secret::SecretError>(())
+/// ```
+pub fn read_hardened_file(path: &Path, limits: FileLimits) -> Result<SecretBytes, SecretError> {
+    #[cfg(unix)]
+    {
+        read_hardened_file_unix(path, limits)
+    }
+    #[cfg(not(unix))]
+    {
+        read_hardened_file_fallback(path, limits)
     }
 }
 
@@ -259,10 +368,52 @@ pub fn load_from_file(path: &Path, limits: SecretLimits) -> Result<OutboundSecre
 /// Unix implementation: open once, validate the fd, read from the same fd.
 #[cfg(unix)]
 fn load_from_file_unix(path: &Path, limits: SecretLimits) -> Result<OutboundSecret, SecretError> {
+    let bytes = read_hardened_file_unix(
+        path,
+        FileLimits {
+            max_bytes: limits.max_bytes,
+        },
+    )?;
+
+    // Convert to String, zeroizing the bytes on error
+    let mut value = match String::from_utf8(bytes.expose().to_vec()) {
+        Ok(text) => text,
+        Err(error) => {
+            // Recover and zeroize the buffer
+            let mut recovered = error.into_bytes();
+            recovered.zeroize();
+            return Err(SecretError::FileInvalidUtf8 {
+                path: path.to_path_buf(),
+            });
+        }
+    };
+
+    // Strip at most one trailing newline (either \n or \r\n)
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+
+    // Reject empty or whitespace-only secrets
+    if value.trim().is_empty() {
+        value.zeroize();
+        return Err(SecretError::FileEmpty {
+            path: path.to_path_buf(),
+        });
+    }
+
+    Ok(OutboundSecret(value))
+}
+
+/// Unix hardened read: open once with `O_NOFOLLOW`, validate the descriptor,
+/// read from that same descriptor.
+#[cfg(unix)]
+fn read_hardened_file_unix(path: &Path, limits: FileLimits) -> Result<SecretBytes, SecretError> {
     use rustix::fs::{Mode, OFlags, fstat, open};
     use rustix::io::Errno;
     use std::io::Read;
-    use zeroize::Zeroizing;
 
     // Open with NOFOLLOW to reject symlinks at open time
     let fd = open(
@@ -313,9 +464,14 @@ fn load_from_file_unix(path: &Path, limits: SecretLimits) -> Result<OutboundSecr
         });
     }
 
-    // Check ownership: must match effective uid
+    // Ownership must match the effective uid — except for root.
+    //
+    // Refusing root would buy nothing: uid 0 can `chown` the file and read it
+    // regardless. It would, however, break `sudo <server> token list` against a
+    // file owned by the service user, which is an ordinary operator action. The
+    // exception is deliberate, not an oversight.
     let effective = rustix::process::geteuid().as_raw();
-    if stat.st_uid != effective {
+    if effective != 0 && stat.st_uid != effective {
         return Err(SecretError::FileWrongOwner {
             path: path.to_path_buf(),
             owner: stat.st_uid,
@@ -333,7 +489,9 @@ fn load_from_file_unix(path: &Path, limits: SecretLimits) -> Result<OutboundSecr
         });
     }
 
-    // Read from the SAME fd, bounded by max_bytes + 1
+    // Read from the SAME fd, bounded by max_bytes + 1. The size check above is
+    // only an early reject: the file can grow between fstat and read, so the
+    // bound here is the enforcement.
     let file = std::fs::File::from(fd);
     let mut bytes = Zeroizing::new(Vec::new());
     file.take((limits.max_bytes + 1) as u64)
@@ -343,7 +501,7 @@ fn load_from_file_unix(path: &Path, limits: SecretLimits) -> Result<OutboundSecr
             source,
         })?;
 
-    // Enforce size limit: the +1 distinguishes at-limit from over-limit
+    // The +1 distinguishes at-limit from over-limit
     if bytes.len() > limits.max_bytes {
         return Err(SecretError::FileTooLarge {
             path: path.to_path_buf(),
@@ -352,11 +510,30 @@ fn load_from_file_unix(path: &Path, limits: SecretLimits) -> Result<OutboundSecr
         });
     }
 
-    // Convert to String, zeroizing the bytes on error
-    let mut value = match String::from_utf8(bytes.to_vec()) {
+    Ok(SecretBytes(std::mem::take(&mut bytes)))
+}
+
+/// Non-Unix fallback: path-based checks, advisory only.
+///
+/// Uses `symlink_metadata` followed by `File::open` — two separate operations,
+/// so the file may be replaced between validation and open. Mode and ownership
+/// are not checked. Callers must not rely on this as a security boundary.
+/// Tracked in #174.
+#[cfg(not(unix))]
+fn load_from_file_non_unix(
+    path: &Path,
+    limits: SecretLimits,
+) -> Result<OutboundSecret, SecretError> {
+    let bytes = read_hardened_file_fallback(
+        path,
+        FileLimits {
+            max_bytes: limits.max_bytes,
+        },
+    )?;
+
+    let mut value = match String::from_utf8(bytes.expose().to_vec()) {
         Ok(text) => text,
         Err(error) => {
-            // Recover and zeroize the buffer
             let mut recovered = error.into_bytes();
             recovered.zeroize();
             return Err(SecretError::FileInvalidUtf8 {
@@ -365,7 +542,6 @@ fn load_from_file_unix(path: &Path, limits: SecretLimits) -> Result<OutboundSecr
         }
     };
 
-    // Strip at most one trailing newline (either \n or \r\n)
     if value.ends_with('\n') {
         value.pop();
         if value.ends_with('\r') {
@@ -373,7 +549,6 @@ fn load_from_file_unix(path: &Path, limits: SecretLimits) -> Result<OutboundSecr
         }
     }
 
-    // Reject empty or whitespace-only secrets
     if value.trim().is_empty() {
         value.zeroize();
         return Err(SecretError::FileEmpty {
@@ -384,18 +559,13 @@ fn load_from_file_unix(path: &Path, limits: SecretLimits) -> Result<OutboundSecr
     Ok(OutboundSecret(value))
 }
 
-/// Non-Unix fallback: path-based checks, advisory only.
-///
-/// Uses `symlink_metadata` followed by `File::open` — two separate operations,
-/// so the file may be replaced between validation and open. Mode and ownership
-/// are not checked. Callers must not rely on this as a security boundary.
+/// Non-Unix hardened read: path-based, **advisory only**. See #174.
 #[cfg(not(unix))]
-fn load_from_file_non_unix(
+fn read_hardened_file_fallback(
     path: &Path,
-    limits: SecretLimits,
-) -> Result<OutboundSecret, SecretError> {
+    limits: FileLimits,
+) -> Result<SecretBytes, SecretError> {
     use std::io::Read;
-    use zeroize::Zeroizing;
 
     let metadata = std::fs::symlink_metadata(path).map_err(|source| SecretError::FileIo {
         path: path.to_path_buf(),
@@ -408,8 +578,7 @@ fn load_from_file_non_unix(
         });
     }
 
-    // Bounded read
-    let mut file = std::fs::File::open(path).map_err(|source| SecretError::FileIo {
+    let file = std::fs::File::open(path).map_err(|source| SecretError::FileIo {
         path: path.to_path_buf(),
         source,
     })?;
@@ -429,32 +598,7 @@ fn load_from_file_non_unix(
         });
     }
 
-    let mut value = match String::from_utf8(bytes.to_vec()) {
-        Ok(text) => text,
-        Err(error) => {
-            let mut recovered = error.into_bytes();
-            recovered.zeroize();
-            return Err(SecretError::FileInvalidUtf8 {
-                path: path.to_path_buf(),
-            });
-        }
-    };
-
-    if value.ends_with('\n') {
-        value.pop();
-        if value.ends_with('\r') {
-            value.pop();
-        }
-    }
-
-    if value.trim().is_empty() {
-        value.zeroize();
-        return Err(SecretError::FileEmpty {
-            path: path.to_path_buf(),
-        });
-    }
-
-    Ok(OutboundSecret(value))
+    Ok(SecretBytes(std::mem::take(&mut bytes)))
 }
 
 #[cfg(test)]
@@ -743,4 +887,178 @@ mod tests {
     // Wrong-owner test: cannot be tested without root privileges to chown.
     // A fabricated test that does not exercise the check would be misleading.
     // To test: run as root, create a file owned by another uid, verify rejection.
+
+    mod hardened_file {
+        use super::*;
+        use std::io::Write;
+        use std::path::PathBuf;
+
+        /// `unwrap_err` will not compile against `SecretBytes` — it has no
+        /// `Debug`, which is the whole point of the type.
+        fn expect_error(result: Result<SecretBytes, SecretError>) -> SecretError {
+            match result {
+                Err(error) => error,
+                Ok(_) => panic!("expected an error, got a successful read"),
+            }
+        }
+
+        fn write_file(dir: &tempfile::TempDir, name: &str, bytes: &[u8], mode: u32) -> PathBuf {
+            let path = dir.path().join(name);
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(bytes).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+            path
+        }
+
+        /// Bytes come back exactly as stored — no newline stripping, no UTF-8
+        /// requirement. A JSON document must not be altered on the way in.
+        #[test]
+        fn returns_bytes_verbatim() {
+            let dir = tempfile::tempdir().unwrap();
+            let content = b"{\"a\":1}\n";
+            let path = write_file(&dir, "doc.json", content, 0o600);
+
+            let bytes = read_hardened_file(&path, FileLimits::default()).unwrap();
+            assert_eq!(bytes.expose(), content, "trailing newline must survive");
+        }
+
+        /// Unlike `load_from_file`, arbitrary bytes are allowed.
+        #[test]
+        fn accepts_non_utf8_content() {
+            let dir = tempfile::tempdir().unwrap();
+            let content = b"\xC3\x28\xFF binary";
+            let path = write_file(&dir, "blob.bin", content, 0o600);
+
+            let bytes = read_hardened_file(&path, FileLimits::default()).unwrap();
+            assert_eq!(bytes.expose(), content);
+        }
+
+        /// An empty document is not an error here, though it is for a secret.
+        #[test]
+        fn accepts_empty_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_file(&dir, "empty.json", b"", 0o600);
+            assert!(
+                read_hardened_file(&path, FileLimits::default())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn rejects_group_or_world_accessible() {
+            let dir = tempfile::tempdir().unwrap();
+            for mode in [0o640, 0o604, 0o666] {
+                let path = write_file(&dir, &format!("m{mode:o}.json"), b"{}", mode);
+                let error = expect_error(read_hardened_file(&path, FileLimits::default()));
+                assert!(
+                    matches!(error, SecretError::FilePermissions { .. }),
+                    "mode {mode:o} should be rejected, got {error:?}"
+                );
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn rejects_symlink() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = write_file(&dir, "real.json", b"{}", 0o600);
+            let link = dir.path().join("link.json");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+
+            let error = expect_error(read_hardened_file(&link, FileLimits::default()));
+            assert!(
+                matches!(error, SecretError::FileIsSymlink { .. }),
+                "got {error:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn rejects_non_regular_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let error = expect_error(read_hardened_file(dir.path(), FileLimits::default()));
+            assert!(
+                matches!(
+                    error,
+                    SecretError::FileNotRegular { .. } | SecretError::FileIo { .. }
+                ),
+                "a directory should not read as a file, got {error:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_oversized_and_accepts_at_the_limit() {
+            let dir = tempfile::tempdir().unwrap();
+            let limits = FileLimits { max_bytes: 64 };
+
+            let at_limit = write_file(&dir, "at.json", &[b'x'; 64], 0o600);
+            assert_eq!(read_hardened_file(&at_limit, limits).unwrap().len(), 64);
+
+            let over = write_file(&dir, "over.json", &[b'x'; 65], 0o600);
+            let error = expect_error(read_hardened_file(&over, limits));
+            assert!(
+                matches!(error, SecretError::FileTooLarge { limit: 64, .. }),
+                "got {error:?}"
+            );
+        }
+
+        /// The default is document-sized, not secret-sized.
+        ///
+        /// LXC 609's real `tokens.json` measured 7614 bytes against
+        /// `SecretLimits`' 8192 ceiling, so reusing the secret default here
+        /// would have left a running server a few tokens from failing to start.
+        #[test]
+        fn default_limit_is_document_sized() {
+            assert!(
+                FileLimits::default().max_bytes >= 1024 * 1024,
+                "a token or inventory document grows with the deployment"
+            );
+            assert!(FileLimits::default().max_bytes > SecretLimits::default().max_bytes * 100);
+        }
+
+        /// The returned buffer must not be printable.
+        ///
+        /// A `Zeroizing<Vec<u8>>` forwards `Vec`'s `Debug`, so one
+        /// `tracing::debug!(?bytes)` would have dumped a `devices.json` — device
+        /// passwords included — into the logs. This is a compile-time property,
+        /// so the test is the commented line: uncommenting it must not compile.
+        #[test]
+        fn secret_bytes_is_not_printable() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_file(&dir, "doc.json", b"{\"password\":\"hunter2\"}", 0o600);
+            let bytes = read_hardened_file(&path, FileLimits::default()).unwrap();
+
+            // println!("{bytes:?}");   // must not compile: no Debug
+            // println!("{bytes}");     // must not compile: no Display
+            // let copy = bytes.clone(); // must not compile: no Clone
+
+            // Reaching the bytes has to be deliberate and greppable.
+            assert!(bytes.expose().starts_with(b"{"));
+            assert_eq!(bytes.len(), 22);
+        }
+
+        /// `load_from_file` still applies the secret-specific rules on top.
+        #[test]
+        fn secret_loader_still_trims_and_rejects_empty() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_file(&dir, "secret", b"value\n", 0o600);
+            let secret = load_from_file(&path, SecretLimits::default()).unwrap();
+            assert_eq!(secret.expose(), "value");
+
+            // `unwrap_err` will not compile here: `OutboundSecret` deliberately
+            // implements no `Debug`, which is the point of the type.
+            let blank = write_file(&dir, "blank", b"   \n", 0o600);
+            match load_from_file(&blank, SecretLimits::default()) {
+                Err(SecretError::FileEmpty { .. }) => {}
+                Err(other) => panic!("wrong error: {other:?}"),
+                Ok(_) => panic!("a whitespace-only secret must be rejected"),
+            }
+        }
+    }
 }
