@@ -407,6 +407,36 @@ fn safe_url(url: &reqwest::Url) -> String {
     safe.to_string()
 }
 
+/// Render an error together with its source chain.
+///
+/// `reqwest::Error`'s `Display` prints only the top-level kind — after
+/// `without_url()` that is the bare string "error sending request" — while the
+/// actionable cause (DNS failure, connection refused, certificate not trusted,
+/// protocol error) sits in the source chain. Without this, every transport
+/// failure looks identical in the logs.
+///
+/// The chain is bounded: a cyclic or pathological chain must not spin here.
+/// Only reqwest's own `Display` carries the request URL, and that is stripped
+/// before this is called, so walking the causes adds no disclosure.
+fn describe_with_causes(error: &dyn std::error::Error) -> String {
+    const MAX_CAUSES: usize = 8;
+
+    let mut description = error.to_string();
+    let mut source = error.source();
+    for _ in 0..MAX_CAUSES {
+        let Some(cause) = source else { break };
+        let text = cause.to_string();
+        // Skip a cause that merely restates its parent, which hyper and io
+        // layers do often enough to be noisy.
+        if !description.contains(&text) {
+            description.push_str(": ");
+            description.push_str(&text);
+        }
+        source = cause.source();
+    }
+    description
+}
+
 /// Every URL component that can carry a credential.
 ///
 /// Enumerated in one place on purpose. This was fixed three times in a row as
@@ -670,7 +700,9 @@ impl HttpClient {
                 let is_connect = error.is_connect();
                 // `without_url` first: reqwest's Display appends the *raw* URL,
                 // query and all, which is where a signed-URL credential lives.
-                let detail = error.without_url().to_string();
+                // Then walk the causes, because reqwest's own Display alone says
+                // only "error sending request" for every possible failure.
+                let detail = describe_with_causes(&error.without_url());
                 let url = url_for_diagnostics.clone();
                 if is_connect {
                     HttpError::Connect { url, detail }
@@ -1627,6 +1659,57 @@ mod tests {
                 ..Default::default()
             })
             .is_ok()
+        );
+    }
+
+    /// A transport failure must name its actual cause.
+    ///
+    /// Without the source chain every failure renders as "error sending
+    /// request", so DNS, refused connections and TLS rejections are
+    /// indistinguishable in an operator's logs.
+    #[tokio::test]
+    async fn connect_error_reports_the_underlying_cause() {
+        let (listener, port) = bind_local().await;
+        drop(listener);
+
+        let client = build_client(HttpClientConfig {
+            request_timeout: Duration::from_secs(10),
+            ..Default::default()
+        })
+        .unwrap();
+        let request = HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap();
+
+        let error = client.send(request).await.unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            rendered.to_lowercase().contains("refused"),
+            "the refusal should reach the operator, got: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn untrusted_certificate_error_names_the_certificate() {
+        let (_cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+        serve(
+            listener,
+            server_config,
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            1,
+        );
+
+        let client = build_client(HttpClientConfig {
+            request_timeout: Duration::from_secs(10),
+            ..Default::default()
+        })
+        .unwrap();
+        let request = HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap();
+
+        let rendered = client.send(request).await.unwrap_err().to_string();
+        let lowered = rendered.to_lowercase();
+        assert!(
+            lowered.contains("certificate") || lowered.contains("tls") || lowered.contains("cert"),
+            "a TLS rejection should say so, got: {rendered}"
         );
     }
 
