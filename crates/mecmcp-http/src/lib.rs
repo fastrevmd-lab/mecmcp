@@ -35,6 +35,29 @@
 //!   form.
 //! - **Secrets marked sensitive**: `HeaderValue::set_sensitive(true)` is called
 //!   for secret headers and bearer auth, keeping values out of logging paths.
+//! - **One wire attempt per `send`**: reqwest's default protocol-NACK retry is
+//!   turned off, so a replayable POST cannot be resent behind the caller's back.
+//!
+//! ## The consumer installs the crypto provider
+//!
+//! This crate enables reqwest's `rustls-no-provider` feature and picks **no**
+//! rustls `CryptoProvider`. That is workspace decision D4, and it is not a
+//! detail: reqwest's plain `rustls` feature would enable `rustls/aws-lc-rs`
+//! across the whole dependency graph, and a shared crate choosing a provider is
+//! how aws-lc-rs was once linked into a ring build and broke TLS. Install one in
+//! the binary before constructing a client:
+//!
+//! ```text
+//! rustls::crypto::aws_lc_rs::default_provider()
+//!     .install_default()
+//!     .expect("provider already installed");
+//! ```
+//!
+//! Shown as text, not a doctest: this crate cannot compile that call, because it
+//! deliberately does not enable a provider feature. That is the point.
+//!
+//! [`HttpClient::new`] returns [`HttpError::NoCryptoProvider`] if none is
+//! installed, rather than letting reqwest panic.
 //!
 //! ## Examples
 //!
@@ -176,7 +199,7 @@ impl HttpRequest {
         // can still carry a readable password, and this error embeds the raw
         // string because there is nothing structured left to report.
         let parsed = reqwest::Url::parse(url).map_err(|error| HttpError::InvalidUrl {
-            url: redact_userinfo(url),
+            url: redact_unparsed_url(url),
             detail: error.to_string(),
         })?;
 
@@ -192,7 +215,7 @@ impl HttpRequest {
 
         if parsed.scheme() != "https" {
             return Err(HttpError::InsecureScheme {
-                url: redact_userinfo(url),
+                url: redact_parsed_url(&parsed),
                 scheme: parsed.scheme().to_owned(),
             });
         }
@@ -201,7 +224,7 @@ impl HttpRequest {
         // is a defensive backstop rather than the primary check.
         if parsed.host_str().is_none_or(str::is_empty) {
             return Err(HttpError::MissingHost {
-                url: redact_userinfo(url),
+                url: redact_parsed_url(&parsed),
             });
         }
 
@@ -352,33 +375,33 @@ impl std::fmt::Debug for HttpRequest {
     }
 }
 
-/// Replace any `userinfo@` segment in a URL string with `[redacted]@`.
+/// Render a successfully parsed URL for an error message, without userinfo.
 ///
-/// Operates on the raw text rather than a parsed `Url` so it also works on input
-/// that failed to parse — which is where a credential is most likely to survive
-/// into an error message.
-fn redact_userinfo(raw: &str) -> String {
-    let Some(scheme_end) = raw.find("://") else {
-        return raw.to_owned();
-    };
-    let authority_start = scheme_end + "://".len();
-    let authority_end = raw[authority_start..]
-        .find(['/', '?', '#'])
-        .map_or(raw.len(), |offset| authority_start + offset);
+/// Exact rather than textual: the parser has already told us where the
+/// credentials are, so there is no guessing.
+fn redact_parsed_url(url: &reqwest::Url) -> String {
+    let mut safe = url.clone();
+    // Both fail only for cannot-be-a-base URLs, which cannot carry userinfo.
+    let _ = safe.set_username("");
+    let _ = safe.set_password(None);
+    safe.to_string()
+}
 
-    let authority = &raw[authority_start..authority_end];
-    // `rfind`: userinfo may itself contain a percent-encoded '@', and the last
-    // one is the true separator.
-    let Some(at) = authority.rfind('@') else {
-        return raw.to_owned();
-    };
-
-    let mut redacted = String::with_capacity(raw.len());
-    redacted.push_str(&raw[..authority_start]);
-    redacted.push_str("[redacted]");
-    redacted.push_str(&authority[at..]);
-    redacted.push_str(&raw[authority_end..]);
-    redacted
+/// Redact a URL string that could **not** be parsed.
+///
+/// Deliberately blunt: everything up to and including the last `@` is dropped.
+/// A structural scan cannot be trusted here, because the input is by definition
+/// malformed — `https//user:secret@example.com` (one missing colon) has no
+/// `://` for an authority to start after, and an earlier version of this
+/// function returned such input verbatim and leaked the password.
+///
+/// Over-redacting an error message costs a little debuggability. Under-redacting
+/// costs a credential. So when in doubt this cuts.
+fn redact_unparsed_url(raw: &str) -> String {
+    match raw.rfind('@') {
+        Some(at) => format!("[redacted]{}", &raw[at..]),
+        None => raw.to_owned(),
+    }
 }
 
 /// Parse and validate a header name.
@@ -405,16 +428,24 @@ impl HttpClient {
     ///
     /// # Errors
     /// Returns [`HttpError::ConfigValidation`] if the configuration is invalid
-    /// (zero timeouts or limits), [`HttpError::InvalidRootCertificate`] if an
-    /// entry in `extra_root_certificates` is not usable PEM, or
+    /// (zero timeouts or limits), [`HttpError::NoCryptoProvider`] if the process
+    /// has no rustls provider installed, [`HttpError::InvalidRootCertificate`] if
+    /// an entry in `extra_root_certificates` is not usable PEM, or
     /// [`HttpError::ClientConstruction`] if the underlying client cannot be built.
     ///
     /// # Examples
     /// ```
-    /// use mecmcp_http::{HttpClient, HttpClientConfig};
+    /// use mecmcp_http::{HttpClient, HttpClientConfig, HttpError};
     ///
-    /// let client = HttpClient::new(HttpClientConfig::default())?;
-    /// # Ok::<(), mecmcp_http::HttpError>(())
+    /// // Construction needs a rustls CryptoProvider installed by the binary.
+    /// // Without one this is the error you get — not a panic, and not a client
+    /// // that fails later at the first request.
+    /// match HttpClient::new(HttpClientConfig::default()) {
+    ///     Ok(client) => { /* ready to send */ }
+    ///     Err(HttpError::NoCryptoProvider) => { /* install a provider first */ }
+    ///     Err(other) => return Err(other),
+    /// }
+    /// # Ok::<(), HttpError>(())
     /// ```
     pub fn new(config: HttpClientConfig) -> Result<Self, HttpError> {
         // Validate configuration
@@ -449,9 +480,22 @@ impl HttpClient {
             });
         }
 
+        // reqwest panics if it needs a provider and none is installed, and a
+        // shared crate must not hand a consumer a panic. Report it instead.
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            return Err(HttpError::NoCryptoProvider);
+        }
+
         let mut builder = reqwest::Client::builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
+            // reqwest 0.13 retries protocol NACKs twice by default, and these
+            // bodies are replayable — so an HTTP/2 GOAWAY or REFUSED_STREAM would
+            // silently resend a POST or PATCH that changes device configuration,
+            // without the product's retry policy ever seeing the first attempt.
+            // Retry policy belongs to the consumer (see README), so this crate
+            // makes exactly one wire attempt and lets the caller decide.
+            .retry(reqwest::retry::never())
             .no_proxy()
             .connect_timeout(config.connect_timeout)
             // Deliberately no `.timeout()`. The whole-request deadline in `send`
@@ -748,6 +792,16 @@ pub enum HttpError {
         /// Detail about the validation failure.
         detail: String,
     },
+    /// No process-wide rustls `CryptoProvider` has been installed.
+    ///
+    /// This crate deliberately does not choose one — the provider is the
+    /// consumer's decision, so that a shared crate cannot link aws-lc-rs into a
+    /// ring-based binary. Install one before building a client, for example
+    /// `rustls::crypto::aws_lc_rs::default_provider().install_default()`.
+    #[error(
+        "no rustls CryptoProvider installed; call CryptoProvider::install_default() before building an HttpClient"
+    )]
+    NoCryptoProvider,
     /// An entry in `extra_root_certificates` is not usable.
     #[error("extra_root_certificates[{index}] is not a usable certificate: {detail}")]
     InvalidRootCertificate {
@@ -887,8 +941,26 @@ mod tests {
         (listener, port)
     }
 
+    /// Install a crypto provider once for the whole test binary.
+    ///
+    /// The crate deliberately does not pick one (decision D4), so tests stand in
+    /// for the consumer binary that must. `install_default` is process-global and
+    /// one-shot, which is also why the `NoCryptoProvider` branch cannot be
+    /// exercised in-process — see the note on that test.
+    fn ensure_crypto_provider() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
+
+    fn build_client(config: HttpClientConfig) -> Result<HttpClient, HttpError> {
+        ensure_crypto_provider();
+        HttpClient::new(config)
+    }
+
     fn client_trusting(cert_pem: String) -> HttpClient {
-        HttpClient::new(HttpClientConfig {
+        build_client(HttpClientConfig {
             extra_root_certificates: vec![cert_pem],
             ..Default::default()
         })
@@ -979,7 +1051,7 @@ mod tests {
         let (listener, port) = bind_local().await;
         drop(listener);
 
-        let client = HttpClient::new(HttpClientConfig {
+        let client = build_client(HttpClientConfig {
             request_timeout: Duration::from_secs(10),
             ..Default::default()
         })
@@ -1007,7 +1079,7 @@ mod tests {
             1,
         );
 
-        let client = HttpClient::new(HttpClientConfig {
+        let client = build_client(HttpClientConfig {
             request_timeout: Duration::from_secs(10),
             ..Default::default()
         })
@@ -1061,7 +1133,7 @@ mod tests {
         // connect_timeout deliberately far longer than request_timeout: the
         // deadline is then the only thing that can fire, so `Timeout` is asserted
         // exactly rather than as one of several acceptable errors.
-        let client = HttpClient::new(HttpClientConfig {
+        let client = build_client(HttpClientConfig {
             extra_root_certificates: vec![cert_pem],
             request_timeout: Duration::from_millis(250),
             connect_timeout: Duration::from_secs(30),
@@ -1107,7 +1179,7 @@ mod tests {
         });
 
         let client = Arc::new(
-            HttpClient::new(HttpClientConfig {
+            build_client(HttpClientConfig {
                 extra_root_certificates: vec![cert_pem],
                 max_concurrent_requests: 1,
                 request_timeout: Duration::from_millis(300),
@@ -1182,7 +1254,7 @@ mod tests {
         }
 
         let client = Arc::new(
-            HttpClient::new(HttpClientConfig {
+            build_client(HttpClientConfig {
                 extra_root_certificates: vec![cert_pem],
                 max_concurrent_requests: LIMIT,
                 request_timeout: Duration::from_secs(20),
@@ -1274,6 +1346,12 @@ mod tests {
             format!("https://user:{CANARY}@exa mple.com/"), // unparseable
             format!("http://user:{CANARY}@[bad/"),        // unparseable, insecure
             format!("https://{CANARY}@example.com/"),     // username only, no password
+            // One missing colon, so there is no "://" delimiter for an authority
+            // to start after. The first version of the redaction helper returned
+            // this verbatim and leaked the password.
+            format!("https//user:{CANARY}@example.com"),
+            format!("{CANARY}@example.com"), // no scheme at all
+            format!("https:/user:{CANARY}@example.com"), // single slash
         ];
 
         for candidate in candidates {
@@ -1287,23 +1365,33 @@ mod tests {
     }
 
     #[test]
-    fn redact_userinfo_preserves_everything_else() {
+    fn redact_parsed_url_strips_userinfo_and_keeps_the_rest() {
+        let url = reqwest::Url::parse("https://user:pw@example.com/a/b?q=1#f").unwrap();
+        let rendered = redact_parsed_url(&url);
+        assert!(!rendered.contains("pw"), "{rendered}");
+        assert!(!rendered.contains("user"), "{rendered}");
+        assert!(rendered.contains("example.com/a/b?q=1#f"), "{rendered}");
+
+        // An '@' in the path is not userinfo and must survive untouched.
+        let plain = reqwest::Url::parse("https://example.com/mail@host").unwrap();
+        assert_eq!(redact_parsed_url(&plain), "https://example.com/mail@host");
+    }
+
+    #[test]
+    fn redact_unparsed_url_cuts_at_the_last_at_sign() {
+        // The case that leaked: one missing colon, so there is no "://" for an
+        // authority to begin after.
         assert_eq!(
-            redact_userinfo("https://user:pw@example.com/a/b?q=1#f"),
-            "https://[redacted]@example.com/a/b?q=1#f"
+            redact_unparsed_url("https//user:secret@example.com"),
+            "[redacted]@example.com"
         );
-        // No userinfo, no change.
+        // Deliberately blunt on malformed input — over-redaction is the safe
+        // direction.
         assert_eq!(
-            redact_userinfo("https://example.com/a?q=@1"),
-            "https://example.com/a?q=@1"
+            redact_unparsed_url("garbage user:secret@host/path"),
+            "[redacted]@host/path"
         );
-        // An '@' in the path must not be mistaken for a userinfo separator.
-        assert_eq!(
-            redact_userinfo("https://example.com/mail@host"),
-            "https://example.com/mail@host"
-        );
-        // Not a URL at all.
-        assert_eq!(redact_userinfo("nonsense"), "nonsense");
+        assert_eq!(redact_unparsed_url("no-at-sign-here"), "no-at-sign-here");
     }
 
     #[test]
@@ -1341,7 +1429,7 @@ mod tests {
         let junk_der = "-----BEGIN CERTIFICATE-----\nAAAAAAAAAAAAAAAA\n-----END CERTIFICATE-----\n";
         let (good_pem, _) = tls_material();
 
-        let error = HttpClient::new(HttpClientConfig {
+        let error = build_client(HttpClientConfig {
             extra_root_certificates: vec![good_pem, junk_der.to_owned()],
             ..Default::default()
         })
@@ -1468,7 +1556,7 @@ mod tests {
         ];
 
         for (field, config) in cases {
-            let error = HttpClient::new(config).unwrap_err();
+            let error = build_client(config).unwrap_err();
             assert!(
                 matches!(error, HttpError::ConfigValidation { .. }),
                 "{field} should fail validation, got {error:?}"
@@ -1482,7 +1570,7 @@ mod tests {
 
     #[test]
     fn default_config_is_accepted() {
-        assert!(HttpClient::new(HttpClientConfig::default()).is_ok());
+        assert!(build_client(HttpClientConfig::default()).is_ok());
     }
 
     /// Bad PEM must fail at construction, not at the first request.
@@ -1507,7 +1595,7 @@ mod tests {
         ];
 
         for (pem, description) in cases {
-            let error = HttpClient::new(HttpClientConfig {
+            let error = build_client(HttpClientConfig {
                 extra_root_certificates: vec![pem.to_owned()],
                 ..Default::default()
             })
@@ -1527,7 +1615,7 @@ mod tests {
         let (second_pem, _) = tls_material();
         let bundle = format!("{first_pem}{second_pem}");
         assert!(
-            HttpClient::new(HttpClientConfig {
+            build_client(HttpClientConfig {
                 extra_root_certificates: vec![bundle],
                 ..Default::default()
             })
@@ -1538,7 +1626,7 @@ mod tests {
     #[test]
     fn invalid_root_certificate_error_names_its_position() {
         let (good_pem, _) = tls_material();
-        let error = HttpClient::new(HttpClientConfig {
+        let error = build_client(HttpClientConfig {
             extra_root_certificates: vec![good_pem, "junk".to_owned()],
             ..Default::default()
         })
