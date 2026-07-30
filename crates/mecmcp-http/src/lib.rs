@@ -37,6 +37,11 @@
 //!   for secret headers and bearer auth, keeping values out of logging paths.
 //! - **One wire attempt per `send`**: reqwest's default protocol-NACK retry is
 //!   turned off, so a replayable POST cannot be resent behind the caller's back.
+//! - **HTTP/1.1 only**: the HTTP/2 stack is not compiled in. See the note in
+//!   `Cargo.toml` — hyper 1.11 underflows on an h2 peer that lies about
+//!   `Content-Length`, and h2 renders peer-controlled GOAWAY debug data into
+//!   the error chain. Neither is this crate's to fix, so the protocol is left
+//!   out rather than defended against.
 //!
 //! ## The consumer installs the crypto provider
 //!
@@ -936,7 +941,12 @@ impl HttpResponse {
     /// A header value as a string, or `None` if it is absent or not UTF-8.
     #[must_use]
     pub fn header_str(&self, name: &str) -> Option<&str> {
-        self.headers.get(name).and_then(|value| value.to_str().ok())
+        // `HeaderValue::to_str` accepts only visible ASCII, so it would reject a
+        // perfectly valid UTF-8 obs-text value such as "café" — and this method
+        // promises `None` only for absent or non-UTF-8.
+        self.headers
+            .get(name)
+            .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
     }
 
     /// Every header, as name and raw bytes.
@@ -1987,6 +1997,11 @@ mod tests {
     }
 
     /// An honest oversized `Content-Length` is rejected without reading a body.
+    ///
+    /// The assertion is on `body_written`, not just on the error: without it,
+    /// removing the fast path entirely would still produce `ResponseTooLarge`
+    /// from the first chunk and the test would pass regardless. The server
+    /// handle is awaited so the check cannot race the writer.
     #[tokio::test]
     async fn oversized_content_length_is_rejected_before_reading() {
         let (cert_pem, server_config) = tls_material();
@@ -1994,7 +2009,7 @@ mod tests {
         let body_written = Arc::new(AtomicUsize::new(0));
 
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-        {
+        let server = {
             let body_written = Arc::clone(&body_written);
             tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -2005,14 +2020,14 @@ mod tests {
                         b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n",
                     )
                     .await;
-                // Give the client a moment to reject on the header alone.
-                tokio::time::sleep(Duration::from_millis(150)).await;
+                // Long enough for the client to reject on the header alone.
+                tokio::time::sleep(Duration::from_millis(300)).await;
                 let payload = vec![b'y'; 1024 * 1024];
-                if tls.write_all(&payload).await.is_ok() {
+                if tls.write_all(&payload).await.is_ok() && tls.flush().await.is_ok() {
                     body_written.store(payload.len(), Ordering::SeqCst);
                 }
-            });
-        }
+            })
+        };
 
         let client = build_client(HttpClientConfig {
             extra_root_certificates: vec![cert_pem],
@@ -2030,6 +2045,62 @@ mod tests {
             matches!(error, HttpError::ResponseTooLarge { .. }),
             "got {error:?}"
         );
+
+        let _ = server.await;
+        assert_eq!(
+            body_written.load(Ordering::SeqCst),
+            0,
+            "the body was read despite an oversized Content-Length — the fast path did not fire"
+        );
+    }
+
+    /// What an *undersized* `Content-Length` actually does on HTTP/1.1.
+    ///
+    /// #179 asked for a "lying Content-Length" case on the theory that it would
+    /// distinguish a real streaming implementation from one that trusts the
+    /// header. On HTTP/1.1 it does not, and this test records why rather than
+    /// leaving the case looking untested: `Content-Length` **is** the framing, so
+    /// hyper hands us exactly the declared ten bytes and the surplus is never
+    /// part of this response at all. There is nothing for the size limit to
+    /// reject, because nothing oversized is ever delivered.
+    ///
+    /// The case that genuinely exercises the limit is a chunked body, which
+    /// declares no length — see `endless_chunked_body_is_stopped_by_the_streaming_limit`.
+    #[tokio::test]
+    async fn undersized_content_length_is_framed_by_the_declared_length() {
+        let (cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            read_request_head(&mut tls).await;
+            let _ = tls
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n")
+                .await;
+            let mut body = b"0123456789".to_vec();
+            body.extend(std::iter::repeat_n(b'z', 512 * 1024));
+            let _ = tls.write_all(&body).await;
+            let _ = tls.flush().await;
+        });
+
+        let client = build_client(HttpClientConfig {
+            extra_root_certificates: vec![cert_pem],
+            max_response_bytes: 4096,
+            request_timeout: Duration::from_secs(10),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let response = client
+            .send(HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap())
+            .await
+            .unwrap();
+
+        // Exactly the declared length, and none of the surplus.
+        assert_eq!(response.body(), b"0123456789");
+        assert!(response.body().len() <= 4096);
     }
 
     /// A body trickled forever must hit the whole-request deadline.
@@ -2185,6 +2256,32 @@ mod tests {
         );
         // It is not UTF-8, so the string accessor declines rather than corrupting.
         assert_eq!(response.header_str("etag"), None);
+    }
+
+    /// `header_str` must accept all valid UTF-8, not just visible ASCII.
+    ///
+    /// `HeaderValue::to_str` rejects anything outside printable ASCII, so it
+    /// would return `None` for a perfectly good "café" — contradicting the
+    /// documented "None only if absent or not UTF-8".
+    #[test]
+    fn header_str_accepts_non_ascii_utf8() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-label",
+            HeaderValue::from_bytes("café".as_bytes()).unwrap(),
+        );
+        headers.insert("x-binary", HeaderValue::from_bytes(b"\xC3\x28").unwrap());
+        let response = HttpResponse {
+            status: 200,
+            headers,
+            body: Vec::new(),
+        };
+
+        assert_eq!(response.header_str("x-label"), Some("café"));
+        assert_eq!(response.header("x-label"), Some("café".as_bytes()));
+        // Genuinely not UTF-8: declines rather than corrupting.
+        assert_eq!(response.header_str("x-binary"), None);
+        assert_eq!(response.header("x-binary"), Some(&b"\xC3\x28"[..]));
     }
 
     #[test]
