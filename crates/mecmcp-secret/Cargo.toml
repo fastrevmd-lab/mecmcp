@@ -1,0 +1,20 @@
+[package]
+name        = "mecmcp-secret"
+description = "Vendor-neutral outbound credential type and hardened loader for mechub MCP servers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustix    = { workspace = true }
+thiserror = { workspace = true }
+zeroize   = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
