@@ -19,7 +19,17 @@ mecmcp-secret = { version = "0.3.7", path = "../mecmcp-secret" }
 # how aws-lc-rs got linked into a ring build and broke TLS before — see the note
 # in mecmcp-transport/Cargo.toml. A consumer must install a CryptoProvider;
 # `HttpClient::new` checks and reports that rather than letting reqwest panic.
-reqwest       = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
+# No "http2". Two hazards live in that stack and neither is ours to fix:
+#   * hyper 1.11 `DecodedLength::sub_if` (body/length.rs:73) does an unchecked
+#     `*known -= amt`, so an h2 peer declaring Content-Length: 10 and sending a
+#     larger DATA frame underflows it — a panic under overflow checks, a wrap in
+#     release.
+#   * h2's `Error: Display` renders a GOAWAY frame's `debug_data` (error.rs:191),
+#     which is arbitrary peer-controlled bytes, straight into our error chain.
+# HTTP/1.1 with pooling is ample for management-plane API calls, so the whole
+# protocol is left out rather than defended against. Revisit when hyper fixes
+# the subtraction.
+reqwest       = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 # Direct dependency only to detect a missing process-wide CryptoProvider.
 # Deliberately no provider feature here either, for the same reason.
 rustls        = { version = "0.23", default-features = false, features = ["std"] }
