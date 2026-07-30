@@ -26,6 +26,41 @@ impl OutboundSecret {
     }
 }
 
+/// The bytes of a file that may contain credentials. Zeroized on drop.
+///
+/// Implements neither `Clone`, `Debug`, `Display`, nor `Serialize`, exactly as
+/// [`OutboundSecret`] does, so it cannot reach a log by accident.
+///
+/// A plain `Zeroizing<Vec<u8>>` would not do: it forwards `Vec`'s `Debug`, so a
+/// single `tracing::debug!(?bytes)` — or a `#[derive(Debug)]` on any struct
+/// holding one — prints the whole file. The documents this reader is for include
+/// `devices.json`, which carries device credentials in plaintext.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct SecretBytes(Vec<u8>);
+
+impl SecretBytes {
+    /// Expose the bytes for parsing.
+    ///
+    /// Named to be conspicuous at call sites and greppable in review, matching
+    /// [`OutboundSecret::expose`].
+    #[must_use]
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Number of bytes read.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the file was empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Limits applied when loading a secret.
 #[derive(Debug, Clone, Copy)]
 pub struct SecretLimits {
@@ -98,14 +133,11 @@ impl Default for FileLimits {
 /// use std::path::Path;
 ///
 /// let bytes = read_hardened_file(Path::new("/etc/example/tokens.json"), FileLimits::default())?;
-/// // Parse `&bytes` with whatever the caller uses; nothing has been altered.
+/// // Parse `bytes.expose()` with whatever the caller uses; nothing was altered.
 /// assert!(!bytes.is_empty());
 /// # Ok::<(), mecmcp_secret::SecretError>(())
 /// ```
-pub fn read_hardened_file(
-    path: &Path,
-    limits: FileLimits,
-) -> Result<Zeroizing<Vec<u8>>, SecretError> {
+pub fn read_hardened_file(path: &Path, limits: FileLimits) -> Result<SecretBytes, SecretError> {
     #[cfg(unix)]
     {
         read_hardened_file_unix(path, limits)
@@ -344,7 +376,7 @@ fn load_from_file_unix(path: &Path, limits: SecretLimits) -> Result<OutboundSecr
     )?;
 
     // Convert to String, zeroizing the bytes on error
-    let mut value = match String::from_utf8(bytes.to_vec()) {
+    let mut value = match String::from_utf8(bytes.expose().to_vec()) {
         Ok(text) => text,
         Err(error) => {
             // Recover and zeroize the buffer
@@ -378,10 +410,7 @@ fn load_from_file_unix(path: &Path, limits: SecretLimits) -> Result<OutboundSecr
 /// Unix hardened read: open once with `O_NOFOLLOW`, validate the descriptor,
 /// read from that same descriptor.
 #[cfg(unix)]
-fn read_hardened_file_unix(
-    path: &Path,
-    limits: FileLimits,
-) -> Result<Zeroizing<Vec<u8>>, SecretError> {
+fn read_hardened_file_unix(path: &Path, limits: FileLimits) -> Result<SecretBytes, SecretError> {
     use rustix::fs::{Mode, OFlags, fstat, open};
     use rustix::io::Errno;
     use std::io::Read;
@@ -481,7 +510,7 @@ fn read_hardened_file_unix(
         });
     }
 
-    Ok(bytes)
+    Ok(SecretBytes(std::mem::take(&mut bytes)))
 }
 
 /// Non-Unix fallback: path-based checks, advisory only.
@@ -502,7 +531,7 @@ fn load_from_file_non_unix(
         },
     )?;
 
-    let mut value = match String::from_utf8(bytes.to_vec()) {
+    let mut value = match String::from_utf8(bytes.expose().to_vec()) {
         Ok(text) => text,
         Err(error) => {
             let mut recovered = error.into_bytes();
@@ -535,7 +564,7 @@ fn load_from_file_non_unix(
 fn read_hardened_file_fallback(
     path: &Path,
     limits: FileLimits,
-) -> Result<Zeroizing<Vec<u8>>, SecretError> {
+) -> Result<SecretBytes, SecretError> {
     use std::io::Read;
 
     let metadata = std::fs::symlink_metadata(path).map_err(|source| SecretError::FileIo {
@@ -864,6 +893,15 @@ mod tests {
         use std::io::Write;
         use std::path::PathBuf;
 
+        /// `unwrap_err` will not compile against `SecretBytes` — it has no
+        /// `Debug`, which is the whole point of the type.
+        fn expect_error(result: Result<SecretBytes, SecretError>) -> SecretError {
+            match result {
+                Err(error) => error,
+                Ok(_) => panic!("expected an error, got a successful read"),
+            }
+        }
+
         fn write_file(dir: &tempfile::TempDir, name: &str, bytes: &[u8], mode: u32) -> PathBuf {
             let path = dir.path().join(name);
             let mut file = std::fs::File::create(&path).unwrap();
@@ -885,7 +923,7 @@ mod tests {
             let path = write_file(&dir, "doc.json", content, 0o600);
 
             let bytes = read_hardened_file(&path, FileLimits::default()).unwrap();
-            assert_eq!(bytes.as_slice(), content, "trailing newline must survive");
+            assert_eq!(bytes.expose(), content, "trailing newline must survive");
         }
 
         /// Unlike `load_from_file`, arbitrary bytes are allowed.
@@ -896,7 +934,7 @@ mod tests {
             let path = write_file(&dir, "blob.bin", content, 0o600);
 
             let bytes = read_hardened_file(&path, FileLimits::default()).unwrap();
-            assert_eq!(bytes.as_slice(), content);
+            assert_eq!(bytes.expose(), content);
         }
 
         /// An empty document is not an error here, though it is for a secret.
@@ -917,7 +955,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             for mode in [0o640, 0o604, 0o666] {
                 let path = write_file(&dir, &format!("m{mode:o}.json"), b"{}", mode);
-                let error = read_hardened_file(&path, FileLimits::default()).unwrap_err();
+                let error = expect_error(read_hardened_file(&path, FileLimits::default()));
                 assert!(
                     matches!(error, SecretError::FilePermissions { .. }),
                     "mode {mode:o} should be rejected, got {error:?}"
@@ -933,7 +971,7 @@ mod tests {
             let link = dir.path().join("link.json");
             std::os::unix::fs::symlink(&target, &link).unwrap();
 
-            let error = read_hardened_file(&link, FileLimits::default()).unwrap_err();
+            let error = expect_error(read_hardened_file(&link, FileLimits::default()));
             assert!(
                 matches!(error, SecretError::FileIsSymlink { .. }),
                 "got {error:?}"
@@ -944,7 +982,7 @@ mod tests {
         #[test]
         fn rejects_non_regular_file() {
             let dir = tempfile::tempdir().unwrap();
-            let error = read_hardened_file(dir.path(), FileLimits::default()).unwrap_err();
+            let error = expect_error(read_hardened_file(dir.path(), FileLimits::default()));
             assert!(
                 matches!(
                     error,
@@ -963,7 +1001,7 @@ mod tests {
             assert_eq!(read_hardened_file(&at_limit, limits).unwrap().len(), 64);
 
             let over = write_file(&dir, "over.json", &[b'x'; 65], 0o600);
-            let error = read_hardened_file(&over, limits).unwrap_err();
+            let error = expect_error(read_hardened_file(&over, limits));
             assert!(
                 matches!(error, SecretError::FileTooLarge { limit: 64, .. }),
                 "got {error:?}"
@@ -982,6 +1020,27 @@ mod tests {
                 "a token or inventory document grows with the deployment"
             );
             assert!(FileLimits::default().max_bytes > SecretLimits::default().max_bytes * 100);
+        }
+
+        /// The returned buffer must not be printable.
+        ///
+        /// A `Zeroizing<Vec<u8>>` forwards `Vec`'s `Debug`, so one
+        /// `tracing::debug!(?bytes)` would have dumped a `devices.json` — device
+        /// passwords included — into the logs. This is a compile-time property,
+        /// so the test is the commented line: uncommenting it must not compile.
+        #[test]
+        fn secret_bytes_is_not_printable() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_file(&dir, "doc.json", b"{\"password\":\"hunter2\"}", 0o600);
+            let bytes = read_hardened_file(&path, FileLimits::default()).unwrap();
+
+            // println!("{bytes:?}");   // must not compile: no Debug
+            // println!("{bytes}");     // must not compile: no Display
+            // let copy = bytes.clone(); // must not compile: no Clone
+
+            // Reaching the bytes has to be deliberate and greppable.
+            assert!(bytes.expose().starts_with(b"{"));
+            assert_eq!(bytes.len(), 22);
         }
 
         /// `load_from_file` still applies the secret-specific rules on top.
