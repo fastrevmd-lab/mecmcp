@@ -19,16 +19,25 @@ mecmcp-secret = { version = "0.3.7", path = "../mecmcp-secret" }
 # how aws-lc-rs got linked into a ring build and broke TLS before — see the note
 # in mecmcp-transport/Cargo.toml. A consumer must install a CryptoProvider;
 # `HttpClient::new` checks and reports that rather than letting reqwest panic.
-# No "http2". Two hazards live in that stack and neither is ours to fix:
-#   * hyper 1.11 `DecodedLength::sub_if` (body/length.rs:73) does an unchecked
-#     `*known -= amt`, so an h2 peer declaring Content-Length: 10 and sending a
-#     larger DATA frame underflows it — a panic under overflow checks, a wrap in
-#     release.
-#   * h2's `Error: Display` renders a GOAWAY frame's `debug_data` (error.rs:191),
-#     which is arbitrary peer-controlled bytes, straight into our error chain.
-# HTTP/1.1 with pooling is ample for management-plane API calls, so the whole
-# protocol is left out rather than defended against. Revisit when hyper fixes
-# the subtraction.
+# No "http2", and `.http1_only()` on the builder — the builder call is the
+# guarantee, since a Cargo feature unifies back on from anywhere in the
+# consumer's graph.
+#
+# The reason is narrower than an earlier version of this comment claimed, and the
+# correction is worth keeping. h2 renders a GOAWAY frame's `debug_data`
+# (h2-0.4.15/src/error.rs:191) into the error chain; that is by design, not an h2
+# bug, and this crate now bounds and sanitises causes rather than relying on the
+# protocol being absent (#181).
+#
+# The other reason originally given does NOT hold: hyper's unchecked
+# `*known -= amt` in `DecodedLength::sub_if` (hyper-1.11.0/src/body/length.rs:73)
+# is real code but unreachable, because h2 validates Content-Length against DATA
+# frames with `checked_sub` and resets the stream first
+# (h2-0.4.15/src/proto/streams/stream.rs:340, proto/streams/recv.rs:695).
+#
+# HTTP/1.1 stays, on its own merits: management-plane API calls do not need
+# multiplexing, and a protocol not compiled in is a protocol that cannot surprise
+# us.
 reqwest       = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 # Direct dependency only to detect a missing process-wide CryptoProvider.
 # Deliberately no provider feature here either, for the same reason.

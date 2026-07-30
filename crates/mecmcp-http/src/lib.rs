@@ -37,11 +37,14 @@
 //!   for secret headers and bearer auth, keeping values out of logging paths.
 //! - **One wire attempt per `send`**: reqwest's default protocol-NACK retry is
 //!   turned off, so a replayable POST cannot be resent behind the caller's back.
-//! - **HTTP/1.1 only**: the HTTP/2 stack is not compiled in. See the note in
-//!   `Cargo.toml` — hyper 1.11 underflows on an h2 peer that lies about
-//!   `Content-Length`, and h2 renders peer-controlled GOAWAY debug data into
-//!   the error chain. Neither is this crate's to fix, so the protocol is left
-//!   out rather than defended against.
+//! - **HTTP/1.1 only**: enforced by `.http1_only()`, with the `http2` feature
+//!   also left off. Management-plane API calls do not need multiplexing, and a
+//!   protocol that is not compiled in cannot surprise us. See the note in
+//!   `Cargo.toml`, which also records a claim from an earlier version of this
+//!   decision that turned out not to hold.
+//! - **Error causes are bounded and inert**: some links in an error's source
+//!   chain are chosen by the peer, so they are truncated and stripped of control
+//!   characters before they can reach a log.
 //!
 //! ## The consumer installs the crypto provider
 //!
@@ -603,34 +606,88 @@ async fn read_body_within_limit(
     Ok(body)
 }
 
-/// Render an error together with its source chain.
+/// Longest text taken from any single error cause.
+const MAX_CAUSE_BYTES: usize = 256;
+/// Longest description built from a whole chain.
+const MAX_DESCRIPTION_BYTES: usize = 1024;
+/// Most causes walked, so a cyclic or pathological chain cannot spin.
+const MAX_CAUSES: usize = 8;
+
+/// Render an error together with its source chain, bounded and made inert.
 ///
 /// `reqwest::Error`'s `Display` prints only the top-level kind — after
 /// `without_url()` that is the bare string "error sending request" — while the
-/// actionable cause (DNS failure, connection refused, certificate not trusted,
-/// protocol error) sits in the source chain. Without this, every transport
-/// failure looks identical in the logs.
+/// actionable cause (DNS failure, connection refused, certificate not trusted)
+/// sits in the source chain. Without walking it, every transport failure looks
+/// identical in the logs.
 ///
-/// The chain is bounded: a cyclic or pathological chain must not spin here.
-/// Only reqwest's own `Display` carries the request URL, and that is stripped
-/// before this is called, so walking the causes adds no disclosure.
+/// **Some links in that chain are chosen by the peer.** h2 renders a GOAWAY
+/// frame's `debug_data` verbatim (`h2/src/error.rs:191`), and nothing stops a
+/// future transitive layer doing the same. Concatenating them raw would let a
+/// hostile endpoint forge log lines with newlines, drive a terminal with escape
+/// sequences, and write unbounded volume. So every cause is truncated, the whole
+/// description is truncated, and control characters are replaced before anything
+/// is emitted. Removing HTTP/2 took away the known source, not the class.
+///
+/// Only reqwest's own `Display` carries the request URL, and that is stripped by
+/// `without_url()` before this is called.
 fn describe_with_causes(error: &dyn std::error::Error) -> String {
-    const MAX_CAUSES: usize = 8;
-
-    let mut description = error.to_string();
+    let mut description = sanitize_cause(&error.to_string());
     let mut source = error.source();
+
     for _ in 0..MAX_CAUSES {
         let Some(cause) = source else { break };
-        let text = cause.to_string();
+        if description.len() >= MAX_DESCRIPTION_BYTES {
+            description.push_str(" [...]");
+            break;
+        }
+
+        let text = sanitize_cause(&cause.to_string());
         // Skip a cause that merely restates its parent, which hyper and io
         // layers do often enough to be noisy.
-        if !description.contains(&text) {
+        if !text.is_empty() && !description.contains(&text) {
             description.push_str(": ");
             description.push_str(&text);
         }
         source = cause.source();
     }
+
+    truncate_on_char_boundary(&mut description, MAX_DESCRIPTION_BYTES);
     description
+}
+
+/// Bound one cause and strip anything that could act on a log reader.
+///
+/// Control characters become `.` rather than being dropped, so the size of what
+/// the peer sent stays visible. `\r` and `\n` matter most — they are how a
+/// forged log line is injected — but C0 and C1 escapes can drive a terminal, so
+/// the whole class goes.
+fn sanitize_cause(raw: &str) -> String {
+    let mut text: String = raw
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '.'
+            } else {
+                character
+            }
+        })
+        .collect();
+    truncate_on_char_boundary(&mut text, MAX_CAUSE_BYTES);
+    text
+}
+
+/// Truncate to at most `limit` bytes without splitting a character.
+fn truncate_on_char_boundary(text: &mut String, limit: usize) {
+    if text.len() <= limit {
+        return;
+    }
+    let mut cut = limit;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    text.push_str("...");
 }
 
 /// Headers that describe how the body is framed on the wire.
@@ -2452,6 +2509,80 @@ mod tests {
                 .any(|window| window == expected.as_slice()),
             "If-Match did not carry the original bytes"
         );
+    }
+
+    /// A cause chosen by the peer must not be able to act on a log reader.
+    #[test]
+    fn error_causes_are_bounded_and_inert() {
+        #[derive(Debug)]
+        struct Hostile(String, Option<Box<Hostile>>);
+        impl std::fmt::Display for Hostile {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+        impl std::error::Error for Hostile {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1
+                    .as_ref()
+                    .map(|inner| inner.as_ref() as &(dyn std::error::Error + 'static))
+            }
+        }
+
+        // A GOAWAY debug_data payload is arbitrary peer bytes. This is what one
+        // would look like if it were trying to forge a log line and repaint a
+        // terminal.
+        let injected = Hostile(
+            "goaway\r\n2026-07-30 ERROR forged log line\r\n\u{1b}[31mred\u{1b}[0m".to_owned(),
+            None,
+        );
+        let outer = Hostile("error sending request".to_owned(), Some(Box::new(injected)));
+
+        let rendered = describe_with_causes(&outer);
+        assert!(!rendered.contains('\n'), "newline survived: {rendered:?}");
+        assert!(
+            !rendered.contains('\r'),
+            "carriage return survived: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "escape sequence survived: {rendered:?}"
+        );
+        // The text is still there, just inert, so the log stays diagnosable.
+        assert!(rendered.contains("forged log line"), "{rendered}");
+        assert!(rendered.contains("error sending request"), "{rendered}");
+    }
+
+    #[test]
+    fn a_huge_cause_is_truncated() {
+        #[derive(Debug)]
+        struct Huge(String);
+        impl std::fmt::Display for Huge {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+        impl std::error::Error for Huge {}
+
+        let rendered = describe_with_causes(&Huge("A".repeat(100_000)));
+        assert!(
+            rendered.len() <= MAX_DESCRIPTION_BYTES + 8,
+            "description was {} bytes",
+            rendered.len()
+        );
+        assert!(rendered.ends_with("..."), "{rendered}");
+    }
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        // Multi-byte characters straddling the cut point must not produce
+        // invalid UTF-8 — the function operates on a String, so a naive
+        // byte truncate would panic.
+        for filler in ["é", "€", "🔒"] {
+            let mut text = filler.repeat(2000);
+            truncate_on_char_boundary(&mut text, MAX_CAUSE_BYTES);
+            assert!(text.len() <= MAX_CAUSE_BYTES + 3, "{}", text.len());
+        }
     }
 
     #[test]
