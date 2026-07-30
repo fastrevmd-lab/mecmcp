@@ -199,7 +199,7 @@ impl HttpRequest {
         // can still carry a readable password, and this error embeds the raw
         // string because there is nothing structured left to report.
         let parsed = reqwest::Url::parse(url).map_err(|error| HttpError::InvalidUrl {
-            url: redact_unparsed_url(url),
+            url: SafeUrl::from_unparsed(url),
             detail: error.to_string(),
         })?;
 
@@ -215,7 +215,7 @@ impl HttpRequest {
 
         if parsed.scheme() != "https" {
             return Err(HttpError::InsecureScheme {
-                url: safe_url(&parsed),
+                url: SafeUrl::from_parsed(&parsed),
                 scheme: parsed.scheme().to_owned(),
             });
         }
@@ -224,7 +224,7 @@ impl HttpRequest {
         // is a defensive backstop rather than the primary check.
         if parsed.host_str().is_none_or(str::is_empty) {
             return Err(HttpError::MissingHost {
-                url: safe_url(&parsed),
+                url: SafeUrl::from_parsed(&parsed),
             });
         }
 
@@ -368,44 +368,127 @@ impl std::fmt::Debug for HttpRequest {
         let header_names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
         f.debug_struct("HttpRequest")
             .field("method", &self.method.as_str())
-            .field("url", &safe_url(&self.url))
+            .field("url", &SafeUrl::from_parsed(&self.url))
             .field("headers", &header_names)
             .field("body_bytes", &self.body.as_ref().map_or(0, Vec::len))
             .finish()
     }
 }
 
-/// Render a parsed URL for a diagnostic, with every credential-bearing part
-/// removed.
+/// A URL that has been rendered safe to put in a diagnostic.
 ///
-/// Strips userinfo, drops the fragment outright, and replaces every query
-/// **value** with `[redacted]` while keeping the keys. Query strings are not
-/// merely metadata: signed URLs and query-based API keys are ordinary practice,
-/// and a fragment carries the token in an OAuth implicit flow. Keys are kept
-/// because `?api_key=[redacted]&page=[redacted]` is still useful to read, and
-/// costs nothing.
-fn safe_url(url: &reqwest::Url) -> String {
-    let mut safe = url.clone();
-    // Both setters fail only for cannot-be-a-base URLs, which carry no userinfo.
-    let _ = safe.set_username("");
-    let _ = safe.set_password(None);
-    safe.set_fragment(None);
+/// The chokepoint for URL disclosure. The **only** ways to obtain one are
+/// [`SafeUrl::from_parsed`] and [`SafeUrl::from_unparsed`], both of which strip
+/// every credential-bearing component. There is deliberately no `From<String>`,
+/// no constructor accepting arbitrary text, and no public field — so an error
+/// variant that holds a `SafeUrl` cannot be handed an unredacted URL by
+/// construction, rather than by everyone remembering to call a helper.
+///
+/// That distinction is the whole reason this type exists. Five consecutive
+/// review rounds found a credential escaping through a URL in a diagnostic:
+/// userinfo, then input with no `://`, then query and fragment, then fragment on
+/// the unparsed path, then a bare token used as a query *key* and an `@` inside
+/// a query defeating the userinfo scan. Every one was a place that formatted a
+/// URL without going through the redaction. Making that unrepresentable is the
+/// only fix that generalises.
+///
+/// # Examples
+/// ```
+/// # use mecmcp_http::{HttpRequest, Method, HttpError};
+/// let error = HttpRequest::new(Method::Get, "https://u:pw@host/?api_key=SEKRIT")
+///     .unwrap_err();
+/// assert!(!error.to_string().contains("SEKRIT"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeUrl(String);
 
-    if safe.query().is_some() {
-        let keys: Vec<String> = safe
-            .query_pairs()
-            .map(|(key, _)| key.into_owned())
-            .collect();
-        let mut pairs = safe.query_pairs_mut();
-        pairs.clear();
-        for key in keys {
-            pairs.append_pair(&key, "[redacted]");
+impl SafeUrl {
+    /// Build from a successfully parsed URL.
+    ///
+    /// Strips userinfo, and drops the query and fragment entirely — replacing
+    /// them with a marker that records only that they were present.
+    ///
+    /// The query is dropped whole rather than having its values blanked. An
+    /// earlier version kept the keys, on the grounds that
+    /// `?api_key=[redacted]&page=[redacted]` reads usefully; that was wrong,
+    /// because an API taking a bare token (`?TOKEN`) parses the credential *as*
+    /// the key. Structure is not worth a credential.
+    #[must_use]
+    pub fn from_parsed(url: &reqwest::Url) -> Self {
+        let mut safe = url.clone();
+        // Both setters fail only for cannot-be-a-base URLs, which carry no
+        // userinfo.
+        let _ = safe.set_username("");
+        let _ = safe.set_password(None);
+
+        let had_query = safe.query().is_some();
+        let had_fragment = safe.fragment().is_some();
+        safe.set_query(None);
+        safe.set_fragment(None);
+
+        let mut rendered = safe.to_string();
+        if had_query {
+            rendered.push_str("?[redacted]");
         }
-        drop(pairs);
+        if had_fragment {
+            rendered.push_str("#[redacted]");
+        }
+        Self(rendered)
     }
 
-    safe.to_string()
+    /// Build from a string that could **not** be parsed as a URL.
+    ///
+    /// Deliberately blunt, because malformed input offers no structure to trust.
+    /// The query and fragment are cut first, and only then is the remaining head
+    /// scanned for userinfo — that order matters: an `@` inside a query (an
+    /// `?email=user@example.com` parameter) would otherwise anchor the userinfo
+    /// scan past the `?` and leave everything after it exposed.
+    ///
+    /// Over-redacting an error message costs a little debuggability.
+    /// Under-redacting costs a credential.
+    #[must_use]
+    pub fn from_unparsed(raw: &str) -> Self {
+        let (head, tail_present) = match raw.find(CREDENTIAL_BEARING_DELIMITERS) {
+            Some(cut) => (&raw[..cut], true),
+            None => (raw, false),
+        };
+
+        let mut rendered = match head.rfind('@') {
+            Some(at) => format!("[redacted]{}", &head[at..]),
+            None => head.to_owned(),
+        };
+        if tail_present {
+            rendered.push_str("[redacted]");
+        }
+        Self(rendered)
+    }
+
+    /// The redacted text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
+
+impl std::fmt::Display for SafeUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Every URL component that can carry a credential.
+///
+/// Enumerated in one place on purpose. Anything added here must be honoured by
+/// both [`SafeUrl::from_parsed`] and [`SafeUrl::from_unparsed`].
+///
+/// - **userinfo** (`user:pass@`) — HTTP basic auth in a URL.
+/// - **query** (`?api_key=…`, or a bare `?TOKEN`) — signed URLs and query-based
+///   API keys. The key is as sensitive as the value.
+/// - **fragment** (`#access_token=…`) — the OAuth implicit flow.
+///
+/// The path is deliberately *not* redacted: it is structural, and losing it
+/// would leave errors with nothing actionable in them.
+const CREDENTIAL_BEARING_DELIMITERS: [char; 2] = ['?', '#'];
 
 /// Render an error together with its source chain.
 ///
@@ -435,43 +518,6 @@ fn describe_with_causes(error: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     description
-}
-
-/// Every URL component that can carry a credential.
-///
-/// Enumerated in one place on purpose. This was fixed three times in a row as
-/// separate one-off cases — userinfo, then query, then fragment — because each
-/// fix addressed the instance rather than the category. Anything added here must
-/// be handled by both [`safe_url`] and [`redact_unparsed_url`].
-///
-/// - **userinfo** (`user:pass@`) — HTTP basic auth in a URL.
-/// - **query** (`?api_key=…`) — signed URLs and query-based API keys.
-/// - **fragment** (`#access_token=…`) — the OAuth implicit flow.
-///
-/// The path is deliberately *not* redacted: it is structural, and losing it
-/// would leave errors with nothing actionable in them.
-const CREDENTIAL_BEARING_DELIMITERS: [char; 2] = ['?', '#'];
-
-/// Redact a URL string that could **not** be parsed.
-///
-/// Deliberately blunt: everything up to and including the last `@` is dropped,
-/// and everything from the first `?` or `#` onward with it. A structural scan
-/// cannot be trusted here, because the input is by definition malformed —
-/// `https//user:secret@example.com` (one missing colon) has no `://` for an
-/// authority to start after, and an earlier version of this function returned
-/// such input verbatim and leaked the password.
-///
-/// Over-redacting an error message costs a little debuggability. Under-redacting
-/// costs a credential. So when in doubt this cuts.
-fn redact_unparsed_url(raw: &str) -> String {
-    let after_userinfo = match raw.rfind('@') {
-        Some(at) => format!("[redacted]{}", &raw[at..]),
-        None => raw.to_owned(),
-    };
-    match after_userinfo.find(CREDENTIAL_BEARING_DELIMITERS) {
-        Some(cut) => format!("{}[redacted]", &after_userinfo[..cut]),
-        None => after_userinfo,
-    }
 }
 
 /// Parse and validate a header name.
@@ -673,7 +719,7 @@ impl HttpClient {
     pub async fn send(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
         // Computed once, up front: every error below reports it, and the raw URL
         // must never reach any of them.
-        let url_for_diagnostics = safe_url(&request.url);
+        let url_for_diagnostics = SafeUrl::from_parsed(&request.url);
 
         // Whole-request deadline covering permit acquisition and send
         let result = tokio::time::timeout(self.request_timeout, async {
@@ -831,24 +877,24 @@ pub enum HttpError {
     /// The URL is invalid.
     #[error("invalid URL '{url}': {detail}")]
     InvalidUrl {
-        /// The URL that was invalid.
-        url: String,
+        /// The URL that was invalid, redacted. See [`SafeUrl`].
+        url: SafeUrl,
         /// Detail about what was invalid.
         detail: String,
     },
     /// The URL uses an insecure scheme (not HTTPS).
     #[error("insecure scheme '{scheme}' in URL '{url}' (only https:// is allowed)")]
     InsecureScheme {
-        /// The URL that was rejected.
-        url: String,
+        /// The URL that was rejected, redacted. See [`SafeUrl`].
+        url: SafeUrl,
         /// The scheme that was used.
         scheme: String,
     },
     /// The URL has no host component.
     #[error("URL '{url}' has no host component")]
     MissingHost {
-        /// The URL that was rejected.
-        url: String,
+        /// The URL that was rejected, redacted. See [`SafeUrl`].
+        url: SafeUrl,
     },
     /// The URL embeds credentials in its userinfo component.
     ///
@@ -908,8 +954,8 @@ pub enum HttpError {
     /// The request timed out.
     #[error("request to {url} timed out after {timeout:?}")]
     Timeout {
-        /// The target, with userinfo, query values and fragment removed.
-        url: String,
+        /// The target, redacted. See [`SafeUrl`].
+        url: SafeUrl,
         /// The timeout that was exceeded.
         timeout: Duration,
     },
@@ -928,16 +974,16 @@ pub enum HttpError {
     /// trust, or the connect timeout expiring.
     #[error("failed to connect to {url}: {detail}")]
     Connect {
-        /// The target, with userinfo, query values and fragment removed.
-        url: String,
+        /// The target, redacted. See [`SafeUrl`].
+        url: SafeUrl,
         /// Detail about the connection failure.
         detail: String,
     },
     /// The underlying HTTP request failed.
     #[error("request to {url} failed: {detail}")]
     RequestFailed {
-        /// The target, with userinfo, query values and fragment removed.
-        url: String,
+        /// The target, redacted. See [`SafeUrl`].
+        url: SafeUrl,
         /// Detail about the failure.
         detail: String,
     },
@@ -1450,6 +1496,10 @@ mod tests {
             // Unparseable *and* fragment-bearing: no '@', no '?' to cut at.
             format!("https://exa mple.com/#access_token={CANARY}"),
             format!("https://exa mple.com/?api_key={CANARY}"),
+            // A bare query token: the credential is the query *key*.
+            format!("https://exa mple.com/?{CANARY}"),
+            // An '@' inside the query, which defeated an earlier userinfo scan.
+            format!("https://exa mple.com/?email=user@example.com&api_key={CANARY}"),
         ];
 
         for candidate in candidates {
@@ -1463,55 +1513,66 @@ mod tests {
     }
 
     #[test]
-    fn safe_url_strips_userinfo_query_values_and_fragment() {
+    fn safe_url_from_parsed_drops_userinfo_query_and_fragment() {
         let url =
             reqwest::Url::parse("https://user:pw@example.com/a/b?api_key=SEKRIT&page=2#tok=SEKRIT")
                 .unwrap();
-        let rendered = safe_url(&url);
+        let rendered = SafeUrl::from_parsed(&url).to_string();
 
         assert!(!rendered.contains("SEKRIT"), "{rendered}");
         assert!(!rendered.contains("pw"), "{rendered}");
         assert!(!rendered.contains("user"), "{rendered}");
-        // Structure worth keeping: host, path, and the query *keys*.
+        // Query keys go too: an API taking a bare token parses the credential
+        // *as* the key.
+        assert!(!rendered.contains("api_key"), "{rendered}");
         assert!(rendered.contains("example.com/a/b"), "{rendered}");
-        assert!(rendered.contains("api_key=%5Bredacted%5D"), "{rendered}");
-        assert!(rendered.contains("page=%5Bredacted%5D"), "{rendered}");
+        assert!(rendered.contains("?[redacted]"), "{rendered}");
+        assert!(rendered.contains("#[redacted]"), "{rendered}");
+
+        // A bare query token is a key with an empty value.
+        let bare = reqwest::Url::parse("https://example.com/?SEKRIT").unwrap();
+        let rendered = SafeUrl::from_parsed(&bare).to_string();
+        assert!(
+            !rendered.contains("SEKRIT"),
+            "bare query token leaked: {rendered}"
+        );
 
         // An '@' in the path is not userinfo and must survive untouched.
         let plain = reqwest::Url::parse("https://example.com/mail@host").unwrap();
-        assert_eq!(safe_url(&plain), "https://example.com/mail@host");
+        assert_eq!(
+            SafeUrl::from_parsed(&plain).as_str(),
+            "https://example.com/mail@host"
+        );
     }
 
     #[test]
-    fn redact_unparsed_url_cuts_at_the_last_at_sign() {
-        // The case that leaked: one missing colon, so there is no "://" for an
-        // authority to begin after.
+    fn safe_url_from_unparsed_cuts_the_tail_before_scanning_for_userinfo() {
+        // The ordering bug: an '@' inside the query would anchor the userinfo
+        // scan past the '?', leaving everything after it exposed.
+        let rendered =
+            SafeUrl::from_unparsed("https://exa mple.com/?email=user@example.com&api_key=SEKRIT")
+                .to_string();
+        assert!(
+            !rendered.contains("SEKRIT"),
+            "query survived the '@' scan: {rendered}"
+        );
+
         assert_eq!(
-            redact_unparsed_url("https//user:secret@example.com"),
+            SafeUrl::from_unparsed("https//user:secret@example.com").as_str(),
             "[redacted]@example.com"
         );
-        // Deliberately blunt on malformed input — over-redaction is the safe
-        // direction.
         assert_eq!(
-            redact_unparsed_url("garbage user:secret@host/path"),
-            "[redacted]@host/path"
-        );
-        assert_eq!(redact_unparsed_url("no-at-sign-here"), "no-at-sign-here");
-        // A query credential has no '@' to cut at, so the query goes too.
-        assert_eq!(
-            redact_unparsed_url("https//host?api_key=SEKRIT"),
+            SafeUrl::from_unparsed("https//host?api_key=SEKRIT").as_str(),
             "https//host[redacted]"
         );
-        // Fragment credentials — the OAuth implicit flow — have neither an '@'
-        // nor a '?' to cut at.
+        // Fragment credentials — the OAuth implicit flow.
         assert_eq!(
-            redact_unparsed_url("https://exa mple.com/#access_token=SEKRIT"),
+            SafeUrl::from_unparsed("https://exa mple.com/#access_token=SEKRIT").as_str(),
             "https://exa mple.com/[redacted]"
         );
-        // Both present: the earliest delimiter wins.
         assert_eq!(
-            redact_unparsed_url("h ttp://host/p?a=SEKRIT#b=SEKRIT"),
-            "h ttp://host/p[redacted]"
+            SafeUrl::from_unparsed("no-at-sign-here").as_str(),
+            "no-at-sign-here"
         );
     }
 
