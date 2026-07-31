@@ -1,0 +1,21 @@
+[package]
+name        = "mecmcp-job"
+description = "Vendor-neutral cancellable job polling with capped backoff for mechub MCP servers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mecmcp-device = { version = "0.3.7", path = "../mecmcp-device" }
+thiserror     = { workspace = true }
+tokio         = { version = "1", features = ["time"] }
+tokio-util    = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "test-util", "time"] }
