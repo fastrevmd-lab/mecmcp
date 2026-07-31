@@ -5,12 +5,7 @@ use crate::{
     digest::{compute_approval_digest, compute_waiver_digest, validate_fingerprint},
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    fs,
-    io::{Read, Write},
-    path::Path,
-};
+use std::{collections::BTreeMap, fs, io::Write, path::Path};
 
 /// Error type for persistence operations.
 #[derive(Debug)]
@@ -61,57 +56,28 @@ struct OnDiskChangesetState {
 /// Returns an error if the file does not exist, has incorrect permissions,
 /// contains an unsupported version, or fails validation.
 pub fn read_state(path: &Path, max_state_bytes: u64) -> Result<ChangesetState, PersistenceError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
+    // One implementation of the symlink / regular-file / mode / owner / size
+    // checks, shared with `mecmcp-auth`, `mecmcp-inventory` and `mecmcp-secret`
+    // (#173, #187). The copy that used to live here called `symlink_metadata`
+    // and then `File::open` — two operations on the same path, so the file could
+    // be swapped in between. Opening once with `O_NOFOLLOW` and validating the
+    // descriptor closes that race.
+    //
+    // The caller's `max_state_bytes` is honoured rather than
+    // `FileLimits::default()`: 608's live state file is already 26 KB and grows
+    // with change-set history, and the product owns that budget.
+    let limits = mecmcp_secret::FileLimits {
+        max_bytes: usize::try_from(max_state_bytes).unwrap_or(usize::MAX),
+    };
+    let bytes = mecmcp_secret::read_hardened_file(path, limits).map_err(|error| {
         PersistenceError::new(format!(
-            "could not inspect changeset state '{}': {error}",
+            "could not read changeset state '{}': {error}",
             path.display()
         ))
     })?;
+    let bytes = bytes.expose();
 
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(PersistenceError::new(
-            "changeset state must be a regular non-symlink file",
-        ));
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.mode() & 0o077 != 0 {
-            return Err(PersistenceError::new(
-                "changeset state must not permit group/other access",
-            ));
-        }
-        let owner = metadata.uid();
-        let effective = rustix::process::geteuid().as_raw();
-        if owner != effective && owner != 0 {
-            return Err(PersistenceError::new(format!(
-                "changeset state owner uid {owner} is neither effective uid {effective} nor root"
-            )));
-        }
-    }
-
-    if metadata.len() > max_state_bytes {
-        return Err(PersistenceError::new(format!(
-            "changeset state exceeds {max_state_bytes} bytes"
-        )));
-    }
-
-    let file = fs::File::open(path).map_err(|error| {
-        PersistenceError::new(format!(
-            "could not open changeset state '{}': {error}",
-            path.display()
-        ))
-    })?;
-
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(max_state_bytes + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            PersistenceError::new(format!("could not read changeset state: {error}"))
-        })?;
-
-    let on_disk: OnDiskChangesetState = serde_json::from_slice(&bytes)
+    let on_disk: OnDiskChangesetState = serde_json::from_slice(bytes)
         .map_err(|error| PersistenceError::new(format!("invalid changeset state JSON: {error}")))?;
 
     if on_disk.version != 1 && on_disk.version != 2 {
