@@ -136,6 +136,16 @@ pub enum ConfigError {
         /// The rejected multiplier.
         multiplier: u32,
     },
+    /// The deadline cannot be represented as an instant on this platform.
+    ///
+    /// Reported rather than quietly clamped: substituting a shorter budget while
+    /// still naming the configured one in the error would make the crate lie
+    /// about the guarantee it exists to provide.
+    #[error("PollConfig::deadline ({deadline:?}) is too large to anchor as an instant")]
+    DeadlineUnrepresentable {
+        /// The rejected deadline.
+        deadline: Duration,
+    },
     /// The starting interval already exceeds the ceiling.
     #[error(
         "PollConfig::first_interval ({first_interval:?}) exceeds max_interval ({max_interval:?})"
@@ -256,9 +266,15 @@ where
     // top of the probe — slides the effective deadline outwards. `timeout_at`
     // cannot drift, because the instant never moves.
     let started = tokio::time::Instant::now();
-    let expires_at = started
-        .checked_add(config.deadline)
-        .unwrap_or_else(|| started + Duration::from_secs(u32::MAX.into()));
+    let Some(expires_at) = started.checked_add(config.deadline) else {
+        // Do not substitute a shorter budget. An earlier version fell back to
+        // ~136 years here, which would have returned `DeadlineExceeded` long
+        // before the configured deadline while still reporting the configured
+        // value — the crate lying about its own guarantee.
+        return Err(PollError::Config(ConfigError::DeadlineUnrepresentable {
+            deadline: config.deadline,
+        }));
+    };
     let mut interval = config.first_interval;
     let mut attempts: u32 = 0;
 
@@ -661,6 +677,37 @@ mod tests {
             probes.load(Ordering::SeqCst),
             0,
             "a bad config still probed"
+        );
+    }
+
+    /// A deadline too large to anchor must be reported, not quietly shortened.
+    #[tokio::test(start_paused = true)]
+    async fn an_unrepresentable_deadline_is_rejected_not_clamped() {
+        let token = CancellationToken::new();
+        let probes = AtomicU32::new(0);
+
+        let config = PollConfig {
+            deadline: Duration::MAX,
+            ..fast()
+        };
+        let error = poll_until_ready(&token, config, |_| async {
+            probes.fetch_add(1, Ordering::SeqCst);
+            Ok::<Probe<()>, ProbeError>(Probe::Pending)
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            PollError::Config(ConfigError::DeadlineUnrepresentable {
+                deadline: Duration::MAX,
+            }),
+            "an unanchorable deadline must be named, not replaced"
+        );
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "it polled on a bad config"
         );
     }
 
