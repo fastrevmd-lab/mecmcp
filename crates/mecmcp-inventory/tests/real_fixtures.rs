@@ -20,6 +20,28 @@
 use mecmcp_inventory::Inventory;
 use serde::Deserialize;
 
+/// Stage a vendored fixture at mode 0600, then return its path.
+///
+/// Since #173 `FileInventory::load` refuses a group- or world-readable
+/// inventory. Repo files are 0644 and git records only the exec bit, so a
+/// committed `chmod` would not survive a fresh clone. Staging keeps these tests
+/// loading the real fixtures through the real `load` path.
+fn staged(dir: &tempfile::TempDir, fixture: &str) -> std::path::PathBuf {
+    let body = std::fs::read(fixture).unwrap_or_else(|e| panic!("read {fixture}: {e}"));
+    let name = std::path::Path::new(fixture)
+        .file_name()
+        .expect("fixture has a file name");
+    let path = dir.path().join(name);
+    std::fs::write(&path, body).expect("stage fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod fixture");
+    }
+    path
+}
+
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 struct JunosDevice {
     ip: String,
@@ -69,12 +91,14 @@ struct PanosDevice {
 
 #[test]
 fn loads_real_junos_fixture() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let junos_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/junos-devices.json"
     );
     let inv: mecmcp_inventory::FileInventory<JunosDevice, JunosPolicy> =
-        mecmcp_inventory::FileInventory::load(junos_path).expect("load junos fixture");
+        mecmcp_inventory::FileInventory::load(staged(&dir, junos_path))
+            .expect("load junos fixture");
     let names = inv.names();
 
     assert!(
@@ -88,12 +112,14 @@ fn loads_real_junos_fixture() {
 
 #[test]
 fn loads_real_panos_fixture() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let panos_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/panos-devices.json"
     );
     let inv: mecmcp_inventory::FileInventory<PanosDevice, ()> =
-        mecmcp_inventory::FileInventory::load(panos_path).expect("load panos fixture");
+        mecmcp_inventory::FileInventory::load(staged(&dir, panos_path))
+            .expect("load panos fixture");
     let names = inv.names();
 
     assert!(
@@ -144,8 +170,9 @@ fn trait_methods_work_through_dyn() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/junos-devices.json"
     );
+    let dir = tempfile::tempdir().expect("tempdir");
     let concrete: mecmcp_inventory::FileInventory<JunosDevice, JunosPolicy> =
-        mecmcp_inventory::FileInventory::load(path).expect("load junos fixture");
+        mecmcp_inventory::FileInventory::load(staged(&dir, path)).expect("load junos fixture");
 
     let inventory: &dyn mecmcp_inventory::Inventory<JunosDevice, JunosPolicy> = &concrete;
 

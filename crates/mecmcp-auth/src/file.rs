@@ -197,19 +197,29 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
     }
 
     fn read_store(path: &Path) -> Result<(TokenStore<G>, u32), FileError> {
-        check_permissions(path)?;
-        let body = std::fs::read_to_string(path).map_err(|source| FileError::Io {
+        // One implementation of the symlink / regular-file / mode / owner / size
+        // checks, shared with `mecmcp-inventory` and `mecmcp-secret` (#173). The
+        // copy that used to live here validated by path and then reopened by
+        // name, so it carried a TOCTOU race, enforced no ownership, rejected no
+        // symlinks, and bounded nothing.
+        let bytes = mecmcp_secret::read_hardened_file(path, token_file_limits())
+            .map_err(|source| map_secret_error(path, &source))?;
+
+        // Borrowed, not copied: `SecretBytes` zeroizes on drop, and a `String`
+        // built from it would be a second unzeroized copy of the token file.
+        let body = std::str::from_utf8(bytes.expose()).map_err(|_| FileError::Permissions {
             path: path.to_path_buf(),
-            source,
+            detail: "file is not valid UTF-8".to_owned(),
         })?;
+
         let document: TokenDocument<G> =
-            serde_json::from_str(&body).map_err(|source| FileError::Parse {
+            serde_json::from_str(body).map_err(|source| FileError::Parse {
                 path: path.to_path_buf(),
                 source,
             })?;
 
         check_supported_version(document.version, path)?;
-        Self::reject_dropped_grant_fields(path, &body, &document)?;
+        Self::reject_dropped_grant_fields(path, body, &document)?;
 
         let store = TokenStore::try_new(document.tokens).map_err(|source| FileError::Store {
             path: path.to_path_buf(),
@@ -662,73 +672,37 @@ fn validate_references<G: Grant>(
     Ok(())
 }
 
-/// Reject group- or world-accessible token files, with an operator-facing
-/// explanation naming the file's owner and mode and the calling process's uid.
-#[cfg(unix)]
-fn check_permissions(path: &Path) -> Result<(), FileError> {
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::fs::PermissionsExt;
-
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(FileError::Permissions {
-                path: path.to_path_buf(),
-                detail: format!(
-                    "permission denied reading metadata; this process runs as uid {}",
-                    rustix_getuid()
-                ),
-            });
-        }
-        Err(source) => {
-            return Err(FileError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
-
-    if !metadata.is_file() {
-        return Err(FileError::Permissions {
-            path: path.to_path_buf(),
-            detail: "not a regular file".to_owned(),
-        });
-    }
-
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(FileError::Permissions {
-            path: path.to_path_buf(),
-            detail: format!(
-                "mode {mode:04o} is group- or world-accessible (owner uid {}, this process uid {}); \
-                 run: chmod 600 {}",
-                metadata.uid(),
-                rustix_getuid(),
-                path.display()
-            ),
-        });
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_permissions(path: &Path) -> Result<(), FileError> {
-    if !path.is_file() {
-        return Err(FileError::Permissions {
-            path: path.to_path_buf(),
-            detail: "not a regular file".to_owned(),
-        });
-    }
-    Ok(())
-}
-
-/// The calling process's real uid.
+/// Size ceiling for a token file.
 ///
-/// `rustix` rather than `libc::getuid`, which is an `unsafe extern` call that
-/// `unsafe_code = "forbid"` rejects.
-#[cfg(unix)]
-fn rustix_getuid() -> u32 {
-    rustix::process::getuid().as_raw()
+/// Deliberately **not** `SecretLimits`, which is sized for a single credential
+/// at 8 KiB. LXC 609's live `tokens.json` measured 7614 bytes, so the secret
+/// ceiling would have left that server a handful of tokens from refusing to
+/// start — presenting as corruption rather than as a limit.
+fn token_file_limits() -> mecmcp_secret::FileLimits {
+    mecmcp_secret::FileLimits::default()
+}
+
+/// Translate a hardening failure into this crate's existing error surface.
+///
+/// No new `FileError` variant: both shipping servers pin this crate and may
+/// match exhaustively, so the public enum stays as it is (#173).
+fn map_secret_error(path: &Path, source: &mecmcp_secret::SecretError) -> FileError {
+    use mecmcp_secret::SecretError;
+
+    match source {
+        // A genuine I/O failure stays I/O.
+        SecretError::FileIo { .. } => FileError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(source.to_string()),
+        },
+        // Everything else is a refusal to trust the file, which is what
+        // `Permissions` has always meant here. `SecretError`'s own messages
+        // already name the mode, owner and remedy.
+        _ => FileError::Permissions {
+            path: path.to_path_buf(),
+            detail: source.to_string(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -755,6 +729,79 @@ mod tests {
             }
         ]
     }"#;
+
+    /// Capabilities gained by adopting the shared reader (#173).
+    ///
+    /// The previous local check validated by path and reopened by name — a
+    /// TOCTOU race — and enforced no ownership, rejected no symlinks, and bounded
+    /// nothing.
+    #[allow(clippy::unwrap_used)]
+    mod hardening {
+        use super::*;
+
+        #[cfg(unix)]
+        #[test]
+        fn rejects_a_symlinked_token_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let real = write_file(&dir, TWO_TOKENS);
+            let link = dir.path().join("link.json");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+
+            let error = TokenStoreFile::<NoGrant>::load(&link).unwrap_err();
+            assert!(
+                matches!(error, FileError::Permissions { .. }),
+                "a symlinked token file must be refused, got {error:?}"
+            );
+            assert!(error.to_string().contains("symlink"), "{error}");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn still_rejects_group_or_world_accessible() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_file(&dir, TWO_TOKENS);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            let error = TokenStoreFile::<NoGrant>::load(&path).unwrap_err();
+            assert!(
+                matches!(error, FileError::Permissions { .. }),
+                "got {error:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_a_token_file_over_the_size_limit() {
+            let dir = tempfile::tempdir().unwrap();
+            let limit = token_file_limits().max_bytes;
+            // Valid JSON so the rejection can only come from the size bound.
+            let padding = " ".repeat(limit + 1);
+            let path = write_file(&dir, &format!("{TWO_TOKENS}{padding}"));
+
+            let error = TokenStoreFile::<NoGrant>::load(&path).unwrap_err();
+            assert!(
+                matches!(error, FileError::Permissions { .. }),
+                "got {error:?}"
+            );
+            assert!(error.to_string().contains("limit is"), "{error}");
+        }
+
+        /// The limit must stay document-sized. 609's live `tokens.json` is 7614
+        /// bytes; `SecretLimits`' 8192 ceiling would have been a live hazard.
+        #[test]
+        fn size_limit_is_document_sized() {
+            assert!(token_file_limits().max_bytes >= 1024 * 1024);
+        }
+
+        /// A real token file from LXC 609 is 7614 bytes and must load.
+        #[test]
+        fn a_file_the_size_of_the_live_one_loads() {
+            let dir = tempfile::tempdir().unwrap();
+            let padding = " ".repeat(7614usize.saturating_sub(TWO_TOKENS.len()));
+            let path = write_file(&dir, &format!("{TWO_TOKENS}{padding}"));
+            assert!(TokenStoreFile::<NoGrant>::load(&path).is_ok());
+        }
+    }
 
     fn write_file(dir: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
         let path = dir.path().join("tokens.json");
