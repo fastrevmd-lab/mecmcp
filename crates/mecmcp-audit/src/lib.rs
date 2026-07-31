@@ -14,7 +14,7 @@ pub mod testutil;
 pub use attribution::{
     ActorType, AgentIdentity, Attribution, Principal, Tier, TokenVerifiedFields,
 };
-pub use init::{AuditConfig, AuditFormat, init_tracing};
+pub use init::{AuditConfig, AuditFileSink, AuditFormat, FileHandle, init_tracing};
 pub use redact::{
     AuditRedaction, FieldTransform, REDACTABLE_FIELDS, RedactError, active, install, render,
 };
