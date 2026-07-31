@@ -249,7 +249,16 @@ where
 {
     config.validate()?;
 
+    // One absolute anchor for the whole operation, not a relative budget
+    // recomputed each pass. A relative `timeout(remaining, ...)` starts counting
+    // when the timer is created, so any work between measuring `remaining` and
+    // the future's first await — a descheduled task, or synchronous work at the
+    // top of the probe — slides the effective deadline outwards. `timeout_at`
+    // cannot drift, because the instant never moves.
     let started = tokio::time::Instant::now();
+    let expires_at = started
+        .checked_add(config.deadline)
+        .unwrap_or_else(|| started + Duration::from_secs(u32::MAX.into()));
     let mut interval = config.first_interval;
     let mut attempts: u32 = 0;
 
@@ -260,16 +269,12 @@ where
             return Err(PollError::Cancelled { attempts });
         }
 
-        let remaining = config
-            .deadline
-            .checked_sub(started.elapsed())
-            .filter(|left| !left.is_zero());
-        let Some(remaining) = remaining else {
+        if tokio::time::Instant::now() >= expires_at {
             return Err(PollError::DeadlineExceeded {
                 attempts,
                 deadline: config.deadline,
             });
-        };
+        }
 
         attempts = attempts.saturating_add(1);
 
@@ -279,7 +284,7 @@ where
         // wins even if the deadline expires in the same poll.
         let probed = select_cancel_raw::<_, _, CancelMarker>(
             token,
-            tokio::time::timeout(remaining, probe(attempts)),
+            tokio::time::timeout_at(expires_at, probe(attempts)),
         )
         .await;
 
@@ -298,19 +303,19 @@ where
 
         // Never wait past the deadline: sleeping beyond it would report the
         // timeout later than it happened and hold the caller for no reason.
-        let left = config
-            .deadline
-            .checked_sub(started.elapsed())
-            .filter(|left| !left.is_zero());
-        let Some(left) = left else {
+        // Anchored the same way, so the wake instant cannot drift either.
+        let now = tokio::time::Instant::now();
+        if now >= expires_at {
             return Err(PollError::DeadlineExceeded {
                 attempts,
                 deadline: config.deadline,
             });
-        };
-        let wait = interval.min(left);
+        }
+        let wake_at = now
+            .checked_add(interval)
+            .map_or(expires_at, |wake| wake.min(expires_at));
 
-        if select_cancel_raw::<_, _, CancelMarker>(token, tokio::time::sleep(wait))
+        if select_cancel_raw::<_, _, CancelMarker>(token, tokio::time::sleep_until(wake_at))
             .await
             .is_err()
         {
@@ -332,10 +337,24 @@ fn next_interval(current: Duration, multiplier: u32, ceiling: Duration) -> Durat
         .as_nanos()
         .saturating_mul(u128::from(multiplier))
         .min(ceiling.as_nanos());
-    // The `min` above bounds this by `ceiling`, so the conversion cannot fail;
-    // `unwrap_or` keeps the panic path out of the code rather than relying on
-    // that reasoning staying true.
-    u64::try_from(grown).map_or(ceiling, Duration::from_nanos)
+    duration_from_nanos(grown)
+}
+
+/// Build a `Duration` from a `u128` nanosecond count without losing range.
+///
+/// `Duration::from_nanos` takes a `u64`, which tops out around 584 years — well
+/// short of what `Duration` itself holds. Converting through `u64` therefore
+/// discarded any interval above that and silently substituted the ceiling, so a
+/// `multiplier` of 1 could jump straight to `max_interval` instead of standing
+/// still. Absurd as a poll interval, but it is the kind of quiet substitution
+/// that is worth not having.
+fn duration_from_nanos(nanos: u128) -> Duration {
+    const NANOS_PER_SEC: u128 = 1_000_000_000;
+
+    let seconds = nanos / NANOS_PER_SEC;
+    // Always below 1e9, so `Duration::new` cannot carry and cannot panic.
+    let remainder = u32::try_from(nanos % NANOS_PER_SEC).unwrap_or(0);
+    u64::try_from(seconds).map_or(Duration::MAX, |seconds| Duration::new(seconds, remainder))
 }
 
 #[cfg(test)]
@@ -574,6 +593,27 @@ mod tests {
 
         let clamped = next_interval(Duration::from_secs(1), u32::MAX, Duration::from_secs(30));
         assert_eq!(clamped, Duration::from_secs(30), "the ceiling must hold");
+    }
+
+    /// Above `u64::MAX` nanoseconds — roughly 584 years — the interval must
+    /// still be itself, not silently become the ceiling.
+    ///
+    /// `Duration::from_nanos` takes a `u64`, so converting through it discarded
+    /// this whole range. A `multiplier` of 1 would then jump straight to
+    /// `max_interval` rather than standing still.
+    #[test]
+    fn an_interval_beyond_u64_nanoseconds_is_preserved() {
+        let beyond = Duration::from_secs(600 * 365 * 24 * 60 * 60); // ~600 years
+        assert!(
+            beyond.as_nanos() > u128::from(u64::MAX),
+            "the fixture must actually exceed the u64 nanosecond range"
+        );
+
+        let unchanged = next_interval(beyond, 1, Duration::MAX);
+        assert_eq!(unchanged, beyond, "multiplier 1 must not move the interval");
+
+        // And the round-trip itself is exact.
+        assert_eq!(duration_from_nanos(beyond.as_nanos()), beyond);
     }
 
     #[tokio::test(start_paused = true)]
