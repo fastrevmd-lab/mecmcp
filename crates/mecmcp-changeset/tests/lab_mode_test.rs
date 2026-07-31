@@ -36,6 +36,7 @@ fn setup_coordinator(lab_mode: bool) -> (tempfile::TempDir, ChangesetCoordinator
         max_actions_per_set: 64,
         max_state_bytes: 8 * 1024 * 1024,
         max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
     };
     let approval_ttl = Duration::from_secs(15 * 60);
 
@@ -160,6 +161,7 @@ async fn test_waived_record_is_distinguishable_from_genuine_approval() {
         max_actions_per_set: 64,
         max_state_bytes: 8 * 1024 * 1024,
         max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
     };
     let approval_ttl = Duration::from_secs(15 * 60);
 
@@ -270,6 +272,7 @@ async fn test_waived_record_round_trips() {
         max_actions_per_set: 64,
         max_state_bytes: 8 * 1024 * 1024,
         max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
     };
     let approval_ttl = Duration::from_secs(15 * 60);
 
@@ -328,6 +331,7 @@ async fn test_tampering_waived_record_by_inserting_approver_is_rejected() {
         max_actions_per_set: 64,
         max_state_bytes: 8 * 1024 * 1024,
         max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
     };
     let approval_ttl = Duration::from_secs(15 * 60);
 
@@ -478,6 +482,7 @@ async fn test_waiving_after_ttl_expires_is_refused() {
         max_actions_per_set: 64,
         max_state_bytes: 8 * 1024 * 1024,
         max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
     };
 
     // Use a 1-second approval TTL so it expires immediately

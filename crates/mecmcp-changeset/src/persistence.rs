@@ -231,10 +231,15 @@ pub fn write_state(
         .operations
         .values()
         .any(|op| op.attribution.is_some() || op.rollback_deadline_unix.is_some());
-    let change_sets_need_v2 = state
-        .change_sets
-        .values()
-        .any(|cs| !cs.policy_signature.is_empty());
+    let change_sets_need_v2 = state.change_sets.values().any(|cs| {
+        // `targets` and `preview` join `policy_signature` here for the same
+        // reason: `ChangeSetRecord` is `deny_unknown_fields`, so a binary that
+        // predates a field rejects the WHOLE file rather than the one record,
+        // and rolling a release back is a documented deploy step. A deployment
+        // using none of them keeps producing version-1 files the older binary
+        // reads — which is what LXC 608 is doing today.
+        !cs.policy_signature.is_empty() || !cs.targets.is_empty() || cs.preview.is_some()
+    });
     // A non-HTTPS endpoint is a version-2 record too. It is not a new *field*,
     // but the version-1 reader validated `starts_with("https://")` and would
     // reject the whole file over it — which is the same practical consequence

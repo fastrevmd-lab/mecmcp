@@ -85,6 +85,8 @@ fn make_change_set_record(id: &str, state: ChangeSetState) -> ChangeSetRecord {
         expires_at_unix: 0,
         operation_id: None,
         policy_signature: String::new(),
+        targets: Vec::new(),
+        preview: None,
     }
 }
 
@@ -362,6 +364,7 @@ async fn test_capacity_limits_from_operation_limits() {
         max_actions_per_set: 64,
         max_change_set_bytes: 256 * 1024,
         max_state_bytes: 8 * 1024 * 1024,
+        ..OperationLimits::default()
     };
     let approval_ttl = Duration::from_secs(900);
 
@@ -410,6 +413,7 @@ async fn test_terminal_records_evicted_at_capacity() {
         max_actions_per_set: 64,
         max_change_set_bytes: 256 * 1024,
         max_state_bytes: 8 * 1024 * 1024,
+        ..OperationLimits::default()
     };
     let approval_ttl = Duration::from_secs(900);
 

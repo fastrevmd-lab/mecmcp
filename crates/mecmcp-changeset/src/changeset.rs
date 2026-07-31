@@ -148,6 +148,10 @@ impl ChangesetCoordinator {
             expires_at_unix: now.saturating_add(self.approval_ttl().as_secs()),
             operation_id: None,
             policy_signature,
+            // Single-target, so both stay absent and the record still writes as
+            // version 1 — which is what LXC 608 is running.
+            targets: Vec::new(),
+            preview: None,
         };
 
         self.insert_change_set(record.clone()).await?;

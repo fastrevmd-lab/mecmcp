@@ -43,6 +43,36 @@ pub fn change_set_digest<A: Serialize>(
     Ok(format!("sha256:{}", digest_hex(&canonical)))
 }
 
+/// Computes a change-set digest that also binds a multi-target set.
+///
+/// A change set whose target list can be edited without invalidating the digest
+/// is not digest-bound, so the targets have to be inside it.
+///
+/// **An empty `targets` produces the byte-identical digest
+/// [`change_set_digest`] does**, by serialising the original four-tuple
+/// unchanged rather than a five-tuple with an empty list. That is not a
+/// micro-optimisation: LXC 608 holds ten change sets whose stored digests were
+/// computed by the old function, and any change to the single-target encoding
+/// invalidates all of them on the next approval.
+///
+/// # Errors
+///
+/// Returns an error if the inputs cannot be serialized.
+pub fn change_set_digest_with_targets<A: Serialize>(
+    owner: &str,
+    device: &str,
+    fingerprint: &str,
+    actions: &[A],
+    targets: &[String],
+) -> Result<String, DigestError> {
+    if targets.is_empty() {
+        return change_set_digest(owner, device, fingerprint, actions);
+    }
+    let canonical = serde_json::to_vec(&(owner, device, fingerprint, actions, targets))
+        .map_err(|_| DigestError::new("actions", "could not encode change-set digest"))?;
+    Ok(format!("sha256:{}", digest_hex(&canonical)))
+}
+
 /// Validates a digest value.
 ///
 /// The format must be `sha256:<64 lowercase hex>`.
