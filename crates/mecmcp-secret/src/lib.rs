@@ -417,10 +417,17 @@ fn read_hardened_file_inner(path: &Path, limits: FileLimits) -> Result<SecretByt
     use rustix::io::Errno;
     use std::io::Read;
 
-    // Open with NOFOLLOW to reject symlinks at open time
+    // NOFOLLOW rejects symlinks at open time.
+    //
+    // NONBLOCK is what stops a FIFO from hanging the caller: `open(O_RDONLY)` on
+    // a named pipe with no writer blocks forever, and the file-type check that
+    // would reject it happens *after* the open. A path-based `symlink_metadata`
+    // could not hang, so this became reachable when callers moved to the
+    // descriptor-based reader. On a regular file NONBLOCK has no effect, and a
+    // non-regular file is rejected below before anything is read.
     let fd = open(
         path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
     )
     .map_err(|error| {
@@ -481,12 +488,17 @@ fn read_hardened_file_inner(path: &Path, limits: FileLimits) -> Result<SecretByt
         });
     }
 
-    // Check size before reading (cheap early reject)
-    #[allow(clippy::cast_possible_truncation)]
-    if stat.st_size > limits.max_bytes as i64 {
+    // Check size before reading (cheap early reject).
+    //
+    // Compared in `u64`, never by casting the limit to `i64`: `usize::MAX as
+    // i64` is -1, so every file would have looked oversized and a large
+    // caller-supplied limit inverted the check entirely. The `allow` that used
+    // to sit here was hiding exactly that. Found by mutation testing in #187.
+    let declared = u64::try_from(stat.st_size).unwrap_or(0);
+    if declared > limits.max_bytes as u64 {
         return Err(SecretError::FileTooLarge {
             path: path.to_path_buf(),
-            actual: stat.st_size as u64,
+            actual: declared,
             limit: limits.max_bytes,
         });
     }
@@ -494,9 +506,13 @@ fn read_hardened_file_inner(path: &Path, limits: FileLimits) -> Result<SecretByt
     // Read from the SAME fd, bounded by max_bytes + 1. The size check above is
     // only an early reject: the file can grow between fstat and read, so the
     // bound here is the enforcement.
+    //
+    // `saturating_add`, because a caller passing `usize::MAX` would otherwise
+    // overflow — a panic in debug, and in release a wrap to `take(0)` that reads
+    // nothing and reports the file as empty. Found by mutation testing in #187.
     let file = std::fs::File::from(fd);
     let mut bytes = Zeroizing::new(Vec::new());
-    file.take((limits.max_bytes + 1) as u64)
+    file.take(limits.max_bytes.saturating_add(1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|source| SecretError::FileIo {
             path: path.to_path_buf(),
@@ -920,6 +936,66 @@ mod tests {
                 matches!(error, SecretError::FileTooLarge { limit: 64, .. }),
                 "got {error:?}"
             );
+        }
+
+        /// A FIFO must be rejected, not waited on.
+        ///
+        /// `open(O_RDONLY)` on a named pipe with no writer blocks forever, and
+        /// the file-type check happens after the open — so without `O_NONBLOCK`
+        /// a coordinator pointed at a FIFO hangs at startup instead of
+        /// reporting a bad path. The bound below is what makes a regression fail
+        /// rather than wedge the suite.
+        #[cfg(unix)]
+        #[test]
+        fn a_fifo_is_rejected_without_blocking() {
+            use std::sync::mpsc;
+
+            let dir = tempfile::tempdir().unwrap();
+            let fifo = dir.path().join("state.fifo");
+            let status = std::process::Command::new("mkfifo")
+                .arg("-m")
+                .arg("600")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo");
+            assert!(status.success(), "mkfifo failed");
+
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let outcome = read_hardened_file(&fifo, FileLimits::default());
+                let _ = tx.send(matches!(outcome, Err(SecretError::FileNotRegular { .. })));
+            });
+
+            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(rejected_as_non_regular) => {
+                    assert!(
+                        rejected_as_non_regular,
+                        "a FIFO must be rejected as non-regular"
+                    );
+                }
+                Err(_) => panic!("read_hardened_file blocked on a FIFO instead of rejecting it"),
+            }
+        }
+
+        /// `usize::MAX` must not overflow the read bound.
+        ///
+        /// `max_bytes + 1` panicked in debug and wrapped to `take(0)` in
+        /// release — reading nothing and reporting a perfectly good file as
+        /// empty. A caller deriving the limit from a `u64` config value can
+        /// reach this.
+        #[test]
+        fn an_enormous_limit_does_not_overflow_the_read_bound() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_file(&dir, "doc.json", b"{\"ok\":true}", 0o600);
+
+            let bytes = read_hardened_file(
+                &path,
+                FileLimits {
+                    max_bytes: usize::MAX,
+                },
+            )
+            .unwrap();
+            assert_eq!(bytes.expose(), b"{\"ok\":true}");
         }
 
         /// The default is document-sized, not secret-sized.
