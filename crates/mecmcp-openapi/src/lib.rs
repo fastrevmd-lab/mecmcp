@@ -117,6 +117,10 @@ pub fn expand_path(template: &str, params: &[(&str, &str)]) -> Result<String, Pa
     let mut rest = template;
 
     while let Some(open) = rest.find('{') {
+        // A `}` in the literal text before a placeholder is unmatched.
+        if rest[..open].contains('}') {
+            return Err(PathError::MalformedTemplate);
+        }
         out.push_str(&rest[..open]);
         let after = &rest[open + 1..];
         let Some(close) = after.find('}') else {
@@ -134,6 +138,11 @@ pub fn expand_path(template: &str, params: &[(&str, &str)]) -> Result<String, Pa
 
         out.push_str(&encode_segment(name, params[index].1)?);
         rest = &after[close + 1..];
+    }
+    // ... and so is one in the tail. `/v1/devices/{id}}` and `/v1/devices/id}`
+    // both used to sail through and put a stray brace on the wire.
+    if rest.contains('}') {
+        return Err(PathError::MalformedTemplate);
     }
     out.push_str(rest);
 
@@ -182,11 +191,21 @@ fn encode_segment(name: &str, value: &str) -> Result<String, PathError> {
         }
     }
 
-    // A literal `%` in the input is encoded to `%25`, so an already-encoded
-    // slash (`%2f`) becomes `%252f` on the wire and decodes back to the literal
-    // text `%2f` — one segment, never a separator. That is why the checks above
-    // can look at raw bytes only: no decoding happens downstream that this
-    // function did not produce.
+    // Raw bytes are not enough. An earlier version of this comment asserted that
+    // "no decoding happens downstream that this function did not produce" — an
+    // assumption about other people's infrastructure, stated as fact. It is
+    // wrong wherever an ingress proxy decodes and then the application decodes
+    // again: `%2f` leaves here as `%252f`, becomes `%2f` after the first decode,
+    // and `/` after the second. The parameter alters the path structure after
+    // all.
+    //
+    // So the value is decoded repeatedly until it stops changing, and rejected
+    // if any intermediate form is structural. That covers arbitrary decode
+    // depth instead of assuming one.
+    if let Some(error) = structural_after_decoding(name, value) {
+        return Err(error);
+    }
+
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if is_unreserved(byte) {
@@ -197,6 +216,72 @@ fn encode_segment(name: &str, value: &str) -> Result<String, PathError> {
         }
     }
     Ok(encoded)
+}
+
+/// Bytes that change a URL's structure rather than its content.
+fn is_structural(byte: u8) -> bool {
+    matches!(byte, b'/' | b'\\' | b'?' | b'#') || byte.is_ascii_control()
+}
+
+/// Detect a value that becomes structural once something downstream decodes it.
+///
+/// Decoding is applied repeatedly, because a request can pass through more than
+/// one decoder — a proxy and then the application is the ordinary case. Bounded
+/// at four rounds, which is far past any real topology and stops a crafted input
+/// from spinning here.
+fn structural_after_decoding(name: &str, value: &str) -> Option<PathError> {
+    const MAX_DECODE_ROUNDS: usize = 4;
+
+    let mut current = value.to_owned();
+    for _ in 0..MAX_DECODE_ROUNDS {
+        let decoded = percent_decode_lossy(&current);
+        if decoded == current {
+            return None;
+        }
+        if decoded.bytes().any(is_structural) {
+            return Some(PathError::SegmentBreak {
+                name: name.to_owned(),
+            });
+        }
+        if decoded == "." || decoded == ".." {
+            return Some(PathError::RelativeComponent {
+                name: name.to_owned(),
+            });
+        }
+        current = decoded;
+    }
+    // Still changing after four rounds: too many layers to reason about.
+    Some(PathError::SegmentBreak {
+        name: name.to_owned(),
+    })
+}
+
+/// Percent-decode one round, leaving invalid escapes as literal text.
+///
+/// Lossy on purpose: the question is only "could this become structural", and a
+/// malformed escape that a lenient decoder would pass through must be examined
+/// as that decoder would see it.
+fn percent_decode_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let pair = &bytes[index + 1..index + 3];
+            if let Some(byte) = std::str::from_utf8(pair)
+                .ok()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+            {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Bounds accepted by [`page`].
@@ -310,7 +395,12 @@ pub fn page(from: u64, size: u64, limits: PageLimits) -> Result<Page, PageError>
     // Checked in `u64`, where the operands already live, so the sum cannot wrap
     // before it is examined. Both are within `u32` by the checks above, so this
     // is defence against a future limits change rather than a live hazard.
-    if from.checked_add(size).is_none() {
+    // The exclusive end must fit the output width, not merely the input width.
+    // With `PageLimits` set to `u32::MAX`, `from + size` is representable in
+    // `u64` but not in `u32`, and a caller computing its next offset then wraps
+    // in release or panics in debug.
+    let end = from.checked_add(size);
+    if end.is_none_or(|end| end > u64::from(u32::MAX)) {
         return Err(PageError::WindowOverflow { from, size });
     }
 
@@ -383,26 +473,53 @@ mod tests {
         }
     }
 
-    /// An encoded slash must not survive as a separator.
+    /// An encoded separator is refused, at any decode depth.
     ///
-    /// `%2f` is encoded again to `%252f`, which decodes to the literal text
-    /// `%2f` — one segment. A server that decodes twice still cannot reach a
-    /// different endpoint.
+    /// The first version of this crate encoded `%2f` to `%252f` and reasoned
+    /// that one downstream decode yields the literal text `%2f`. That assumed
+    /// exactly one decoder. With an ingress proxy decoding and then the
+    /// application decoding, `%252f` becomes `%2f` becomes `/` — and the
+    /// parameter changes the path after all.
     #[test]
-    fn encoded_slashes_are_neutralised_not_passed_through() {
-        for value in ["%2f", "%2F", "%252f"] {
-            let path = expand_path("/v1/devices/{id}", &[("id", value)]).unwrap();
+    fn encoded_separators_are_refused_at_any_decode_depth() {
+        let escapes = [
+            "%2f", "%2F", // one decode away from '/'
+            "%252f", "%252F",   // two decodes away
+            "%25252f", // three
+            "%5c", "%5C", // backslash
+            "%3f", // query
+            "%23", // fragment
+            "%00", // NUL
+        ];
+
+        for value in escapes {
             assert!(
-                !path.contains("%2f") && !path.contains("%2F"),
-                "an encoded separator survived in {path}"
-            );
-            assert!(path.starts_with("/v1/devices/%25"), "got {path}");
-            assert_eq!(
-                path.matches('/').count(),
-                3,
-                "segment count changed: {path}"
+                expand_path("/v1/devices/{id}", &[("id", value)]).is_err(),
+                "{value} was accepted; it decodes to a structural character"
             );
         }
+    }
+
+    /// `%2e%2e` decodes to `..`, which climbs the hierarchy.
+    #[test]
+    fn encoded_dot_segments_are_refused() {
+        for value in ["%2e%2e", "%2E%2E", "%252e%252e"] {
+            assert!(
+                expand_path("/v1/a/{id}/b", &[("id", value)]).is_err(),
+                "{value} was accepted; it decodes to a relative component"
+            );
+        }
+    }
+
+    /// A literal `%` that never becomes structural is still allowed.
+    ///
+    /// The check is about what a value decodes *to*, not about banning a
+    /// character outright — over-rejecting is its own kind of wrong.
+    #[test]
+    fn a_harmless_percent_is_still_accepted() {
+        let path = expand_path("/v1/a/{id}", &[("id", "100%25done")]).unwrap();
+        assert!(path.starts_with("/v1/a/"), "got {path}");
+        assert_eq!(path.matches('/').count(), 3);
     }
 
     #[test]
@@ -506,6 +623,42 @@ mod tests {
             }
         }
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn an_unmatched_closing_brace_is_an_error() {
+        for template in ["/v1/devices/{id}}", "/v1/devices/id}", "/v1/}/{id}", "}"] {
+            assert_eq!(
+                expand_path(template, &[("id", "fw-01")]),
+                Err(PathError::MalformedTemplate),
+                "template {template:?} was accepted"
+            );
+        }
+    }
+
+    /// The window's exclusive end must fit the output width.
+    ///
+    /// At `u32::MAX` limits, `from + size` is representable in `u64` but not in
+    /// `u32`; a caller computing its next offset then wraps in release or panics
+    /// in debug.
+    #[test]
+    fn a_window_whose_end_exceeds_u32_is_refused() {
+        let limits = PageLimits {
+            max_size: u32::MAX,
+            max_from: u32::MAX,
+        };
+
+        let error = page(u64::from(u32::MAX), 1, limits).unwrap_err();
+        assert_eq!(
+            error,
+            PageError::WindowOverflow {
+                from: u64::from(u32::MAX),
+                size: 1,
+            }
+        );
+
+        // The largest representable window is still accepted.
+        assert!(page(u64::from(u32::MAX) - 1, 1, limits).is_ok());
     }
 
     #[test]
