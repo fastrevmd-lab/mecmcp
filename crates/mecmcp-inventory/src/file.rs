@@ -336,11 +336,19 @@ fn read_inventory_file(path: &Path) -> Result<mecmcp_secret::SecretBytes, Invent
             // crate and may match exhaustively, so the public enum is unchanged
             // (#173). A refusal to trust the file is reported as a
             // permission-denied I/O condition, which is what it is.
-            let kind = match source {
-                mecmcp_secret::SecretError::FileIo { .. } => std::io::ErrorKind::Other,
-                _ => std::io::ErrorKind::PermissionDenied,
-            };
-            InventoryError::IoError(std::io::Error::new(kind, source.to_string()))
+            match source {
+                // Move the original `io::Error` through rather than
+                // restringifying it. Callers branch on `kind()`, so a missing
+                // inventory must stay `NotFound` — flattening to `Other` would
+                // have them report a permissions problem for an absent file.
+                mecmcp_secret::SecretError::FileIo { source, .. } => {
+                    InventoryError::IoError(source)
+                }
+                other => InventoryError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    other.to_string(),
+                )),
+            }
         },
     )
 }
@@ -584,6 +592,20 @@ mod tests {
             assert!(matches!(error, InventoryError::IoError(_)), "{error:?}");
             // The already-loaded inventory is untouched by a failed reload.
             assert_eq!(inv.names(), vec!["r1"]);
+        }
+
+        /// A missing inventory must stay `NotFound`.
+        #[test]
+        fn a_missing_inventory_preserves_not_found() {
+            let dir = tempfile::tempdir().unwrap();
+            let missing = dir.path().join("absent.json");
+
+            let result: Result<FileInventory<JunosDevice, JunosPolicy>, _> =
+                FileInventory::load(&missing);
+            let Err(InventoryError::IoError(source)) = result else {
+                panic!("expected an IoError")
+            };
+            assert_eq!(source.kind(), std::io::ErrorKind::NotFound, "{source:?}");
         }
 
         /// The inventory limit is document-sized. 609 holds 34 devices in 6309

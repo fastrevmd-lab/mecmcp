@@ -203,13 +203,17 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
         // name, so it carried a TOCTOU race, enforced no ownership, rejected no
         // symlinks, and bounded nothing.
         let bytes = mecmcp_secret::read_hardened_file(path, token_file_limits())
-            .map_err(|source| map_secret_error(path, &source))?;
+            .map_err(|source| map_secret_error(path, source))?;
 
         // Borrowed, not copied: `SecretBytes` zeroizes on drop, and a `String`
         // built from it would be a second unzeroized copy of the token file.
-        let body = std::str::from_utf8(bytes.expose()).map_err(|_| FileError::Permissions {
+        // `Io`/`InvalidData`, not `Permissions`: nothing about the file's mode
+        // or owner is wrong. Reporting corruption as a permissions failure sends
+        // an operator to chmod a file that needs repairing. This is the
+        // classification the previous `read_to_string` produced.
+        let body = std::str::from_utf8(bytes.expose()).map_err(|source| FileError::Io {
             path: path.to_path_buf(),
-            detail: "file is not valid UTF-8".to_owned(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
         })?;
 
         let document: TokenDocument<G> =
@@ -686,21 +690,24 @@ fn token_file_limits() -> mecmcp_secret::FileLimits {
 ///
 /// No new `FileError` variant: both shipping servers pin this crate and may
 /// match exhaustively, so the public enum stays as it is (#173).
-fn map_secret_error(path: &Path, source: &mecmcp_secret::SecretError) -> FileError {
+fn map_secret_error(path: &Path, source: mecmcp_secret::SecretError) -> FileError {
     use mecmcp_secret::SecretError;
 
     match source {
-        // A genuine I/O failure stays I/O.
-        SecretError::FileIo { .. } => FileError::Io {
+        // The original `io::Error` is moved through, not restringified. Callers
+        // branch on `kind()` — a missing token file must stay `NotFound`, and
+        // flattening everything to `Other` would have them report a chmod
+        // problem for a path that does not exist.
+        SecretError::FileIo { source, .. } => FileError::Io {
             path: path.to_path_buf(),
-            source: std::io::Error::other(source.to_string()),
+            source,
         },
         // Everything else is a refusal to trust the file, which is what
         // `Permissions` has always meant here. `SecretError`'s own messages
         // already name the mode, owner and remedy.
-        _ => FileError::Permissions {
+        other => FileError::Permissions {
             path: path.to_path_buf(),
-            detail: source.to_string(),
+            detail: other.to_string(),
         },
     }
 }
@@ -784,6 +791,47 @@ mod tests {
                 "got {error:?}"
             );
             assert!(error.to_string().contains("limit is"), "{error}");
+        }
+
+        /// A missing file must stay `NotFound`.
+        ///
+        /// Callers branch on `kind()`. Flattening every I/O failure to `Other`
+        /// would have them report a chmod problem for a path that does not
+        /// exist.
+        #[test]
+        fn a_missing_file_preserves_not_found() {
+            let dir = tempfile::tempdir().unwrap();
+            let missing = dir.path().join("absent.json");
+
+            let error = TokenStoreFile::<NoGrant>::load(&missing).unwrap_err();
+            match error {
+                FileError::Io { source, .. } => {
+                    assert_eq!(source.kind(), std::io::ErrorKind::NotFound, "{source:?}");
+                }
+                other => panic!("expected Io/NotFound, got {other:?}"),
+            }
+        }
+
+        /// Corruption is not a permissions problem.
+        ///
+        /// A non-UTF-8 token file used to surface as `Io`/`InvalidData`.
+        /// Reporting it as `Permissions` would send an operator to chmod a file
+        /// that needs repairing.
+        #[test]
+        fn non_utf8_is_reported_as_invalid_data_not_permissions() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tokens.json");
+            std::fs::write(&path, b"\xC3\x28 not utf8").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+            let error = TokenStoreFile::<NoGrant>::load(&path).unwrap_err();
+            match error {
+                FileError::Io { source, .. } => {
+                    assert_eq!(source.kind(), std::io::ErrorKind::InvalidData, "{source:?}");
+                }
+                other => panic!("expected Io/InvalidData, got {other:?}"),
+            }
         }
 
         /// The limit must stay document-sized. 609's live `tokens.json` is 7614
