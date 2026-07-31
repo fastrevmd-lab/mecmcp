@@ -36,6 +36,7 @@ fn setup_coordinator() -> (tempfile::TempDir, ChangesetCoordinator) {
         max_actions_per_set: 64,
         max_state_bytes: 8 * 1024 * 1024,
         max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
     };
     let approval_ttl = Duration::from_secs(15 * 60);
 
@@ -193,6 +194,7 @@ async fn test_expired_change_set_transitions_on_status_poll() {
         max_actions_per_set: 64,
         max_state_bytes: 8 * 1024 * 1024,
         max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
     };
 
     // Use a 1-second approval TTL so it expires immediately
@@ -290,6 +292,7 @@ async fn test_approval_digest_tamper_detection_swap_approver() {
         max_actions_per_set: 64,
         max_state_bytes: 8 * 1024 * 1024,
         max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
     };
     let approval_ttl = Duration::from_secs(15 * 60);
 
@@ -360,6 +363,7 @@ async fn test_new_approval_has_approval_digest() {
         max_actions_per_set: 64,
         max_state_bytes: 8 * 1024 * 1024,
         max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
     };
     let approval_ttl = Duration::from_secs(15 * 60);
 

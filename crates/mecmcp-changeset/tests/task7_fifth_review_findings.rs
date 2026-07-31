@@ -441,6 +441,7 @@ async fn finding_2_operation_record_write_failure_returns_handle() {
         max_actions_per_set: 64,
         max_change_set_bytes: 1024 * 1024,
         max_state_bytes: 10 * 1024 * 1024,
+        ..OperationLimits::default()
     };
 
     let coordinator = ChangesetCoordinator::load(

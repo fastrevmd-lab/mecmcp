@@ -213,6 +213,133 @@ pub struct ChangeSetRecord {
     /// here stops the coordinator loading its own state file after an upgrade.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub policy_signature: String,
+    /// Additional targets when this change set spans more than one device.
+    ///
+    /// Sorted and unique, and **absent** on a single-target change set — which
+    /// is every change set both shipping servers create today. `device` remains
+    /// the field they read; use [`ChangeSetRecord::targets`] to ask once and get
+    /// the right answer either way.
+    ///
+    /// Absent rather than `[device]` for a reason: this type is
+    /// `deny_unknown_fields`, so a binary predating this field rejects the whole
+    /// state file if it appears. LXC 608's live file is version 1 and carries
+    /// none of it. See the version gate in `persistence.rs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
+    /// Preview artifact produced before applying, with its canonical digest.
+    ///
+    /// Absent when the product does not produce one, for the same
+    /// forward-compatibility reason as `targets`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<PreviewRecord>,
+}
+
+/// A preview of what a change set will do, bound to a digest.
+///
+/// The digest is what makes the preview evidence rather than decoration: an
+/// artifact edited in the state file no longer matches, and the mismatch is
+/// detectable without re-running the preview.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewRecord {
+    /// The vendor's own preview output, opaque here.
+    pub artifact: String,
+    /// `sha256:<64 lowercase hex>` over `artifact`.
+    pub digest: String,
+    /// Identifier of the job that produced the preview, when the API returns one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+}
+
+impl ChangeSetRecord {
+    /// Every device this change set applies to.
+    ///
+    /// Returns the multi-target set when present and `[device]` otherwise, so a
+    /// caller never has to know which shape it is reading. Junos and PAN-OS see
+    /// exactly one element today.
+    #[must_use]
+    pub fn targets(&self) -> Vec<String> {
+        if self.targets.is_empty() {
+            vec![self.device.clone()]
+        } else {
+            self.targets.clone()
+        }
+    }
+}
+
+/// A target set that cannot be used.
+///
+/// Hand-written rather than derived: this crate does not depend on `thiserror`,
+/// and matching `DigestError`'s shape keeps one error style across the module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetError {
+    /// The set was empty.
+    Empty,
+    /// A target name was empty.
+    EmptyName,
+    /// The set held a duplicate.
+    ///
+    /// A duplicate changes the digest without changing the meaning, which makes
+    /// the digest a function of how the caller built the list rather than of
+    /// what the change set does.
+    Duplicate(String),
+    /// The set was not sorted. Same reason as a duplicate: order must not be
+    /// able to alter the digest.
+    Unsorted(String),
+    /// The set exceeded the configured maximum.
+    TooMany {
+        /// How many were supplied.
+        count: usize,
+        /// How many are allowed.
+        maximum: usize,
+    },
+}
+
+impl std::fmt::Display for TargetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "targets: a change set must name at least one target"),
+            Self::EmptyName => write!(f, "targets: a target name must not be empty"),
+            Self::Duplicate(name) => write!(f, "targets: '{name}' appears more than once"),
+            Self::Unsorted(name) => write!(f, "targets: must be sorted; '{name}' is out of order"),
+            Self::TooMany { count, maximum } => {
+                write!(f, "targets: {count} exceeds the maximum of {maximum}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TargetError {}
+
+/// Check a target set: non-empty, sorted, unique, and within `maximum`.
+///
+/// # Errors
+/// Returns [`TargetError`] describing the first problem found.
+pub fn validate_targets(targets: &[String], maximum: usize) -> Result<(), TargetError> {
+    if targets.is_empty() {
+        return Err(TargetError::Empty);
+    }
+    if targets.len() > maximum {
+        return Err(TargetError::TooMany {
+            count: targets.len(),
+            maximum,
+        });
+    }
+    for (index, name) in targets.iter().enumerate() {
+        if name.is_empty() {
+            return Err(TargetError::EmptyName);
+        }
+        if index > 0 {
+            let previous = &targets[index - 1];
+            if name == previous {
+                return Err(TargetError::Duplicate(name.clone()));
+            }
+            if name < previous {
+                return Err(TargetError::Unsorted(name.clone()));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Approval record stored on a change set after successful approval or waiver.
@@ -417,4 +544,4 @@ pub fn validate_change_set_actions<A: Serialize>(
 }
 
 /// Re-export digest functions for use in tests and validation.
-pub use crate::digest::change_set_digest;
+pub use crate::digest::{change_set_digest, change_set_digest_with_targets};

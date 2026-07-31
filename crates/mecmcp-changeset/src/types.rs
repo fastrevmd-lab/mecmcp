@@ -15,6 +15,13 @@ pub struct OperationLimits {
     pub max_change_set_bytes: u64,
     /// Maximum serialized size of the state file in bytes.
     pub max_state_bytes: u64,
+    /// Maximum number of targets in a single change set.
+    pub max_targets_per_set: usize,
+    /// Maximum size of a stored preview artifact, in bytes.
+    ///
+    /// `max_change_set_bytes` bounds the record as a whole, but a preview is the
+    /// part a vendor API controls the size of, so it gets its own ceiling.
+    pub max_preview_bytes: usize,
 }
 
 impl Default for OperationLimits {
@@ -25,6 +32,8 @@ impl Default for OperationLimits {
             max_actions_per_set: 64,
             max_change_set_bytes: 256 * 1024, // 256KB per change set
             max_state_bytes: 8 * 1024 * 1024, // 8MB total state file
+            max_targets_per_set: 64,
+            max_preview_bytes: 64 * 1024,
         }
     }
 }
