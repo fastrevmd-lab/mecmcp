@@ -139,7 +139,13 @@ impl PollConfig {
 /// Not a product policy — a representability guard. Anchoring a deadline as an
 /// instant fails for absurd values, and validation that accepts what execution
 /// rejects is worse than no validation.
-const MAX_REPRESENTABLE_DEADLINE: Duration = Duration::from_secs(u32::MAX as u64);
+///
+/// Fifty years, not `u32::MAX` seconds (~136). Tokio documents that adding
+/// roughly a century can overflow `Instant` on some targets, so a 136-year
+/// ceiling could pass validation and then fail the runtime `checked_add` —
+/// reintroducing the preflight/runtime disagreement this constant exists to
+/// close. Still absurd for a poll budget by five orders of magnitude.
+const MAX_REPRESENTABLE_DEADLINE: Duration = Duration::from_secs(50 * 365 * 24 * 60 * 60);
 
 /// A [`PollConfig`] that cannot be used.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -188,13 +194,13 @@ pub enum PollError<E> {
     #[error("polling cancelled after {attempts} attempt(s)")]
     Cancelled {
         /// Probes issued before cancelling.
-        attempts: u32,
+        attempts: u64,
     },
     /// The whole-operation budget ran out.
     #[error("polling exceeded its {deadline:?} deadline after {attempts} attempt(s)")]
     DeadlineExceeded {
         /// Probes issued before the deadline.
-        attempts: u32,
+        attempts: u64,
         /// The budget that was exceeded.
         deadline: Duration,
     },
@@ -205,7 +211,7 @@ pub enum PollError<E> {
     #[error("probe failed on attempt {attempts}: {source}")]
     Probe {
         /// Which attempt failed.
-        attempts: u32,
+        attempts: u64,
         /// The consumer's own error.
         #[source]
         source: E,
@@ -274,7 +280,7 @@ pub async fn poll_until_ready<P, Fut, T, E>(
     mut probe: P,
 ) -> Result<T, PollError<E>>
 where
-    P: FnMut(u32) -> Fut,
+    P: FnMut(u64) -> Fut,
     Fut: Future<Output = Result<Probe<T>, E>>,
 {
     config.validate()?;
@@ -296,7 +302,11 @@ where
         }));
     };
     let mut interval = config.first_interval;
-    let mut attempts: u32 = 0;
+    // `u64`, not `u32`: a 1 ms interval over a deadline longer than ~49.7 days
+    // exhausts a `u32`, and a saturating counter would then hand every
+    // subsequent probe the same attempt number and under-report it in the error.
+    // Both are documented guarantees.
+    let mut attempts: u64 = 0;
 
     loop {
         // Cancellation is checked before probing, so a token that fired while
@@ -895,6 +905,53 @@ mod tests {
             probes.load(Ordering::SeqCst),
             0,
             "it polled on a bad config"
+        );
+    }
+
+    /// The ceiling must sit below where any supported target's `Instant`
+    /// overflows, or validation and the runtime disagree again.
+    #[test]
+    fn the_deadline_ceiling_is_conservative() {
+        assert!(
+            MAX_REPRESENTABLE_DEADLINE < Duration::from_secs(100 * 365 * 24 * 60 * 60),
+            "tokio documents ~a century as the overflow point on some targets"
+        );
+        // And still far beyond any real polling budget.
+        assert!(MAX_REPRESENTABLE_DEADLINE > Duration::from_secs(10 * 365 * 24 * 60 * 60));
+
+        let over = PollConfig {
+            deadline: MAX_REPRESENTABLE_DEADLINE + Duration::from_secs(1),
+            ..PollConfig::default()
+        };
+        assert!(matches!(
+            over.validate(),
+            Err(ConfigError::DeadlineUnrepresentable { .. })
+        ));
+    }
+
+    /// The attempt counter must not saturate.
+    ///
+    /// A 1 ms interval over a deadline beyond ~49.7 days exhausts a `u32`, and a
+    /// saturated counter hands every later probe the same number while
+    /// under-reporting it in the error.
+    #[test]
+    fn the_attempt_counter_is_wide_enough_not_to_saturate() {
+        let reachable_with_u32 = u64::from(u32::MAX);
+        let attempts_in_a_year_at_1ms = 365u64 * 24 * 60 * 60 * 1000;
+        assert!(
+            attempts_in_a_year_at_1ms > reachable_with_u32,
+            "the scenario must actually exceed u32, or this proves nothing"
+        );
+
+        // The error carries a count a u32 could not hold.
+        let error = PollError::<ProbeError>::DeadlineExceeded {
+            attempts: attempts_in_a_year_at_1ms,
+            deadline: Duration::from_secs(1),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains(&attempts_in_a_year_at_1ms.to_string())
         );
     }
 
