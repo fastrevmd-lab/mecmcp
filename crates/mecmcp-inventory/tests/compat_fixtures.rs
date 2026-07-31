@@ -48,6 +48,37 @@ struct JunosPolicy {
     config: Vec<String>,
 }
 
+/// Stage a fixture the way a deployment stores an inventory, then load it.
+///
+/// Since #173 `FileInventory::load` refuses a group- or world-readable file,
+/// because `devices.json` carries device credentials. Repo fixtures are 0644 and
+/// cannot be otherwise — git records only the exec bit, so a `chmod` here would
+/// not survive a fresh clone. Copying to a temp path at 0600 keeps these tests
+/// exercising the real `load` path, hardening included, rather than sidestepping
+/// it by parsing bytes directly.
+fn staged(dir: &tempfile::TempDir, fixture: &str) -> std::path::PathBuf {
+    let body = std::fs::read(fixture).unwrap_or_else(|e| panic!("read {fixture}: {e}"));
+    let name = std::path::Path::new(fixture)
+        .file_name()
+        .expect("fixture has a file name");
+    let path = dir.path().join(name);
+    std::fs::write(&path, body).expect("stage fixture");
+    write_mode_600(&path);
+    path
+}
+
+/// Write mode 0600, matching the deployed `devices.json` on 608 and 609.
+fn write_mode_600(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod fixture");
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 /// Load and parse each golden fixture, asserting:
 /// 1. The file parses successfully
 /// 2. The expected number of devices is present
@@ -55,11 +86,15 @@ struct JunosPolicy {
 /// 4. For legacy-junos with blocklist, verify policy is captured and NOT in devices
 #[test]
 fn all_golden_fixtures_parse() {
+    let dir = tempfile::tempdir().expect("should create tempdir");
     // Legacy Junos: flat map with password auth
     {
         let inv: mecmcp_inventory::FileInventory<JunosDevice, JunosPolicy> =
-            mecmcp_inventory::FileInventory::load("tests/compat/junos-flat-password.json")
-                .expect("junos-flat-password.json should parse");
+            mecmcp_inventory::FileInventory::load(staged(
+                &dir,
+                "tests/compat/junos-flat-password.json",
+            ))
+            .expect("junos-flat-password.json should parse");
         let names = inv.names();
         assert_eq!(names.len(), 1, "junos-flat-password should have 1 device");
         assert_eq!(names[0], "r1");
@@ -77,8 +112,11 @@ fn all_golden_fixtures_parse() {
     // Legacy Junos: flat map with SSH key auth (3 devices)
     {
         let inv: mecmcp_inventory::FileInventory<JunosDevice, JunosPolicy> =
-            mecmcp_inventory::FileInventory::load("tests/compat/junos-flat-sshkey.json")
-                .expect("junos-flat-sshkey.json should parse");
+            mecmcp_inventory::FileInventory::load(staged(
+                &dir,
+                "tests/compat/junos-flat-sshkey.json",
+            ))
+            .expect("junos-flat-sshkey.json should parse");
         let names = inv.names();
         assert_eq!(names.len(), 3, "junos-flat-sshkey should have 3 devices");
         assert!(names.contains(&"br1-fw".to_string()));
@@ -98,9 +136,10 @@ fn all_golden_fixtures_parse() {
     // Legacy Junos: flat map with _blocklist_defaults (MAGIC KEY TEST)
     {
         let inv: mecmcp_inventory::FileInventory<JunosDevice, JunosPolicy> =
-            mecmcp_inventory::FileInventory::load(
+            mecmcp_inventory::FileInventory::load(staged(
+                &dir,
                 "tests/compat/junos-flat-with-blocklist-defaults.json",
-            )
+            ))
             .expect("junos-flat-with-blocklist-defaults.json should parse");
         let names = inv.names();
         assert_eq!(
@@ -121,8 +160,11 @@ fn all_golden_fixtures_parse() {
     // Legacy PAN-OS: minimal envelope (1 device)
     {
         let inv: mecmcp_inventory::FileInventory<PanosDevice, ()> =
-            mecmcp_inventory::FileInventory::load("tests/compat/panos-envelope-minimal.json")
-                .expect("panos-envelope-minimal.json should parse");
+            mecmcp_inventory::FileInventory::load(staged(
+                &dir,
+                "tests/compat/panos-envelope-minimal.json",
+            ))
+            .expect("panos-envelope-minimal.json should parse");
         let names = inv.names();
         assert_eq!(
             names.len(),
@@ -147,8 +189,11 @@ fn all_golden_fixtures_parse() {
     // Legacy PAN-OS: rich envelope (2 devices with all optional fields)
     {
         let inv: mecmcp_inventory::FileInventory<PanosDevice, ()> =
-            mecmcp_inventory::FileInventory::load("tests/compat/panos-envelope-rich.json")
-                .expect("panos-envelope-rich.json should parse");
+            mecmcp_inventory::FileInventory::load(staged(
+                &dir,
+                "tests/compat/panos-envelope-rich.json",
+            ))
+            .expect("panos-envelope-rich.json should parse");
         let names = inv.names();
         assert_eq!(names.len(), 2, "panos-envelope-rich should have 2 devices");
         assert!(names.contains(&"panosvm".to_string()));
@@ -221,6 +266,7 @@ fn canonical_envelope_parses() {
 }"#,
     )
     .expect("should write canonical fixture");
+    write_mode_600(&path);
 
     let inv: mecmcp_inventory::FileInventory<JunosDevice, JunosPolicy> =
         mecmcp_inventory::FileInventory::load(&path).expect("canonical envelope should parse");
@@ -249,6 +295,7 @@ fn empty_devices_handling() {
     {
         let path = dir.path().join("empty_junos.json");
         std::fs::write(&path, "{}").expect("should write empty junos");
+        write_mode_600(&path);
         let inv: mecmcp_inventory::FileInventory<JunosDevice, JunosPolicy> =
             mecmcp_inventory::FileInventory::load(&path).expect("empty junos map should parse");
         assert_eq!(inv.names().len(), 0);
@@ -259,6 +306,7 @@ fn empty_devices_handling() {
         let path = dir.path().join("empty_canonical.json");
         std::fs::write(&path, r#"{"version": 1, "devices": {}}"#)
             .expect("should write empty canonical");
+        write_mode_600(&path);
         let inv: mecmcp_inventory::FileInventory<JunosDevice, JunosPolicy> =
             mecmcp_inventory::FileInventory::load(&path)
                 .expect("empty canonical devices should parse");

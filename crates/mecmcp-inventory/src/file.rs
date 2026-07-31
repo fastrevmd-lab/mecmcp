@@ -53,8 +53,8 @@ where
     /// acceptable — Junos accepts `{}`, PAN-OS rejects it.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, InventoryError> {
         let path = path.as_ref();
-        let bytes = std::fs::read(path)?;
-        let (devices, policy) = parse_inventory(&bytes)?;
+        let bytes = read_inventory_file(path)?;
+        let (devices, policy) = parse_inventory(bytes.expose())?;
 
         Ok(Self {
             inner: Arc::new(RwLock::new(InventoryInner {
@@ -73,8 +73,8 @@ where
             inner.source.clone()
         };
 
-        let bytes = std::fs::read(&path)?;
-        let (devices, policy) = parse_inventory(&bytes)?;
+        let bytes = read_inventory_file(&path)?;
+        let (devices, policy) = parse_inventory(bytes.expose())?;
         let count = devices.len();
 
         let mut inner = self.inner.write().expect("inventory lock poisoned");
@@ -316,6 +316,43 @@ where
     }
 }
 
+/// Read an inventory file through the workspace's one hardened reader.
+///
+/// New behaviour as of #173: this crate previously did a bare `std::fs::read`
+/// with **no** checks at all. An inventory is not innocuous — `devices.json`
+/// carries device credentials — so it now gets the same symlink / regular-file /
+/// mode / owner / size treatment as a token file.
+///
+/// Verified against the deployed files before this landed: 608's and 609's
+/// `devices.json` are both mode 600, owned by the service user, regular files,
+/// with no symlinks in their directories. Nothing running today is refused.
+///
+/// The limit is document-sized, not secret-sized: an inventory grows with the
+/// estate, and 609's already holds 34 devices in 6309 bytes.
+fn read_inventory_file(path: &Path) -> Result<mecmcp_secret::SecretBytes, InventoryError> {
+    mecmcp_secret::read_hardened_file(path, mecmcp_secret::FileLimits::default()).map_err(
+        |source| {
+            // No new `InventoryError` variant: both shipping servers pin this
+            // crate and may match exhaustively, so the public enum is unchanged
+            // (#173). A refusal to trust the file is reported as a
+            // permission-denied I/O condition, which is what it is.
+            match source {
+                // Move the original `io::Error` through rather than
+                // restringifying it. Callers branch on `kind()`, so a missing
+                // inventory must stay `NotFound` — flattening to `Other` would
+                // have them report a permissions problem for an absent file.
+                mecmcp_secret::SecretError::FileIo { source, .. } => {
+                    InventoryError::IoError(source)
+                }
+                other => InventoryError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    other.to_string(),
+                )),
+            }
+        },
+    )
+}
+
 /// SHA-256 of the file at `path`. Returns zeros if the file doesn't exist.
 #[allow(dead_code)]
 pub fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
@@ -477,22 +514,122 @@ mod tests {
             assert!(matches!(result, Err(InventoryError::DuplicateName(_))));
         }
 
+        /// Write an inventory the way a deployment actually stores one.
+        ///
+        /// 0600 is not test decoration: 608's and 609's real `devices.json` are
+        /// both mode 600 owned by the service user, and since #173 an inventory
+        /// carrying device credentials is refused if it is readable by anyone
+        /// else.
+        fn write_inventory(path: &std::path::Path, body: &str) {
+            std::fs::write(path, body).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+
+        /// Checks this crate did not have before #173.
+        ///
+        /// `load` and `reload` were a bare `std::fs::read` — no mode check, no
+        /// ownership, no symlink rejection, no size bound — on a file that holds
+        /// device credentials.
+        #[cfg(unix)]
+        #[test]
+        fn refuses_a_group_readable_inventory() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("devices.json");
+            std::fs::write(&path, r#"{"r1": {"ip": "1.2.3.4", "username": "admin"}}"#).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            let result: Result<FileInventory<JunosDevice, JunosPolicy>, _> =
+                FileInventory::load(&path);
+            // `unwrap_err` needs `T: Debug`; `FileInventory` has none.
+            let Err(error) = result else {
+                panic!("a group-readable inventory must be refused")
+            };
+            assert!(matches!(error, InventoryError::IoError(_)), "{error:?}");
+            assert!(
+                error.to_string().contains("group- or world-accessible"),
+                "{error}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn refuses_a_symlinked_inventory() {
+            let dir = tempfile::tempdir().unwrap();
+            let real = dir.path().join("devices.json");
+            write_inventory(&real, r#"{"r1": {"ip": "1.2.3.4", "username": "admin"}}"#);
+            let link = dir.path().join("link.json");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+
+            let result: Result<FileInventory<JunosDevice, JunosPolicy>, _> =
+                FileInventory::load(&link);
+            let Err(error) = result else {
+                panic!("a symlinked inventory must be refused")
+            };
+            assert!(error.to_string().contains("symlink"), "{error}");
+        }
+
+        /// A reload must be as strict as the initial load.
+        ///
+        /// Otherwise a file could be tightened for startup and loosened
+        /// afterwards, and the hot-reload path would accept it.
+        #[cfg(unix)]
+        #[test]
+        fn reload_refuses_a_file_that_became_readable() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("devices.json");
+            write_inventory(&path, r#"{"r1": {"ip": "1.2.3.4", "username": "admin"}}"#);
+
+            let inv: FileInventory<JunosDevice, JunosPolicy> = FileInventory::load(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            let error = inv.reload().unwrap_err();
+            assert!(matches!(error, InventoryError::IoError(_)), "{error:?}");
+            // The already-loaded inventory is untouched by a failed reload.
+            assert_eq!(inv.names(), vec!["r1"]);
+        }
+
+        /// A missing inventory must stay `NotFound`.
+        #[test]
+        fn a_missing_inventory_preserves_not_found() {
+            let dir = tempfile::tempdir().unwrap();
+            let missing = dir.path().join("absent.json");
+
+            let result: Result<FileInventory<JunosDevice, JunosPolicy>, _> =
+                FileInventory::load(&missing);
+            let Err(InventoryError::IoError(source)) = result else {
+                panic!("expected an IoError")
+            };
+            assert_eq!(source.kind(), std::io::ErrorKind::NotFound, "{source:?}");
+        }
+
+        /// The inventory limit is document-sized. 609 holds 34 devices in 6309
+        /// bytes; a secret-sized ceiling would be a live hazard.
+        #[test]
+        fn inventory_limit_is_document_sized() {
+            assert!(mecmcp_secret::FileLimits::default().max_bytes >= 1024 * 1024);
+        }
+
         #[test]
         fn file_inventory_loads_and_reloads() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("devices.json");
-            std::fs::write(&path, r#"{"r1": {"ip": "1.2.3.4", "username": "admin"}}"#).unwrap();
+            write_inventory(&path, r#"{"r1": {"ip": "1.2.3.4", "username": "admin"}}"#);
 
             let inv: FileInventory<JunosDevice, JunosPolicy> = FileInventory::load(&path).unwrap();
             let names = inv.names();
             assert_eq!(names, vec!["r1"]);
 
             // Modify file and reload
-            std::fs::write(
+            write_inventory(
                 &path,
                 r#"{"r1": {"ip": "1.2.3.4", "username": "admin"}, "r2": {"ip": "1.2.3.5", "username": "netconf"}}"#,
-            )
-            .unwrap();
+            );
             // No runtime needed: reload is synchronous. It was async only
             // because the lock was tokio's, which also made names() call
             // blocking_read() — a panic if reached from async code.

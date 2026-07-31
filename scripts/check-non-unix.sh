@@ -12,6 +12,12 @@
 #
 # This is a compile check only. It says nothing about behaviour, and the non-Unix
 # guarantees remain advisory (see #174).
+#
+# SCOPE, stated because it has already bitten: this checks mecmcp-secret's LIB
+# only. It does not cover other crates, and it does not cover test targets — a
+# `cfg(unix)`-less chmod in a mecmcp-auth test slipped past it and was caught by
+# review instead. Widening it to the workspace and to --all-targets is worth
+# doing; until then, do not read a pass here as "non-Unix is fine".
 set -euo pipefail
 
 crate_dir="$(cd "$(dirname "$0")/.." && pwd)/crates/mecmcp-secret"

@@ -6,6 +6,23 @@
 use mecmcp_inventory::{FileInventory, InventoryError};
 use serde::{Deserialize, Serialize};
 
+/// Mode 0600, matching the deployed `devices.json` on 608 and 609.
+///
+/// Since #173 `FileInventory::load` refuses a group- or world-readable
+/// inventory. These tests are about *parse* discrimination, so the file has to
+/// clear the permission check first or every one of them fails for the wrong
+/// reason.
+fn write_mode_600(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod fixture");
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct TestDevice {
     name: String,
@@ -26,6 +43,7 @@ fn typo_in_devices_key_produces_specific_error() {
     )
     .expect("should write typo file");
 
+    write_mode_600(&path);
     let result: Result<FileInventory<TestDevice, TestPolicy>, _> = FileInventory::load(&path);
     let err = match result {
         Err(e) => e,
@@ -63,6 +81,7 @@ fn version_wrong_type_produces_field_error() {
     )
     .expect("should write version wrong type file");
 
+    write_mode_600(&path);
     let result: Result<FileInventory<TestDevice, TestPolicy>, _> = FileInventory::load(&path);
     let err = match result {
         Err(e) => e,
@@ -89,6 +108,7 @@ fn unrelated_document_produces_shape_guidance() {
     std::fs::write(&path, r#"{"app": "unrelated", "config": {"timeout": 30}}"#)
         .expect("should write unrelated file");
 
+    write_mode_600(&path);
     let result: Result<FileInventory<TestDevice, TestPolicy>, _> = FileInventory::load(&path);
     let err = match result {
         Err(e) => e,
@@ -115,6 +135,7 @@ fn top_level_array_produces_must_be_object_error() {
     let path = dir.path().join("array.json");
     std::fs::write(&path, r#"[{"name": "r1"}]"#).expect("should write array file");
 
+    write_mode_600(&path);
     let result: Result<FileInventory<TestDevice, TestPolicy>, _> = FileInventory::load(&path);
     let err = match result {
         Err(e) => e,
@@ -140,6 +161,7 @@ fn devices_without_version_is_ambiguous() {
     std::fs::write(&path, r#"{"devices": {"r1": {"name": "r1"}}}"#)
         .expect("should write no-version file");
 
+    write_mode_600(&path);
     let result: Result<FileInventory<TestDevice, TestPolicy>, _> = FileInventory::load(&path);
     let err = match result {
         Err(e) => e,
@@ -172,6 +194,7 @@ fn devices_wrong_type_produces_specific_error() {
     )
     .expect("should write devices wrong type file");
 
+    write_mode_600(&path);
     let result: Result<FileInventory<TestDevice, TestPolicy>, _> = FileInventory::load(&path);
     let err = match result {
         Err(e) => e,
