@@ -29,10 +29,11 @@
 //! - **No proxy**: default features are disabled and `.no_proxy()` is set
 //!   explicitly, so proxy environment variables cannot redirect traffic.
 //! - **Bounded concurrency**: `max_concurrent_requests` enforced via a
-//!   semaphore.
+//!   semaphore, and `max_queued_requests` bounds how many callers wait behind it.
 //! - **Whole-request deadline**: covers both permit acquisition and send, so a
 //!   caller's deadline is a wall-clock promise and unbounded backlog cannot
-//!   form.
+//!   form. A burst that exceeds both the concurrency limit and the queue returns
+//!   [`HttpError::QueueFull`] immediately rather than queueing forever.
 //! - **Secrets marked sensitive**: `HeaderValue::set_sensitive(true)` is called
 //!   for secret headers and bearer auth, keeping values out of logging paths.
 //! - **One wire attempt per `send`**: reqwest's default protocol-NACK retry is
@@ -141,6 +142,14 @@ pub struct HttpClientConfig {
     pub request_timeout: Duration,
     /// Maximum concurrent requests allowed.
     pub max_concurrent_requests: usize,
+    /// Maximum requests allowed to wait behind the concurrency limit.
+    ///
+    /// A request that cannot acquire a permit and cannot queue returns
+    /// [`HttpError::QueueFull`] immediately. Set this to match expected burst
+    /// sizes above steady-state concurrency: a brief spike that exceeds
+    /// `max_concurrent_requests` will queue rather than fail outright, but a
+    /// sustained overload still surfaces as backpressure.
+    pub max_queued_requests: usize,
     /// Connection pool idle timeout.
     pub pool_idle_timeout: Duration,
     /// Maximum idle connections per host in the pool.
@@ -166,6 +175,7 @@ impl Default for HttpClientConfig {
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
             max_concurrent_requests: 8,
+            max_queued_requests: 16,
             pool_idle_timeout: Duration::from_secs(90),
             pool_max_idle_per_host: 4,
             max_response_bytes: 8 * 1024 * 1024,
@@ -723,7 +733,8 @@ fn parse_header_name(name: &str) -> Result<HeaderName, HttpError> {
 #[derive(Debug)]
 pub struct HttpClient {
     inner: reqwest::Client,
-    semaphore: Arc<Semaphore>,
+    concurrency_semaphore: Arc<Semaphore>,
+    queue_semaphore: Arc<Semaphore>,
     request_timeout: Duration,
     max_response_bytes: usize,
 }
@@ -772,6 +783,12 @@ impl HttpClient {
                 detail: "must be greater than zero".to_owned(),
             });
         }
+        if config.max_queued_requests == 0 {
+            return Err(HttpError::ConfigValidation {
+                field: "max_queued_requests".to_owned(),
+                detail: "must be greater than zero".to_owned(),
+            });
+        }
         if config.max_response_bytes == 0 {
             return Err(HttpError::ConfigValidation {
                 field: "max_response_bytes".to_owned(),
@@ -784,6 +801,23 @@ impl HttpClient {
             return Err(HttpError::ConfigValidation {
                 field: "max_concurrent_requests".to_owned(),
                 detail: format!("must not exceed {}", Semaphore::MAX_PERMITS),
+            });
+        }
+        // The queue semaphore is sized `concurrent + queued`, so validate the sum.
+        let total_capacity = config
+            .max_concurrent_requests
+            .checked_add(config.max_queued_requests)
+            .ok_or_else(|| HttpError::ConfigValidation {
+                field: "max_queued_requests".to_owned(),
+                detail: "max_concurrent_requests + max_queued_requests overflows usize".to_owned(),
+            })?;
+        if total_capacity > Semaphore::MAX_PERMITS {
+            return Err(HttpError::ConfigValidation {
+                field: "max_queued_requests".to_owned(),
+                detail: format!(
+                    "max_concurrent_requests + max_queued_requests must not exceed {}",
+                    Semaphore::MAX_PERMITS
+                ),
             });
         }
         if config.pool_max_idle_per_host == 0 {
@@ -884,9 +918,13 @@ impl HttpClient {
             detail: e.to_string(),
         })?;
 
+        // The total was validated above, so this cannot panic.
+        let queue_capacity = config.max_concurrent_requests + config.max_queued_requests;
+
         Ok(Self {
             inner,
-            semaphore: Arc::new(Semaphore::new(config.max_concurrent_requests)),
+            concurrency_semaphore: Arc::new(Semaphore::new(config.max_concurrent_requests)),
+            queue_semaphore: Arc::new(Semaphore::new(queue_capacity)),
             request_timeout: config.request_timeout,
             max_response_bytes: config.max_response_bytes,
         })
@@ -905,7 +943,8 @@ impl HttpClient {
     /// # Errors
     /// Returns [`HttpError::Timeout`] if the request exceeds the configured
     /// `request_timeout` — including time spent queued behind the concurrency
-    /// limit — [`HttpError::LimiterClosed`] if the limiter has been closed,
+    /// limit — [`HttpError::QueueFull`] if the queue is full and no slot is
+    /// available, [`HttpError::LimiterClosed`] if the limiter has been closed,
     /// [`HttpError::Connect`] if the connection could not be established, or
     /// [`HttpError::RequestFailed`] if the request fails after connecting.
     ///
@@ -928,9 +967,17 @@ impl HttpClient {
 
         // Whole-request deadline covering permit acquisition and send
         let result = tokio::time::timeout(self.request_timeout, async {
-            // Acquire permit (bounded concurrency)
-            let _permit = self
-                .semaphore
+            // Two-semaphore pattern: try_acquire the queue semaphore first (fail
+            // fast if the queue is full), then await the concurrency semaphore
+            // (which may block). Both permits are held until the response body is
+            // read, so memory use is bounded by the queue capacity.
+            let _queue_permit = self
+                .queue_semaphore
+                .try_acquire()
+                .map_err(|_| HttpError::QueueFull)?;
+
+            let _concurrency_permit = self
+                .concurrency_semaphore
                 .acquire()
                 .await
                 .map_err(|_| HttpError::LimiterClosed)?;
@@ -1169,6 +1216,13 @@ pub enum HttpError {
         /// The timeout that was exceeded.
         timeout: Duration,
     },
+    /// The request queue is full.
+    ///
+    /// Both the concurrency limit and the queue are saturated: all available
+    /// permits are in use, and `max_queued_requests` callers are already waiting.
+    /// Retry with backoff, or shed load.
+    #[error("HTTP client queue is full (concurrency limit and queue both saturated)")]
+    QueueFull,
     /// The client's concurrency limiter has been closed.
     ///
     /// Not the same thing as being *at* the limit — reaching the limit makes a
@@ -1942,10 +1996,23 @@ mod tests {
         );
         assert!(error.to_string().contains("max_concurrent_requests"));
 
-        // The bound itself must still be accepted.
+        // The bound itself must still be accepted when the queue is zero.
+        // With the default queue (16), concurrent + queue exceeds MAX_PERMITS.
         assert!(
             build_client(HttpClientConfig {
                 max_concurrent_requests: Semaphore::MAX_PERMITS,
+                max_queued_requests: 0,
+                ..Default::default()
+            })
+            .is_err(),
+            "zero max_queued_requests should be rejected"
+        );
+
+        // MAX_PERMITS - 1 for concurrency, 1 for queue: total = MAX_PERMITS
+        assert!(
+            build_client(HttpClientConfig {
+                max_concurrent_requests: Semaphore::MAX_PERMITS - 1,
+                max_queued_requests: 1,
                 ..Default::default()
             })
             .is_ok()
@@ -2871,5 +2938,287 @@ mod tests {
             Some(&b"application/json"[..])
         );
         assert_eq!(response.header("missing"), None);
+    }
+
+    /// The queue bound is validated at construction.
+    #[test]
+    fn zero_max_queued_requests_is_rejected() {
+        let error = build_client(HttpClientConfig {
+            max_queued_requests: 0,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, HttpError::ConfigValidation { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("max_queued_requests"));
+    }
+
+    /// The sum of concurrent + queued must fit in a semaphore.
+    #[test]
+    fn concurrent_plus_queued_cannot_overflow() {
+        let error = build_client(HttpClientConfig {
+            max_concurrent_requests: Semaphore::MAX_PERMITS,
+            max_queued_requests: 100,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, HttpError::ConfigValidation { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("max_queued_requests"));
+
+        // The bound itself is still accepted if the sum does not overflow.
+        assert!(
+            build_client(HttpClientConfig {
+                max_concurrent_requests: Semaphore::MAX_PERMITS - 1,
+                max_queued_requests: 1,
+                ..Default::default()
+            })
+            .is_ok()
+        );
+    }
+
+    /// Overflow in the addition is caught even when both inputs are small.
+    #[test]
+    fn concurrent_plus_queued_overflow_arithmetic() {
+        let error = build_client(HttpClientConfig {
+            max_concurrent_requests: usize::MAX,
+            max_queued_requests: 1,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, HttpError::ConfigValidation { .. }),
+            "{error:?}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("overflows") || rendered.contains("exceed"),
+            "should report overflow or bound exceeded: {rendered}"
+        );
+    }
+
+    /// A burst that saturates both the concurrency limit and the queue returns
+    /// `QueueFull` immediately, without waiting.
+    #[tokio::test]
+    async fn queue_full_is_returned_when_the_queue_is_saturated() {
+        const CONCURRENCY: usize = 2;
+        const QUEUE: usize = 1;
+
+        let (cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+
+        // Server that holds requests open until told to release them
+        let release = Arc::new(tokio::sync::Notify::new());
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        {
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let acceptor = acceptor.clone();
+                    let release = Arc::clone(&release);
+                    tokio::spawn(async move {
+                        let Ok(mut tls) = acceptor.accept(stream).await else {
+                            return;
+                        };
+                        read_request_head(&mut tls).await;
+                        release.notified().await;
+                        let _ = tls
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                    });
+                }
+            });
+        }
+
+        let client = Arc::new(
+            build_client(HttpClientConfig {
+                extra_root_certificates: vec![cert_pem],
+                max_concurrent_requests: CONCURRENCY,
+                max_queued_requests: QUEUE,
+                request_timeout: Duration::from_secs(30),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        let url = format!("https://localhost:{port}/hold");
+        let mut handles = Vec::new();
+
+        // Start CONCURRENCY + QUEUE requests; they should all be accepted
+        for _ in 0..(CONCURRENCY + QUEUE) {
+            let client = Arc::clone(&client);
+            let url = url.clone();
+            handles.push(tokio::spawn(async move {
+                client
+                    .send(HttpRequest::new(Method::Get, &url).unwrap())
+                    .await
+            }));
+        }
+
+        // Let them reach the server
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The next one must return QueueFull immediately
+        let overflow = client
+            .send(HttpRequest::new(Method::Get, &url).unwrap())
+            .await;
+        assert!(
+            matches!(overflow, Err(HttpError::QueueFull)),
+            "expected QueueFull, got {overflow:?}"
+        );
+
+        // Release the held requests so the test can clean up
+        release.notify_waiters();
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+
+    /// Requests queued within the limit still complete successfully.
+    #[tokio::test]
+    async fn queued_requests_within_the_limit_succeed() {
+        const CONCURRENCY: usize = 1;
+        const QUEUE: usize = 2;
+        const TOTAL: usize = CONCURRENCY + QUEUE;
+
+        let (cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    read_request_head(&mut tls).await;
+                    // Hold the request briefly so queueing actually happens
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let _ = tls
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let client = Arc::new(
+            build_client(HttpClientConfig {
+                extra_root_certificates: vec![cert_pem],
+                max_concurrent_requests: CONCURRENCY,
+                max_queued_requests: QUEUE,
+                request_timeout: Duration::from_secs(20),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        let url = format!("https://localhost:{port}/queue");
+        let mut handles = Vec::new();
+        for _ in 0..TOTAL {
+            let client = Arc::clone(&client);
+            let url = url.clone();
+            handles.push(tokio::spawn(async move {
+                client
+                    .send(HttpRequest::new(Method::Get, &url).unwrap())
+                    .await
+            }));
+        }
+
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(
+                result.is_ok(),
+                "a queued request within the limit should succeed, got {result:?}"
+            );
+            assert_eq!(result.unwrap().status(), 200);
+        }
+    }
+
+    /// The queue bound prevents unbounded memory use from a burst.
+    #[tokio::test]
+    async fn queue_bound_prevents_unbounded_memory_from_burst() {
+        const CONCURRENCY: usize = 2;
+        const QUEUE: usize = 3;
+
+        let (cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+
+        // Server holds all connections open until notified to release them
+        let release = Arc::new(tokio::sync::Notify::new());
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        {
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let acceptor = acceptor.clone();
+                    let release = Arc::clone(&release);
+                    tokio::spawn(async move {
+                        let Ok(mut tls) = acceptor.accept(stream).await else {
+                            return;
+                        };
+                        read_request_head(&mut tls).await;
+                        release.notified().await;
+                        let _ = tls
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                    });
+                }
+            });
+        }
+
+        let client = Arc::new(
+            build_client(HttpClientConfig {
+                extra_root_certificates: vec![cert_pem],
+                max_concurrent_requests: CONCURRENCY,
+                max_queued_requests: QUEUE,
+                request_timeout: Duration::from_secs(10),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        let url = format!("https://localhost:{port}/burst");
+
+        // Launch CONCURRENCY + QUEUE requests in background; they will hold
+        let mut background = Vec::new();
+        for _ in 0..(CONCURRENCY + QUEUE) {
+            let client = Arc::clone(&client);
+            let url = url.clone();
+            background.push(tokio::spawn(async move {
+                client
+                    .send(HttpRequest::new(Method::Get, &url).unwrap())
+                    .await
+            }));
+        }
+
+        // Give them time to acquire all permits and queue slots
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Now try a burst of 10 more; they should all be rejected
+        let mut rejected = 0usize;
+        for _ in 0..10 {
+            match client
+                .send(HttpRequest::new(Method::Get, &url).unwrap())
+                .await
+            {
+                Err(HttpError::QueueFull) => rejected += 1,
+                other => panic!("expected QueueFull, got {other:?}"),
+            }
+        }
+
+        assert_eq!(rejected, 10, "all overflow requests should be rejected");
+
+        // Clean up: release the held requests
+        release.notify_waiters();
+        for handle in background {
+            let _ = handle.await;
+        }
     }
 }
