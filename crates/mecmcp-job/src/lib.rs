@@ -312,9 +312,26 @@ where
                     deadline: config.deadline,
                 });
             }
-            Ok(Ok(Err(source))) => return Err(PollError::Probe { attempts, source }),
-            Ok(Ok(Ok(Probe::Ready(value)))) => return Ok(value),
-            Ok(Ok(Ok(Probe::Pending))) => {}
+            Ok(Ok(completed)) => {
+                // `Timeout::poll` polls the wrapped future *before* its timer
+                // (tokio-1.53.1 time/timeout.rs:216, "First, try polling the
+                // future"). When a response lands after `expires_at` but the
+                // task is not polled until afterwards, both are ready and the
+                // future wins — so a completion can arrive past the budget and
+                // still be accepted. Rechecking here is what makes the deadline
+                // a promise rather than a preference.
+                if tokio::time::Instant::now() >= expires_at {
+                    return Err(PollError::DeadlineExceeded {
+                        attempts,
+                        deadline: config.deadline,
+                    });
+                }
+                match completed {
+                    Err(source) => return Err(PollError::Probe { attempts, source }),
+                    Ok(Probe::Ready(value)) => return Ok(value),
+                    Ok(Probe::Pending) => {}
+                }
+            }
         }
 
         // Never wait past the deadline: sleeping beyond it would report the
@@ -531,6 +548,63 @@ mod tests {
             started.elapsed(),
             Duration::from_secs(5),
             "the probe was not bounded by the deadline itself"
+        );
+    }
+
+    /// A probe that completes after the deadline must not be accepted.
+    ///
+    /// `Timeout::poll` polls the wrapped future before its timer, so when both
+    /// are ready the completion wins. Without an explicit recheck, a response
+    /// that arrived past the budget would be returned as success.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_completing_after_the_deadline_is_not_accepted() {
+        let token = CancellationToken::new();
+        let config = PollConfig {
+            deadline: Duration::from_secs(5),
+            ..fast()
+        };
+
+        // The probe must come due at *exactly* the deadline, not after it: a
+        // later sleep is simply pre-empted by the timer and never races. Both
+        // timers firing on the same instant is what makes `Timeout::poll` reach
+        // the completed future first.
+        let error = poll_until_ready(&token, config, |_| async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok::<_, ProbeError>(Probe::Ready("too late"))
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            PollError::DeadlineExceeded {
+                attempts: 1,
+                deadline: Duration::from_secs(5),
+            },
+            "a late completion was accepted as success"
+        );
+    }
+
+    /// The same guard applies to a late *error*: it must read as the deadline,
+    /// not as a probe failure, because the budget is what actually ended it.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_erroring_after_the_deadline_reads_as_the_deadline() {
+        let token = CancellationToken::new();
+        let config = PollConfig {
+            deadline: Duration::from_secs(5),
+            ..fast()
+        };
+
+        let error = poll_until_ready(&token, config, |_| async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Err::<Probe<()>, _>(ProbeError("late failure"))
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, PollError::DeadlineExceeded { .. }),
+            "expected the deadline, got {error:?}"
         );
     }
 
