@@ -819,11 +819,16 @@ mod tests {
         /// that needs repairing.
         #[test]
         fn non_utf8_is_reported_as_invalid_data_not_permissions() {
-            use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("tokens.json");
             std::fs::write(&path, b"\xC3\x28 not utf8").unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            // Unix-gated: `PermissionsExt` does not exist elsewhere, and the
+            // fallback reader has no mode check to satisfy anyway.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
 
             let error = TokenStoreFile::<NoGrant>::load(&path).unwrap_err();
             match error {
