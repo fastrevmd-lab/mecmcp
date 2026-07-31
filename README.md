@@ -90,6 +90,18 @@ refused at startup by 0.3.8.
 | `mecmcp-openapi` | Whole-segment path expansion and bounded pagination — rejects, never clamps | new — see #90 |
 | `mecmcp-intent` | Vendor-neutral policy/object model with per-vendor rendering | new — see ROADMAP |
 
+### Remote listeners fail closed
+
+A Streamable HTTP listener bound off-loopback must name what it accepts:
+`--allowed-host` and `--allowed-origin` are both required, and an allowlist of
+blank strings does not count. An empty allowlist is not "accept whatever the
+operator forgot to configure" — it is a DNS-rebinding and Host-confusion surface
+on Host, and it disables browser-origin policy entirely on Origin.
+
+Loopback binds are exempt. A listener on `127.0.0.1` or `::1` is already bounded
+by the host, and requiring the flags there would break every stdio and
+local-HTTP deployment for nothing.
+
 Vendor servers keep their protocol adapters, XML parsers, and vendor workflows.
 For `mecmcp-http` specifically, that means endpoint catalogs, header names, payload
 schemas, terminal job states, and retry policy stay in the product repository —
