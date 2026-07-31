@@ -35,15 +35,39 @@ apply) and the modern crate hygiene. Neither benefits from the other.
 
 ## Status
 
-**Planning.** No crates published yet. This repo currently holds the analysis
-and the extraction plan; code lands per the phases in [`PLAN.md`](PLAN.md).
+**0.3.8 — eleven crates, extraction complete.** Both the original extraction and
+the cloud-foundations programme (#90) have landed: `mecmcp-secret`,
+`mecmcp-http`, `mecmcp-job` and `mecmcp-openapi` are new, and `mecmcp-changeset`
+gained multi-target change sets.
+
+Not published to crates.io. Consumers depend on this repository directly and pin
+an exact version.
+
+### Upgrading to 0.3.8
+
+This release is **breaking at the source level**, and needs a deliberate upgrade
+rather than a version-string change:
+
+| Change | What a consumer must do |
+|---|---|
+| `ChangeSetRecord` and `OperationLimits` gained public fields | struct-literal construction needs `..OperationLimits::default()` |
+| `mecmcp-secret` is now Unix-only | nothing on Linux; the crate refuses to compile elsewhere by design |
+| `mecmcp-auth` and `mecmcp-inventory` read their files through the shared hardened loader | `tokens.json` and `devices.json` **must** be mode 0600, a regular file, and owned by the service user — inventory had no such check before |
+
+On-disk state is compatible in both directions: a 0.3.8 deployment using no
+multi-target change set still writes version-1 files that the previous binary
+reads.
+
+**Verify the deployed files before rolling out.** A `tokens.json` or
+`devices.json` that has drifted to 0644 loaded fine under 0.3.7 and will be
+refused at startup by 0.3.8.
 
 ## Documents
 
 | Document | What it is |
 |---|---|
 | [`ANALYSIS.md`](ANALYSIS.md) | Side-by-side teardown of both repos — what is duplicated, what is asymmetric, what stays vendor-specific |
-| [`PLAN.md`](PLAN.md) | Program-level extraction plan: crate map, phase sequencing, decisions, exit criteria |
+| [`PLAN.md`](PLAN.md) | Program-level extraction plan: crate map, phase sequencing, decisions, exit criteria (historical — the plan is delivered) |
 | [`ROADMAP.md`](ROADMAP.md) | What "enterprise grade" means at 150 engineers and 4,000 multi-vendor firewalls |
 | [`docs/PACKAGING.md`](docs/PACKAGING.md) | How a mechub MCP server is delivered and installed — container base, LXC, README requirements |
 | [`docs/superpowers/plans/`](docs/superpowers/plans/) | Executable per-phase implementation plans |
