@@ -284,6 +284,35 @@ pub enum TokenAction {
         #[arg(long)]
         server_pid: Option<i32>,
     },
+    /// Change an existing token's scopes without touching its secret.
+    ///
+    /// The alternatives all mint a new secret: `rotate` preserves scopes and
+    /// changes the secret — the exact inverse of what is wanted — and
+    /// `revoke`+`add` does the same. Hand-editing `tokens.json` keeps the secret
+    /// but skips every validation this path performs (#163).
+    SetScopes {
+        /// Absolute token-store path.
+        #[arg(long)]
+        tokens_file: PathBuf,
+        /// Token audit name.
+        #[arg(long)]
+        name: String,
+        /// Replacement device scope. Omit to leave unchanged.
+        #[arg(long, value_delimiter = ',')]
+        devices: Option<Vec<String>>,
+        /// Replacement tool scope. Omit to leave unchanged.
+        #[arg(long, value_delimiter = ',')]
+        tools: Option<Vec<String>>,
+        /// Apply a widening without the interactive confirmation.
+        ///
+        /// Widening is a privilege escalation, so it is confirmed by default.
+        /// Narrowing is not: reducing a scope cannot grant anything.
+        #[arg(long)]
+        yes: bool,
+        /// Send SIGHUP to this pid after writing.
+        #[arg(long)]
+        server_pid: Option<i32>,
+    },
     /// List token names + scopes (never the hash or secret).
     List {
         /// Absolute token-store path.

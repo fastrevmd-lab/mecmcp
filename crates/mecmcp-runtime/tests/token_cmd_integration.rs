@@ -789,3 +789,292 @@ mod grant_lifecycle {
         );
     }
 }
+
+/// `token set-scopes` (#163): change scopes without minting a new secret.
+///
+/// The gap this closes is specific. `rotate` preserves scopes and changes the
+/// secret — the exact inverse of what an operator adjusting a scope needs — and
+/// `revoke`+`add` costs the same. Hand-editing `tokens.json` keeps the secret
+/// only because scopes sit in plaintext beside the digest, which is an
+/// implementation detail that also skips every validation here.
+#[allow(clippy::unwrap_used)]
+mod set_scopes {
+    use super::{KNOWN_TOOLS, temp_tokens_file};
+    use mecmcp_auth::{Grant, GrantError, TokenStoreFile};
+    use mecmcp_runtime::{cli::TokenAction, token_cmd::run_with_grant};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct XpathGrant {
+        allowed_roots: Vec<String>,
+    }
+
+    impl Grant for XpathGrant {
+        type Action = ();
+        fn allows_action(&self, _action: Self::Action) -> bool {
+            true
+        }
+        fn allows_subject(&self, subject: &str) -> bool {
+            self.allowed_roots.iter().any(|r| subject.starts_with(r))
+        }
+        fn validate(&self) -> Result<(), GrantError> {
+            if self.allowed_roots.iter().any(String::is_empty) {
+                return Err(GrantError::Invalid("root must not be empty".into()));
+            }
+            Ok(())
+        }
+    }
+
+    fn add(tokens_file: &std::path::Path, grant: XpathGrant) {
+        run_with_grant(
+            TokenAction::Add {
+                tokens_file: tokens_file.to_path_buf(),
+                name: "writer".to_owned(),
+                devices: vec!["*".to_owned()],
+                tools: vec!["*".to_owned()],
+                provider: None,
+                provider_tier: None,
+                on_behalf_of: None,
+                actor_type: None,
+                server_pid: None,
+            },
+            &[],
+            KNOWN_TOOLS,
+            Some(grant),
+        )
+        .unwrap();
+    }
+
+    fn digest_of(tokens_file: &std::path::Path) -> mecmcp_auth::TokenDigest {
+        let file: TokenStoreFile<XpathGrant> = TokenStoreFile::load(tokens_file).unwrap();
+        let store = file.store();
+        store
+            .entries()
+            .iter()
+            .find(|e| e.name == "writer")
+            .unwrap()
+            .digest
+            .clone()
+    }
+
+    /// The scenario from the issue: widening a PAN-OS mutation root, which
+    /// `set_scopes` could not express at all before because the grant was not a
+    /// parameter.
+    #[test]
+    fn a_grant_can_be_widened_without_changing_the_secret() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        add(
+            &tokens_file,
+            XpathGrant {
+                allowed_roots: vec!["/config/devices/address".to_owned()],
+            },
+        );
+        let digest_before = digest_of(&tokens_file);
+
+        run_with_grant(
+            TokenAction::SetScopes {
+                tokens_file: tokens_file.clone(),
+                name: "writer".to_owned(),
+                devices: None,
+                tools: None,
+                yes: true,
+                server_pid: None,
+            },
+            &[],
+            KNOWN_TOOLS,
+            Some(XpathGrant {
+                allowed_roots: vec![
+                    "/config/devices/address".to_owned(),
+                    "/config/devices/network/interface/ethernet".to_owned(),
+                ],
+            }),
+        )
+        .unwrap();
+
+        let file: TokenStoreFile<XpathGrant> = TokenStoreFile::load(&tokens_file).unwrap();
+        let store = file.store();
+        let entry = store.entries().iter().find(|e| e.name == "writer").unwrap();
+        assert_eq!(
+            entry.grant.as_ref().unwrap().allowed_roots.len(),
+            2,
+            "the grant must be the widened one"
+        );
+        assert_eq!(
+            entry.digest, digest_before,
+            "the secret must be untouched — that is the entire point"
+        );
+    }
+
+    /// An invalid grant is refused as bad input, not written and not surfaced
+    /// as a storage fault.
+    #[test]
+    fn an_invalid_grant_is_refused() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        add(
+            &tokens_file,
+            XpathGrant {
+                allowed_roots: vec!["/config".to_owned()],
+            },
+        );
+
+        let error = run_with_grant(
+            TokenAction::SetScopes {
+                tokens_file: tokens_file.clone(),
+                name: "writer".to_owned(),
+                devices: None,
+                tools: None,
+                yes: true,
+                server_pid: None,
+            },
+            &[],
+            KNOWN_TOOLS,
+            Some(XpathGrant {
+                allowed_roots: vec![String::new()],
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid grant"), "got {error}");
+
+        // And nothing was written.
+        let file: TokenStoreFile<XpathGrant> = TokenStoreFile::load(&tokens_file).unwrap();
+        let store = file.store();
+        let entry = store.entries().iter().find(|e| e.name == "writer").unwrap();
+        assert_eq!(entry.grant.as_ref().unwrap().allowed_roots, vec!["/config"]);
+    }
+
+    /// A widening without `--yes` is refused, so it cannot be a silent side
+    /// effect of a typo.
+    #[test]
+    fn widening_requires_confirmation() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        run_with_grant::<mecmcp_auth::NoGrant>(
+            TokenAction::Add {
+                tokens_file: tokens_file.clone(),
+                name: "reader".to_owned(),
+                devices: vec!["device1".to_owned()],
+                tools: vec!["get_config".to_owned()],
+                provider: None,
+                provider_tier: None,
+                on_behalf_of: None,
+                actor_type: None,
+                server_pid: None,
+            },
+            &["device1".to_owned(), "device2".to_owned()],
+            KNOWN_TOOLS,
+            None,
+        )
+        .unwrap();
+
+        let error = run_with_grant::<mecmcp_auth::NoGrant>(
+            TokenAction::SetScopes {
+                tokens_file: tokens_file.clone(),
+                name: "reader".to_owned(),
+                devices: Some(vec!["device1".to_owned(), "device2".to_owned()]),
+                tools: None,
+                yes: false,
+                server_pid: None,
+            },
+            &["device1".to_owned(), "device2".to_owned()],
+            KNOWN_TOOLS,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--yes"), "got {error}");
+    }
+
+    /// Narrowing does not need confirmation — it cannot grant anything.
+    #[test]
+    fn narrowing_needs_no_confirmation() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        run_with_grant::<mecmcp_auth::NoGrant>(
+            TokenAction::Add {
+                tokens_file: tokens_file.clone(),
+                name: "reader".to_owned(),
+                devices: vec!["*".to_owned()],
+                tools: vec!["get_config".to_owned()],
+                provider: None,
+                provider_tier: None,
+                on_behalf_of: None,
+                actor_type: None,
+                server_pid: None,
+            },
+            &["device1".to_owned()],
+            KNOWN_TOOLS,
+            None,
+        )
+        .unwrap();
+
+        run_with_grant::<mecmcp_auth::NoGrant>(
+            TokenAction::SetScopes {
+                tokens_file: tokens_file.clone(),
+                name: "reader".to_owned(),
+                devices: Some(vec!["device1".to_owned()]),
+                tools: None,
+                yes: false,
+                server_pid: None,
+            },
+            &["device1".to_owned()],
+            KNOWN_TOOLS,
+            None,
+        )
+        .expect("narrowing must not require --yes");
+    }
+
+    #[test]
+    fn an_unknown_token_is_reported_clearly() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        add(
+            &tokens_file,
+            XpathGrant {
+                allowed_roots: vec!["/config".to_owned()],
+            },
+        );
+
+        let error = run_with_grant(
+            TokenAction::SetScopes {
+                tokens_file: tokens_file.clone(),
+                name: "nobody".to_owned(),
+                devices: None,
+                tools: None,
+                yes: true,
+                server_pid: None,
+            },
+            &[],
+            KNOWN_TOOLS,
+            Some(XpathGrant {
+                allowed_roots: vec!["/config".to_owned()],
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not exist"), "got {error}");
+    }
+
+    /// Changing nothing is a usage error, not a silent no-op write.
+    #[test]
+    fn no_change_requested_is_an_error() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        add(
+            &tokens_file,
+            XpathGrant {
+                allowed_roots: vec!["/config".to_owned()],
+            },
+        );
+
+        let error = run_with_grant::<XpathGrant>(
+            TokenAction::SetScopes {
+                tokens_file: tokens_file.clone(),
+                name: "writer".to_owned(),
+                devices: None,
+                tools: None,
+                yes: true,
+                server_pid: None,
+            },
+            &[],
+            KNOWN_TOOLS,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("at least one"), "got {error}");
+    }
+}
