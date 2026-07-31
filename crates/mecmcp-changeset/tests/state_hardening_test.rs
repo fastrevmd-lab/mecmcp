@@ -97,3 +97,37 @@ fn refuses_a_directory() {
         "a directory must not read as state"
     );
 }
+
+/// Replacing the state file must not change who owns it.
+///
+/// The reader permits uid 0 so `sudo` operator commands work, which makes this
+/// reachable: offline recovery run as root against a service-owned file would
+/// otherwise leave a root-owned 0600 file the service cannot open, and the
+/// server then fails to start with an error that never mentions ownership.
+///
+/// Running as root, this asserts the real chown. Running as an ordinary user it
+/// asserts the weaker but still meaningful property that ownership is unchanged.
+#[test]
+fn replacing_the_state_preserves_its_owner() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+    write_state(&path, &ChangesetState::default(), LIMIT).expect("seed");
+
+    let before = std::fs::metadata(&path).unwrap();
+    let (uid_before, gid_before) = (before.uid(), before.gid());
+
+    write_state(&path, &ChangesetState::default(), LIMIT).expect("replace");
+
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!(after.uid(), uid_before, "owner uid changed on replace");
+    assert_eq!(after.gid(), gid_before, "owner gid changed on replace");
+
+    // And the mode stays private.
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(after.permissions().mode() & 0o777, 0o600);
+
+    // The service must still be able to read what it just wrote.
+    assert!(read_state(&path, LIMIT).is_ok());
+}

@@ -417,10 +417,17 @@ fn read_hardened_file_inner(path: &Path, limits: FileLimits) -> Result<SecretByt
     use rustix::io::Errno;
     use std::io::Read;
 
-    // Open with NOFOLLOW to reject symlinks at open time
+    // NOFOLLOW rejects symlinks at open time.
+    //
+    // NONBLOCK is what stops a FIFO from hanging the caller: `open(O_RDONLY)` on
+    // a named pipe with no writer blocks forever, and the file-type check that
+    // would reject it happens *after* the open. A path-based `symlink_metadata`
+    // could not hang, so this became reachable when callers moved to the
+    // descriptor-based reader. On a regular file NONBLOCK has no effect, and a
+    // non-regular file is rejected below before anything is read.
     let fd = open(
         path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
     )
     .map_err(|error| {
@@ -929,6 +936,45 @@ mod tests {
                 matches!(error, SecretError::FileTooLarge { limit: 64, .. }),
                 "got {error:?}"
             );
+        }
+
+        /// A FIFO must be rejected, not waited on.
+        ///
+        /// `open(O_RDONLY)` on a named pipe with no writer blocks forever, and
+        /// the file-type check happens after the open — so without `O_NONBLOCK`
+        /// a coordinator pointed at a FIFO hangs at startup instead of
+        /// reporting a bad path. The bound below is what makes a regression fail
+        /// rather than wedge the suite.
+        #[cfg(unix)]
+        #[test]
+        fn a_fifo_is_rejected_without_blocking() {
+            use std::sync::mpsc;
+
+            let dir = tempfile::tempdir().unwrap();
+            let fifo = dir.path().join("state.fifo");
+            let status = std::process::Command::new("mkfifo")
+                .arg("-m")
+                .arg("600")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo");
+            assert!(status.success(), "mkfifo failed");
+
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let outcome = read_hardened_file(&fifo, FileLimits::default());
+                let _ = tx.send(matches!(outcome, Err(SecretError::FileNotRegular { .. })));
+            });
+
+            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(rejected_as_non_regular) => {
+                    assert!(
+                        rejected_as_non_regular,
+                        "a FIFO must be rejected as non-regular"
+                    );
+                }
+                Err(_) => panic!("read_hardened_file blocked on a FIFO instead of rejecting it"),
+            }
         }
 
         /// `usize::MAX` must not overflow the read bound.

@@ -293,6 +293,26 @@ pub fn write_state(
         PersistenceError::new(format!("could not sync changeset state: {error}"))
     })?;
 
+    // Preserve the destination's ownership across the replacement.
+    //
+    // Without this, offline recovery run under `sudo` against a service-owned
+    // state file leaves a root-owned 0600 file that the non-root service cannot
+    // open at all — the server then fails to start with a permission error that
+    // never mentions ownership. The shared reader permits uid 0 as a *reader*
+    // precisely so `sudo` operator commands work, which is what makes this
+    // reachable.
+    //
+    // `mecmcp-auth::write_atomic` already does this for tokens.json and its
+    // comment describes the same failure; this is the same fix for the same
+    // reason. Best-effort by design: no destination means nothing to preserve,
+    // and failing to chown means we are almost certainly already the owner.
+    #[cfg(unix)]
+    if let Ok(existing) = fs::metadata(path) {
+        use std::os::unix::fs::MetadataExt;
+        let _ =
+            std::os::unix::fs::chown(temporary.path(), Some(existing.uid()), Some(existing.gid()));
+    }
+
     temporary.persist(path).map_err(|error| {
         PersistenceError::new(format!(
             "could not replace changeset state: {}",
