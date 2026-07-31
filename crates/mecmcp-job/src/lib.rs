@@ -111,6 +111,19 @@ impl PollConfig {
                 multiplier: self.multiplier,
             });
         }
+        // `poll_until_ready` anchors the deadline to an instant, which fails for
+        // absurd values. Checking it here too keeps a startup preflight honest:
+        // a config `validate()` accepts must not be one the first job rejects.
+        //
+        // A fixed ceiling rather than `Instant::now().checked_add(..)`, because
+        // validation has to be deterministic and callable outside a runtime.
+        // 136 years is far past any real polling budget and comfortably inside
+        // what `Instant` can represent.
+        if self.deadline > MAX_REPRESENTABLE_DEADLINE {
+            return Err(ConfigError::DeadlineUnrepresentable {
+                deadline: self.deadline,
+            });
+        }
         if self.first_interval > self.max_interval {
             return Err(ConfigError::IntervalAboveMaximum {
                 first_interval: self.first_interval,
@@ -120,6 +133,13 @@ impl PollConfig {
         Ok(())
     }
 }
+
+/// Largest deadline [`PollConfig::validate`] accepts.
+///
+/// Not a product policy — a representability guard. Anchoring a deadline as an
+/// instant fails for absurd values, and validation that accepts what execution
+/// rejects is worse than no validation.
+const MAX_REPRESENTABLE_DEADLINE: Duration = Duration::from_secs(u32::MAX as u64);
 
 /// A [`PollConfig`] that cannot be used.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -303,6 +323,15 @@ where
             tokio::time::timeout_at(expires_at, probe(attempts)),
         )
         .await;
+
+        // Cancellation is documented to win, and `select_cancel_raw` alone does
+        // not guarantee that: if the token fires while the inner future is being
+        // polled, the biased branch has already returned `Pending` for this
+        // wake, so a probe or deadline that becomes ready in the same poll is
+        // reported instead. Rechecking after the await restores the precedence.
+        if token.is_cancelled() {
+            return Err(PollError::Cancelled { attempts });
+        }
 
         match probed {
             Err(CancelMarker) => return Err(PollError::Cancelled { attempts }),
@@ -606,6 +635,90 @@ mod tests {
             matches!(error, PollError::DeadlineExceeded { .. }),
             "expected the deadline, got {error:?}"
         );
+    }
+
+    /// Cancellation wins over a probe that succeeds in the same poll.
+    ///
+    /// Cancelling from inside the probe, immediately before it returns
+    /// `Ready`, is the deterministic form of the race: the token fires while
+    /// the inner future is being polled, so `select_cancel_raw`'s biased branch
+    /// has already yielded `Pending` for that wake.
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_wins_over_a_probe_that_completes_in_the_same_poll() {
+        let token = CancellationToken::new();
+        let inner = token.clone();
+
+        let error = poll_until_ready(&token, fast(), move |_| {
+            let inner = inner.clone();
+            async move {
+                inner.cancel();
+                Ok::<_, ProbeError>(Probe::Ready("should not be accepted"))
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            PollError::Cancelled { attempts: 1 },
+            "a success racing cancellation was accepted"
+        );
+    }
+
+    /// The same precedence applies to a probe error racing cancellation.
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_wins_over_a_probe_error_in_the_same_poll() {
+        let token = CancellationToken::new();
+        let inner = token.clone();
+
+        let error = poll_until_ready(&token, fast(), move |_| {
+            let inner = inner.clone();
+            async move {
+                inner.cancel();
+                Err::<Probe<()>, _>(ProbeError("racing failure"))
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, PollError::Cancelled { attempts: 1 });
+    }
+
+    /// `validate()` must not accept what `poll_until_ready` will reject.
+    ///
+    /// A startup preflight that passes, followed by a first job that fails, is
+    /// worse than no preflight at all.
+    #[tokio::test(start_paused = true)]
+    async fn validate_agrees_with_the_runtime_on_an_absurd_deadline() {
+        let config = PollConfig {
+            deadline: Duration::MAX,
+            ..fast()
+        };
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::DeadlineUnrepresentable {
+                deadline: Duration::MAX,
+            }),
+            "validate accepted a deadline the runtime rejects"
+        );
+
+        let token = CancellationToken::new();
+        let runtime_error = poll_until_ready(&token, config, |_| async {
+            Ok::<Probe<()>, ProbeError>(Probe::Pending)
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            runtime_error,
+            PollError::Config(ConfigError::DeadlineUnrepresentable { .. })
+        ));
+
+        // A large but sane budget must still be accepted.
+        let year = PollConfig {
+            deadline: Duration::from_secs(365 * 24 * 60 * 60),
+            ..fast()
+        };
+        assert!(year.validate().is_ok(), "a one-year budget must be usable");
     }
 
     /// Repeated pending probes eventually exhaust the budget.
