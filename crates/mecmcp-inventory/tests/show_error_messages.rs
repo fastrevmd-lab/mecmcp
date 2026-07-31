@@ -19,8 +19,6 @@ fn write_mode_600(path: &std::path::Path) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .expect("chmod fixture");
     }
-    #[cfg(not(unix))]
-    let _ = path;
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

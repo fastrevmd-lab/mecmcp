@@ -3,6 +3,33 @@
 //! Provides a zeroizing secret type for outbound credentials (API keys, bearer
 //! tokens) and hardened loaders that validate file permissions and reject
 //! symlinks, oversized values, and group/world-accessible files.
+//!
+//! **Unix-only.** Every mechub MCP server ships as a Debian LXC guest or a Linux
+//! container image, so this crate refuses to compile elsewhere rather than offer
+//! a fallback that cannot enforce what it claims. See the `compile_error!`
+//! below.
+
+/// This crate is Unix-only, and deliberately so.
+///
+/// Every mechub MCP server ships as a Debian LXC guest or a Linux container
+/// image; CI builds `ubuntu-24.04` and nothing else. There is no Windows or
+/// macOS delivery path.
+///
+/// A `cfg(not(unix))` fallback used to live here. It compiled, so the crate
+/// *presented* as cross-platform while providing none of its guarantees there:
+/// no mode check, no ownership check, and `symlink_metadata` followed by
+/// `File::open` — a TOCTOU race by construction. A security crate whose central
+/// function silently degrades to unenforced is a footgun, not a courtesy.
+/// Windows ACLs do not map onto `mode & 0o077` in any case, so a real port needs
+/// a genuine ACL implementation rather than that stub.
+///
+/// Failing at compile time states the limitation instead of faking coverage.
+#[cfg(not(unix))]
+compile_error!(
+    "mecmcp-secret is Unix-only. Its file hardening is built on O_NOFOLLOW, \
+     fstat and Unix mode/owner semantics, which have no faithful equivalent \
+     elsewhere. A port needs a real ACL implementation, not a fallback."
+);
 
 use std::env;
 use std::path::Path;
@@ -111,11 +138,8 @@ impl Default for FileLimits {
 /// UTF-8 requirement, no newline stripping, no empty rejection. Callers parsing
 /// JSON want the bytes exactly as stored.
 ///
-/// **Unix:** opens once with `O_NOFOLLOW`, validates the descriptor with
-/// `fstat`, and reads from that same descriptor. TOCTOU-safe.
-///
-/// **Non-Unix:** path-based checks that are **advisory only** — see
-/// [`load_from_file`].
+/// Opens once with `O_NOFOLLOW`, validates the descriptor with `fstat`, and
+/// reads from that same descriptor. TOCTOU-safe.
 ///
 /// Ownership must match the effective uid, except that **root is permitted**:
 /// uid 0 can `chown` and read the file anyway, so refusing it would break
@@ -138,14 +162,7 @@ impl Default for FileLimits {
 /// # Ok::<(), mecmcp_secret::SecretError>(())
 /// ```
 pub fn read_hardened_file(path: &Path, limits: FileLimits) -> Result<SecretBytes, SecretError> {
-    #[cfg(unix)]
-    {
-        read_hardened_file_unix(path, limits)
-    }
-    #[cfg(not(unix))]
-    {
-        read_hardened_file_fallback(path, limits)
-    }
+    read_hardened_file_inner(path, limits)
 }
 
 /// Error while loading a secret.
@@ -323,19 +340,13 @@ pub fn load_from_env(var: &str, limits: SecretLimits) -> Result<OutboundSecret, 
 
 /// Load a secret from a file with hardened validation.
 ///
-/// **Unix platforms:** Opens the file once with `O_NOFOLLOW`, validates the
-/// file descriptor (regular file, mode 0600, owned by effective uid, size <=
-/// limit), and reads from the same descriptor. TOCTOU-safe.
+/// Opens the file once with `O_NOFOLLOW`, validates the file descriptor
+/// (regular file, mode 0600, owned by the effective uid, size within limit), and
+/// reads from that same descriptor. TOCTOU-safe.
 ///
-/// **Non-Unix platforms:** Uses path-based checks (`symlink_metadata` then
-/// `File::open`), which are **advisory only**. The file may be replaced between
-/// validation and open. Mode and ownership are not checked at all. **Callers on
-/// non-Unix platforms must not rely on this function as a security boundary.**
-///
-/// Rejects: symlinks (Unix-only, TOCTOU-safe; non-Unix, advisory), non-regular
-/// files (advisory on non-Unix), group- or world-accessible files (Unix-only),
-/// files not owned by effective uid (Unix-only), oversized files, empty or
-/// whitespace-only files, invalid UTF-8.
+/// Rejects: symlinks, non-regular files, group- or world-accessible files, files
+/// not owned by the effective uid (root excepted), oversized files, empty or
+/// whitespace-only files, and invalid UTF-8.
 ///
 /// Strips **at most one** trailing `\n` or `\r\n`: credential files routinely
 /// end with a newline and a secret with a stray newline fails authentication
@@ -355,20 +366,12 @@ pub fn load_from_env(var: &str, limits: SecretLimits) -> Result<OutboundSecret, 
 /// println!("Loaded {} bytes", secret.expose().len());
 /// ```
 pub fn load_from_file(path: &Path, limits: SecretLimits) -> Result<OutboundSecret, SecretError> {
-    #[cfg(unix)]
-    {
-        load_from_file_unix(path, limits)
-    }
-    #[cfg(not(unix))]
-    {
-        load_from_file_non_unix(path, limits)
-    }
+    load_from_file_inner(path, limits)
 }
 
-/// Unix implementation: open once, validate the fd, read from the same fd.
-#[cfg(unix)]
-fn load_from_file_unix(path: &Path, limits: SecretLimits) -> Result<OutboundSecret, SecretError> {
-    let bytes = read_hardened_file_unix(
+/// Open once, validate the fd, read from the same fd.
+fn load_from_file_inner(path: &Path, limits: SecretLimits) -> Result<OutboundSecret, SecretError> {
+    let bytes = read_hardened_file_inner(
         path,
         FileLimits {
             max_bytes: limits.max_bytes,
@@ -407,10 +410,9 @@ fn load_from_file_unix(path: &Path, limits: SecretLimits) -> Result<OutboundSecr
     Ok(OutboundSecret(value))
 }
 
-/// Unix hardened read: open once with `O_NOFOLLOW`, validate the descriptor,
-/// read from that same descriptor.
-#[cfg(unix)]
-fn read_hardened_file_unix(path: &Path, limits: FileLimits) -> Result<SecretBytes, SecretError> {
+/// Hardened read: open once with `O_NOFOLLOW`, validate the descriptor, read
+/// from that same descriptor.
+fn read_hardened_file_inner(path: &Path, limits: FileLimits) -> Result<SecretBytes, SecretError> {
     use rustix::fs::{Mode, OFlags, fstat, open};
     use rustix::io::Errno;
     use std::io::Read;
@@ -502,94 +504,6 @@ fn read_hardened_file_unix(path: &Path, limits: FileLimits) -> Result<SecretByte
         })?;
 
     // The +1 distinguishes at-limit from over-limit
-    if bytes.len() > limits.max_bytes {
-        return Err(SecretError::FileTooLarge {
-            path: path.to_path_buf(),
-            actual: bytes.len() as u64,
-            limit: limits.max_bytes,
-        });
-    }
-
-    Ok(SecretBytes(std::mem::take(&mut bytes)))
-}
-
-/// Non-Unix fallback: path-based checks, advisory only.
-///
-/// Uses `symlink_metadata` followed by `File::open` — two separate operations,
-/// so the file may be replaced between validation and open. Mode and ownership
-/// are not checked. Callers must not rely on this as a security boundary.
-/// Tracked in #174.
-#[cfg(not(unix))]
-fn load_from_file_non_unix(
-    path: &Path,
-    limits: SecretLimits,
-) -> Result<OutboundSecret, SecretError> {
-    let bytes = read_hardened_file_fallback(
-        path,
-        FileLimits {
-            max_bytes: limits.max_bytes,
-        },
-    )?;
-
-    let mut value = match String::from_utf8(bytes.expose().to_vec()) {
-        Ok(text) => text,
-        Err(error) => {
-            let mut recovered = error.into_bytes();
-            recovered.zeroize();
-            return Err(SecretError::FileInvalidUtf8 {
-                path: path.to_path_buf(),
-            });
-        }
-    };
-
-    if value.ends_with('\n') {
-        value.pop();
-        if value.ends_with('\r') {
-            value.pop();
-        }
-    }
-
-    if value.trim().is_empty() {
-        value.zeroize();
-        return Err(SecretError::FileEmpty {
-            path: path.to_path_buf(),
-        });
-    }
-
-    Ok(OutboundSecret(value))
-}
-
-/// Non-Unix hardened read: path-based, **advisory only**. See #174.
-#[cfg(not(unix))]
-fn read_hardened_file_fallback(
-    path: &Path,
-    limits: FileLimits,
-) -> Result<SecretBytes, SecretError> {
-    use std::io::Read;
-
-    let metadata = std::fs::symlink_metadata(path).map_err(|source| SecretError::FileIo {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    if !metadata.is_file() {
-        return Err(SecretError::FileNotRegular {
-            path: path.to_path_buf(),
-        });
-    }
-
-    let file = std::fs::File::open(path).map_err(|source| SecretError::FileIo {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut bytes = Zeroizing::new(Vec::new());
-    file.take((limits.max_bytes + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|source| SecretError::FileIo {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
     if bytes.len() > limits.max_bytes {
         return Err(SecretError::FileTooLarge {
             path: path.to_path_buf(),
