@@ -114,6 +114,7 @@ pub enum PathError {
 pub fn expand_path(template: &str, params: &[(&str, &str)]) -> Result<String, PathError> {
     let mut out = String::with_capacity(template.len());
     let mut used = vec![false; params.len()];
+    let mut expansions: Vec<Expansion> = Vec::new();
     let mut rest = template;
 
     while let Some(open) = rest.find('{') {
@@ -127,6 +128,12 @@ pub fn expand_path(template: &str, params: &[(&str, &str)]) -> Result<String, Pa
             return Err(PathError::MalformedTemplate);
         };
         let name = &after[..close];
+        // `/v1/{id{suffix}` with a caller who supplies the literal name
+        // `id{suffix` used to expand cleanly, so unbalanced braces reached the
+        // wire whenever the caller's key happened to match the mess.
+        if name.contains('{') {
+            return Err(PathError::MalformedTemplate);
+        }
 
         let index = params
             .iter()
@@ -136,7 +143,16 @@ pub fn expand_path(template: &str, params: &[(&str, &str)]) -> Result<String, Pa
             })?;
         used[index] = true;
 
-        out.push_str(&encode_segment(name, params[index].1)?);
+        let encoded = encode_segment(name, params[index].1)?;
+        // Where each expansion landed, so the rendered segment can be checked
+        // below. `encode_segment` sees the value alone; an escape assembled from
+        // the value *and* the literal text beside it is invisible to it.
+        expansions.push(Expansion {
+            name: name.to_owned(),
+            start: out.len(),
+            end: out.len() + encoded.len(),
+        });
+        out.push_str(&encoded);
         rest = &after[close + 1..];
     }
     // ... and so is one in the tail. `/v1/devices/{id}}` and `/v1/devices/id}`
@@ -154,7 +170,59 @@ pub fn expand_path(template: &str, params: &[(&str, &str)]) -> Result<String, Pa
         });
     }
 
+    // Validating each value in isolation is not enough when a placeholder shares
+    // its segment with literal text: the escape can be assembled only once the
+    // two are joined. `expand_path("/v1/a/{id}2f", &[("id", "%")])` returned
+    // `/v1/a/%252f`, which a proxy-then-application double decode turns into
+    // `/v1/a//` — caller input adding a segment, which is the one thing this
+    // function exists to prevent.
+    if let Some(error) = structural_after_joining(&out, &expansions) {
+        return Err(error);
+    }
+
     Ok(out)
+}
+
+/// Where one expanded value landed in the rendered path.
+struct Expansion {
+    /// The parameter's name, for attributing an error to it.
+    name: String,
+    /// Byte offset of the first character of the encoded value.
+    start: usize,
+    /// Byte offset just past its last character.
+    end: usize,
+}
+
+/// Re-check every rendered segment that an expansion contributed to.
+///
+/// Only those segments: a segment of pure template text is the author's own
+/// business, and rejecting it here would refuse templates that never touch
+/// caller input. The error is attributed to the first parameter in the segment,
+/// which is the value the caller can change.
+fn structural_after_joining(path: &str, expansions: &[Expansion]) -> Option<PathError> {
+    if expansions.is_empty() {
+        return None;
+    }
+    let mut offset = 0;
+    for segment in path.split('/') {
+        let start = offset;
+        let end = offset + segment.len();
+        offset = end + 1; // past the '/' that split consumed
+
+        let Some(expansion) = expansions
+            .iter()
+            .find(|expansion| expansion.start < end && expansion.end > start)
+        else {
+            continue;
+        };
+        // A segment that is exactly one expansion was already checked by
+        // `encode_segment`, and re-checking is harmless; the case that matters is
+        // a segment where the expansion is only part of the text.
+        if let Some(error) = structural_after_decoding(&expansion.name, segment) {
+            return Some(error);
+        }
+    }
+    None
 }
 
 /// Validate one parameter value and render it as a single segment.
@@ -223,6 +291,17 @@ fn is_structural(byte: u8) -> bool {
     matches!(byte, b'/' | b'\\' | b'?' | b'#') || byte.is_ascii_control()
 }
 
+/// The error a structural byte deserves, matching what `encode_segment` reports
+/// for the same byte before any decoding.
+fn structural_error(name: &str, byte: u8) -> PathError {
+    let name = name.to_owned();
+    match byte {
+        b'?' | b'#' => PathError::QueryOrFragment { name },
+        byte if byte.is_ascii_control() => PathError::ControlCharacter { name },
+        _ => PathError::SegmentBreak { name },
+    }
+}
+
 /// Detect a value that becomes structural once something downstream decodes it.
 ///
 /// Decoding is applied repeatedly, because a request can pass through more than
@@ -238,10 +317,12 @@ fn structural_after_decoding(name: &str, value: &str) -> Option<PathError> {
         if decoded == current {
             return None;
         }
-        if decoded.bytes().any(is_structural) {
-            return Some(PathError::SegmentBreak {
-                name: name.to_owned(),
-            });
+        // Classify by which byte appeared. Returning `SegmentBreak` for every
+        // case told a caller matching on `PathError` that `%3f` "would span more
+        // than one path segment", which is neither what happened nor what the
+        // documented variants promise.
+        if let Some(byte) = decoded.bytes().find(|byte| is_structural(*byte)) {
+            return Some(structural_error(name, byte));
         }
         if decoded == "." || decoded == ".." {
             return Some(PathError::RelativeComponent {
@@ -749,5 +830,82 @@ mod tests {
         assert!(limits.max_size > 0);
         assert!(page(0, u64::from(limits.max_size), limits).is_ok());
         assert!(page(u64::from(limits.max_from), 1, limits).is_ok());
+    }
+
+    /// The bypass: a placeholder that is not a whole segment.
+    ///
+    /// `encode_segment` sees only the value, so an escape assembled from the
+    /// value and the literal text beside it is invisible to it. `%` encodes to
+    /// `%25`, the template's own `2f` follows, and a proxy-then-application
+    /// double decode turns `/v1/a/%252f` into `/v1/a//` — caller input adding a
+    /// segment, which is the one thing this function exists to prevent.
+    #[test]
+    fn a_placeholder_sharing_its_segment_cannot_assemble_an_escape() {
+        let error = expand_path("/v1/a/{id}2f", &[("id", "%")]).unwrap_err();
+        assert!(
+            matches!(error, PathError::SegmentBreak { .. }),
+            "got {error:?}"
+        );
+
+        // The same trick with the literal text in front of the placeholder.
+        assert!(expand_path("/v1/a/%25{id}", &[("id", "2f")]).is_err());
+    }
+
+    /// A suffix that assembles nothing is still allowed. The rule is about
+    /// escapes forming across the join, not about placeholders having to own a
+    /// whole segment — refusing that would reject ordinary OpenAPI templates.
+    #[test]
+    fn an_ordinary_suffix_after_a_placeholder_still_expands() {
+        assert_eq!(
+            expand_path("/v1/devices/{id}.json", &[("id", "fw-01")]).unwrap(),
+            "/v1/devices/fw-01.json"
+        );
+        assert_eq!(
+            expand_path("/v1/{kind}-list", &[("kind", "address")]).unwrap(),
+            "/v1/address-list"
+        );
+    }
+
+    /// An unbalanced brace reached the wire whenever the caller's key happened
+    /// to match the mess inside it.
+    #[test]
+    fn a_nested_opening_brace_is_a_malformed_template() {
+        let error = expand_path("/v1/{id{suffix}", &[("id{suffix", "x")]).unwrap_err();
+        assert!(
+            matches!(error, PathError::MalformedTemplate),
+            "got {error:?}"
+        );
+    }
+
+    /// A caller matching on `PathError` was told `%3f` "would span more than one
+    /// path segment", which is neither what happened nor what the documented
+    /// variants promise.
+    #[test]
+    fn a_decoded_byte_keeps_its_own_error_kind() {
+        let query = expand_path("/v1/{id}", &[("id", "%3f")]).unwrap_err();
+        assert!(
+            matches!(query, PathError::QueryOrFragment { .. }),
+            "got {query:?}"
+        );
+
+        let fragment = expand_path("/v1/{id}", &[("id", "%23")]).unwrap_err();
+        assert!(
+            matches!(fragment, PathError::QueryOrFragment { .. }),
+            "got {fragment:?}"
+        );
+
+        let control = expand_path("/v1/{id}", &[("id", "%00")]).unwrap_err();
+        assert!(
+            matches!(control, PathError::ControlCharacter { .. }),
+            "got {control:?}"
+        );
+
+        // The variant that was already right, so the classification did not just
+        // move the problem.
+        let slash = expand_path("/v1/{id}", &[("id", "%2f")]).unwrap_err();
+        assert!(
+            matches!(slash, PathError::SegmentBreak { .. }),
+            "got {slash:?}"
+        );
     }
 }
