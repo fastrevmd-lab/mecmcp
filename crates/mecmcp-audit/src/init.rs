@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
 /// stderr output format for logs and audit events.
@@ -54,6 +53,10 @@ pub struct AuditConfig {
 pub struct FileHandle {
     file: Arc<Mutex<File>>,
     path: Arc<Path>,
+    /// Held for the whole of [`FileHandle::reopen`], so two rotations cannot
+    /// interleave. Separate from `file`: the point of opening outside the write
+    /// lock is that a bad path fails without disturbing the working sink.
+    reopening: Arc<Mutex<()>>,
 }
 
 impl FileHandle {
@@ -62,10 +65,21 @@ impl FileHandle {
     /// # Errors
     /// Returns the underlying I/O error if the file cannot be opened.
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let f = OpenOptions::new().create(true).append(true).open(path)?;
+        // Anchored before it is stored. A relative path is resolved against the
+        // working directory, and a process that changes directory afterwards —
+        // daemonizing is the ordinary case — keeps writing through the open
+        // descriptor while `reopen` would resolve the same string somewhere
+        // else, silently moving audit records to a different file.
+        //
+        // `absolute`, not `canonicalize`: this must work before the file exists,
+        // and an operator who deliberately points the audit log through a
+        // symlink should keep that link rather than have it resolved away.
+        let path = std::path::absolute(path)?;
+        let f = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(FileHandle {
             file: Arc::new(Mutex::new(f)),
-            path: Arc::from(path),
+            path: Arc::from(path.as_path()),
+            reopening: Arc::new(Mutex::new(())),
         })
     }
 
@@ -84,6 +98,18 @@ impl FileHandle {
     /// # Errors
     /// Returns the underlying I/O error if the path cannot be reopened.
     pub fn reopen(&self) -> std::io::Result<()> {
+        // One reopen at a time. Both used to open outside the write lock and
+        // then race for it, so an older call could win the swap and install a
+        // descriptor to an inode a newer call had already rotated away — every
+        // record after that going to the renamed file.
+        //
+        // This is not the write lock, so the property above still holds: a bad
+        // path fails without disturbing the sink that is currently working.
+        let _serialized = self
+            .reopening
+            .lock()
+            .expect("audit reopen mutex not poisoned");
+
         let fresh = OpenOptions::new()
             .create(true)
             .append(true)
@@ -241,13 +267,32 @@ pub fn init_tracing(cfg: &AuditConfig) -> io::Result<Option<AuditFileSink>> {
     let journald_layer =
         make_journald_layer_with(cfg.journald, tracing_journald::layer)?.map(audit_journald_layer);
 
-    let installed = tracing_subscriber::registry()
+    let subscriber = tracing_subscriber::registry()
         .with(env)
         .with(stderr)
         .with(file_layer)
-        .with(journald_layer)
-        .try_init()
-        .is_ok();
+        .with(journald_layer);
+
+    // `set_global_default` directly, rather than `try_init`.
+    //
+    // `try_init` installs the subscriber and *then* initialises the `log`
+    // bridge, returning the bridge's error as its own. A consumer that had
+    // already installed a `log` logger — but no tracing subscriber — therefore
+    // got an error from a call that had in fact installed the subscriber
+    // globally. Reading that as "not installed" dropped the only rotation
+    // handle while audit records went on being written through the layer, so
+    // after a rotation nothing could reopen the live sink and every record
+    // landed in the renamed inode.
+    let installed = tracing::subscriber::set_global_default(subscriber).is_ok();
+
+    // Best effort, and deliberately after the fact. The bridge is a convenience
+    // for consumers that emit through `log`; its absence does not cost a single
+    // audit record, so it must not be able to fail the installation.
+    if installed {
+        let _ = tracing_log::LogTracer::builder()
+            .with_max_level(log::LevelFilter::Trace)
+            .init();
+    }
 
     if let Some(redaction) = cfg.redaction.clone() {
         crate::redact::install(redaction);
