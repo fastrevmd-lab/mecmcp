@@ -5,7 +5,10 @@
 //! - **Rendering a result** — [`tool_result`], [`tool_error`], [`bounded_text`].
 //!   A handler's return value is caller-visible and vendor-sized, so it is
 //!   bounded before it leaves.
-//! - **Authorizing a call** — the scope checks, added separately.
+//! - **Authorizing a call** — [`authorize_call`] and the rest of
+//!   [`mod@authorize`]. Note the rule stated there: a `None` caller is the
+//!   stdio path and is authorized, so a handler must pass the caller it
+//!   recovered rather than `None` on a lookup miss.
 //!
 //! Nothing here knows a vendor's names, paths, headers, models, or statuses.
 //! That is the whole point: three servers were carrying their own copy of this
@@ -22,6 +25,13 @@
 //!
 //! [`bounded_text`] is the other half, for the places that genuinely want a
 //! prefix — a log line, a preview — and it says so in its return value.
+
+pub mod authorize;
+
+pub use authorize::{
+    AuthorizationError, audit_scope, authorize_call, authorize_target, authorize_tool,
+    caller_from_extensions, filter_tools_for_scope,
+};
 
 use serde::Serialize;
 use std::fmt::Display;
