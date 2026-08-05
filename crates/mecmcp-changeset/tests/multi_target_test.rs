@@ -9,7 +9,8 @@
 
 use mecmcp_changeset::{
     ChangeSetRecord, ChangesetState, OperationLimits, PreviewRecord, TargetError,
-    change_set_digest, change_set_digest_with_targets, read_state, validate_targets, write_state,
+    change_set_digest, change_set_digest_with_targets, preview_digest, read_state,
+    validate_targets, write_state,
 };
 
 fn record(device: &str, targets: Vec<String>) -> ChangeSetRecord {
@@ -197,9 +198,13 @@ fn a_preview_record_forces_version_two_and_round_trips() {
     let path = dir.path().join("state.json");
 
     let mut changeset = record("fw-01", Vec::new());
+    let artifact = "+ set address x".to_owned();
     changeset.preview = Some(PreviewRecord {
-        artifact: "+ set address x".to_owned(),
-        digest: format!("sha256:{}", "d".repeat(64)),
+        // Built with `preview_digest`, not by hand. A fabricated value used to
+        // reload cleanly, which is what made the preview decoration rather than
+        // evidence.
+        digest: preview_digest(&artifact),
+        artifact,
         job_id: Some("job-7".to_owned()),
     });
 
@@ -267,4 +272,243 @@ fn a_deployed_version_one_file_still_loads() {
     assert!(loaded.preview.is_none());
     // And the accessor still answers.
     assert_eq!(loaded.targets(), vec!["panosvm-writer".to_string()]);
+}
+
+/// The defect that made multi-target unusable across restarts.
+///
+/// A multi-target record is written with the five-tuple digest, but load-time
+/// validation recomputed the four-tuple. Every such record was therefore
+/// rejected on the next `read_state` or coordinator restart with a digest
+/// mismatch — the feature worked exactly until the process stopped.
+#[test]
+fn a_multi_target_record_survives_a_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+
+    let targets = vec!["fw-01".to_owned(), "fw-02".to_owned()];
+    let mut changeset = record("fw-01", targets.clone());
+    changeset.digest = change_set_digest_with_targets(
+        &changeset.owner,
+        &changeset.device,
+        &changeset.expected_candidate_fingerprint,
+        &changeset.actions,
+        &targets,
+    )
+    .unwrap();
+
+    let mut state = ChangesetState::default();
+    state.change_sets.insert("a".repeat(64), changeset);
+    write_state(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
+
+    let reloaded = read_state(&path, OperationLimits::default().max_state_bytes)
+        .expect("a multi-target record must reload");
+    assert_eq!(reloaded.change_sets[&"a".repeat(64)].targets, targets);
+}
+
+/// A single-target record still validates against the four-tuple, byte for
+/// byte. LXC 608 holds change sets whose digests were computed by the old
+/// function; the target-aware recompute must not invalidate them.
+#[test]
+fn a_single_target_record_still_validates_against_the_old_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+
+    let mut changeset = record("fw-01", Vec::new());
+    changeset.digest = change_set_digest(
+        &changeset.owner,
+        &changeset.device,
+        &changeset.expected_candidate_fingerprint,
+        &changeset.actions,
+    )
+    .unwrap();
+
+    let mut state = ChangesetState::default();
+    state.change_sets.insert("a".repeat(64), changeset);
+    write_state(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
+
+    read_state(&path, OperationLimits::default().max_state_bytes)
+        .expect("a record written by the old digest function must still load");
+}
+
+/// The digest is what makes a preview evidence. An artifact edited in the state
+/// file used to reload cleanly and be served as valid.
+#[test]
+fn an_edited_preview_artifact_is_rejected_on_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+
+    let artifact = "+ set address x".to_owned();
+    let mut changeset = record("fw-01", Vec::new());
+    changeset.preview = Some(PreviewRecord {
+        digest: preview_digest(&artifact),
+        artifact,
+        job_id: None,
+    });
+
+    let mut state = ChangesetState::default();
+    state.change_sets.insert("a".repeat(64), changeset);
+    write_state(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
+
+    // Edit the artifact on disk, leaving the digest alone — the tamper this
+    // digest exists to catch.
+    let mut on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    on_disk["state"]["change_sets"][&"a".repeat(64)]["preview"]["artifact"] =
+        serde_json::json!("+ set address evil");
+    std::fs::write(&path, serde_json::to_vec(&on_disk).unwrap()).unwrap();
+
+    let error = read_state(&path, OperationLimits::default().max_state_bytes)
+        .expect_err("an edited artifact must not reload");
+    assert!(error.to_string().contains("preview"), "got {error}");
+}
+
+/// A structurally invalid target set is rejected on load, not just at insert.
+///
+/// The digest check cannot catch this on its own: a record written with an
+/// unsorted list and a digest computed over that same unsorted list verifies
+/// perfectly. That is the point of the ordering rule — without it the digest is
+/// a function of how the caller built the list rather than of what the change
+/// set does, so two identical change sets can hold different digests.
+#[test]
+fn an_unsorted_target_set_is_rejected_on_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+
+    let targets = vec!["fw-02".to_owned(), "fw-01".to_owned()];
+    let mut changeset = record("fw-01", targets.clone());
+    changeset.digest = change_set_digest_with_targets(
+        &changeset.owner,
+        &changeset.device,
+        &changeset.expected_candidate_fingerprint,
+        &changeset.actions,
+        &targets,
+    )
+    .unwrap();
+
+    let mut state = ChangesetState::default();
+    state.change_sets.insert("a".repeat(64), changeset);
+    write_state(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
+
+    let error = read_state(&path, OperationLimits::default().max_state_bytes)
+        .expect_err("an unsorted target set must not reload");
+    assert!(error.to_string().contains("sorted"), "got {error}");
+}
+
+/// A target set that omits the record's own device makes the record name
+/// different devices depending on which API is asked: `targets()` reports the
+/// list, while approval and apply still look it up under `device`.
+#[test]
+fn a_target_set_must_contain_the_records_own_device() {
+    let changeset = record("fw-01", vec!["fw-02".to_owned(), "fw-03".to_owned()]);
+    assert_eq!(
+        changeset.validate_target_set(64),
+        Err(TargetError::MissingPrimary("fw-01".to_owned()))
+    );
+
+    let good = record("fw-01", vec!["fw-01".to_owned(), "fw-02".to_owned()]);
+    assert_eq!(good.validate_target_set(64), Ok(()));
+}
+
+/// An empty target set is the single-target shape, which is always valid.
+#[test]
+fn an_empty_target_set_is_the_single_target_shape() {
+    let changeset = record("fw-01", Vec::new());
+    assert_eq!(changeset.validate_target_set(64), Ok(()));
+    assert_eq!(changeset.targets(), vec!["fw-01".to_owned()]);
+}
+
+/// The configured ceilings, which nothing read.
+///
+/// `max_targets_per_set` and `max_preview_bytes` were both dead: a target list
+/// of any length and a preview of any size were accepted so long as the whole
+/// file stayed under `max_state_bytes`. The preview is the part a vendor API
+/// controls the size of, which is why it has a ceiling of its own.
+mod insert_boundary {
+    use super::record;
+    use mecmcp_changeset::{
+        ChangesetCoordinator, OperationLimits, PreviewRecord, change_set_digest_with_targets,
+        preview_digest,
+    };
+
+    fn coordinator(dir: &tempfile::TempDir, limits: OperationLimits) -> ChangesetCoordinator {
+        ChangesetCoordinator::load(
+            Some(&dir.path().join("state.json")),
+            limits,
+            std::time::Duration::from_secs(900),
+            false,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn too_many_targets_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = OperationLimits {
+            max_targets_per_set: 2,
+            ..OperationLimits::default()
+        };
+        let targets = vec!["fw-01".to_owned(), "fw-02".to_owned(), "fw-03".to_owned()];
+        let mut changeset = record("fw-01", targets.clone());
+        changeset.digest = change_set_digest_with_targets(
+            &changeset.owner,
+            &changeset.device,
+            &changeset.expected_candidate_fingerprint,
+            &changeset.actions,
+            &targets,
+        )
+        .unwrap();
+
+        let error = coordinator(&dir, limits)
+            .insert_change_set(changeset)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds the maximum"),
+            "got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_preview_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = OperationLimits {
+            max_preview_bytes: 16,
+            ..OperationLimits::default()
+        };
+        let artifact = "x".repeat(17);
+        let mut changeset = record("fw-01", Vec::new());
+        changeset.preview = Some(PreviewRecord {
+            digest: preview_digest(&artifact),
+            artifact,
+            job_id: None,
+        });
+
+        let error = coordinator(&dir, limits)
+            .insert_change_set(changeset)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds the maximum"),
+            "got {error}"
+        );
+    }
+
+    /// A ceiling lowered after the fact must not make an existing file
+    /// unloadable — which is why `validate_state` checks structure only.
+    #[tokio::test]
+    async fn a_preview_within_the_ceiling_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = "+ set address x".to_owned();
+        let mut changeset = record("fw-01", Vec::new());
+        changeset.preview = Some(PreviewRecord {
+            digest: preview_digest(&artifact),
+            artifact,
+            job_id: None,
+        });
+
+        coordinator(&dir, OperationLimits::default())
+            .insert_change_set(changeset)
+            .await
+            .expect("a preview inside the ceiling must be accepted");
+    }
 }

@@ -26,10 +26,10 @@ pub use lifecycle::{ChangeSetState, LifecycleState};
 pub use operation::StageOutput;
 pub use persistence::{ChangesetState, PersistenceError, read_state, validate_state, write_state};
 pub use records::{
-    ApprovalRecord, ChangeSetRecord, OperationRecord, PreviewRecord, RecordError, TargetError,
-    WaiverRecord, change_set_digest, change_set_digest_with_targets, mutation_policy_signature,
-    require_operation_fingerprint, require_operation_policy, validate_change_set_actions,
-    validate_targets,
+    ApprovalRecord, ChangeSetRecord, OperationRecord, PreviewError, PreviewRecord, RecordError,
+    TargetError, WaiverRecord, change_set_digest, change_set_digest_with_targets,
+    mutation_policy_signature, preview_digest, require_operation_fingerprint,
+    require_operation_policy, validate_change_set_actions, validate_targets,
 };
 pub use recovery::{RecoveryDisposition, ResolvedOperationOutput, resolve_persisted_operation};
 pub use transaction::{

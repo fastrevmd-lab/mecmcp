@@ -149,15 +149,33 @@ pub fn validate_state(state: &ChangesetState) -> Result<(), PersistenceError> {
                 "changeset state change set has an invalid action count",
             ));
         }
+        // Structure first, because the digest is computed over the target list:
+        // a record whose targets are unsorted or duplicated has a digest that is
+        // a function of how the caller built the list rather than of what the
+        // change set does. `usize::MAX` because the count ceiling is a resource
+        // limit the coordinator enforces at insert, and `validate_state` has no
+        // limits to consult — a file that was legal when written must not become
+        // unloadable because the ceiling was lowered afterwards.
+        record
+            .validate_target_set(usize::MAX)
+            .map_err(|error| PersistenceError::new(format!("changeset state {error}")))?;
+
         // Recompute the digest to detect tampering. With preserve_order enabled on
         // serde_json::Value, the key order from the file is preserved and this check
         // reproduces the original digest exactly. Without preserve_order, this would
         // reject all production state files due to key reordering.
-        let expected = crate::digest::change_set_digest(
+        //
+        // Target-aware: a multi-target record is written with the five-tuple
+        // digest, so recomputing the four-tuple here rejected every one of them
+        // on the next load and made the feature unusable across restarts.
+        // `change_set_digest_with_targets` reproduces the four-tuple byte for
+        // byte when `targets` is empty, so single-target records are unaffected.
+        let expected = crate::digest::change_set_digest_with_targets(
             &record.owner,
             &record.device,
             &record.expected_candidate_fingerprint,
             &record.actions,
+            &record.targets,
         )
         .map_err(|error| {
             PersistenceError::new(format!("could not recompute change-set digest: {error}"))
@@ -167,6 +185,12 @@ pub fn validate_state(state: &ChangesetState) -> Result<(), PersistenceError> {
                 "changeset state change-set digest mismatch",
             ));
         }
+
+        // Same reasoning as the target ceiling: verify the preview's digest
+        // here, and leave the size ceiling to the insert boundary.
+        record
+            .validate_preview(usize::MAX)
+            .map_err(|error| PersistenceError::new(format!("changeset state {error}")))?;
 
         // Validate approval digest if present (Issue #50: approval tamper-evidence)
         if let Some(approval) = &record.approval {
