@@ -265,7 +265,92 @@ impl ChangeSetRecord {
             self.targets.clone()
         }
     }
+
+    /// Check this record's target set, including that it names `device`.
+    ///
+    /// An empty set is the single-target shape and is always valid — `targets()`
+    /// reports `[device]` for it.
+    ///
+    /// Separate from [`validate_targets`] because the primary-device rule needs
+    /// the record, not just the list. Without it a set of `["fw-02"]` on a
+    /// record whose `device` is `fw-01` passes every structural check while
+    /// `targets()` reports `fw-02` and approval and apply still find the record
+    /// under `fw-01`.
+    ///
+    /// # Errors
+    /// Returns [`TargetError`] describing the first problem found.
+    pub fn validate_target_set(&self, maximum: usize) -> Result<(), TargetError> {
+        if self.targets.is_empty() {
+            return Ok(());
+        }
+        validate_targets(&self.targets, maximum)?;
+        if !self.targets.contains(&self.device) {
+            return Err(TargetError::MissingPrimary(self.device.clone()));
+        }
+        Ok(())
+    }
+
+    /// Check the stored preview: digest well-formed, matching, and within
+    /// `max_preview_bytes`.
+    ///
+    /// The digest is the only thing that makes a preview evidence rather than
+    /// decoration. Nothing verified it, so an artifact edited in the state file
+    /// reloaded cleanly and was served as valid evidence.
+    ///
+    /// # Errors
+    /// Returns a message naming what failed.
+    pub fn validate_preview(&self, max_preview_bytes: usize) -> Result<(), PreviewError> {
+        let Some(preview) = &self.preview else {
+            return Ok(());
+        };
+        if preview.artifact.len() > max_preview_bytes {
+            return Err(PreviewError::TooLarge {
+                bytes: preview.artifact.len(),
+                maximum: max_preview_bytes,
+            });
+        }
+        crate::digest::validate_digest(&preview.digest, "preview_digest")
+            .map_err(|error| PreviewError::Malformed(error.to_string()))?;
+        let expected = crate::digest::preview_digest(&preview.artifact);
+        if expected != preview.digest {
+            return Err(PreviewError::Mismatch);
+        }
+        Ok(())
+    }
 }
+
+/// A stored preview that cannot be trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewError {
+    /// The digest was not `sha256:<64 lowercase hex>`.
+    Malformed(String),
+    /// The digest did not match the artifact.
+    Mismatch,
+    /// The artifact exceeded the configured maximum.
+    TooLarge {
+        /// How large the artifact is.
+        bytes: usize,
+        /// How large it may be.
+        maximum: usize,
+    },
+}
+
+impl std::fmt::Display for PreviewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(detail) => write!(f, "preview: {detail}"),
+            Self::Mismatch => write!(
+                f,
+                "preview: digest does not match the artifact; the preview has been tampered with"
+            ),
+            Self::TooLarge { bytes, maximum } => {
+                write!(f, "preview: {bytes} bytes exceeds the maximum of {maximum}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PreviewError {}
 
 /// A target set that cannot be used.
 ///
@@ -286,6 +371,12 @@ pub enum TargetError {
     /// The set was not sorted. Same reason as a duplicate: order must not be
     /// able to alter the digest.
     Unsorted(String),
+    /// The set did not contain the record's own `device`.
+    ///
+    /// Approval and apply look a record up by `device`, so a target set that
+    /// omits it makes the record name different devices depending on which API
+    /// is asked.
+    MissingPrimary(String),
     /// The set exceeded the configured maximum.
     TooMany {
         /// How many were supplied.
@@ -302,6 +393,10 @@ impl std::fmt::Display for TargetError {
             Self::EmptyName => write!(f, "targets: a target name must not be empty"),
             Self::Duplicate(name) => write!(f, "targets: '{name}' appears more than once"),
             Self::Unsorted(name) => write!(f, "targets: must be sorted; '{name}' is out of order"),
+            Self::MissingPrimary(device) => write!(
+                f,
+                "targets: must contain the change set's own device '{device}'"
+            ),
             Self::TooMany { count, maximum } => {
                 write!(f, "targets: {count} exceeds the maximum of {maximum}")
             }
@@ -544,4 +639,4 @@ pub fn validate_change_set_actions<A: Serialize>(
 }
 
 /// Re-export digest functions for use in tests and validation.
-pub use crate::digest::{change_set_digest, change_set_digest_with_targets};
+pub use crate::digest::{change_set_digest, change_set_digest_with_targets, preview_digest};

@@ -73,6 +73,23 @@ pub fn change_set_digest_with_targets<A: Serialize>(
     Ok(format!("sha256:{}", digest_hex(&canonical)))
 }
 
+/// Computes the digest of a preview artifact.
+///
+/// Plain SHA-256 over the artifact bytes, with no framing: a preview is one
+/// opaque vendor string, so there is nothing to separate and nothing that could
+/// be confused with a neighbouring field.
+///
+/// This is the only value [`ChangeSetRecord::validate_preview`] accepts, so
+/// vendors must build [`PreviewRecord::digest`] with it rather than by hand —
+/// which is how the digest stops being decoration.
+///
+/// [`ChangeSetRecord::validate_preview`]: crate::ChangeSetRecord::validate_preview
+/// [`PreviewRecord::digest`]: crate::PreviewRecord::digest
+#[must_use]
+pub fn preview_digest(artifact: &str) -> String {
+    format!("sha256:{}", digest_hex(artifact.as_bytes()))
+}
+
 /// Validates a digest value.
 ///
 /// The format must be `sha256:<64 lowercase hex>`.

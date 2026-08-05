@@ -476,6 +476,18 @@ impl ChangesetCoordinator {
     /// - The principal already has a pending change set on the device
     /// - Persistence fails
     pub async fn insert_change_set(&self, record: ChangeSetRecord) -> Result<(), CoordinatorError> {
+        // The configured ceilings, enforced where the limits are in scope.
+        // `validate_state` sees no limits, so it checks structure only — a file
+        // that was legal when written must not become unloadable because a
+        // ceiling was lowered afterwards. Nothing called either of these before,
+        // so `max_targets_per_set` and `max_preview_bytes` had no effect at all.
+        record
+            .validate_target_set(self.limits.max_targets_per_set)
+            .map_err(|error| CoordinatorError::new("targets", error.to_string()))?;
+        record
+            .validate_preview(self.limits.max_preview_bytes)
+            .map_err(|error| CoordinatorError::new("preview", error.to_string()))?;
+
         let mut state = self.state.lock().await;
 
         // Retire anything past its approval deadline before doing anything else.
