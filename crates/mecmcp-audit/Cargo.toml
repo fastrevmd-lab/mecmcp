@@ -20,6 +20,11 @@ serde_json  = { workspace = true }
 sha2        = { workspace = true }
 tempfile    = { workspace = true }
 tracing     = { workspace = true }
+# Both already in the graph via tracing-subscriber's default features, so naming
+# them directly adds no crate. Needed because `init_tracing` installs the
+# subscriber and the `log` bridge as separate steps — see the note there.
+log         = { workspace = true }
+tracing-log = { workspace = true }
 tracing-journald = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid        = { workspace = true }
