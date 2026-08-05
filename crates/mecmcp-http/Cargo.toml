@@ -58,5 +58,5 @@ zeroize       = { workspace = true }
 rcgen        = "0.13"
 rustls       = { version = "0.23", features = ["aws-lc-rs"] }
 tempfile     = { workspace = true }
-tokio        = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
+tokio        = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "test-util"] }
 tokio-rustls = "0.26"
