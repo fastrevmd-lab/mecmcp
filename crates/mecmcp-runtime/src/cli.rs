@@ -4,6 +4,7 @@
 //! extensible command enum for vendor-specific subcommands.
 
 use clap::{Parser, Subcommand, ValueEnum};
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 /// MCP transport mode.
@@ -23,6 +24,10 @@ pub enum Transport {
 /// consumer's `CARGO_PKG_NAME`/`CARGO_PKG_VERSION` and both `--version` and
 /// `--help` report the binary rather than this crate.
 ///
+/// For a server that adds flags of its own, parse the server's own type with
+/// [`parse_with_provenance`] instead — this function understands only the
+/// shared arguments and rejects anything else as unknown.
+///
 /// # Examples
 /// ```no_run
 /// let cli = mecmcp_runtime::cli::parse_for(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -30,35 +35,54 @@ pub enum Transport {
 /// ```
 #[must_use]
 pub fn parse_for(binary_name: &'static str, version: &'static str) -> Cli {
-    parse_with_provenance(binary_name, version).cli
+    parse_with_provenance::<Cli>(binary_name, version).cli
 }
 
-/// Parse, and record which arguments the operator actually supplied.
+/// Parse the consumer's CLI, and record which arguments the operator supplied.
 ///
 /// The provenance is the point. A consumer that also reads these values from
 /// product configuration cannot otherwise tell an explicitly supplied
 /// `--approval-timeout-secs 900` from clap's default of the same number, so it
 /// cannot implement any precedence rule at all without guessing (#162).
 ///
+/// `C` is the *consumer's* parser, not the shared [`Cli`]. That is the whole
+/// point: `approval_timeout_secs` and the rest of the flags this precedence
+/// rule exists for are defined by each server, so a parser hard-wired to the
+/// shared type would reject them as unknown and could never report their
+/// provenance. A server flattens [`Cli`] into its own struct and passes that.
+///
 /// # Examples
 /// ```no_run
-/// let parsed = mecmcp_runtime::cli::parse_with_provenance(
+/// use clap::Parser;
+/// use mecmcp_runtime::cli::{Cli, parse_with_provenance};
+///
+/// #[derive(Debug, Parser)]
+/// struct ServerCli {
+///     #[command(flatten)]
+///     shared: Cli,
+///     /// A vendor flag the shared type knows nothing about.
+///     #[arg(long, default_value_t = 900)]
+///     approval_timeout_secs: u64,
+/// }
+///
+/// let parsed = parse_with_provenance::<ServerCli>(
 ///     env!("CARGO_PKG_NAME"),
 ///     env!("CARGO_PKG_VERSION"),
 /// );
-/// // CLI wins only when it was actually given. `host` stands in here for any
-/// // value a consumer also keeps in product configuration; the change-set
-/// // flags this rule exists for are defined by each server, not shared.
-/// let host = if parsed.was_supplied("host") {
-///     parsed.cli.host.clone()
+/// // CLI wins only when it was actually given.
+/// let approval_timeout_secs = if parsed.was_supplied("approval_timeout_secs") {
+///     parsed.cli.approval_timeout_secs
 /// } else {
-///     "from-product-config".to_owned()
+///     600 // from product configuration
 /// };
-/// # let _ = host;
+/// # let _ = approval_timeout_secs;
 /// ```
 #[must_use]
-pub fn parse_with_provenance(binary_name: &'static str, version: &'static str) -> ParsedCli {
-    match try_parse_from(binary_name, version, std::env::args_os()) {
+pub fn parse_with_provenance<C>(binary_name: &'static str, version: &'static str) -> ParsedCli<C>
+where
+    C: clap::CommandFactory + clap::FromArgMatches,
+{
+    match try_parse_from::<C, _, _>(binary_name, version, std::env::args_os()) {
         Ok(parsed) => parsed,
         Err(error) => error.exit(),
     }
@@ -74,73 +98,144 @@ pub fn parse_with_provenance(binary_name: &'static str, version: &'static str) -
 /// # Errors
 /// Returns the clap error, including the `DisplayVersion` and `DisplayHelp`
 /// cases, which are not failures.
-pub fn try_parse_from<I, T>(
+pub fn try_parse_from<C, I, T>(
     binary_name: &'static str,
     version: &'static str,
     args: I,
-) -> Result<ParsedCli, clap::Error>
+) -> Result<ParsedCli<C>, clap::Error>
 where
+    C: clap::CommandFactory + clap::FromArgMatches,
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    use clap::{CommandFactory, FromArgMatches};
-
-    let command = <Cli as CommandFactory>::command()
-        .name(binary_name)
-        .version(version);
-    // Captured before `try_get_matches_from` consumes the command.
+    let mut command = C::command().name(binary_name).version(version);
+    // Built explicitly, then read, then parsed. `try_get_matches_from` builds
+    // too, but only after this function has already captured the tree — and an
+    // unbuilt tree has not yet had global arguments propagated into its
+    // subcommands, so what gets captured would depend on that ordering rather
+    // than on a stated rule. Building first makes the tree the real one and puts
+    // the global handling in `argument_ids_of`, where it is visible.
+    command.build();
     let argument_ids = argument_ids_of(&command);
     let matches = command.try_get_matches_from(args)?;
 
-    let supplied = supplied_ids_from(&argument_ids, &matches);
-    let cli = <Cli as FromArgMatches>::from_arg_matches(&matches)?;
+    let supplied = supplied_arguments_from(&argument_ids, &matches);
+    let cli = C::from_arg_matches(&matches)?;
 
     Ok(ParsedCli { cli, supplied })
 }
 
-/// Collect the argument ids that came from the command line.
+/// An argument the operator typed, and where in the command tree it sits.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SuppliedArgument {
+    /// Subcommand path, outermost first. Empty for a top-level argument.
+    ///
+    /// `token add --tokens-file x` yields `["token", "add"]`.
+    pub command_path: Vec<String>,
+    /// The clap argument id — the field name, not the flag spelling.
+    pub id: String,
+}
+
+/// Every real argument id in a command tree, keyed by subcommand path.
+///
+/// Global arguments are recorded only at the level that declares them. Clap
+/// propagates a global into every descendant's matches, so counting it again
+/// deeper would report `--device-mapping` as supplied to `token add` when the
+/// operator typed it once, before the subcommand.
+fn argument_ids_of(command: &clap::Command) -> BTreeMap<Vec<String>, HashSet<String>> {
+    fn walk(
+        command: &clap::Command,
+        path: Vec<String>,
+        into: &mut BTreeMap<Vec<String>, HashSet<String>>,
+    ) {
+        let ids: HashSet<String> = command
+            .get_arguments()
+            .filter(|arg| path.is_empty() || !arg.is_global_set())
+            .map(|arg| arg.get_id().as_str().to_owned())
+            .collect();
+        for subcommand in command.get_subcommands() {
+            let mut child = path.clone();
+            child.push(subcommand.get_name().to_owned());
+            walk(subcommand, child, into);
+        }
+        into.insert(path, ids);
+    }
+
+    let mut ids = BTreeMap::new();
+    walk(command, Vec::new(), &mut ids);
+    ids
+}
+
+/// Collect the arguments that came from the command line, at every depth.
+///
+/// Clap keeps a subcommand's own arguments in a child `ArgMatches`, so a walk
+/// of the root alone reported nothing for `token add --tokens-file x` and
+/// `supplied_ids()` quietly contradicted its every-argument contract.
 ///
 /// `ArgMatches::ids()` also yields the `ArgGroup` clap's derive creates for the
 /// struct itself — an id named `Cli` that is not an argument at all and would
 /// otherwise be reported as something the operator supplied. Groups are
 /// excluded by intersecting against the command's real arguments; `try_get_raw`
 /// does not distinguish them, which a test caught.
-fn supplied_ids_from(
-    argument_ids: &std::collections::HashSet<String>,
+fn supplied_arguments_from(
+    argument_ids: &BTreeMap<Vec<String>, HashSet<String>>,
     matches: &clap::ArgMatches,
-) -> std::collections::HashSet<String> {
-    matches
-        .ids()
-        .filter(|id| argument_ids.contains(id.as_str()))
-        .filter(|id| {
-            matches.value_source(id.as_str()) == Some(clap::parser::ValueSource::CommandLine)
-        })
-        .map(|id| id.as_str().to_owned())
-        .collect()
-}
+) -> Vec<SuppliedArgument> {
+    fn walk(
+        argument_ids: &BTreeMap<Vec<String>, HashSet<String>>,
+        matches: &clap::ArgMatches,
+        path: Vec<String>,
+        into: &mut Vec<SuppliedArgument>,
+    ) {
+        if let Some(known) = argument_ids.get(&path) {
+            for id in matches.ids() {
+                let id = id.as_str();
+                if known.contains(id)
+                    && matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
+                {
+                    into.push(SuppliedArgument {
+                        command_path: path.clone(),
+                        id: id.to_owned(),
+                    });
+                }
+            }
+        }
 
-/// Every real argument id on a command, excluding groups.
-fn argument_ids_of(command: &clap::Command) -> std::collections::HashSet<String> {
-    command
-        .get_arguments()
-        .map(|arg| arg.get_id().as_str().to_owned())
-        .collect()
+        if let Some((name, child_matches)) = matches.subcommand() {
+            let mut child = path;
+            child.push(name.to_owned());
+            walk(argument_ids, child_matches, child, into);
+        }
+    }
+
+    let mut supplied = Vec::new();
+    walk(argument_ids, matches, Vec::new(), &mut supplied);
+    supplied.sort_unstable();
+    supplied
 }
 
 /// A parsed CLI plus which of its arguments the operator actually typed.
+///
+/// `C` defaults to the shared [`Cli`] so a server with no flags of its own can
+/// name the type without a parameter.
 #[derive(Debug)]
-pub struct ParsedCli {
+pub struct ParsedCli<C = Cli> {
     /// The parsed arguments.
-    pub cli: Cli,
-    /// Argument ids that came from the command line rather than a default.
-    supplied: std::collections::HashSet<String>,
+    pub cli: C,
+    /// Arguments that came from the command line rather than a default.
+    supplied: Vec<SuppliedArgument>,
 }
 
-impl ParsedCli {
-    /// Whether `id` was supplied on the command line rather than defaulted.
+impl<C> ParsedCli<C> {
+    /// Whether a top-level `id` was supplied on the command line.
     ///
     /// `id` is the field name as clap sees it — `approval_timeout_secs`, not
     /// `--approval-timeout-secs`.
+    ///
+    /// Top-level only, deliberately. `tokens_file` names both a server flag and
+    /// an argument of `token add`; answering `true` for the second would tell a
+    /// server the operator had chosen a value for the first. Use
+    /// [`was_supplied_in`](Self::was_supplied_in) for a subcommand.
     ///
     /// This is the mechanism behind the precedence rule in `docs/PACKAGING.md`:
     /// an explicit CLI value wins over product configuration, and a defaulted
@@ -149,15 +244,37 @@ impl ParsedCli {
     /// with a default the operator never chose.
     #[must_use]
     pub fn was_supplied(&self, id: &str) -> bool {
-        self.supplied.contains(id)
+        self.was_supplied_in(&[], id)
     }
 
-    /// Every argument id the operator supplied.
+    /// Whether `id` was supplied to the subcommand at `command_path`.
+    ///
+    /// `was_supplied_in(&["token", "add"], "tokens_file")` answers for
+    /// `token add --tokens-file x`. An empty path is the top level.
+    #[must_use]
+    pub fn was_supplied_in(&self, command_path: &[&str], id: &str) -> bool {
+        self.supplied
+            .iter()
+            .any(|argument| argument.id == id && argument.command_path == command_path)
+    }
+
+    /// Every top-level argument id the operator supplied, sorted.
+    ///
+    /// Subcommand arguments are in [`supplied_arguments`](Self::supplied_arguments),
+    /// which carries the path that tells them apart.
     #[must_use]
     pub fn supplied_ids(&self) -> Vec<&str> {
-        let mut ids: Vec<&str> = self.supplied.iter().map(String::as_str).collect();
-        ids.sort_unstable();
-        ids
+        self.supplied
+            .iter()
+            .filter(|argument| argument.command_path.is_empty())
+            .map(|argument| argument.id.as_str())
+            .collect()
+    }
+
+    /// Every argument the operator supplied anywhere in the command tree.
+    #[must_use]
+    pub fn supplied_arguments(&self) -> &[SuppliedArgument] {
+        &self.supplied
     }
 }
 
@@ -414,7 +531,7 @@ mod composition_tests {
     /// binaries run. An earlier version built an equivalent `Command` instead
     /// and a mutation to the real function slipped past it.
     fn parse(args: &[&str]) -> Result<ParsedCli, clap::Error> {
-        try_parse_from("consumer-mcp", "9.9.9", args)
+        try_parse_from::<Cli, _, _>("consumer-mcp", "9.9.9", args)
     }
 
     #[test]
@@ -492,6 +609,128 @@ mod composition_tests {
             parsed.supplied_ids().is_empty(),
             "got {:?}",
             parsed.supplied_ids()
+        );
+    }
+
+    /// The API's reason for existing, which it could not actually do.
+    ///
+    /// `approval_timeout_secs` is the flag the doc example names and the one
+    /// #162 was raised for, and it is defined by the *server*, not by the shared
+    /// type. A parser hard-wired to `Cli` rejected it as unknown, so no consumer
+    /// could have implemented the precedence rule this API documents.
+    #[test]
+    fn a_consumers_own_flag_parses_and_reports_provenance() {
+        #[derive(Debug, Parser)]
+        struct ServerCli {
+            #[command(flatten)]
+            shared: Cli,
+            #[arg(long, default_value_t = 900)]
+            approval_timeout_secs: u64,
+        }
+
+        let parsed: ParsedCli<ServerCli> = try_parse_from(
+            "consumer-mcp",
+            "9.9.9",
+            ["consumer-mcp", "--approval-timeout-secs", "60"],
+        )
+        .expect("a consumer's own flag must parse");
+
+        assert_eq!(parsed.cli.approval_timeout_secs, 60);
+        assert!(
+            parsed.was_supplied("approval_timeout_secs"),
+            "the vendor flag must report as supplied"
+        );
+        // The shared arguments still work through the flattened struct.
+        assert_eq!(parsed.cli.shared.host, "127.0.0.1");
+        assert!(!parsed.was_supplied("host"));
+    }
+
+    /// Clap stores a subcommand's own arguments in a child `ArgMatches`, so a
+    /// walk of the root alone reported nothing for them.
+    #[test]
+    fn subcommand_arguments_are_collected_with_their_path() {
+        let parsed = parse(&[
+            "consumer-mcp",
+            "token",
+            "add",
+            "--tokens-file",
+            "/etc/t.json",
+            "--name",
+            "writer",
+            "--devices",
+            "*",
+            "--tools",
+            "*",
+        ])
+        .unwrap();
+
+        assert!(
+            parsed.was_supplied_in(&["token", "add"], "tokens_file"),
+            "supplied {:?}",
+            parsed.supplied_arguments()
+        );
+        assert!(parsed.was_supplied_in(&["token", "add"], "name"));
+    }
+
+    /// The reason subcommand provenance carries a path rather than joining one
+    /// flat set: `tokens_file` names both a server flag and an argument of
+    /// `token add`, and a server asking about its own flag must not be told
+    /// "yes" because the operator typed the other one.
+    #[test]
+    fn a_subcommand_argument_does_not_answer_for_the_top_level_flag_of_the_same_name() {
+        let parsed = parse(&[
+            "consumer-mcp",
+            "token",
+            "add",
+            "--tokens-file",
+            "/etc/t.json",
+            "--name",
+            "writer",
+            "--devices",
+            "*",
+            "--tools",
+            "*",
+        ])
+        .unwrap();
+
+        assert!(parsed.was_supplied_in(&["token", "add"], "tokens_file"));
+        assert!(
+            !parsed.was_supplied("tokens_file"),
+            "the server's own --tokens-file was never typed"
+        );
+        assert!(
+            !parsed.supplied_ids().contains(&"tokens_file"),
+            "top-level ids must stay top-level: {:?}",
+            parsed.supplied_ids()
+        );
+    }
+
+    /// A global typed once, before the subcommand, is supplied once. Clap
+    /// propagates globals into every descendant's matches, so counting them at
+    /// each level would invent supplies the operator never made.
+    #[test]
+    fn a_global_is_reported_once_at_the_level_it_was_typed() {
+        let parsed = parse(&[
+            "consumer-mcp",
+            "--device-mapping",
+            "/etc/devices.json",
+            "token",
+            "list",
+            "--tokens-file",
+            "/etc/t.json",
+        ])
+        .unwrap();
+
+        assert!(parsed.was_supplied("device_mapping"));
+        let mappings: Vec<_> = parsed
+            .supplied_arguments()
+            .iter()
+            .filter(|argument| argument.id == "device_mapping")
+            .collect();
+        assert_eq!(
+            mappings.len(),
+            1,
+            "a global typed once must be reported once: {mappings:?}"
         );
     }
 }
