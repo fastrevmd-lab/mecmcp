@@ -25,6 +25,20 @@ fn is_pending(state: ChangeSetState) -> bool {
     )
 }
 
+/// Whether the approval deadline may still retire this change set.
+///
+/// Narrower than [`is_pending`], and deliberately so. `Applying` means a device
+/// transaction is in flight against this record — the deadline bounds how long
+/// an approval may sit unused, not how long an apply may take. Retiring an
+/// `Applying` record would rewrite the lifecycle out from under the running
+/// apply, make it evictable at capacity, and admit a second change set for the
+/// same principal and device. A crash would then leave the live operation paired
+/// with an expired or absent change set, instead of the `Failed` state that
+/// restart recovery assigns to anything caught mid-apply.
+fn is_expirable(state: ChangeSetState) -> bool {
+    matches!(state, ChangeSetState::Planned | ChangeSetState::Approved)
+}
+
 /// Error type for coordinator operations.
 #[derive(Debug)]
 pub struct CoordinatorError {
@@ -488,20 +502,49 @@ impl ChangesetCoordinator {
         // No log line here: this crate has no `tracing` dependency and adding
         // one for a single message is not worth it. The transition is durable
         // in the state file and visible through `change_sets()`.
-        for existing in state.change_sets.values_mut() {
-            if is_pending(existing.state) && existing.expires_at_unix <= now {
+        //
+        // What each retirement replaced is kept so the sweep can be undone if
+        // the persist below fails.
+        let mut retired: Vec<(String, ChangeSetState)> = Vec::new();
+        for (id, existing) in &mut state.change_sets {
+            if is_expirable(existing.state) && existing.expires_at_unix <= now {
+                retired.push((id.clone(), existing.state));
                 existing.state = ChangeSetState::Expired;
             }
         }
 
         // Evict terminal change sets if at capacity
+        let mut evicted: Vec<ChangeSetRecord> = Vec::new();
         if state.change_sets.len() >= self.limits.max_change_sets {
             state.change_sets.retain(|_, existing| {
-                !matches!(
+                let terminal = matches!(
                     existing.state,
                     ChangeSetState::Applied | ChangeSetState::Expired | ChangeSetState::Failed
-                )
+                );
+                if terminal {
+                    evicted.push(existing.clone());
+                }
+                !terminal
             });
+        }
+
+        // Both of those changed the store regardless of whether this insert goes
+        // on to succeed, so persist them now rather than on the success path
+        // alone. Every rejection below returns early; leaving the sweep unwritten
+        // would let memory report a record `Expired` while the file still says
+        // `Approved`, and a restart would resurrect the blocker this sweep just
+        // retired — #193 again, with the fix in place.
+        let swept = !retired.is_empty() || !evicted.is_empty();
+        if swept && let Err(error) = self.persist_locked(&state) {
+            for (id, previous) in retired {
+                if let Some(existing) = state.change_sets.get_mut(&id) {
+                    existing.state = previous;
+                }
+            }
+            for record in evicted {
+                state.change_sets.insert(record.id.clone(), record);
+            }
+            return Err(error);
         }
 
         if state.change_sets.len() >= self.limits.max_change_sets {
