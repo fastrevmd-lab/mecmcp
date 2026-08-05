@@ -171,6 +171,34 @@ impl LimitsConfig {
     }
 }
 
+/// Build rmcp's `StreamableHttpServerConfig` from this crate's [`LimitsConfig`].
+///
+/// Use this rather than `StreamableHttpServerConfig::default()`. rmcp 3 added
+/// its own `max_request_body_bytes`, defaulting to **4 MiB**, enforced *inside*
+/// rmcp after this crate's `apply_body_limit` layer has already accepted the
+/// request. A consumer whose `LimitsConfig` allows more than 4 MiB — the default
+/// here is 10 MiB — would find requests between the two silently rejected with
+/// 413 by a limit it never configured and cannot see.
+///
+/// `max_request_body_bytes: 0` means unlimited in [`LimitsConfig`], which rmcp
+/// has no spelling for, so it maps to `usize::MAX`.
+///
+/// `legacy_session_mode` is left at rmcp's default (`true`): the `initialize`
+/// handshake and `Mcp-Session-Id` stay available for pre-2026-07-28 clients,
+/// while clients declaring `2026-07-28` are routed statelessly per request.
+/// Both are served simultaneously; this is not a cutover.
+pub fn streamable_http_server_config(
+    cfg: &LimitsConfig,
+) -> rmcp::transport::streamable_http_server::StreamableHttpServerConfig {
+    let mut server = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();
+    server.max_request_body_bytes = if cfg.max_request_body_bytes == 0 {
+        usize::MAX
+    } else {
+        cfg.max_request_body_bytes
+    };
+    server
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
