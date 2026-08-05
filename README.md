@@ -43,6 +43,34 @@ gained multi-target change sets.
 Not published to crates.io. Consumers depend on this repository directly and pin
 an exact version.
 
+### Upgrading to 0.4.0
+
+**Additive: one new crate, `mecmcp-server`, and nothing else changed.** The minor
+bump is because a new crate is new API, not because anything broke — a consumer
+that does not want it can stay pinned at `v0.3.9` indefinitely.
+
+`mecmcp-server` is #199's milestone 1: the vendor-neutral helpers every MCP tool
+handler in this family needs, which three servers were each carrying their own
+copy of.
+
+| Group | Items |
+|---|---|
+| Rendering a result | `tool_result`, `tool_error`, `ResultFormat`, `ResultLimits`, `BoundedText`, `bounded_text` |
+| Authorizing a call | `authorize_call`, `authorize_tool`, `authorize_target`, `AuthorizationError`, `caller_from_extensions`, `filter_tools_for_scope`, `audit_scope` |
+
+Two behaviours to know before adopting, both documented at the call site:
+
+- **`tool_result` refuses an oversized success rather than truncating it.** A
+  caller handed a shortened value cannot tell it from a complete one.
+  `bounded_text` is for the places that genuinely want a prefix.
+- **A `None` caller is authorized for everything**, because that is the stdio
+  path, which has no bearer token. On an authenticated path a handler must pass
+  the caller it recovered — passing `None` on a lookup miss authorizes the call.
+
+This lets `rustsdcmcp` delete `compat/server.rs` and `rustsdcmcp-core/src/compat.rs`,
+332 of its 1,162 compat lines. The remaining groups — bearer boundary, HTTP
+transport assembly, preflight — are tracked in #199.
+
 ### Upgrading to 0.3.9
 
 A correctness release: every finding from the codex review of 0.3.8's unreviewed
