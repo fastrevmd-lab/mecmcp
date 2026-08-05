@@ -92,11 +92,17 @@ refused at startup by 0.3.8.
 
 ### Remote listeners fail closed
 
-A Streamable HTTP listener bound off-loopback must name what it accepts:
-`--allowed-host` and `--allowed-origin` are both required, and an allowlist of
-blank strings does not count. An empty allowlist is not "accept whatever the
-operator forgot to configure" — it is a DNS-rebinding and Host-confusion surface
-on Host, and it disables browser-origin policy entirely on Origin.
+A Streamable HTTP listener bound off-loopback must supply `--allowed-host`, and
+an allowlist of blank strings does not count. An empty Host allowlist is not
+"accept whatever the operator forgot to configure" — it is a DNS-rebinding and
+Host-confusion surface.
+
+`--allowed-origin` is required only by consumers whose transport actually
+applies browser-Origin policy, via `validate_with_origin_policy`. Requiring it
+everywhere refused a deployed server whose transport applies only `allowed_host`
+— and any dummy value would have satisfied it while enabling nothing. That is
+the failure `docs/PACKAGING.md` names: a flag that is present but ignored is
+worse than one that is absent, because the operator cannot tell.
 
 Loopback binds are exempt. A listener on `127.0.0.1` or `::1` is already bounded
 by the host, and requiring the flags there would break every stdio and
