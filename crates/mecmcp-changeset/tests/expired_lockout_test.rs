@@ -232,3 +232,126 @@ async fn a_different_principal_is_unaffected() {
         .await
         .expect("the guard is per principal and device");
 }
+
+/// The deadline retires an unused approval, not a running apply.
+///
+/// `Applying` means a device transaction is in flight against the record. The
+/// first version of the sweep used the same predicate as the blocking guard, so
+/// an apply that crossed its TTL mid-flight — waiting on `stage()`, say — was
+/// rewritten to `Expired` by any concurrent create. That freed the slot for a
+/// second change set on the same principal and device and made the live record
+/// evictable, so a crash left the running operation paired with an expired or
+/// absent change set instead of the `Failed` state restart recovery assigns.
+#[tokio::test]
+async fn an_applying_change_set_is_not_retired_by_its_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let coordinator = load_coordinator(&dir);
+
+    let in_flight = record(
+        "a",
+        "alice",
+        "fw-01",
+        ChangeSetState::Applying,
+        now() - 3600, // past its deadline, but the apply is still running
+    );
+    let in_flight_id = in_flight.id.clone();
+    coordinator.insert_change_set(in_flight).await.unwrap();
+
+    // A concurrent create must not free the slot out from under the apply.
+    let error = coordinator
+        .insert_change_set(record(
+            "b",
+            "alice",
+            "fw-01",
+            ChangeSetState::Planned,
+            now() + 900,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("already has a pending change set"),
+        "got {error}"
+    );
+
+    let states = coordinator.change_sets().await;
+    let live = states
+        .iter()
+        .find(|existing| existing.id == in_flight_id)
+        .expect("the in-flight record must still be in the store");
+    assert_eq!(
+        live.state,
+        ChangeSetState::Applying,
+        "the deadline must not rewrite a record whose apply is in flight"
+    );
+}
+
+/// The sweep is durable even when the insert that triggered it is refused.
+///
+/// Every check after the sweep returns early. Writing the expirations only on
+/// the success path left memory reporting `Expired` while the file still said
+/// `Approved`, so a restart resurrected the very blocker the sweep had just
+/// retired — the #193 lockout, with the fix in place.
+#[tokio::test]
+async fn a_sweep_survives_a_refused_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let coordinator = load_coordinator(&dir);
+
+    // The blocker goes in first, and the stale record second. Order matters: a
+    // later *successful* insert runs the same sweep and persists it on its own
+    // success path, which would hide the bug this test exists for. The refused
+    // insert below must be the first one whose sweep touches the stale record.
+    let blocker = record("b", "bob", "fw-02", ChangeSetState::Planned, now() + 900);
+    coordinator.insert_change_set(blocker).await.unwrap();
+
+    // Retired by the sweep: past its deadline, owned by someone else. Already
+    // stale when inserted — the sweep runs over the records already in the store,
+    // so it does not retire the one being added.
+    let stale = record(
+        "a",
+        "alice",
+        "fw-01",
+        ChangeSetState::Approved,
+        now() - 3600,
+    );
+    let stale_id = stale.id.clone();
+    coordinator.insert_change_set(stale).await.unwrap();
+
+    coordinator
+        .insert_change_set(record(
+            "c",
+            "bob",
+            "fw-02",
+            ChangeSetState::Planned,
+            now() + 900,
+        ))
+        .await
+        .unwrap_err();
+
+    // Reload from the file, which is what a restart sees.
+    let restarted = load_coordinator(&dir);
+    let states = restarted.change_sets().await;
+    let stale = states
+        .iter()
+        .find(|existing| existing.id == stale_id)
+        .expect("the retired record must still be on disk");
+    assert_eq!(
+        stale.state,
+        ChangeSetState::Expired,
+        "the sweep must be persisted even though the insert was refused"
+    );
+
+    // And the proof it matters: after the restart the retired record blocks
+    // nothing.
+    restarted
+        .insert_change_set(record(
+            "d",
+            "alice",
+            "fw-01",
+            ChangeSetState::Planned,
+            now() + 900,
+        ))
+        .await
+        .expect("a retired record must not block after a restart");
+}
