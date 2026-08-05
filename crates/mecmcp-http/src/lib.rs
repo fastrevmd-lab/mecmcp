@@ -3012,20 +3012,20 @@ mod tests {
         let (listener, port) = bind_local().await;
 
         // Server that holds requests open until told to release them
-        let release = Arc::new(tokio::sync::Notify::new());
+        let release = ReleaseGate::new();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
         {
-            let release = Arc::clone(&release);
+            let release = release.clone();
             tokio::spawn(async move {
                 while let Ok((stream, _)) = listener.accept().await {
                     let acceptor = acceptor.clone();
-                    let release = Arc::clone(&release);
+                    let release = release.clone();
                     tokio::spawn(async move {
                         let Ok(mut tls) = acceptor.accept(stream).await else {
                             return;
                         };
                         read_request_head(&mut tls).await;
-                        release.notified().await;
+                        release.wait().await;
                         let _ = tls
                             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                             .await;
@@ -3072,9 +3072,45 @@ mod tests {
         );
 
         // Release the held requests so the test can clean up
-        release.notify_waiters();
+        release.release();
         for handle in handles {
             let _ = handle.await;
+        }
+    }
+
+    /// A release gate that keeps its signal, unlike `Notify`.
+    ///
+    /// `Notify::notify_waiters` stores no permit. Only the `CONCURRENCY` active
+    /// handlers can be parked on it when the release fires — a *queued* request
+    /// cannot reach the wait until an active one finishes, so it misses the call
+    /// entirely and then sits out the full `request_timeout`, turning cleanup
+    /// into a deterministic 30-second (and 10-second) wait in the suite.
+    ///
+    /// The repository already pins that behaviour in
+    /// `notify_waiters_is_lost_when_nobody_is_registered_yet_but_a_permit_is_not`,
+    /// so the fix is a primitive that latches rather than a second notify.
+    #[derive(Clone)]
+    struct ReleaseGate {
+        released: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl ReleaseGate {
+        fn new() -> Self {
+            Self {
+                released: tokio::sync::watch::channel(false).0,
+            }
+        }
+
+        /// Wait until released. Returns immediately if that already happened.
+        async fn wait(&self) {
+            let mut seen = self.released.subscribe();
+            // Only fails once every sender is dropped, and this holds one.
+            let _ = seen.wait_for(|released| *released).await;
+        }
+
+        /// Release everyone waiting now, and everyone who arrives later.
+        fn release(&self) {
+            let _ = self.released.send(true);
         }
     }
 
@@ -3151,20 +3187,20 @@ mod tests {
         let (listener, port) = bind_local().await;
 
         // Server holds all connections open until notified to release them
-        let release = Arc::new(tokio::sync::Notify::new());
+        let release = ReleaseGate::new();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
         {
-            let release = Arc::clone(&release);
+            let release = release.clone();
             tokio::spawn(async move {
                 while let Ok((stream, _)) = listener.accept().await {
                     let acceptor = acceptor.clone();
-                    let release = Arc::clone(&release);
+                    let release = release.clone();
                     tokio::spawn(async move {
                         let Ok(mut tls) = acceptor.accept(stream).await else {
                             return;
                         };
                         read_request_head(&mut tls).await;
-                        release.notified().await;
+                        release.wait().await;
                         let _ = tls
                             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                             .await;
@@ -3216,7 +3252,7 @@ mod tests {
         assert_eq!(rejected, 10, "all overflow requests should be rejected");
 
         // Clean up: release the held requests
-        release.notify_waiters();
+        release.release();
         for handle in background {
             let _ = handle.await;
         }
