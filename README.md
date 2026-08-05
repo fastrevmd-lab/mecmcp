@@ -46,10 +46,11 @@ an exact version.
 ### Upgrading to 0.3.9
 
 A correctness release: every finding from the codex review of 0.3.8's unreviewed
-window, nine P1 and twelve P2. Two changes need a consumer's attention.
+window, nine P1 and twelve P2. Four changes need a consumer's attention.
 
 | Change | What a consumer must do |
 |---|---|
+| `TokenStoreFile::set_scopes` gained a `grant: Option<G>` parameter | pass `None` to leave the stored grant alone — a `NoGrant` consumer always wants `None`. This is a plain arity change, so the compiler will find every call site |
 | `TargetError` gained `MissingPrimary` | nothing unless you match the enum exhaustively; a target set must now contain the record's own `device` |
 | `try_parse_from`, `parse_with_provenance` and `ParsedCli` are generic over the consumer's parser | nothing if you use `parse_for`; `ParsedCli` defaults to `Cli`. **Servers with flags of their own should now flatten `Cli` into their own struct and pass that** — the previous API could not parse a vendor flag at all |
 | `ChangeSetRecord::validate_target_set` and `validate_preview` are enforced at insert and load | a preview's `digest` must be built with the new `preview_digest`; a hand-written value is refused |
