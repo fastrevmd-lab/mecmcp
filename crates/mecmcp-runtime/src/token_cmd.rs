@@ -9,6 +9,29 @@ use std::io::Write;
 use std::path::Path;
 use thiserror::Error;
 
+/// Whether replacing `current` with `next` grants anything it did not before.
+///
+/// Only a widening needs confirmation. Narrowing cannot grant access, so
+/// requiring `--yes` to *reduce* a scope would train operators to pass it
+/// reflexively — which is how the confirmation stops being one.
+///
+/// Conservative by construction: anything not provably a narrowing counts as a
+/// widening. `Wildcard` -> `Allowlist` is the one clear narrowing; an allowlist
+/// that gains a name, or any move to `Wildcard`, is a widening.
+fn is_widening(current: &ScopeSet, next: Option<&ScopeSet>) -> bool {
+    let Some(next) = next else {
+        return false; // unchanged
+    };
+    match (current, next) {
+        (ScopeSet::Wildcard, ScopeSet::Wildcard) => false,
+        (ScopeSet::Wildcard, ScopeSet::Allowlist(_)) => false,
+        (ScopeSet::Allowlist(_), ScopeSet::Wildcard) => true,
+        (ScopeSet::Allowlist(have), ScopeSet::Allowlist(want)) => {
+            want.iter().any(|name| !have.contains(name))
+        }
+    }
+}
+
 /// Token command execution error.
 #[derive(Debug, Error)]
 pub enum TokenCommandError {
@@ -235,6 +258,97 @@ where
             signal_reload(server_pid)?;
             Ok(())
         }
+        TokenAction::SetScopes {
+            tokens_file,
+            name,
+            devices,
+            tools,
+            yes,
+            server_pid,
+        } => {
+            let devices_scope = devices.map(|v| parse_scope(v, "devices")).transpose()?;
+            let tools_scope = tools.map(|v| parse_scope(v, "tools")).transpose()?;
+
+            if devices_scope.is_none() && tools_scope.is_none() && new_grant.is_none() {
+                return Err(TokenCommandError::InvalidArgument(
+                    "set-scopes needs at least one of --devices, --tools, or a grant".to_owned(),
+                ));
+            }
+
+            // Read the current scopes so the operator sees what is changing.
+            // A scope change is a security event and previously left no trace
+            // at all; showing before and after is the minimum that makes a
+            // widening deliberate rather than a side effect of a typo.
+            // Same reasoning as the Add arm: validate here so the operator is
+            // told their grant is bad, not handed a nested storage error.
+            if let Some(grant) = new_grant.as_ref() {
+                grant.validate().map_err(|error| {
+                    TokenCommandError::InvalidArgument(format!("invalid grant: {error}"))
+                })?;
+            }
+
+            // Cloned out of the store: `store()` returns a guard, and holding
+            // a borrow into it across the write below would not compile.
+            let store_file = TokenStoreFile::<G>::load(&tokens_file)?;
+            let (before_devices, before_tools) = {
+                let store = store_file.store();
+                let existing = store
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .ok_or_else(|| {
+                        TokenCommandError::InvalidArgument(format!("token '{name}' does not exist"))
+                    })?;
+                (existing.devices.clone(), existing.tools.clone())
+            };
+
+            let widening = is_widening(&before_devices, devices_scope.as_ref())
+                || is_widening(&before_tools, tools_scope.as_ref());
+
+            println!("token: {name}");
+            println!("  devices: {before_devices:?}");
+            if let Some(next) = devices_scope.as_ref() {
+                println!("        -> {next:?}");
+            }
+            println!("  tools:   {before_tools:?}");
+            if let Some(next) = tools_scope.as_ref() {
+                println!("        -> {next:?}");
+            }
+            if new_grant.is_some() {
+                println!("  grant:   replaced");
+            }
+
+            if widening && !yes {
+                return Err(TokenCommandError::InvalidArgument(
+                    "this widens a scope, which is a privilege escalation; re-run with --yes"
+                        .to_owned(),
+                ));
+            }
+
+            TokenStoreFile::<G>::set_scopes(
+                &tokens_file,
+                &name,
+                devices_scope,
+                tools_scope,
+                new_grant,
+                &known,
+            )?;
+
+            // A scope change is a security event. Emitting it here means the
+            // record exists even though the change is made by a CLI rather than
+            // through the served API.
+            tracing::info!(
+                target: "audit",
+                tool = "token_set_scopes",
+                action = "set_scopes",
+                result = "ok",
+                metadata = format!("token={name} widening={widening}"),
+                "token scopes changed",
+            );
+
+            signal_reload(server_pid)?;
+            Ok(())
+        }
         TokenAction::List { tokens_file } => list::<G>(&tokens_file),
         TokenAction::Revoke {
             tokens_file,
@@ -451,5 +565,65 @@ mod tests {
         } else {
             panic!("expected Scope error");
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod widening_tests {
+    use super::*;
+
+    fn allow(names: &[&str]) -> ScopeSet {
+        ScopeSet::Allowlist(names.iter().map(|n| (*n).to_owned()).collect())
+    }
+
+    /// Only a widening is confirmed. Requiring `--yes` to *narrow* would train
+    /// operators to pass it reflexively, which is how a confirmation stops
+    /// being one.
+    #[test]
+    fn narrowing_and_no_change_are_not_widenings() {
+        assert!(!is_widening(&ScopeSet::Wildcard, None), "unchanged");
+        assert!(
+            !is_widening(&ScopeSet::Wildcard, Some(&allow(&["a"]))),
+            "wildcard -> allowlist is the clearest narrowing there is"
+        );
+        assert!(
+            !is_widening(&allow(&["a", "b"]), Some(&allow(&["a"]))),
+            "dropping a name is a narrowing"
+        );
+        assert!(
+            !is_widening(&allow(&["a"]), Some(&allow(&["a"]))),
+            "the same allowlist is not a widening"
+        );
+        assert!(!is_widening(&ScopeSet::Wildcard, Some(&ScopeSet::Wildcard)));
+    }
+
+    #[test]
+    fn adding_a_name_or_going_wildcard_is_a_widening() {
+        assert!(
+            is_widening(&allow(&["a"]), Some(&allow(&["a", "b"]))),
+            "gaining a name grants something new"
+        );
+        assert!(
+            is_widening(&allow(&["a"]), Some(&ScopeSet::Wildcard)),
+            "allowlist -> wildcard grants everything"
+        );
+        assert!(
+            is_widening(&allow(&[]), Some(&allow(&["a"]))),
+            "empty -> one name is a widening"
+        );
+    }
+
+    /// Reordering is not a widening — the set is what matters, not the order.
+    #[test]
+    fn reordering_an_allowlist_is_not_a_widening() {
+        assert!(!is_widening(&allow(&["a", "b"]), Some(&allow(&["b", "a"]))));
+    }
+
+    /// A swap that both adds and removes still counts, because it grants
+    /// something that was not permitted before.
+    #[test]
+    fn a_swap_that_adds_anything_is_a_widening() {
+        assert!(is_widening(&allow(&["a"]), Some(&allow(&["b"]))));
     }
 }

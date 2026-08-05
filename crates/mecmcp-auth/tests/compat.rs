@@ -147,7 +147,7 @@ fn writing_a_deployed_file_preserves_its_envelope_version() {
             ],
         };
 
-        TokenStoreFile::<NoGrant>::set_scopes(&path, "readonly-observer", None, None, &known)
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "readonly-observer", None, None, None, &known)
             .expect("set_scopes on junos fixture");
 
         let body = std::fs::read_to_string(&path).expect("read junos file");
@@ -180,8 +180,15 @@ fn writing_a_deployed_file_preserves_its_envelope_version() {
             tools: &["get_panos_config", "list_devices", "stage_panos_config"],
         };
 
-        TokenStoreFile::<MutationGrant>::set_scopes(&path, "panos-operator", None, None, &known)
-            .expect("set_scopes on panos fixture");
+        TokenStoreFile::<MutationGrant>::set_scopes(
+            &path,
+            "panos-operator",
+            None,
+            None,
+            None,
+            &known,
+        )
+        .expect("set_scopes on panos fixture");
 
         let body = std::fs::read_to_string(&path).expect("read panos file");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse panos");
@@ -232,7 +239,7 @@ fn round_trip_through_write_atomic_does_not_mutate_untagged_tokens() {
             "get_router_list",
         ],
     };
-    TokenStoreFile::<NoGrant>::set_scopes(&path, "readonly-observer", None, None, &known)
+    TokenStoreFile::<NoGrant>::set_scopes(&path, "readonly-observer", None, None, None, &known)
         .expect("set_scopes rewrites the file");
 
     // Read it back and prove actor_type was NOT added.

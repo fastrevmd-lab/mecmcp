@@ -458,10 +458,18 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
 
     /// Narrow or widen an existing token's scopes without touching its secret.
     ///
-    /// Pass `None` for a scope to leave it unchanged; `Some(scope)` replaces it.
-    /// Both `None` is a no-op write-through. This method can widen as well as
-    /// narrow a scope; widening is a privilege escalation that belongs behind
-    /// whatever authorization the calling CLI enforces.
+    /// Pass `None` for a field to leave it unchanged; `Some(value)` replaces it.
+    /// All `None` is a no-op write-through. This can widen as well as narrow;
+    /// widening is a privilege escalation that belongs behind whatever
+    /// authorization the calling CLI enforces.
+    ///
+    /// `grant` covers the consumer's own scope — `allowed_xpath_roots` and
+    /// `actions` on PAN-OS. Without it this method could not adjust the scope
+    /// operators most often need to change, because that is the one encoding
+    /// device config paths, and those grow with the deployment (#163). The
+    /// alternatives were all wrong: `rotate` and `revoke`+`add` mint a new
+    /// secret, forcing every registered client to be reconfigured, and
+    /// hand-editing `tokens.json` bypasses the validation performed here.
     ///
     /// # Errors
     /// Returns [`FileError`] if the named token does not exist, if the scopes
@@ -471,6 +479,7 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
         name: &str,
         devices: Option<ScopeSet>,
         tools: Option<ScopeSet>,
+        grant: Option<G>,
         known: &KnownNames<'_>,
     ) -> Result<(), FileError> {
         let (current, version) = Self::read_store(path)?;
@@ -496,7 +505,7 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
                         tools: tools.clone().unwrap_or_else(|| entry.tools.clone()),
                         created_at: entry.created_at,
                         expires_at: entry.expires_at,
-                        grant: entry.grant.clone(),
+                        grant: grant.clone().or_else(|| entry.grant.clone()),
                         provider: entry.provider.clone(),
                         provider_tier: entry.provider_tier,
                         on_behalf_of: entry.on_behalf_of.clone(),
@@ -1325,6 +1334,7 @@ mod tests {
             "lab",
             None,
             Some(ScopeSet::Allowlist(vec!["get_junos_config".to_owned()])),
+            None,
             &known,
         )
         .expect("set_scopes");
@@ -1372,6 +1382,7 @@ mod tests {
             "lab",
             Some(ScopeSet::Allowlist(vec!["core-fw".to_owned()])),
             None,
+            None,
             &known,
         )
         .expect("set devices");
@@ -1396,6 +1407,7 @@ mod tests {
             "lab",
             None,
             Some(ScopeSet::Allowlist(vec!["get_junos_config".to_owned()])),
+            None,
             &known,
         )
         .expect("set tools");
@@ -1457,6 +1469,7 @@ mod tests {
             "lab",
             None,
             Some(ScopeSet::Allowlist(vec!["get_junos_config".to_owned()])),
+            None,
             &known,
         )
         .expect("set_scopes");
@@ -1518,6 +1531,7 @@ mod tests {
             "lab",
             None,
             Some(ScopeSet::Allowlist(vec!["get_junos_config".to_owned()])),
+            None,
             &known,
         )
         .expect("set_scopes");
@@ -1563,6 +1577,7 @@ mod tests {
             "missing",
             None,
             Some(ScopeSet::Allowlist(vec!["get_junos_config".to_owned()])),
+            None,
             &known,
         );
 
@@ -1599,6 +1614,7 @@ mod tests {
             &path,
             "lab",
             Some(ScopeSet::Allowlist(vec!["unknown-device".to_owned()])),
+            None,
             None,
             &known,
         );
@@ -1643,6 +1659,7 @@ mod tests {
             "lab",
             None,
             Some(ScopeSet::Allowlist(vec!["unknown_tool".to_owned()])),
+            None,
             &known,
         );
 
@@ -1696,6 +1713,7 @@ mod tests {
             "lab",
             None,
             Some(ScopeSet::Allowlist(vec!["get_junos_config".to_owned()])),
+            None,
             &known,
         )
         .expect("set_scopes");
@@ -1748,7 +1766,7 @@ mod tests {
             .find(|e| e.name == "lab")
             .expect("entry before");
 
-        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known)
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, None, &known)
             .expect("set_scopes with both None");
 
         let after: TokenStoreFile<NoGrant> = TokenStoreFile::load(&path).expect("load after");
@@ -1824,6 +1842,7 @@ mod tests {
             Some(ScopeSet::Allowlist(vec![
                 "load_and_commit_config".to_owned(),
             ])),
+            None,
             &known,
         )
         .expect("set_scopes");
@@ -1865,7 +1884,7 @@ mod tests {
         };
 
         // Run a lifecycle op (set_scopes is cheapest)
-        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known)
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, None, &known)
             .expect("set_scopes");
 
         // Reload the raw JSON and verify version is still 1
@@ -1898,7 +1917,7 @@ mod tests {
             tools: &["get_junos_config"],
         };
 
-        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known)
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, None, &known)
             .expect("set_scopes");
 
         let body = std::fs::read_to_string(&path).expect("read");
@@ -1934,7 +1953,7 @@ mod tests {
             devices: Some(known_devices()),
             tools: &["get_junos_config"],
         };
-        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known)
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, None, &known)
             .expect("set_scopes");
 
         let body = std::fs::read_to_string(&path).expect("read");
@@ -2035,7 +2054,7 @@ mod tests {
             tools: &["get_junos_config"],
         };
 
-        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, &known)
+        TokenStoreFile::<NoGrant>::set_scopes(&path, "lab", None, None, None, &known)
             .expect("set_scopes");
 
         let bytes = std::fs::read(&path).expect("read file");
@@ -2271,6 +2290,7 @@ mod tests {
             "lab",
             None,
             Some(ScopeSet::Allowlist(vec!["get_junos_config".to_owned()])),
+            None,
             &known_narrow,
         )
         .expect("set_scopes must succeed when devices is None");
