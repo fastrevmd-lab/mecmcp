@@ -50,13 +50,17 @@ rather than a version-string change:
 
 | Change | What a consumer must do |
 |---|---|
-| `ChangeSetRecord` and `OperationLimits` gained public fields | struct-literal construction needs `..OperationLimits::default()` |
+| `OperationLimits` gained public fields | struct-literal construction needs `..OperationLimits::default()` |
+| `ChangeSetRecord` gained required `targets` and `preview` fields | it has no `Default`, so `..Default::default()` does not compile — add `targets: Vec::new(), preview: None` to every literal |
 | `mecmcp-secret` is now Unix-only | nothing on Linux; the crate refuses to compile elsewhere by design |
 | `mecmcp-auth` and `mecmcp-inventory` read their files through the shared hardened loader | `tokens.json` and `devices.json` **must** be mode 0600, a regular file, and owned by the service user — inventory had no such check before |
 
-On-disk state is compatible in both directions: a 0.3.8 deployment using no
-multi-target change set still writes version-1 files that the previous binary
-reads.
+On-disk state is compatible in both directions **only while no change set holds
+targets or a preview**. Either one gates the file to version 2, and 0.3.7's
+`ChangeSetRecord` is `deny_unknown_fields`, so it rejects the whole file — the
+absence of multi-target sets alone is not enough, because `preview` does it too.
+A 0.3.8 deployment using neither still writes version-1 files that the previous
+binary reads.
 
 **Verify the deployed files before rolling out.** A `tokens.json` or
 `devices.json` that has drifted to 0644 loaded fine under 0.3.7 and will be
