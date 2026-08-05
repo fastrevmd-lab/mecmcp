@@ -108,6 +108,52 @@ deployments.
 
 Adding a vendor server means adopting these names, not inventing better ones.
 
+#### CLI beats product configuration, but only when actually supplied
+
+A server that also stores these values in its own configuration file needs one
+rule, or adopting the standard flags silently moves durable state or changes an
+approval lifetime (mecmcp#162). The rule is:
+
+1. **An explicitly supplied CLI value wins.** The operator typed it; nothing
+   should override it.
+2. **Otherwise product configuration wins**, if the server has such a file.
+3. **Otherwise the built-in default.**
+
+The trap is step 1. A defaulted flag is indistinguishable from a supplied one by
+value alone — clap hands you `900` either way, and
+`--approval-timeout-secs 900` is a legitimate thing to type. Comparing against
+the default gets this wrong in both directions: it ignores a flag the operator
+did type, and it overrides a config value with a default the operator never
+chose.
+
+`mecmcp_runtime::cli::parse_with_provenance` reports which arguments came from
+the command line:
+
+```rust
+let parsed = mecmcp_runtime::cli::parse_with_provenance(
+    env!("CARGO_PKG_NAME"),
+    env!("CARGO_PKG_VERSION"),
+);
+
+let approval_ttl = if parsed.was_supplied("approval_timeout_secs") {
+    parsed.cli_approval_timeout()          // the operator asked for this
+} else {
+    product_config.approval_ttl_secs       // fall back to the file
+};
+```
+
+**A flag that is present but ignored is worse than one that is absent**, because
+the operator has no way to tell. A server that cannot honour a standard flag
+should refuse at startup and say so, not accept it silently.
+
+#### Reporting the binary's own version
+
+The shared CLI carries no version of its own, so parsing it directly makes
+`--version` a clap error rather than an answer — which breaks the
+package-identity check a deployment wants to run (mecmcp#159). Use
+`parse_for(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))` so `--version`
+and `--help` name the binary rather than the shared crate.
+
 #### `--lab-mode` never fabricates an approver
 
 A waived change set records `approver: null` alongside
