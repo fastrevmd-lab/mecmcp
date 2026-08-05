@@ -61,6 +61,16 @@ pub enum CliRefusal {
 ///
 /// This function validates the common CLI arguments that apply to all vendors.
 /// Vendor-specific validation should be performed separately.
+///
+/// An off-loopback listener must supply `--allowed-host`. It is **not** required
+/// to supply `--allowed-origin` here: a consumer whose transport enforces
+/// browser-Origin policy calls [`validate_with_origin_policy`] instead.
+///
+/// That split is deliberate. Requiring `--allowed-origin` unconditionally broke
+/// a deployed server whose transport applies only `allowed_host` — and would
+/// have been satisfied by any dummy value, enabling nothing. `docs/PACKAGING.md`
+/// already states the rule this violated: a flag that is present but ignored is
+/// worse than one that is absent, because the operator cannot tell.
 pub fn validate(cli: &Cli) -> Result<(), CliRefusal> {
     // Stdio needs no transport validation.
     if cli.transport == Transport::Stdio {
@@ -108,19 +118,46 @@ pub fn validate(cli: &Cli) -> Result<(), CliRefusal> {
     // Loopback is deliberately exempt. A listener on 127.0.0.1 is already
     // bounded by the host, and requiring the flags there would break every
     // stdio and local-HTTP deployment for no gain.
-    if !host_is_loopback {
-        if !has_usable_entry(&cli.allowed_host) {
-            return Err(CliRefusal::AllowedHostRequired {
-                host: cli.host.clone(),
-            });
-        }
-        if !has_usable_entry(&cli.allowed_origin) {
-            return Err(CliRefusal::AllowedOriginRequired {
-                host: cli.host.clone(),
-            });
-        }
+    if !host_is_loopback && !has_usable_entry(&cli.allowed_host) {
+        return Err(CliRefusal::AllowedHostRequired {
+            host: cli.host.clone(),
+        });
     }
 
+    Ok(())
+}
+
+/// Validate, and additionally require an Origin allowlist off-loopback.
+///
+/// For a consumer whose Streamable HTTP transport actually applies
+/// browser-Origin policy. An empty Origin list disables that check entirely, so
+/// where it *is* applied, requiring one is the same fail-closed argument that
+/// governs `--allowed-host`.
+///
+/// A consumer whose transport ignores Origin must not call this: it would refuse
+/// startup over a value that changes nothing, which is worse than not asking.
+///
+/// # Errors
+/// Returns [`CliRefusal`] for everything [`validate`] refuses, plus
+/// [`CliRefusal::AllowedOriginRequired`] when an off-loopback listener supplies
+/// no usable Origin.
+pub fn validate_with_origin_policy(cli: &Cli) -> Result<(), CliRefusal> {
+    validate(cli)?;
+
+    let host_is_loopback = cli
+        .host
+        .parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false);
+
+    if cli.transport != Transport::Stdio
+        && !host_is_loopback
+        && !has_usable_entry(&cli.allowed_origin)
+    {
+        return Err(CliRefusal::AllowedOriginRequired {
+            host: cli.host.clone(),
+        });
+    }
     Ok(())
 }
 
@@ -265,6 +302,99 @@ mod tests {
         }
     }
 
+    /// The Origin requirement lives on the opt-in path now.
+    ///
+    /// `validate` must NOT refuse a missing Origin: LXC 609 runs off-loopback
+    /// with `--allowed-host` and no `--allowed-origin`, and its transport does
+    /// not apply Origin policy at all. Requiring it there would have refused a
+    /// working deployment at startup over a value that changes nothing.
+    #[test]
+    fn plain_validate_does_not_require_an_origin() {
+        let r = validate(&parse(&[
+            "-t",
+            "streamable-http",
+            "--tokens-file",
+            "/tmp/t.json",
+            "-H",
+            "0.0.0.0",
+            "--allow-insecure-bind",
+            "--allowed-host",
+            "192.168.1.194",
+        ]));
+        assert!(r.is_ok(), "609's shape must keep validating: {r:?}");
+    }
+
+    /// The Host requirement is unconditional — every transport applies it.
+    #[test]
+    fn plain_validate_still_requires_a_host() {
+        let r = validate(&parse(&[
+            "-t",
+            "streamable-http",
+            "--tokens-file",
+            "/tmp/t.json",
+            "-H",
+            "0.0.0.0",
+            "--allow-insecure-bind",
+        ]));
+        assert!(
+            matches!(r, Err(CliRefusal::AllowedHostRequired { .. })),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn origin_policy_path_still_requires_a_host() {
+        let r = validate_with_origin_policy(&parse(&[
+            "-t",
+            "streamable-http",
+            "--tokens-file",
+            "/tmp/t.json",
+            "-H",
+            "0.0.0.0",
+            "--allow-insecure-bind",
+            "--allowed-origin",
+            "https://server.example.org:8443",
+        ]));
+        assert!(
+            matches!(r, Err(CliRefusal::AllowedHostRequired { .. })),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn origin_policy_path_is_satisfied_when_both_are_supplied() {
+        let r = validate_with_origin_policy(&parse(&[
+            "-t",
+            "streamable-http",
+            "--tokens-file",
+            "/tmp/t.json",
+            "-H",
+            "0.0.0.0",
+            "--allow-insecure-bind",
+            "--allowed-host",
+            "server.example.org:8443",
+            "--allowed-origin",
+            "https://server.example.org:8443",
+        ]));
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn origin_policy_path_exempts_loopback_and_stdio() {
+        assert!(validate_with_origin_policy(&parse(&["-t", "stdio"])).is_ok());
+        for host in ["127.0.0.1", "::1"] {
+            let r = validate_with_origin_policy(&parse(&[
+                "-t",
+                "streamable-http",
+                "--tokens-file",
+                "/tmp/t.json",
+                "-H",
+                host,
+            ]));
+            assert!(r.is_ok(), "loopback {host} refused: {r:?}");
+        }
+    }
+
     #[test]
     fn off_loopback_without_allowed_origin_is_refused() {
         for extra in [
@@ -282,7 +412,7 @@ mod tests {
             args.extend(extra.iter());
             args.extend(["--allowed-host", "server.example.org:8443"]);
 
-            let r = validate(&parse(&args));
+            let r = validate_with_origin_policy(&parse(&args));
             assert!(
                 matches!(r, Err(CliRefusal::AllowedOriginRequired { .. })),
                 "expected an Origin refusal for {extra:?}, got {r:?}"
