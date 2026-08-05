@@ -9,6 +9,21 @@ use std::io::Write;
 use std::path::Path;
 use thiserror::Error;
 
+/// Which scope field is being compared.
+///
+/// The comparison is not the same for both. For devices, `Wildcard` permits
+/// every device, so narrowing to an allowlist can only reduce authority. For
+/// tools, `Wildcard` deliberately **denies** the server's write tools, so naming
+/// one explicitly grants something the wildcard did not — the same transition is
+/// a narrowing in one field and an escalation in the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeField {
+    /// Device scope. `Wildcard` is the broadest value.
+    Devices,
+    /// Tool scope. `Wildcard` excludes write tools, so it is not the broadest.
+    Tools,
+}
+
 /// Whether replacing `current` with `next` grants anything it did not before.
 ///
 /// Only a widening needs confirmation. Narrowing cannot grant access, so
@@ -16,15 +31,18 @@ use thiserror::Error;
 /// reflexively — which is how the confirmation stops being one.
 ///
 /// Conservative by construction: anything not provably a narrowing counts as a
-/// widening. `Wildcard` -> `Allowlist` is the one clear narrowing; an allowlist
-/// that gains a name, or any move to `Wildcard`, is a widening.
-fn is_widening(current: &ScopeSet, next: Option<&ScopeSet>) -> bool {
+/// widening.
+fn is_widening(field: ScopeField, current: &ScopeSet, next: Option<&ScopeSet>) -> bool {
     let Some(next) = next else {
         return false; // unchanged
     };
     match (current, next) {
         (ScopeSet::Wildcard, ScopeSet::Wildcard) => false,
-        (ScopeSet::Wildcard, ScopeSet::Allowlist(_)) => false,
+        // Devices: the wildcard already permits everything, so an allowlist is
+        // strictly smaller. Tools: the wildcard withholds write tools, so an
+        // allowlist can name one and gain authority. Treated as a widening
+        // because this function cannot see the server's write-tool registry.
+        (ScopeSet::Wildcard, ScopeSet::Allowlist(_)) => field == ScopeField::Tools,
         (ScopeSet::Allowlist(_), ScopeSet::Wildcard) => true,
         (ScopeSet::Allowlist(have), ScopeSet::Allowlist(want)) => {
             want.iter().any(|name| !have.contains(name))
@@ -290,7 +308,7 @@ where
             // Cloned out of the store: `store()` returns a guard, and holding
             // a borrow into it across the write below would not compile.
             let store_file = TokenStoreFile::<G>::load(&tokens_file)?;
-            let (before_devices, before_tools) = {
+            let (before_devices, before_tools, before_grant) = {
                 let store = store_file.store();
                 let existing = store
                     .entries()
@@ -299,11 +317,24 @@ where
                     .ok_or_else(|| {
                         TokenCommandError::InvalidArgument(format!("token '{name}' does not exist"))
                     })?;
-                (existing.devices.clone(), existing.tools.clone())
+                (
+                    existing.devices.clone(),
+                    existing.tools.clone(),
+                    existing.grant.clone(),
+                )
             };
 
-            let widening = is_widening(&before_devices, devices_scope.as_ref())
-                || is_widening(&before_tools, tools_scope.as_ref());
+            // A grant replacement is always treated as a widening. `Grant`
+            // exposes no subset relation, so this code cannot prove a new grant
+            // is narrower — and the case #163 exists for is widening a mutation
+            // root, which would otherwise have skipped the confirmation entirely
+            // and audited `widening=false`. Confirming a narrowing costs an
+            // operator one flag; missing a widening costs authority nobody
+            // approved.
+            let widening =
+                is_widening(ScopeField::Devices, &before_devices, devices_scope.as_ref())
+                    || is_widening(ScopeField::Tools, &before_tools, tools_scope.as_ref())
+                    || new_grant.is_some();
 
             println!("token: {name}");
             println!("  devices: {before_devices:?}");
@@ -314,8 +345,20 @@ where
             if let Some(next) = tools_scope.as_ref() {
                 println!("        -> {next:?}");
             }
-            if new_grant.is_some() {
-                println!("  grant:   replaced");
+            if let Some(next) = new_grant.as_ref() {
+                // `Debug`, not a bespoke summary: a grant is vendor-defined and
+                // this crate cannot know its shape. Printing only "replaced" —
+                // as the first version did — left an operator unable to spot a
+                // mistyped or unexpectedly broad grant in the very output the
+                // confirmation exists to make them read.
+                //
+                // `Grant: Debug` is a trait bound, and a grant carries authority
+                // rather than secrets: `TokenEntry`'s secret is the digest, which
+                // is not part of this.
+                match before_grant.as_ref() {
+                    Some(current) => println!("  grant:   {current:?}\n        -> {next:?}"),
+                    None => println!("  grant:   (none)\n        -> {next:?}"),
+                }
             }
 
             if widening && !yes {
@@ -582,34 +625,57 @@ mod widening_tests {
     /// being one.
     #[test]
     fn narrowing_and_no_change_are_not_widenings() {
-        assert!(!is_widening(&ScopeSet::Wildcard, None), "unchanged");
         assert!(
-            !is_widening(&ScopeSet::Wildcard, Some(&allow(&["a"]))),
+            !is_widening(ScopeField::Devices, &ScopeSet::Wildcard, None),
+            "unchanged"
+        );
+        assert!(
+            !is_widening(
+                ScopeField::Devices,
+                &ScopeSet::Wildcard,
+                Some(&allow(&["a"]))
+            ),
             "wildcard -> allowlist is the clearest narrowing there is"
         );
         assert!(
-            !is_widening(&allow(&["a", "b"]), Some(&allow(&["a"]))),
+            !is_widening(
+                ScopeField::Devices,
+                &allow(&["a", "b"]),
+                Some(&allow(&["a"]))
+            ),
             "dropping a name is a narrowing"
         );
         assert!(
-            !is_widening(&allow(&["a"]), Some(&allow(&["a"]))),
+            !is_widening(ScopeField::Devices, &allow(&["a"]), Some(&allow(&["a"]))),
             "the same allowlist is not a widening"
         );
-        assert!(!is_widening(&ScopeSet::Wildcard, Some(&ScopeSet::Wildcard)));
+        assert!(!is_widening(
+            ScopeField::Devices,
+            &ScopeSet::Wildcard,
+            Some(&ScopeSet::Wildcard)
+        ));
     }
 
     #[test]
     fn adding_a_name_or_going_wildcard_is_a_widening() {
         assert!(
-            is_widening(&allow(&["a"]), Some(&allow(&["a", "b"]))),
+            is_widening(
+                ScopeField::Devices,
+                &allow(&["a"]),
+                Some(&allow(&["a", "b"]))
+            ),
             "gaining a name grants something new"
         );
         assert!(
-            is_widening(&allow(&["a"]), Some(&ScopeSet::Wildcard)),
+            is_widening(
+                ScopeField::Devices,
+                &allow(&["a"]),
+                Some(&ScopeSet::Wildcard)
+            ),
             "allowlist -> wildcard grants everything"
         );
         assert!(
-            is_widening(&allow(&[]), Some(&allow(&["a"]))),
+            is_widening(ScopeField::Devices, &allow(&[]), Some(&allow(&["a"]))),
             "empty -> one name is a widening"
         );
     }
@@ -617,13 +683,46 @@ mod widening_tests {
     /// Reordering is not a widening — the set is what matters, not the order.
     #[test]
     fn reordering_an_allowlist_is_not_a_widening() {
-        assert!(!is_widening(&allow(&["a", "b"]), Some(&allow(&["b", "a"]))));
+        assert!(!is_widening(
+            ScopeField::Devices,
+            &allow(&["a", "b"]),
+            Some(&allow(&["b", "a"]))
+        ));
     }
 
     /// A swap that both adds and removes still counts, because it grants
     /// something that was not permitted before.
     #[test]
     fn a_swap_that_adds_anything_is_a_widening() {
-        assert!(is_widening(&allow(&["a"]), Some(&allow(&["b"]))));
+        assert!(is_widening(
+            ScopeField::Devices,
+            &allow(&["a"]),
+            Some(&allow(&["b"]))
+        ));
+    }
+
+    /// The field asymmetry, which a field-blind predicate got wrong.
+    ///
+    /// `Wildcard` -> `Allowlist` reduces device authority but can *increase*
+    /// tool authority, because the tool wildcard deliberately withholds the
+    /// server's write tools. Naming one explicitly grants it.
+    #[test]
+    fn wildcard_to_allowlist_differs_by_field() {
+        assert!(
+            !is_widening(
+                ScopeField::Devices,
+                &ScopeSet::Wildcard,
+                Some(&allow(&["fw-01"]))
+            ),
+            "for devices the wildcard is the broadest value, so this is a narrowing"
+        );
+        assert!(
+            is_widening(
+                ScopeField::Tools,
+                &ScopeSet::Wildcard,
+                Some(&allow(&["load_and_commit_config"]))
+            ),
+            "for tools the wildcard withholds write tools, so naming one is an escalation"
+        );
     }
 }
