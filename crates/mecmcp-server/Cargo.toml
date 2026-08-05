@@ -1,0 +1,21 @@
+[package]
+name        = "mecmcp-server"
+description = "Vendor-neutral MCP handler helpers: bounded results and scope authorization for mechub MCP servers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# `default-features = false`: only `rmcp::model` is needed here. The transport
+# features live in mecmcp-transport, and a handler-helper crate that dragged a
+# server transport in would unify those features into every consumer's build
+# whether or not they use that transport (decision D4).
+rmcp        = { version = "2", default-features = false }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
