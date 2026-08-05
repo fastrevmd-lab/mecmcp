@@ -15,6 +15,16 @@ use std::{
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
+/// Whether a change set still occupies the one-pending-per-principal slot.
+///
+/// `Expired`, `Applied` and `Failed` are terminal and block nothing.
+fn is_pending(state: ChangeSetState) -> bool {
+    matches!(
+        state,
+        ChangeSetState::Planned | ChangeSetState::Approved | ChangeSetState::Applying
+    )
+}
+
 /// Error type for coordinator operations.
 #[derive(Debug)]
 pub struct CoordinatorError {
@@ -311,6 +321,23 @@ impl ChangesetCoordinator {
         state.operations.values().cloned().collect()
     }
 
+    /// Every change set currently held, for enumeration by a consumer's tool.
+    ///
+    /// Mirrors [`ChangesetCoordinator::operations`]. This exists because not being able
+    /// to ask "what change sets exist for this device?" is what turned a stale
+    /// record into a lockout: the status path requires an id, and an operator
+    /// who never recorded it had no supported way to find out (#193). The
+    /// reporter escaped only by reading the state file on the container, which
+    /// is not an API.
+    ///
+    /// Returns records as stored. Filtering by device or owner, and deciding
+    /// what a caller is allowed to see, is the consumer's scope policy — this
+    /// crate has never made that decision and should not start here.
+    pub async fn change_sets(&self) -> Vec<ChangeSetRecord> {
+        let state = self.state.lock().await;
+        state.change_sets.values().cloned().collect()
+    }
+
     /// Inserts a new operation record.
     ///
     /// If the operation store is at capacity, terminal records are evicted first.
@@ -437,6 +464,24 @@ impl ChangesetCoordinator {
     pub async fn insert_change_set(&self, record: ChangeSetRecord) -> Result<(), CoordinatorError> {
         let mut state = self.state.lock().await;
 
+        // Retire anything past its approval deadline before doing anything else.
+        //
+        // A change set only became `Expired` lazily, when someone tried to apply
+        // it. One that simply ran out of time kept its `Approved` state
+        // indefinitely, went on blocking the guard below, and was never eligible
+        // for the capacity eviction either — that only retains terminal states.
+        // An operator who had lost the id was then locked out of change sets for
+        // that device with no MCP-reachable remedy (#193).
+        let now = crate::changeset::now_unix()?;
+        // No log line here: this crate has no `tracing` dependency and adding
+        // one for a single message is not worth it. The transition is durable
+        // in the state file and visible through `change_sets()`.
+        for existing in state.change_sets.values_mut() {
+            if is_pending(existing.state) && existing.expires_at_unix <= now {
+                existing.state = ChangeSetState::Expired;
+            }
+        }
+
         // Evict terminal change sets if at capacity
         if state.change_sets.len() >= self.limits.max_change_sets {
             state.change_sets.retain(|_, existing| {
@@ -454,18 +499,25 @@ impl ChangesetCoordinator {
             ));
         }
 
-        // Enforce one pending change set per principal and device
-        if state.change_sets.values().any(|existing| {
+        // Enforce one pending change set per principal and device.
+        //
+        // Expiry is handled above rather than here, so anything still pending at
+        // this point is genuinely live.
+        if let Some(blocker) = state.change_sets.values().find(|existing| {
             existing.owner == record.owner
                 && existing.device == record.device
-                && matches!(
-                    existing.state,
-                    ChangeSetState::Planned | ChangeSetState::Approved | ChangeSetState::Applying
-                )
+                && is_pending(existing.state)
         }) {
+            // Name the blocker. The bare refusal was a dead end: the status tool
+            // requires an id, there was no way to list, and the message did not
+            // say which record was in the way (#193).
             return Err(CoordinatorError::new(
                 "change_set_id",
-                "this principal already has a pending change set on the device",
+                format!(
+                    "this principal already has a pending change set on the device \
+                     (id {}, state {:?}, expires at unix {})",
+                    blocker.id, blocker.state, blocker.expires_at_unix
+                ),
             ));
         }
 
