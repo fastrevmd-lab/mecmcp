@@ -43,6 +43,36 @@ gained multi-target change sets.
 Not published to crates.io. Consumers depend on this repository directly and pin
 an exact version.
 
+### Upgrading to 0.3.9
+
+A correctness release: every finding from the codex review of 0.3.8's unreviewed
+window, nine P1 and twelve P2. Two changes need a consumer's attention.
+
+| Change | What a consumer must do |
+|---|---|
+| `TargetError` gained `MissingPrimary` | nothing unless you match the enum exhaustively; a target set must now contain the record's own `device` |
+| `try_parse_from`, `parse_with_provenance` and `ParsedCli` are generic over the consumer's parser | nothing if you use `parse_for`; `ParsedCli` defaults to `Cli`. **Servers with flags of their own should now flatten `Cli` into their own struct and pass that** — the previous API could not parse a vendor flag at all |
+| `ChangeSetRecord::validate_target_set` and `validate_preview` are enforced at insert and load | a preview's `digest` must be built with the new `preview_digest`; a hand-written value is refused |
+
+Behaviour changes worth knowing about, none of which need code:
+
+- A **multi-target change set now survives a restart.** It was written with the
+  five-tuple digest and re-verified with the four-tuple, so every one was
+  rejected on the next load. Single-target digests are unchanged, byte for byte.
+- `max_targets_per_set` and `max_preview_bytes` are enforced. They were read by
+  nothing before, so a deployment relying on the old non-enforcement would now
+  see refusals.
+- `set-scopes` asks for `--yes` in two more cases: any grant replacement, and a
+  tool scope moving from `*` to an allowlist. Both are escalations — the tool
+  wildcard deliberately withholds the server's write tools, so naming one grants
+  what the wildcard withheld.
+- An expiry sweep no longer retires a change set whose apply is in flight, and it
+  is persisted even when the insert that triggered it is refused.
+- `init_tracing` no longer drops the rotation handle when the consumer already
+  installed a `log` logger.
+
+On-disk state is unchanged from 0.3.8 in both directions.
+
 ### Upgrading to 0.3.8
 
 This release is **breaking at the source level**, and needs a deliberate upgrade

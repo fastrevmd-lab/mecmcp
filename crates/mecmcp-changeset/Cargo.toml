@@ -18,7 +18,7 @@ getrandom    = { workspace = true }
 tokio        = { version = "1", features = ["sync", "macros", "rt", "time"] }
 tokio-util   = { version = "0.7" }
 tempfile     = { workspace = true }
-mecmcp-secret = { version = "0.3.8", path = "../mecmcp-secret" }
+mecmcp-secret = { version = "0.3.9", path = "../mecmcp-secret" }
 rustix       = { workspace = true }
 url          = "2"
 
