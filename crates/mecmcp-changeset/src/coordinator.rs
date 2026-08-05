@@ -323,7 +323,7 @@ impl ChangesetCoordinator {
 
     /// Every change set currently held, for enumeration by a consumer's tool.
     ///
-    /// Mirrors [`Coordinator::operations`]. This exists because not being able
+    /// Mirrors [`ChangesetCoordinator::operations`]. This exists because not being able
     /// to ask "what change sets exist for this device?" is what turned a stale
     /// record into a lockout: the status path requires an id, and an operator
     /// who never recorded it had no supported way to find out (#193). The
