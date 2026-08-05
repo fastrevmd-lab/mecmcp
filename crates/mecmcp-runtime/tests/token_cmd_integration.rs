@@ -1021,6 +1021,83 @@ mod set_scopes {
         .expect("narrowing must not require --yes");
     }
 
+    /// A grant replacement is the mutation-authority change #163 exists for, so
+    /// it must reach the confirmation. Before the fix, changing only the grant
+    /// left both scope comparisons unchanged, `widening` stayed false, and the
+    /// escalation went through unconfirmed and was audited as a non-widening.
+    #[test]
+    fn replacing_a_grant_requires_confirmation() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        add(
+            &tokens_file,
+            XpathGrant {
+                allowed_roots: vec!["/config/devices/address".to_owned()],
+            },
+        );
+
+        let error = run_with_grant(
+            TokenAction::SetScopes {
+                tokens_file: tokens_file.clone(),
+                name: "writer".to_owned(),
+                devices: None,
+                tools: None,
+                yes: false,
+                server_pid: None,
+            },
+            &[],
+            KNOWN_TOOLS,
+            // A far broader mutation root, and nothing else changes.
+            Some(XpathGrant {
+                allowed_roots: vec!["/config".to_owned()],
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--yes"), "got {error}");
+
+        // Refused before the write: the old grant is still on disk.
+        let file: TokenStoreFile<XpathGrant> = TokenStoreFile::load(&tokens_file).unwrap();
+        let store = file.store();
+        let entry = store.entries().iter().find(|e| e.name == "writer").unwrap();
+        assert_eq!(
+            entry.grant.as_ref().unwrap().allowed_roots,
+            vec!["/config/devices/address".to_owned()],
+            "a refused confirmation must not have written the new grant"
+        );
+    }
+
+    /// Narrowing the *tool* wildcard to an allowlist is not a narrowing.
+    ///
+    /// The tool wildcard deliberately withholds the server's write tools, so an
+    /// allowlist naming one grants authority the wildcard withheld. The
+    /// field-blind predicate read this as the same shape as the device case and
+    /// waved it through.
+    #[test]
+    fn wildcard_to_allowlist_on_tools_requires_confirmation() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        add(
+            &tokens_file,
+            XpathGrant {
+                allowed_roots: vec!["/config".to_owned()],
+            },
+        );
+
+        let error = run_with_grant::<XpathGrant>(
+            TokenAction::SetScopes {
+                tokens_file: tokens_file.clone(),
+                name: "writer".to_owned(),
+                devices: None,
+                tools: Some(vec!["get_config".to_owned()]),
+                yes: false,
+                server_pid: None,
+            },
+            &[],
+            KNOWN_TOOLS,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--yes"), "got {error}");
+    }
+
     #[test]
     fn an_unknown_token_is_reported_clearly() {
         let (_dir, tokens_file) = temp_tokens_file();
