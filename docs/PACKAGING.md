@@ -127,20 +127,36 @@ did type, and it overrides a config value with a default the operator never
 chose.
 
 `mecmcp_runtime::cli::parse_with_provenance` reports which arguments came from
-the command line:
+the command line. It parses **your** CLI type, not the shared `Cli` — the flags
+this rule exists for, `--approval-timeout-secs` among them, are defined by each
+server, so flatten the shared type into your own struct and pass that:
 
 ```rust
-let parsed = mecmcp_runtime::cli::parse_with_provenance(
+#[derive(Debug, clap::Parser)]
+struct ServerCli {
+    #[command(flatten)]
+    shared: mecmcp_runtime::cli::Cli,
+    #[arg(long, default_value_t = 900)]
+    approval_timeout_secs: u64,
+}
+
+let parsed = mecmcp_runtime::cli::parse_with_provenance::<ServerCli>(
     env!("CARGO_PKG_NAME"),
     env!("CARGO_PKG_VERSION"),
 );
 
 let approval_ttl = if parsed.was_supplied("approval_timeout_secs") {
-    parsed.cli_approval_timeout()          // the operator asked for this
+    parsed.cli.approval_timeout_secs       // the operator asked for this
 } else {
     product_config.approval_ttl_secs       // fall back to the file
 };
 ```
+
+`was_supplied` answers for top-level arguments only. `tokens_file` names both a
+server flag and an argument of `token add`, and a server asking about its own
+flag must not be told "yes" because the operator typed the other one. For a
+management subcommand use `was_supplied_in(&["token", "add"], "tokens_file")`,
+or `supplied_arguments()` for the whole tree with paths attached.
 
 **A flag that is present but ignored is worse than one that is absent**, because
 the operator has no way to tell. A server that cannot honour a standard flag
