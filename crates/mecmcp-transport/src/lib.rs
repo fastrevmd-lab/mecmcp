@@ -17,7 +17,7 @@ mod target;
 pub mod tls;
 
 pub use concurrency::{ConcurrencyState, apply_body_limit, concurrency_middleware};
-pub use config::{LimitsConfig, LimitsConfigError};
+pub use config::{LimitsConfig, LimitsConfigError, streamable_http_server_config};
 pub use identity::TransportIdentity;
 pub use metrics::PrometheusRuntime;
 pub use overload::overload_response;

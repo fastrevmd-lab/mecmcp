@@ -43,6 +43,95 @@ gained multi-target change sets.
 Not published to crates.io. Consumers depend on this repository directly and pin
 an exact version.
 
+### Upgrading to 0.5.0
+
+**Breaking for consumers only because of the rmcp major: `rmcp 2` → `rmcp 3.1.1`.**
+Nothing in this workspace's own API changed shape. A consumer must bump its own
+`rmcp` dependency in the same commit — cargo will not unify a 2.x and a 3.x rmcp,
+so a partial upgrade is a build failure rather than a subtle one.
+
+**What the rmcp major actually is.** rmcp 3.x implements the 2026-07-28 MCP
+revision, but it is not the forced cutover the spec summaries suggest. The
+`initialize` handshake and `Mcp-Session-Id` are *not* removed: rmcp runs both
+protocols side by side and `StreamableHttpServerConfig::legacy_session_mode`
+defaults to `true`, which is the pre-2026-07-28 flow. Statelessness is opt-in,
+per request, keyed on the version the client declares.
+
+Consumer-visible changes:
+
+| Change | Action |
+|---|---|
+| `StreamableHttpServerConfig::stateful_mode` renamed to `legacy_session_mode` | Rename the field; same default (`true`), same behaviour |
+| `SessionManager` gained `event_store()` | Defaulted, so nothing breaks — but see below if you wrap a manager |
+| `Mcp-Method` / `Mcp-Name` header validation | Now enforced **by the SDK** for clients declaring `>= 2026-07-28`. No middleware needed |
+| **`StreamableHttpServerConfig::max_request_body_bytes` is new, and defaults to 4 MiB** | **Stop calling `StreamableHttpServerConfig::default()`. Call `mecmcp_transport::streamable_http_server_config(&limits)` instead.** |
+
+Everything else is source-compatible. MSRV stays 1.88 and the edition stays 2024,
+both of which this workspace already required.
+
+**The body limit is the one that bites silently.** rmcp 3 enforces its own 4 MiB
+request-body cap *inside* the service, after this crate's `apply_body_limit`
+layer has already accepted the request. `LimitsConfig::max_request_body_bytes`
+defaults to 10 MiB here, so on a plain `default()` every request between 4 and
+10 MiB starts failing with a 413 from a limit the operator never set and cannot
+see in their own config. `streamable_http_server_config` derives it from
+`LimitsConfig` and maps `0` (unlimited) to `usize::MAX`.
+
+**Session capacity is now protocol-aware.** rmcp computes
+`use_session = legacy_session_mode && is_legacy_request(..)`, so a client
+declaring `2026-07-28` is routed statelessly *even though `legacy_session_mode`
+is `true`* — and a stateless POST carries no `Mcp-Session-Id` because there is no
+session. The old classifier (`POST` without that header) would therefore have
+charged every ordinary `tools/call` from a modern client against
+`--max-sessions` and `--max-sessions-per-token`, handing out 503s after
+`max_sessions` calls. `is_session_creating` now also requires the absence of an
+`MCP-Protocol-Version` at or above `2026-07-28`. No consumer action needed.
+
+**One security note on the new header validation.** rmcp only enforces
+`Mcp-Method`/`Mcp-Name` when the request declares protocol `>= 2026-07-28`; a
+client declaring an older version simply omits them. So the headers are an
+optimisation, not a control. **The scope preflight remains the authorization
+boundary** — do not move an authorization decision up to a header a client can
+decline to send by claiming to be old.
+
+### Fixed in 0.5.0: `LimitedSessionManager` answered for the manager it wraps
+
+`LimitedSessionManager` overrode 8 of the 10 `SessionManager` methods and
+inherited the defaults for `restore_session` (`NotSupported`) and, as of rmcp 3,
+`event_store` (`None`). Because it is a *wrapper*, inheriting those defaults meant
+reporting "restore unsupported, no event store" **on behalf of the inner
+manager**, discarding whatever that manager actually provided.
+
+Latent until now — both current consumers wrap `LocalSessionManager`, which
+supplies neither — and it would have stayed silent when it did bite: the symptom
+is SSE resumability quietly not working, not a compile error or a log line.
+
+`event_store` is now forwarded. `restore_session` is now an **explicit refusal**
+rather than an inherited one — same answer, stated on purpose.
+
+That asymmetry is deliberate. Forwarding `event_store` touches no limit and
+undoes a real rmcp 3 regression. Forwarding `restore_session` looked like the
+same two-line change and is not: every limit this wrapper enforces is applied on
+the *create* path, and a restore arrives by a different route.
+
+- **Per-token cap.** The concurrency middleware classifies a request as
+  session-creating with `POST && !contains("mcp-session-id")`. A restore
+  necessarily carries that header, so no token slot is reserved. A restored
+  session would raise only the global count — letting one token restore its old
+  sessions *and* create a full `max_sessions_per_token` on top.
+- **Idle and lifetime timeouts.** The reaper closes the inner in-memory session
+  but cannot delete an entry from an rmcp `session_store` it does not own. A
+  reaped id could be restored with fresh timestamps, repeatedly, which does not
+  weaken the timeouts so much as remove them.
+- **Overload response.** A cap rejection on the restore path would surface as a
+  generic 500 rather than the stable 503 + `Retry-After`.
+
+Refusing costs nothing today — `LocalSessionManager`, which both consumers wrap,
+returns `NotSupported` anyway. Doing it properly needs reaper tombstoning, a
+token reservation on the restore path, generation-safe registration and
+cancellation-safe cleanup; that is tracked separately. Until then an honest
+refusal beats a cap that quietly does not hold.
+
 ### Upgrading to 0.4.0
 
 **Additive: one new crate, `mecmcp-server`, and nothing else changed.** The minor

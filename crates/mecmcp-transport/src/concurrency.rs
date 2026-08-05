@@ -241,9 +241,53 @@ fn is_length_limit_error(mut error: &(dyn std::error::Error + 'static)) -> bool 
     }
 }
 
-/// A session-creating request = POST without an `Mcp-Session-Id` header.
+/// A session-creating request = a *legacy* POST without an `Mcp-Session-Id`
+/// header.
+///
+/// The protocol check is not cosmetic. Under rmcp 3, `handle_post` computes
+/// `use_session = legacy_session_mode && is_legacy_request(..)`, so a client
+/// declaring `2026-07-28` is routed statelessly **even though
+/// `legacy_session_mode` is `true`** — and a stateless POST carries no
+/// `Mcp-Session-Id`, because there is no session. Counting those as
+/// session-creating would charge every ordinary `tools/call` against
+/// `--max-sessions` and `--max-sessions-per-token`, so a modern client would
+/// start collecting 503s the moment it made `max_sessions` calls, and each one
+/// would leave a spurious reservation behind.
+///
+/// `MCP-Protocol-Version` is the cheap discriminator: rmcp requires it on every
+/// request from a modern client and validates it itself. Matching on the header
+/// rather than reparsing the body keeps this from drifting against rmcp's own
+/// (body- and `_meta`-aware) definition, and it is correct in both directions —
+/// a legacy client never sends `>= 2026-07-28`, so its initialize still counts;
+/// a modern client always does, so its stateless calls never do.
+///
+/// This governs a *resource limit*, not an authorization decision. The scope
+/// preflight remains the security boundary.
+///
+/// **Known divergence, accepted deliberately.** rmcp permits a modern client to
+/// omit `MCP-Protocol-Version` on its *first* `initialize`, reading
+/// `params.protocolVersion` from the body instead. This classifier is
+/// header-only, so it counts that one request as session-creating and would shed
+/// it with a 503 if the cap were already full. The alternative is parsing the
+/// JSON body here to recover the version, which duplicates rmcp's
+/// body-and-`_meta`-aware `is_legacy_request` in a second place — and a
+/// divergent copy of protocol detection is a worse long-run failure than a
+/// conservative count. The blast radius is one request per client, only at
+/// capacity, and it errs toward over-counting rather than letting a limit
+/// silently lapse. Revisit alongside the `MCP-Protocol-Version` work in #166.
 fn is_session_creating(req: &Request) -> bool {
-    req.method() == axum::http::Method::POST && !req.headers().contains_key("mcp-session-id")
+    req.method() == axum::http::Method::POST
+        && !req.headers().contains_key("mcp-session-id")
+        && !declares_stateless_protocol(req.headers())
+}
+
+/// True when the client declares a protocol revision at or after the stateless
+/// core (`2026-07-28`). Unparseable or absent means legacy.
+fn declares_stateless_protocol(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|version| version >= rmcp::model::ProtocolVersion::STANDARD_HEADERS.as_str())
 }
 
 async fn observe_body_limit_response(req: Request, next: Next) -> Response {
@@ -312,6 +356,79 @@ impl HttpBody for GuardedBody {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::config::streamable_http_server_config;
+
+    fn post_with(headers: &[(&str, &str)]) -> Request {
+        let mut builder = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/mcp");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(axum::body::Body::empty()).unwrap()
+    }
+
+    /// A pre-2026-07-28 client still opens a session, so its initialize must
+    /// keep consuming session capacity.
+    #[test]
+    fn legacy_initialize_still_counts_as_session_creating() {
+        assert!(is_session_creating(&post_with(&[])));
+        assert!(is_session_creating(&post_with(&[(
+            "mcp-protocol-version",
+            "2025-06-18"
+        )])));
+    }
+
+    /// rmcp 3 routes a 2026-07-28 client's POSTs statelessly even with
+    /// `legacy_session_mode = true`, and a stateless POST carries no
+    /// Mcp-Session-Id. Counting those would charge every tools/call against
+    /// --max-sessions, so a modern client would start collecting 503s after
+    /// max_sessions ordinary calls.
+    #[test]
+    fn stateless_post_from_a_modern_client_does_not_consume_session_capacity() {
+        assert!(!is_session_creating(&post_with(&[(
+            "mcp-protocol-version",
+            "2026-07-28"
+        )])));
+    }
+
+    /// A request already carrying a session id was never session-creating.
+    #[test]
+    fn request_with_a_session_id_is_never_session_creating() {
+        assert!(!is_session_creating(&post_with(&[(
+            "mcp-session-id",
+            "abc"
+        )])));
+    }
+
+    /// rmcp 3 enforces its own body limit inside the service, after
+    /// apply_body_limit has accepted the request. If the two disagree, requests
+    /// between them are rejected by a limit the operator never configured.
+    #[test]
+    fn server_config_body_limit_tracks_limits_config() {
+        let cfg = LimitsConfig {
+            max_request_body_bytes: 9 * 1024 * 1024,
+            ..LimitsConfig::default()
+        };
+        assert_eq!(
+            streamable_http_server_config(&cfg).max_request_body_bytes,
+            9 * 1024 * 1024,
+            "rmcp's 4 MiB default must not silently override the configured limit"
+        );
+    }
+
+    #[test]
+    fn server_config_maps_unlimited_to_usize_max() {
+        let cfg = LimitsConfig {
+            max_request_body_bytes: 0,
+            ..LimitsConfig::default()
+        };
+        assert_eq!(
+            streamable_http_server_config(&cfg).max_request_body_bytes,
+            usize::MAX,
+            "0 means unlimited here; rmcp has no spelling for it"
+        );
+    }
     use axum::Router;
     use axum::body::Bytes;
     use axum::routing::{get, post};

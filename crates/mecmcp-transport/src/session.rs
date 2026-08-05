@@ -7,7 +7,9 @@ use dashmap::DashMap;
 use futures::Stream;
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::transport::common::server_side_http::{ServerSseMessage, SessionId};
-use rmcp::transport::streamable_http_server::session::SessionManager;
+use rmcp::transport::streamable_http_server::session::{
+    EventStore, RestoreOutcome, SessionManager,
+};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
@@ -544,6 +546,61 @@ impl<S: SessionManager> SessionManager for LimitedSessionManager<S> {
             .await
             .map_err(LimitedSessionManagerError::Inner)
     }
+
+    /// **Deliberately not forwarded.** This wrapper refuses external restore,
+    /// and says so explicitly rather than inheriting the trait default that
+    /// happens to say the same thing.
+    ///
+    /// Forwarding looks like a two-line change and is not. Every limit this
+    /// type exists to enforce is applied on the *create* path, and a restore
+    /// request reaches the server by a different route:
+    ///
+    /// - **Per-token cap.** `concurrency_middleware` classifies a request as
+    ///   session-creating with `POST && !contains("mcp-session-id")`. A restore
+    ///   necessarily carries that header, so no token slot is ever reserved and
+    ///   `SessionTracker::note_session_created` has no reservation to bind.
+    ///   A restored session would raise only the global count, letting one
+    ///   token restore its old sessions *and* create a full
+    ///   `max_sessions_per_token` on top.
+    /// - **Idle and lifetime timeouts.** The reaper closes the inner in-memory
+    ///   session but cannot delete an entry from an rmcp `session_store` it does
+    ///   not own. A reaped id could be restored with fresh timestamps, and
+    ///   repeated indefinitely — which does not weaken the timeouts so much as
+    ///   remove them.
+    /// - **Overload response.** `SESSION_CAP_REJECTED` is only scoped for
+    ///   session-creating requests, so a cap rejection here would surface as a
+    ///   generic 500 rather than the stable 503 + `Retry-After`.
+    ///
+    /// Refusing is fail-closed and costs nothing today, though the reason is
+    /// the consumers' configuration rather than rmcp's: `LocalSessionManager`
+    /// *does* implement restore and returns `Restored` once a `session_store`
+    /// is configured. Neither consumer configures one, so nothing is being
+    /// suppressed in practice — but this wrapper, not rmcp, is the layer that
+    /// would suppress it, and anyone adopting persistent sessions needs to know
+    /// that. Supporting it properly needs reaper tombstoning,
+    /// a token reservation on the restore path, generation-safe registration,
+    /// and cancellation-safe cleanup. That is a design task, and until it is
+    /// done an honest refusal beats a cap that quietly does not hold.
+    ///
+    /// Contrast [`Self::event_store`], which *is* forwarded: it has no
+    /// interaction with any limit, and inheriting its default was a genuine
+    /// regression introduced by rmcp 3.
+    async fn restore_session(
+        &self,
+        _id: SessionId,
+    ) -> Result<RestoreOutcome<Self::Transport>, Self::Error> {
+        Ok(RestoreOutcome::NotSupported)
+    }
+
+    /// Forwarded. Inheriting the rmcp 3 default (`None`) would make this wrapper
+    /// answer *on behalf of* the manager it wraps, discarding a store that
+    /// manager actually provides — and the symptom would be SSE resumability
+    /// quietly not working, not a compile error. Unlike
+    /// [`Self::restore_session`], this touches no limit, so forwarding it is
+    /// both correct and safe.
+    fn event_store(&self) -> Option<Arc<dyn EventStore>> {
+        self.inner.event_store()
+    }
 }
 
 #[cfg(test)]
@@ -552,6 +609,7 @@ mod tests {
     use super::*;
     use rmcp::RoleServer;
     use rmcp::transport::Transport;
+    use rmcp::transport::streamable_http_server::session::{EventId, EventStoreError, EventStream};
     use std::convert::Infallible;
     use std::future::Future;
     use std::sync::Barrier;
@@ -610,6 +668,8 @@ mod tests {
         fail_close: AtomicBool,
         fail_create: AtomicBool,
         fail_has_session: AtomicBool,
+        support_restore: AtomicBool,
+        event_store: Mutex<Option<Arc<dyn EventStore>>>,
     }
 
     #[derive(Clone)]
@@ -631,8 +691,14 @@ mod tests {
                     fail_close: AtomicBool::new(false),
                     fail_create: AtomicBool::new(false),
                     fail_has_session: AtomicBool::new(false),
+                    support_restore: AtomicBool::new(false),
+                    event_store: Mutex::new(None),
                 }),
             }
+        }
+
+        fn set_event_store(&self, store: Arc<dyn EventStore>) {
+            *self.state.event_store.lock().unwrap() = Some(store);
         }
 
         fn live_ids(&self) -> HashSet<SessionId> {
@@ -781,6 +847,102 @@ mod tests {
                 "unused test operation",
             ))
         }
+
+        /// Unlike `LocalSessionManager`, this fake supports external restore, so
+        /// the wrapper's forwarding is observable.
+        async fn restore_session(
+            &self,
+            id: SessionId,
+        ) -> Result<RestoreOutcome<Self::Transport>, Self::Error> {
+            if !self.state.support_restore.load(Ordering::SeqCst) {
+                return Ok(RestoreOutcome::NotSupported);
+            }
+            self.state.live.lock().unwrap().insert(id);
+            Ok(RestoreOutcome::Restored(TestTransport))
+        }
+
+        fn event_store(&self) -> Option<Arc<dyn EventStore>> {
+            self.state.event_store.lock().unwrap().clone()
+        }
+    }
+
+    /// Minimal `EventStore` whose only job is to be identifiable by pointer so a
+    /// test can prove the wrapper handed back *this* store rather than `None`.
+    struct MarkerEventStore;
+
+    #[async_trait::async_trait]
+    impl EventStore for MarkerEventStore {
+        async fn store_event(
+            &self,
+            _stream_id: &str,
+            _event: &ServerSseMessage,
+        ) -> Result<EventId, EventStoreError> {
+            Err("marker store is never exercised".into())
+        }
+
+        async fn replay_events_after(
+            &self,
+            _last_event_id: &str,
+        ) -> Result<EventStream, EventStoreError> {
+            Err("marker store is never exercised".into())
+        }
+    }
+
+    /// A wrapper that inherits a trait's default methods answers on behalf of
+    /// the thing it wraps. `event_store` and `restore_session` both default to
+    /// "unsupported", so inheriting them would make `LimitedSessionManager`
+    /// silently disable SSE resumability for any inner manager that supports it
+    /// — with no compile error and no runtime complaint. These two tests are the
+    /// only thing standing between that and a future persistent session store.
+    #[tokio::test]
+    async fn limited_manager_forwards_the_inner_event_store() {
+        let inner = TestSessionManager::new(None);
+        let store: Arc<dyn EventStore> = Arc::new(MarkerEventStore);
+        inner.set_event_store(store.clone());
+
+        let cfg = LimitsConfig::default();
+        let limited = LimitedSessionManager::new(inner, &cfg);
+
+        let forwarded = limited
+            .event_store()
+            .expect("wrapper must not report None when the inner manager has a store");
+        assert!(
+            Arc::ptr_eq(&store, &forwarded),
+            "wrapper must return the inner manager's store, not one of its own"
+        );
+    }
+
+    /// The counterpart: restore is refused even when the inner manager supports
+    /// it, because every limit this wrapper enforces lives on the create path.
+    /// If this test ever fails, the forwarding was added without the reaper
+    /// tombstoning and token reservation that have to come with it — see the
+    /// doc comment on `restore_session`.
+    #[tokio::test]
+    async fn limited_manager_refuses_restore_even_when_the_inner_manager_supports_it() {
+        let inner = TestSessionManager::new(None);
+        inner.state.support_restore.store(true, Ordering::SeqCst);
+        let inner_probe = inner.clone();
+
+        let cfg = LimitsConfig {
+            max_sessions: 1,
+            ..LimitsConfig::default()
+        };
+        let limited = LimitedSessionManager::new(inner, &cfg);
+
+        let outcome = limited.restore_session(id("restored-1")).await;
+        assert!(
+            matches!(outcome, Ok(RestoreOutcome::NotSupported)),
+            "restore must be refused while the cap cannot be enforced on it"
+        );
+        assert!(
+            inner_probe.live_ids().is_empty(),
+            "a refused restore must not have reached the inner manager"
+        );
+        assert_eq!(
+            limited.tracker().active(),
+            0,
+            "a refused restore must not consume a session slot"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
