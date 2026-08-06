@@ -6,7 +6,6 @@ use axum::Router;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
-use mecmcp_auth::CallerCtx;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -233,27 +232,143 @@ async fn rate_limit_middleware(
         return rate_limited_response("ip_rate", retry_after_secs);
     }
 
-    if let Some(caller) = request.extensions().get::<CallerCtx>() {
-        let token = caller.token_name.clone();
-        if let RateDecision::Limited { retry_after_secs } = state.check_token(&token, now) {
-            tracing::warn!(
-                limit = "token_rate",
-                token = %token,
-                rate = state.token_rate_per_second,
-                burst = state.token_burst,
-                retry_after_secs,
-                "request rate limited by token"
-            );
-            return rate_limited_response("token_rate", retry_after_secs);
-        }
+    if let Some(token) = crate::caller::token_name(request.extensions())
+        && let RateDecision::Limited { retry_after_secs } = state.check_token(token, now)
+    {
+        tracing::warn!(
+            limit = "token_rate",
+            token = %token,
+            rate = state.token_rate_per_second,
+            burst = state.token_burst,
+            retry_after_secs,
+            "request rate limited by token"
+        );
+        return rate_limited_response("token_rate", retry_after_secs);
     }
 
     next.run(request).await
 }
 
+/// Per-IP rate limiting middleware (must run BEFORE authentication).
+///
+/// Checks only the IP dimension. Unauthenticated requests (missing/malformed/unknown
+/// tokens) are rate-limited by their source IP, preventing authentication floods
+/// and warning-log spam from driving unbounded work.
+///
+/// This middleware MUST run before authentication so that 401 responses consume
+/// the source IP's budget.
+async fn ip_rate_limit_middleware(
+    State(state): State<RateLimitState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let now = Instant::now();
+
+    let ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip().to_string());
+    if ip.is_none() && state.ip_rate_limit_enabled() {
+        warn_missing_connect_info_once();
+    }
+
+    if let Some(ip) = ip.as_deref()
+        && let RateDecision::Limited { retry_after_secs } = state.check_ip(ip, now)
+    {
+        tracing::warn!(
+            limit = "ip_rate",
+            ip = ip,
+            rate = state.ip_rate_per_second,
+            burst = state.ip_burst,
+            retry_after_secs,
+            "request rate limited by IP"
+        );
+        return rate_limited_response("ip_rate", retry_after_secs);
+    }
+
+    next.run(request).await
+}
+
+/// Per-token rate limiting middleware (must run AFTER authentication).
+///
+/// Checks only the per-token dimension. Requires `AuthenticatedToken` to be present
+/// in request extensions (inserted by the bearer authentication layer).
+///
+/// This middleware MUST run after authentication so it can see the authenticated
+/// token identity.
+async fn token_rate_limit_middleware(
+    State(state): State<RateLimitState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let now = Instant::now();
+
+    if let Some(token) = crate::caller::token_name(request.extensions())
+        && let RateDecision::Limited { retry_after_secs } = state.check_token(token, now)
+    {
+        tracing::warn!(
+            limit = "token_rate",
+            token = %token,
+            rate = state.token_rate_per_second,
+            burst = state.token_burst,
+            retry_after_secs,
+            "request rate limited by token"
+        );
+        return rate_limited_response("token_rate", retry_after_secs);
+    }
+
+    next.run(request).await
+}
+
+/// Apply per-IP rate limiting middleware (must run BEFORE authentication).
+///
+/// If per-IP limiting is disabled in the config, the router is returned unchanged.
+///
+/// This middleware checks only the source IP dimension and must run BEFORE
+/// authentication so that unauthenticated requests (missing/malformed/unknown tokens)
+/// consume the IP's budget, preventing authentication floods.
+pub fn apply_ip_rate_limit(router: Router, config: &LimitsConfig) -> Router {
+    if !config.ip_rate_limit_enabled() {
+        return router;
+    }
+    router.layer(axum::middleware::from_fn_with_state(
+        RateLimitState::new(config),
+        ip_rate_limit_middleware,
+    ))
+}
+
+/// Apply per-token rate limiting middleware (must run AFTER authentication).
+///
+/// If per-token limiting is disabled in the config, the router is returned unchanged.
+///
+/// This middleware checks only the per-token dimension and must run AFTER
+/// authentication so it can see `AuthenticatedToken` in request extensions.
+pub fn apply_token_rate_limit(router: Router, config: &LimitsConfig) -> Router {
+    if !config.token_rate_limit_enabled() {
+        return router;
+    }
+    router.layer(axum::middleware::from_fn_with_state(
+        RateLimitState::new(config),
+        token_rate_limit_middleware,
+    ))
+}
+
 /// Apply per-IP and per-token rate limiting middleware to the router.
 ///
+/// **DEPRECATED:** Use `apply_ip_rate_limit` and `apply_token_rate_limit` separately
+/// to control their placement relative to authentication. IP rate limiting must run
+/// BEFORE authentication (so unauthenticated requests consume IP budget), while
+/// per-token rate limiting must run AFTER authentication (to see the token identity).
+///
+/// This function applies both dimensions together, which prevents correct ordering
+/// when used with bearer authentication. It is retained for backward compatibility
+/// with consumers that do not use bearer authentication.
+///
 /// If both limits are disabled in the config, the router is returned unchanged.
+#[deprecated(
+    since = "0.6.0",
+    note = "Use apply_ip_rate_limit and apply_token_rate_limit separately"
+)]
 pub fn apply_rate_limit(router: Router, config: &LimitsConfig) -> Router {
     if !config.ip_rate_limit_enabled() && !config.token_rate_limit_enabled() {
         return router;
@@ -273,7 +388,7 @@ fn refill_units(elapsed: Duration, rate: u64) -> u128 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, deprecated)]
 mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};

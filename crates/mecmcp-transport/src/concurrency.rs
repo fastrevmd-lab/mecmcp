@@ -16,7 +16,6 @@ use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::LengthLimitError;
-use mecmcp_auth::CallerCtx;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -73,7 +72,172 @@ impl ConcurrencyState {
     }
 }
 
+/// Axum middleware enforcing global + per-token concurrency with load-shed (non-buffering).
+///
+/// This middleware checks global and per-token concurrency limits without reading the
+/// request body. It MUST run before the body limit layer to prevent unauthenticated
+/// flooding and before per-target concurrency (which buffers the body).
+///
+/// **Execution order:** auth → token_rate → **token_concurrency** → body_limit → preflight → target_concurrency
+pub async fn token_concurrency_middleware(
+    State(state): State<ConcurrencyState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let mut permits: Vec<OwnedSemaphorePermit> = Vec::new();
+    let session_creating = is_session_creating(&req);
+    let mut token_session_reservation = None;
+
+    if state.max_global > 0 {
+        match state.global.clone().try_acquire_owned() {
+            Ok(p) => permits.push(p),
+            Err(_) => {
+                tracing::warn!(
+                    limit = "global_concurrency",
+                    max = state.max_global,
+                    "request shed"
+                );
+                return overload_response("global_concurrency");
+            }
+        }
+    }
+
+    if state.max_per_token > 0
+        && let Some(token) = crate::caller::token_name(req.extensions())
+    {
+        let sem = state.token_sem(token);
+        match sem.try_acquire_owned() {
+            Ok(p) => permits.push(p),
+            Err(_) => {
+                tracing::warn!(limit = "token_concurrency", token = %token, max = state.max_per_token, "request shed");
+                return overload_response("token_concurrency"); // global permit drops here
+            }
+        }
+    }
+
+    if let Some(tracker) = &state.sessions
+        && session_creating
+        && tracker.at_capacity()
+    {
+        tracing::warn!(limit = "session_cap", "request shed");
+        return overload_response("session_cap");
+    }
+
+    if session_creating
+        && let Some(tracker) = state.sessions.as_ref()
+        && let Some(token) = crate::caller::token_name(req.extensions())
+    {
+        match tracker.try_reserve_token(token.to_owned()) {
+            Ok(reservation) => token_session_reservation = reservation,
+            Err(capacity) => {
+                tracing::warn!(
+                    limit = "token_session_cap",
+                    token = %token,
+                    current = capacity.current,
+                    max = capacity.max,
+                    "request shed"
+                );
+                let mut response = overload_response("token_session_cap");
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"),
+                );
+                return response;
+            }
+        }
+    }
+
+    let (mut resp, session_cap_rejected) = if session_creating {
+        crate::session::scope_session_cap_rejection(next.run(req)).await
+    } else {
+        (next.run(req).await, false)
+    };
+
+    if session_cap_rejected {
+        tracing::warn!(
+            limit = "session_cap",
+            "request shed after manager registration race"
+        );
+        resp = overload_response("session_cap");
+    }
+
+    if let Some(reservation) = token_session_reservation
+        && resp.status().is_success()
+    {
+        match resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+        {
+            Some(session_id) => {
+                let id: rmcp::transport::common::server_side_http::SessionId =
+                    Arc::from(session_id);
+                let _ = reservation.commit(id);
+            }
+            None => tracing::warn!(
+                limit = "token_session_cap",
+                "successful initialize candidate returned no valid session id"
+            ),
+        }
+    }
+
+    attach_permits(resp, permits)
+}
+
+/// Axum middleware enforcing per-target concurrency with load-shed (buffering).
+///
+/// This middleware buffers the request body to extract target device names,
+/// then checks per-target concurrency limits. It MUST run AFTER body limit
+/// (so buffering is bounded) and AFTER preflight/authorization (so unauthorized
+/// requests never acquire target permits).
+///
+/// **Execution order:** auth → token_rate → token_concurrency → body_limit → preflight → **target_concurrency**
+pub async fn target_concurrency_middleware(
+    State(state): State<ConcurrencyState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let mut permits: Vec<OwnedSemaphorePermit> = Vec::new();
+
+    if state.max_per_target > 0 {
+        let (rebuilt, targets) = match inspect_target_devices(req, &state.target_keys).await {
+            Ok(result) => result,
+            Err(response) => return response,
+        };
+        req = rebuilt;
+
+        match state.per_target.try_acquire(&targets) {
+            Ok(mut target_permits) => permits.append(&mut target_permits),
+            Err(target) => {
+                tracing::warn!(
+                    limit = "target_concurrency",
+                    target = %target,
+                    max = state.max_per_target,
+                    "request shed"
+                );
+                let mut response = overload_response("target_concurrency");
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"),
+                );
+                return response;
+            }
+        }
+    }
+
+    attach_permits(next.run(req).await, permits)
+}
+
 /// Axum middleware enforcing global + per-token + per-target concurrency with load-shed.
+///
+/// **DEPRECATED:** Use `token_concurrency_middleware` before body limit and
+/// `target_concurrency_middleware` after preflight instead. This combined middleware
+/// cannot be correctly ordered when per-target limits are enabled: the buffering
+/// `inspect_target_devices` call would run before the body limit layer.
+#[deprecated(
+    since = "0.6.0",
+    note = "Use token_concurrency_middleware + target_concurrency_middleware split"
+)]
 pub async fn concurrency_middleware(
     State(state): State<ConcurrencyState>,
     mut req: Request,
@@ -98,10 +262,9 @@ pub async fn concurrency_middleware(
     }
 
     if state.max_per_token > 0
-        && let Some(ctx) = req.extensions().get::<CallerCtx>()
+        && let Some(token) = crate::caller::token_name(req.extensions())
     {
-        let token = ctx.token_name.clone();
-        let sem = state.token_sem(&token);
+        let sem = state.token_sem(token);
         match sem.try_acquire_owned() {
             Ok(p) => permits.push(p),
             Err(_) => {
@@ -120,11 +283,10 @@ pub async fn concurrency_middleware(
     }
 
     if session_creating
-        && let (Some(tracker), Some(ctx)) =
-            (state.sessions.as_ref(), req.extensions().get::<CallerCtx>())
+        && let Some(tracker) = state.sessions.as_ref()
+        && let Some(token) = crate::caller::token_name(req.extensions())
     {
-        let token = ctx.token_name.clone();
-        match tracker.try_reserve_token(token.clone()) {
+        match tracker.try_reserve_token(token.to_owned()) {
             Ok(reservation) => token_session_reservation = reservation,
             Err(capacity) => {
                 tracing::warn!(
@@ -216,13 +378,14 @@ async fn inspect_target_devices(
     let bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(error) => {
-            let status = if is_length_limit_error(&error) {
-                StatusCode::PAYLOAD_TOO_LARGE
+            if is_length_limit_error(&error) {
+                tracing::warn!(error = %error, "request body rejected while extracting target devices");
+                // Return marked 413 so it's counted and normalized to JSON
+                return Err(crate::auth::marked_body_limit_response());
             } else {
-                StatusCode::BAD_REQUEST
-            };
-            tracing::warn!(error = %error, %status, "request body rejected while extracting target devices");
-            return Err(status.into_response());
+                tracing::warn!(error = %error, "request body stream failed while extracting target devices");
+                return Err(StatusCode::BAD_REQUEST.into_response());
+            }
         }
     };
     let targets = extract_targets(&bytes, target_keys);
@@ -291,9 +454,21 @@ fn declares_stateless_protocol(headers: &axum::http::HeaderMap) -> bool {
 }
 
 async fn observe_body_limit_response(req: Request, next: Next) -> Response {
-    let response = next.run(req).await;
+    let mut response = next.run(req).await;
     if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        metrics::record_limit_hit("request_body", "request_rejected");
+        // Check if already marked (from inspect_target_devices or other origins)
+        if response
+            .extensions()
+            .get::<crate::auth::BodyLimitMarker>()
+            .is_none()
+        {
+            // Unmarked tower-http response: mark it and count it here
+            metrics::record_limit_hit("request_body", "request_rejected");
+            response
+                .extensions_mut()
+                .insert(crate::auth::BodyLimitMarker);
+        }
+        // Marked responses: already counted at their origin, do nothing
     }
     response
 }
@@ -354,6 +529,7 @@ impl HttpBody for GuardedBody {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
+#[allow(deprecated)] // Tests for old concurrency_middleware
 mod tests {
     use super::*;
     use crate::config::streamable_http_server_config;
