@@ -4,6 +4,7 @@
 //! names, and opaque authorization subjects; it does not know what a subject
 //! means to any particular device family.
 
+pub mod bearer;
 pub mod entry;
 pub mod grant;
 pub mod scope;
@@ -12,6 +13,7 @@ pub mod token;
 
 pub mod file;
 
+pub use bearer::{BearerHeaderError, BearerSyntax, parse_bearer_header};
 pub use entry::{ActorType, EntryError, MAX_TOKEN_NAME, Tier, TokenEntry};
 pub use file::{FileError, KnownNames, TokenStoreFile, write_atomic};
 pub use grant::{Grant, GrantError, NoAction, NoGrant, StoredGrant};

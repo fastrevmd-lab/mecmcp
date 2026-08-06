@@ -6,8 +6,34 @@
 //!
 //! `None` must be behaviourally identical to Junos today.
 
-use mecmcp_auth::CallerCtx;
+use mecmcp_auth::{CallerCtx, Grant, ScopeSet};
 use std::sync::Arc;
+
+/// Scope-only view of an authenticated caller, usable by preflights.
+///
+/// Preflight implementations inspect scopes (`devices`, `tools`) but never
+/// need the grant or provider metadata. This type extracts just those fields,
+/// allowing a single `ScopePreflight` implementation to work with
+/// `CallerCtx<G>` for any `G`.
+#[derive(Debug, Clone)]
+pub struct CallerScopes<'a> {
+    /// Non-secret token name.
+    pub token_name: &'a str,
+    /// Devices this caller may address.
+    pub devices: &'a ScopeSet,
+    /// Tools this caller may call.
+    pub tools: &'a ScopeSet,
+}
+
+impl<'a, G: Grant> From<&'a CallerCtx<G>> for CallerScopes<'a> {
+    fn from(caller: &'a CallerCtx<G>) -> Self {
+        Self {
+            token_name: &caller.token_name,
+            devices: &caller.devices,
+            tools: &caller.tools,
+        }
+    }
+}
 
 /// Preflight authorization check, run before the request reaches the handler.
 ///
@@ -35,7 +61,11 @@ pub trait ScopePreflight: Send + Sync {
     ///
     /// `body` is the complete, already-buffered request body. `Err` should
     /// carry a reason safe to return to the caller.
-    fn check(&self, body: &[u8], caller: &CallerCtx) -> Result<(), String>;
+    ///
+    /// The `caller` parameter is a `CallerScopes` view containing just the
+    /// scope fields, allowing a single implementation to work with
+    /// `CallerCtx<G>` for any grant type `G`.
+    fn check(&self, body: &[u8], caller: CallerScopes<'_>) -> Result<(), String>;
 }
 
 /// An optional preflight. `None` disables it entirely.
@@ -47,13 +77,13 @@ pub type OptionalPreflight = Option<Arc<dyn ScopePreflight>>;
 /// check, and every request proceeds exactly as it does on a server that never
 /// had one. Middleware calls this rather than matching on the `Option` itself,
 /// so the skip semantics live in one place and are testable.
-pub fn run_preflight(
+pub fn run_preflight<G: Grant>(
     preflight: &OptionalPreflight,
     body: &[u8],
-    caller: &CallerCtx,
+    caller: &CallerCtx<G>,
 ) -> Result<(), String> {
     match preflight {
-        Some(check) => check.check(body, caller),
+        Some(check) => check.check(body, CallerScopes::from(caller)),
         None => Ok(()),
     }
 }
@@ -83,7 +113,7 @@ mod tests {
 
     struct AlwaysReject;
     impl ScopePreflight for AlwaysReject {
-        fn check(&self, _body: &[u8], _caller: &CallerCtx) -> Result<(), String> {
+        fn check(&self, _body: &[u8], _caller: CallerScopes<'_>) -> Result<(), String> {
             Err("insufficient_scope".to_owned())
         }
     }
@@ -116,7 +146,7 @@ mod tests {
     fn body_reaches_the_implementation_unaltered() {
         struct Capture(std::sync::Mutex<Vec<u8>>);
         impl ScopePreflight for Capture {
-            fn check(&self, body: &[u8], _caller: &CallerCtx) -> Result<(), String> {
+            fn check(&self, body: &[u8], _caller: CallerScopes<'_>) -> Result<(), String> {
                 *self.0.lock().unwrap() = body.to_vec();
                 Ok(())
             }

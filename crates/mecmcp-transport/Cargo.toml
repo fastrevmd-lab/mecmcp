@@ -12,7 +12,7 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
-axum        = { version = "0.8", default-features = false, features = ["tokio"] }
+axum        = { version = "0.8", default-features = false, features = ["tokio", "json"] }
 dashmap     = "6.1"
 futures     = "0.3"
 http        = "1"

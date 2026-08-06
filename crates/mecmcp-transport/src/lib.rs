@@ -5,6 +5,8 @@
 //! Every consumer-owned choice — metric names, target argument keys, realm,
 //! server label — is passed as a parameter rather than baked in.
 
+mod auth;
+mod caller;
 mod concurrency;
 mod config;
 mod identity;
@@ -16,13 +18,31 @@ mod session;
 mod target;
 pub mod tls;
 
-pub use concurrency::{ConcurrencyState, apply_body_limit, concurrency_middleware};
+pub use auth::{
+    BearerAuthError, BearerAuthenticator, BearerBoundary, BearerResponseProfile,
+    BearerResponseStyle, BoundaryAccounting, apply_bearer_boundary,
+};
+
+// Internal types and functions exported only for testing
+#[doc(hidden)]
+pub mod tests {
+    pub use crate::auth::{
+        AuthState, PreflightState, bearer_auth_middleware, bearer_preflight_middleware,
+    };
+}
+pub use caller::AuthenticatedToken;
+#[allow(deprecated)]
+pub use concurrency::{
+    ConcurrencyState, apply_body_limit, concurrency_middleware, target_concurrency_middleware,
+    token_concurrency_middleware,
+};
 pub use config::{LimitsConfig, LimitsConfigError, streamable_http_server_config};
 pub use identity::TransportIdentity;
 pub use metrics::PrometheusRuntime;
 pub use overload::overload_response;
-pub use preflight::{OptionalPreflight, ScopePreflight};
-pub use rate_limit::apply_rate_limit;
+pub use preflight::{CallerScopes, OptionalPreflight, ScopePreflight};
+#[allow(deprecated)]
+pub use rate_limit::{apply_ip_rate_limit, apply_rate_limit, apply_token_rate_limit};
 pub use session::{LimitedSessionManager, LimitedSessionManagerError, SessionTracker};
 pub use target::{TargetLimiter, extract_targets};
 pub use tls::{TlsError, load as load_tls};
