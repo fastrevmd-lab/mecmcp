@@ -35,6 +35,33 @@ apply) and the modern crate hygiene. Neither benefits from the other.
 
 ## Status
 
+**0.7.0 — extraction milestone 3: HTTP transport assembly.** A consumer no
+longer hand-assembles its router: `HostOriginPolicy`, `HttpTransportConfig`,
+`build_streamable_http_router` and `serve_router` compose the whole protected
+`/mcp` endpoint, and **`serve_router` finally takes a shutdown signal** so
+`systemctl restart` drains in-flight calls instead of dropping them.
+`rustsdcmcp` can delete `compat/http.rs`. Milestone 4 (preflight) remains.
+
+### Upgrading to 0.7.0
+
+- `streamable_http_server_config` merged the body-cap and host/origin concerns;
+  the replacement is exported as **`build_rmcp_server_config`**.
+- **`build_streamable_http_router` returns `(Router, CancellationToken)`.** Pass
+  that token to `serve_router` — the pairing is what keeps rmcp's SSE sessions
+  and the listener draining on the same signal.
+- `GracefulShutdown::new` returns `Result`, and now handles SIGTERM as well as
+  SIGINT. The signal is latched, so one arriving before a subscriber attaches is
+  still observed.
+- `HttpServeError::Serve` carries the address that failed.
+
+`HostOriginPolicy` has only an `Enforced` variant: there is deliberately no way
+to disable the Host allowlist, which is the DNS-rebinding guard
+(RUSTSEC-2026-0189). Note that **Host and Origin treat a portless allowlist entry
+differently, on purpose** — a portless `Host` entry matches any port, because
+`--allowed-host 192.168.1.194` must keep working on `:30031`, while a portless
+`Origin` entry matches only a portless browser Origin, because wildcarding there
+would widen the policy.
+
 **0.6.1 — twelve crates; `mecmcp-scp` added.** A native SCP1 file-transfer
 client for devices that disable SFTP-over-SSH (Junos among them), so a server
 can move files without spawning `scp` — which is what lets a consumer run on a
