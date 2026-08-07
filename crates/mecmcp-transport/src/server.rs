@@ -795,10 +795,14 @@ pub async fn serve_router(
 
     let service = router.into_make_service_with_connect_info::<SocketAddr>();
 
+    // axum-server 0.8 made from_tcp/from_tcp_rustls fallible: they now adopt the
+    // listener rather than assuming it is usable. A failure here is still a bind
+    // problem, so it is reported as one.
     if let Some(tls_config) = tls {
         tracing::info!(%address, "Streamable HTTP listening with TLS");
         let config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
         axum_server::tls_rustls::from_tcp_rustls(listener, config)
+            .map_err(|error| HttpServeError::Bind { address, error })?
             .handle(handle)
             .serve(service)
             .await
@@ -808,6 +812,7 @@ pub async fn serve_router(
 
     tracing::info!(%address, "Streamable HTTP listening");
     axum_server::from_tcp(listener)
+        .map_err(|error| HttpServeError::Bind { address, error })?
         .handle(handle)
         .serve(service)
         .await
