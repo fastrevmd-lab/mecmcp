@@ -35,6 +35,20 @@ apply) and the modern crate hygiene. Neither benefits from the other.
 
 ## Status
 
+**0.7.2 — the drain can now actually deliver a response.** 0.7.1 made SIGTERM
+reach `serve_router`, but rmcp was still handed the *same* token as the
+listener, so it ended every session the instant shutdown began — and an MCP
+response travels back over its session's SSE stream. An in-flight call at
+SIGTERM received 28 bytes of SSE preamble and nothing else, indistinguishable
+from being dropped outright. rmcp now gets its own token, cancelled when the
+drain deadline expires rather than when it starts.
+
+**Breaking:** `build_streamable_http_router` returns `(Router, HttpShutdown)`
+and `serve_router` takes that `HttpShutdown` — the two tokens must stay paired,
+so they are one type rather than a bare `CancellationToken`. Note the
+consequence: while any SSE stream is open, shutdown takes the full
+`shutdown_timeout`. Keep it well under systemd's `TimeoutStopSec`.
+
 **0.7.1 — the 0.7.0 drain never fired. Upgrade past 0.7.0.** `ShutdownSignal`'s
 `Future` impl rebuilt `CancellationToken::cancelled()` on every poll and dropped
 it at the end of the poll, deregistering the waker it had just installed. Nothing
