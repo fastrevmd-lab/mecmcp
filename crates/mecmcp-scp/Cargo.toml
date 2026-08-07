@@ -20,9 +20,13 @@ unwrap_used = "warn"
 
 [dependencies]
 async-trait   = "0.1"
+base64        = "0.22"
+hmac          = "0.12"
 mecmcp-secret = { version = "0.6.0", path = "../mecmcp-secret" }
 russh         = { workspace = true }
 rustix        = { workspace = true }
+sha1          = "0.10"
+tempfile      = { workspace = true }
 thiserror     = { workspace = true }
 tokio         = { version = "1", features = ["fs", "io-util", "process", "rt", "sync"] }
 tokio-util    = { workspace = true, features = ["codec"] }

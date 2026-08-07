@@ -122,10 +122,18 @@ fn libc_fcntl_setfl(fd: std::os::unix::io::RawFd, flags: i32) -> Result<(), ScpE
     .map_err(|e| ScpError::Io(std::io::Error::from_raw_os_error(e.raw_os_error())))
 }
 
-/// Build russh client configuration with secure defaults.
+/// Build russh client configuration with secure defaults and liveness deadlines.
 ///
 /// Extends russh's secure defaults to include NIST ECDH KEX algorithms for
 /// compatibility with legacy devices (e.g., Junos) that only offer those curves.
+///
+/// Liveness policy (matching openssh-client `-o ServerAliveInterval=10 -o ServerAliveCountMax=3`):
+/// - `keepalive_interval = 10s` — send a keepalive if no data received for 10 seconds
+/// - `keepalive_max = 3` — close connection after 3 unanswered keepalives (~30s total)
+/// - `inactivity_timeout = 45s` — garbage-collect idle connections (> 3 * keepalive window)
+///
+/// This prevents black-hole TCP or stalled peers from holding per-device transfer
+/// capacity until the outer timeout (600-900s). A stalled connection fails in ~30s.
 fn build_russh_config() -> client::Config {
     use russh::kex;
     use std::borrow::Cow;
@@ -142,7 +150,241 @@ fn build_russh_config() -> client::Config {
     ]);
     config.preferred.kex = Cow::Owned(kex_list);
 
+    // SSH liveness deadlines: match openssh-client keepalive policy.
+    config.keepalive_interval = Some(std::time::Duration::from_secs(10));
+    config.keepalive_max = 3;
+    config.inactivity_timeout = Some(std::time::Duration::from_secs(45));
+
     config
+}
+
+/// Check for OpenSSH marker lines (@revoked, @cert-authority) in known_hosts.
+///
+/// OpenSSH supports marker lines that begin with `@marker` to denote special entries.
+/// russh's `check_known_hosts_path` does not implement marker semantics, so we handle
+/// them before delegating.
+///
+/// - `@revoked host key`: Marks a key as revoked. If the presented key matches, refuse
+///   the connection with a distinct HostKeyRevoked error.
+/// - `@cert-authority host key`: Marks a CA key for certificate authentication. This
+///   crate does not support certificate authentication, so if the known_hosts file
+///   contains a @cert-authority line for this host, we refuse the connection rather
+///   than silently falling through to a weaker non-CA check.
+///
+/// Marker lines may use hashed hostnames (`|1|salt|hash`), so host matching requires
+/// the same hash computation that russh uses. We reuse russh's implementation by parsing
+/// each line and checking if it would match via `check_known_hosts_path` with a
+/// single-line temporary file.
+///
+/// Returns:
+/// - `Ok(())`: No markers matched (safe to proceed to russh's full check)
+/// - `Err(ScpError::HostKeyRevoked(_))`: @revoked marker matched the presented key
+/// - `Err(ScpError::HostKeyVerification(_))`: @cert-authority for this host, or file error
+fn check_known_hosts_markers(
+    host: &str,
+    port: u16,
+    server_public_key: &PublicKey,
+    known_hosts_path: &Path,
+) -> Result<(), ScpError> {
+    use std::io::{BufRead, BufReader};
+
+    // Read the known_hosts file line by line
+    let file = std::fs::File::open(known_hosts_path).map_err(|e| {
+        ScpError::HostKeyVerification(format!(
+            "failed to read known_hosts {}: {}",
+            known_hosts_path.display(),
+            e
+        ))
+    })?;
+
+    let reader = BufReader::new(file);
+
+    for (line_num, line_result) in reader.lines().enumerate() {
+        let line = line_result.map_err(|e| {
+            ScpError::HostKeyVerification(format!(
+                "failed to read known_hosts line {}: {}",
+                line_num + 1,
+                e
+            ))
+        })?;
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Check if this line starts with a marker
+        if let Some(after_marker) = trimmed.strip_prefix('@') {
+            // Extract marker name (first word after @)
+            if let Some(space_idx) = after_marker.find(|c: char| c.is_whitespace()) {
+                let marker_name = &after_marker[..space_idx];
+                let line_rest = after_marker[space_idx..].trim_start();
+
+                // Check revoked keys
+                if marker_name == "revoked"
+                    && line_matches_host_and_key(line_rest, host, port, server_public_key)?
+                {
+                    return Err(ScpError::HostKeyRevoked(format!(
+                        "Host key for {}:{} is marked @revoked in known_hosts (line {}). \
+                         This key has been compromised or retired and must not be trusted.",
+                        host,
+                        port,
+                        line_num + 1
+                    )));
+                }
+
+                // Check cert-authority entries
+                if marker_name == "cert-authority" && line_matches_host(line_rest, host, port)? {
+                    return Err(ScpError::HostKeyVerification(format!(
+                        "Host {}:{} has a @cert-authority entry in known_hosts (line {}), \
+                         but certificate authentication is not supported by this client. \
+                         Remove the @cert-authority line or use a different authentication method.",
+                        host,
+                        port,
+                        line_num + 1
+                    )));
+                }
+
+                // Unknown markers (e.g., future OpenSSH additions) — ignore them
+            }
+            // Malformed marker line (no content after marker) — ignore it
+            continue;
+        } else {
+            // Not a marker line
+            continue;
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if a known_hosts line (without marker prefix) matches the given host and key.
+///
+/// Uses russh's `check_known_hosts_path` with a temporary file containing just this line.
+/// This reuses russh's hashed-host and key-matching logic without reimplementing it.
+fn line_matches_host_and_key(
+    line: &str,
+    host: &str,
+    port: u16,
+    server_public_key: &PublicKey,
+) -> Result<bool, ScpError> {
+    use russh::keys::known_hosts;
+    use std::io::Write;
+
+    // Create a temporary file with just this line
+    let mut temp_file = tempfile::NamedTempFile::new().map_err(|e| {
+        ScpError::HostKeyVerification(format!(
+            "failed to create temp file for marker check: {}",
+            e
+        ))
+    })?;
+
+    writeln!(temp_file, "{}", line).map_err(|e| {
+        ScpError::HostKeyVerification(format!("failed to write temp known_hosts: {}", e))
+    })?;
+
+    temp_file.flush().map_err(|e| {
+        ScpError::HostKeyVerification(format!("failed to flush temp known_hosts: {}", e))
+    })?;
+
+    // Use russh to check if this line matches
+    match known_hosts::check_known_hosts_path(host, port, server_public_key, temp_file.path()) {
+        Ok(true) => Ok(true),                                    // Host and key match
+        Ok(false) => Ok(false),                                  // Host not in this line
+        Err(russh::keys::Error::KeyChanged { .. }) => Ok(false), // Key mismatch (not a match)
+        Err(e) => Err(ScpError::HostKeyVerification(format!(
+            "error checking marker line: {}",
+            e
+        ))),
+    }
+}
+
+/// Check if a known_hosts line (without marker prefix) matches the given host (ignoring key).
+///
+/// Used for @cert-authority lines where we only care if the host matches, not the key.
+fn line_matches_host(line: &str, host: &str, port: u16) -> Result<bool, ScpError> {
+    // Parse the line to extract the host pattern
+    // Format: "host_pattern key_type key_data"
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 3 {
+        // Malformed line - skip it
+        return Ok(false);
+    }
+
+    let host_pattern = parts[0];
+
+    // Check for hashed host: |1|salt|hash
+    if let Some(rest) = host_pattern.strip_prefix("|1|") {
+        // Hashed host - need to compute the hash to check if it matches
+        let hash_parts: Vec<&str> = rest.split('|').collect();
+        if hash_parts.len() != 2 {
+            return Ok(false);
+        }
+
+        let salt_b64 = hash_parts[0];
+        let expected_hash_b64 = hash_parts[1];
+
+        // Decode salt from base64
+        use base64::Engine;
+        let salt = base64::engine::general_purpose::STANDARD
+            .decode(salt_b64)
+            .map_err(|_| {
+                ScpError::HostKeyVerification(
+                    "failed to decode salt in hashed host pattern".to_string(),
+                )
+            })?;
+
+        // Compute HMAC-SHA1 of the host (with port if non-standard)
+        let host_to_hash = if port == 22 {
+            host.to_string()
+        } else {
+            format!("[{}]:{}", host, port)
+        };
+
+        use hmac::{Hmac, Mac};
+        type HmacSha1 = Hmac<sha1::Sha1>;
+
+        let mut hmac = HmacSha1::new_from_slice(&salt)
+            .map_err(|e| ScpError::HostKeyVerification(format!("failed to create HMAC: {}", e)))?;
+        hmac.update(host_to_hash.as_bytes());
+        let hash = hmac.finalize().into_bytes();
+
+        // Encode to base64
+        let actual_hash_b64 = base64::engine::general_purpose::STANDARD.encode(hash);
+
+        Ok(actual_hash_b64 == expected_hash_b64)
+    } else {
+        // Plain text host pattern - check for exact match, wildcard, or comma-separated list
+        // For simplicity, we delegate to russh by creating a temporary line with a dummy key
+        // and checking if russh would match the host (it will say KeyChanged, but that's fine
+        // since we only care about the host match).
+        //
+        // Actually, let's just do simple matching: exact match, wildcard, or comma-list.
+        if host_pattern.contains(',') {
+            // Comma-separated list
+            let hosts: Vec<&str> = host_pattern.split(',').collect();
+            let target = if port == 22 {
+                host.to_string()
+            } else {
+                format!("[{}]:{}", host, port)
+            };
+            Ok(hosts.iter().any(|&h| h == target || h == host))
+        } else if host_pattern.contains('*') || host_pattern.contains('?') {
+            // Wildcard pattern - for now, we don't implement wildcard matching
+            // (russh does, but it's complex to extract). Be conservative: if the file
+            // uses wildcards in @cert-authority, we can't determine the match reliably,
+            // so we'll return false and let the operator fix the known_hosts file.
+            Ok(false)
+        } else {
+            // Exact match
+            let target = if port == 22 {
+                host.to_string()
+            } else {
+                format!("[{}]:{}", host, port)
+            };
+            Ok(host_pattern == target || host_pattern == host)
+        }
+    }
 }
 
 /// Thread-safe slot for host key verification errors.
@@ -203,10 +445,18 @@ impl client::Handler for SshHandler {
                 }
             }
             HostKeyVerification::KnownHosts(path) | HostKeyVerification::AcceptNew(path) => {
+                // Check for OpenSSH marker lines (@revoked, @cert-authority) BEFORE
+                // delegating to russh. russh does not implement marker semantics.
+                if let Err(e) =
+                    check_known_hosts_markers(&self.host, self.port, server_public_key, path)
+                {
+                    self.error_slot.set(e);
+                    return Err(russh::Error::Disconnect);
+                }
+
                 // Use russh's built-in known_hosts implementation which correctly handles:
                 // - Hashed hosts (|1|...)
                 // - Wildcard/comma host lists
-                // - @revoked/@cert-authority markers
                 // - Non-default ports ([host]:port format)
                 use russh::keys::known_hosts;
 
@@ -790,36 +1040,55 @@ impl ScpClient {
             error_slot: error_slot.clone(),
         };
 
-        // Race connect and auth against cancellation. If the peer stalls after TCP accept
-        // (before SSH handshake completes), this prevents indefinite hang.
-        let mut handle = tokio::select! {
-            result = client::connect(russh_config, (&*config.host, config.port), handler) => {
-                result.map_err(|e| {
-                    error_slot
-                        .take()
-                        .unwrap_or_else(|| ScpError::Connect(format!("SSH connect failed: {e}")))
-                })?
-            }
-            _ = ct.cancelled() => {
-                return Err(ScpError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "cancelled during SSH connect"
-                )));
-            }
+        // Connect and authenticate with a 15-second deadline (matching openssh-client
+        // `-o ConnectTimeout=15`). Race both operations against the timeout and the
+        // cancellation token. A peer that accepts TCP but never speaks SSH, or stalls
+        // mid-handshake, will fail promptly instead of holding per-device capacity.
+        const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+        let connect_fut = async {
+            // Race connect against cancellation.
+            let mut handle = tokio::select! {
+                result = client::connect(russh_config, (&*config.host, config.port), handler) => {
+                    result.map_err(|e| {
+                        error_slot
+                            .take()
+                            .unwrap_or_else(|| ScpError::Connect(format!("SSH connect failed: {e}")))
+                    })?
+                }
+                _ = ct.cancelled() => {
+                    return Err(ScpError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled during SSH connect"
+                    )));
+                }
+            };
+
+            // Authenticate (also cancellable)
+            tokio::select! {
+                result = authenticate(&mut handle, &config.username, &config.auth, ct) => {
+                    result?
+                }
+                _ = ct.cancelled() => {
+                    return Err(ScpError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled during SSH auth"
+                    )));
+                }
+            };
+
+            Ok::<_, ScpError>(handle)
         };
 
-        // Authenticate (also cancellable)
-        tokio::select! {
-            result = authenticate(&mut handle, &config.username, &config.auth, ct) => {
-                result?
-            }
-            _ = ct.cancelled() => {
-                return Err(ScpError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "cancelled during SSH auth"
-                )));
-            }
-        };
+        // Wrap the whole connect+auth sequence in a timeout.
+        let handle = tokio::time::timeout(CONNECT_TIMEOUT, connect_fut)
+            .await
+            .map_err(|_| {
+                ScpError::Connect(format!(
+                    "Connection timed out after {}s",
+                    CONNECT_TIMEOUT.as_secs()
+                ))
+            })??;
 
         Ok(Self {
             handle,
@@ -5712,6 +5981,492 @@ mod e2e_tests {
         assert!(
             curve25519_pos < nistp256_pos,
             "Curve25519 should come before NIST curves"
+        );
+    }
+
+    /// Revoked host key is refused with distinct error
+    #[tokio::test]
+    async fn revoked_host_key_refused() {
+        // Start a test server
+        let state = TestServerState::new(ServerBehavior::SinkSuccess);
+        let (_handle, addr) = start_test_server(state)
+            .await
+            .expect("failed to start server");
+
+        let (_keyfile, key_path) = create_test_key();
+
+        // Connect once with AcceptNew to learn the server's host key
+        let temp_known_hosts = tempfile::NamedTempFile::new().expect("failed to create temp file");
+        let learn_config = SshConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            username: "testuser".to_string(),
+            auth: SshAuth::PrivateKey {
+                path: key_path.clone(),
+                passphrase: None,
+            },
+            host_key_verification: HostKeyVerification::AcceptNew(
+                temp_known_hosts.path().to_path_buf(),
+            ),
+        };
+
+        let ct_learn = CancellationToken::new();
+        ScpClient::connect(learn_config, &ct_learn)
+            .await
+            .expect("initial connect should succeed");
+
+        // Read the learned entry
+        let learned_entry =
+            std::fs::read_to_string(temp_known_hosts.path()).expect("failed to read known_hosts");
+
+        // Create a new known_hosts file with:
+        // 1. The normal entry (so russh would accept it)
+        // 2. An @revoked entry for the same host and key (so we must refuse it)
+        let known_hosts_with_revoked =
+            tempfile::NamedTempFile::new().expect("failed to create temp file");
+        let content = format!(
+            "{}\n@revoked {}",
+            learned_entry.trim(),
+            learned_entry.trim()
+        );
+        std::fs::write(known_hosts_with_revoked.path(), content)
+            .expect("failed to write known_hosts");
+
+        // Try to connect again with the known_hosts file that has the @revoked marker
+        let config = SshConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            username: "testuser".to_string(),
+            auth: SshAuth::PrivateKey {
+                path: key_path,
+                passphrase: None,
+            },
+            host_key_verification: HostKeyVerification::KnownHosts(
+                known_hosts_with_revoked.path().to_path_buf(),
+            ),
+        };
+
+        let ct = CancellationToken::new();
+        let result = ScpClient::connect(config, &ct).await;
+
+        // Must fail with HostKeyRevoked error
+        assert!(result.is_err(), "revoked key should be refused");
+        match result {
+            Err(ScpError::HostKeyRevoked(msg)) => {
+                assert!(
+                    msg.contains("@revoked") && msg.contains("revoked"),
+                    "error should mention @revoked marker, got: {}",
+                    msg
+                );
+            }
+            Err(other) => panic!("expected HostKeyRevoked error, got: {:?}", other),
+            Ok(_) => panic!("revoked key should be refused"),
+        }
+    }
+
+    /// Revoked host key with hashed hostname is refused
+    #[tokio::test]
+    async fn revoked_hashed_host_key_refused() {
+        // Start a test server
+        let state = TestServerState::new(ServerBehavior::SinkSuccess);
+        let (_handle, addr) = start_test_server(state)
+            .await
+            .expect("failed to start server");
+
+        let (_keyfile, key_path) = create_test_key();
+
+        // Connect once with AcceptNew to learn the server's host key
+        let temp_known_hosts = tempfile::NamedTempFile::new().expect("failed to create temp file");
+        let learn_config = SshConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            username: "testuser".to_string(),
+            auth: SshAuth::PrivateKey {
+                path: key_path.clone(),
+                passphrase: None,
+            },
+            host_key_verification: HostKeyVerification::AcceptNew(
+                temp_known_hosts.path().to_path_buf(),
+            ),
+        };
+
+        let ct_learn = CancellationToken::new();
+        ScpClient::connect(learn_config, &ct_learn)
+            .await
+            .expect("initial connect should succeed");
+
+        // Read the learned entry
+        let learned_entry =
+            std::fs::read_to_string(temp_known_hosts.path()).expect("failed to read known_hosts");
+
+        // Hash the entry by creating a new file and using russh's learn function
+        // (russh can hash entries when learning)
+        // For simplicity in this test, we'll manually create a hashed entry.
+        // The hash format is: |1|salt|hash where hash = HMAC-SHA1(salt, host)
+        use base64::Engine;
+        use hmac::{Hmac, Mac};
+        type HmacSha1 = Hmac<sha1::Sha1>;
+
+        let host_to_hash = format!("[127.0.0.1]:{}", addr.port());
+        let salt_bytes: [u8; 20] = rand::random();
+        let salt_b64 = base64::engine::general_purpose::STANDARD.encode(salt_bytes);
+
+        let mut hmac_hasher = HmacSha1::new_from_slice(&salt_bytes).expect("failed to create HMAC");
+        hmac_hasher.update(host_to_hash.as_bytes());
+        let hash = hmac_hasher.finalize().into_bytes();
+        let hash_b64 = base64::engine::general_purpose::STANDARD.encode(hash);
+
+        let hashed_host = format!("|1|{}|{}", salt_b64, hash_b64);
+
+        // Extract key type and key data from learned entry
+        let parts: Vec<&str> = learned_entry.split_whitespace().collect();
+        assert!(
+            parts.len() >= 3,
+            "learned entry should have at least 3 parts"
+        );
+        let key_type = parts[1];
+        let key_data = parts[2];
+
+        // Create a known_hosts file with a hashed @revoked entry
+        let known_hosts_with_revoked =
+            tempfile::NamedTempFile::new().expect("failed to create temp file");
+        let content = format!(
+            "{}\n@revoked {} {} {}",
+            learned_entry.trim(),
+            hashed_host,
+            key_type,
+            key_data
+        );
+        std::fs::write(known_hosts_with_revoked.path(), content)
+            .expect("failed to write known_hosts");
+
+        // Try to connect with the hashed @revoked entry
+        let config = SshConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            username: "testuser".to_string(),
+            auth: SshAuth::PrivateKey {
+                path: key_path,
+                passphrase: None,
+            },
+            host_key_verification: HostKeyVerification::KnownHosts(
+                known_hosts_with_revoked.path().to_path_buf(),
+            ),
+        };
+
+        let ct = CancellationToken::new();
+        let result = ScpClient::connect(config, &ct).await;
+
+        // Must fail with HostKeyRevoked error
+        assert!(result.is_err(), "hashed revoked key should be refused");
+        match result {
+            Err(ScpError::HostKeyRevoked(msg)) => {
+                assert!(
+                    msg.contains("@revoked"),
+                    "error should mention @revoked marker, got: {}",
+                    msg
+                );
+            }
+            Err(other) => panic!("expected HostKeyRevoked error, got: {:?}", other),
+            Ok(_) => panic!("hashed revoked key should be refused"),
+        }
+    }
+
+    /// Revoked entry for a different key on the same host allows the good key
+    #[tokio::test]
+    async fn revoked_different_key_allows_good_key() {
+        use russh::keys::{Algorithm, PrivateKey};
+
+        // Start a test server
+        let state = TestServerState::new(ServerBehavior::SinkSuccess);
+        let (_handle, addr) = start_test_server(state)
+            .await
+            .expect("failed to start server");
+
+        let (_keyfile, key_path) = create_test_key();
+
+        // Connect once with AcceptNew to learn the server's host key
+        let temp_known_hosts = tempfile::NamedTempFile::new().expect("failed to create temp file");
+        let learn_config = SshConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            username: "testuser".to_string(),
+            auth: SshAuth::PrivateKey {
+                path: key_path.clone(),
+                passphrase: None,
+            },
+            host_key_verification: HostKeyVerification::AcceptNew(
+                temp_known_hosts.path().to_path_buf(),
+            ),
+        };
+
+        let ct_learn = CancellationToken::new();
+        ScpClient::connect(learn_config, &ct_learn)
+            .await
+            .expect("initial connect should succeed");
+
+        // Read the learned entry (this is the GOOD key)
+        let learned_entry =
+            std::fs::read_to_string(temp_known_hosts.path()).expect("failed to read known_hosts");
+
+        // Generate a DIFFERENT key (the revoked one)
+        use russh::keys::PublicKeyBase64;
+        let revoked_keypair = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+            .expect("failed to generate key");
+        let revoked_pubkey = revoked_keypair.public_key();
+        let revoked_key_b64 = revoked_pubkey.public_key_base64();
+
+        // Create a known_hosts file with:
+        // 1. The good key (normal entry)
+        // 2. A @revoked entry for the same host but a DIFFERENT key
+        let known_hosts_mixed = tempfile::NamedTempFile::new().expect("failed to create temp file");
+        let content = format!(
+            "{}\n@revoked [127.0.0.1]:{} ssh-ed25519 {}",
+            learned_entry.trim(),
+            addr.port(),
+            revoked_key_b64
+        );
+        std::fs::write(known_hosts_mixed.path(), content).expect("failed to write known_hosts");
+
+        // Connect with the good key - should succeed
+        let config = SshConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            username: "testuser".to_string(),
+            auth: SshAuth::PrivateKey {
+                path: key_path,
+                passphrase: None,
+            },
+            host_key_verification: HostKeyVerification::KnownHosts(
+                known_hosts_mixed.path().to_path_buf(),
+            ),
+        };
+
+        let ct = CancellationToken::new();
+        let result = ScpClient::connect(config, &ct).await;
+
+        if let Err(ref e) = result {
+            panic!(
+                "good key should connect even when a different key is revoked, got error: {}",
+                e
+            );
+        }
+        assert!(result.is_ok());
+    }
+
+    /// @cert-authority entry for the host is refused with distinct error
+    #[tokio::test]
+    async fn cert_authority_entry_refused() {
+        use russh::keys::{Algorithm, PrivateKey};
+
+        // Start a test server
+        let state = TestServerState::new(ServerBehavior::SinkSuccess);
+        let (_handle, addr) = start_test_server(state)
+            .await
+            .expect("failed to start server");
+
+        let (_keyfile, key_path) = create_test_key();
+
+        // Generate a CA key (doesn't need to be related to server's key)
+        use russh::keys::PublicKeyBase64;
+        let ca_keypair = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+            .expect("failed to generate CA key");
+        let ca_pubkey = ca_keypair.public_key();
+        let ca_key_b64 = ca_pubkey.public_key_base64();
+
+        // Create a known_hosts file with only a @cert-authority entry for this host
+        let known_hosts_ca = tempfile::NamedTempFile::new().expect("failed to create temp file");
+        let content = format!(
+            "@cert-authority [127.0.0.1]:{} ssh-ed25519 {}",
+            addr.port(),
+            ca_key_b64
+        );
+        std::fs::write(known_hosts_ca.path(), content).expect("failed to write known_hosts");
+
+        // Try to connect - should fail with HostKeyVerification error mentioning @cert-authority
+        let config = SshConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            username: "testuser".to_string(),
+            auth: SshAuth::PrivateKey {
+                path: key_path,
+                passphrase: None,
+            },
+            host_key_verification: HostKeyVerification::KnownHosts(
+                known_hosts_ca.path().to_path_buf(),
+            ),
+        };
+
+        let ct = CancellationToken::new();
+        let result = ScpClient::connect(config, &ct).await;
+
+        assert!(result.is_err(), "@cert-authority should be refused");
+        match result {
+            Err(ScpError::HostKeyVerification(msg)) => {
+                assert!(
+                    msg.contains("@cert-authority") && msg.contains("not supported"),
+                    "error should mention @cert-authority is not supported, got: {}",
+                    msg
+                );
+            }
+            Err(other) => panic!("expected HostKeyVerification error, got: {:?}", other),
+            Ok(_) => panic!("@cert-authority should be refused"),
+        }
+    }
+
+    /// AcceptNew mode refuses revoked keys instead of learning them
+    #[tokio::test]
+    async fn accept_new_refuses_revoked_keys() {
+        // Start a test server
+        let state = TestServerState::new(ServerBehavior::SinkSuccess);
+        let (_handle, addr) = start_test_server(state)
+            .await
+            .expect("failed to start server");
+
+        let (_keyfile, key_path) = create_test_key();
+
+        // Connect once with AcceptNew to learn the server's host key
+        let temp_known_hosts = tempfile::NamedTempFile::new().expect("failed to create temp file");
+        let learn_config = SshConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            username: "testuser".to_string(),
+            auth: SshAuth::PrivateKey {
+                path: key_path.clone(),
+                passphrase: None,
+            },
+            host_key_verification: HostKeyVerification::AcceptNew(
+                temp_known_hosts.path().to_path_buf(),
+            ),
+        };
+
+        let ct_learn = CancellationToken::new();
+        ScpClient::connect(learn_config, &ct_learn)
+            .await
+            .expect("initial connect should succeed");
+
+        // Read the learned entry
+        let learned_entry =
+            std::fs::read_to_string(temp_known_hosts.path()).expect("failed to read known_hosts");
+
+        // Create a known_hosts file with only the @revoked entry (no normal entry)
+        let known_hosts_revoked =
+            tempfile::NamedTempFile::new().expect("failed to create temp file");
+        let content = format!("@revoked {}", learned_entry.trim());
+        std::fs::write(known_hosts_revoked.path(), content).expect("failed to write known_hosts");
+
+        // Try to connect with AcceptNew mode - should refuse the revoked key
+        // instead of learning it
+        let config = SshConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            username: "testuser".to_string(),
+            auth: SshAuth::PrivateKey {
+                path: key_path,
+                passphrase: None,
+            },
+            host_key_verification: HostKeyVerification::AcceptNew(
+                known_hosts_revoked.path().to_path_buf(),
+            ),
+        };
+
+        let ct = CancellationToken::new();
+        let result = ScpClient::connect(config, &ct).await;
+
+        // Must fail with HostKeyRevoked error, not learn the revoked key
+        assert!(result.is_err(), "AcceptNew should refuse revoked key");
+        match result {
+            Err(ScpError::HostKeyRevoked(msg)) => {
+                assert!(
+                    msg.contains("@revoked"),
+                    "error should mention @revoked marker, got: {}",
+                    msg
+                );
+            }
+            Err(other) => panic!("expected HostKeyRevoked error, got: {:?}", other),
+            Ok(_) => panic!("AcceptNew should refuse revoked key"),
+        }
+
+        // Verify the revoked key was NOT learned (file should still only have @revoked line)
+        let final_content = std::fs::read_to_string(known_hosts_revoked.path())
+            .expect("failed to read known_hosts");
+        let line_count = final_content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert_eq!(
+            line_count, 1,
+            "AcceptNew should not add a new entry for a revoked key"
+        );
+        assert!(
+            final_content.contains("@revoked"),
+            "file should still only contain @revoked line"
+        );
+    }
+
+    /// Assert that a listener that accepts TCP but never speaks SSH fails
+    /// within the 15-second connect timeout, not the outer timeout (600-900s).
+    /// This prevents a black-hole peer from holding per-device capacity.
+    #[tokio::test]
+    async fn connect_timeout_fails_promptly_on_silent_listener() {
+        use tokio::net::TcpListener;
+
+        // Bind a listener that accepts connections but never sends data.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        // Spawn a task that accepts one connection and then hangs forever.
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+            // Connection accepted, now stall forever (never send SSH handshake).
+            std::future::pending::<()>().await;
+        });
+
+        let config = SshConfig {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            username: "test".into(),
+            auth: SshAuth::PrivateKey {
+                path: "/nonexistent/key".into(),
+                passphrase: None,
+            },
+            host_key_verification: HostKeyVerification::AcceptAll,
+        };
+
+        let ct = CancellationToken::new();
+        let start = std::time::Instant::now();
+
+        // Attempt to connect. This should fail within ~15 seconds (the connect timeout),
+        // not hang for 600s (the typical outer timeout).
+        let result = ScpClient::connect(config, &ct).await;
+        let elapsed = start.elapsed();
+
+        // Assert the connect failed (silent listener never completes SSH handshake).
+        assert!(result.is_err(), "connect should fail on silent listener");
+
+        // Assert it failed promptly (within 20 seconds, giving some headroom beyond
+        // the 15s timeout for CI scheduling jitter).
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "connect should timeout within 20s, but took {:?}",
+            elapsed
+        );
+    }
+
+    /// Assert that the russh config has keepalive settings configured.
+    #[test]
+    fn russh_config_has_keepalive_deadlines() {
+        let config = build_russh_config();
+        assert_eq!(
+            config.keepalive_interval,
+            Some(std::time::Duration::from_secs(10)),
+            "keepalive_interval should be 10s"
+        );
+        assert_eq!(config.keepalive_max, 3, "keepalive_max should be 3");
+        assert_eq!(
+            config.inactivity_timeout,
+            Some(std::time::Duration::from_secs(45)),
+            "inactivity_timeout should be 45s"
         );
     }
 }

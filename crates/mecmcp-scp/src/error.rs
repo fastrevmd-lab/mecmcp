@@ -29,6 +29,13 @@ pub enum ScpError {
     #[error("Host key verification failed: {0}")]
     HostKeyVerification(String),
 
+    /// Host key is revoked in known_hosts.
+    ///
+    /// The server presented a host key that is marked @revoked in the known_hosts file.
+    /// This indicates the key has been compromised or retired and should not be trusted.
+    #[error("Host key revoked: {0}")]
+    HostKeyRevoked(String),
+
     /// SCP client is poisoned due to cancelled channel open.
     ///
     /// When a transfer is cancelled during channel open, the client becomes
