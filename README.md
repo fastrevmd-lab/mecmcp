@@ -35,6 +35,14 @@ apply) and the modern crate hygiene. Neither benefits from the other.
 
 ## Status
 
+**0.7.3 — axum-server 0.8, dropping the unmaintained `rustls-pemfile`.**
+0.7.2 put `axum-server` into every consumer's tree, which brought
+`rustls-pemfile` with it and tripped RUSTSEC-2025-0134 (unmaintained) in two
+consumer pipelines. 0.8 drops that dependency outright, so the fix belongs here
+rather than as an ignore entry repeated in each consumer. Its `from_tcp` and
+`from_tcp_rustls` are now fallible; a failure there is reported as
+`HttpServeError::Bind`.
+
 **0.7.2 — the drain can now actually deliver a response.** 0.7.1 made SIGTERM
 reach `serve_router`, but rmcp was still handed the *same* token as the
 listener, so it ended every session the instant shutdown began — and an MCP
