@@ -46,7 +46,7 @@ pub use preflight::{CallerScopes, OptionalPreflight, ScopePreflight};
 #[allow(deprecated)]
 pub use rate_limit::{apply_ip_rate_limit, apply_rate_limit, apply_token_rate_limit};
 pub use server::{
-    HostOriginPolicy, HttpServeError, HttpTransportBuildError, HttpTransportConfig,
+    HostOriginPolicy, HttpServeError, HttpShutdown, HttpTransportBuildError, HttpTransportConfig,
     build_streamable_http_router, loopback_origins, serve_router,
     streamable_http_server_config as build_rmcp_server_config,
 };

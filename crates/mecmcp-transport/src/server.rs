@@ -125,9 +125,9 @@ pub fn loopback_origins(
 ///
 /// Combines identity, resource limits, Host/Origin policy, optional bearer
 /// authentication, metrics, and a shutdown signal. The shutdown signal is a
-/// required constructor parameter (not a builder step) because rmcp terminates
-/// every active session on that token: a listener built without one leaks SSE
-/// streams past process shutdown, so it must not be possible to forget it.
+/// required constructor parameter (not a builder step) because a listener built
+/// without one can never drain: nothing would tell it to stop accepting. It is
+/// the token the caller cancels on SIGTERM.
 pub struct HttpTransportConfig<G: Grant> {
     identity: TransportIdentity,
     limits: LimitsConfig,
@@ -140,9 +140,9 @@ pub struct HttpTransportConfig<G: Grant> {
 impl<G: Grant> HttpTransportConfig<G> {
     /// Construct unauthenticated transport settings.
     ///
-    /// `shutdown` is a required parameter because rmcp terminates every active
-    /// session on that token: a listener without one leaks SSE streams past
-    /// process shutdown. Off-loopback no-auth policy is a runtime CLI decision;
+    /// `shutdown` is a required parameter because a listener without one can
+    /// never drain: it is the token the caller cancels on SIGTERM.
+    /// Off-loopback no-auth policy is a runtime CLI decision;
     /// callers must validate it before building the router.
     ///
     /// # Example
@@ -312,10 +312,9 @@ pub fn streamable_http_server_config(
 /// bypass vulnerabilities. The order was established in 0.6.0 after review
 /// found real bypasses in earlier arrangements.
 ///
-/// **Returns `(Router, CancellationToken)`** where the token **must** be passed
-/// to `serve_router` to ensure rmcp's session termination and axum-server's
-/// graceful drain use the same signal. Using different tokens would leave SSE
-/// streams live past the drain timeout (#156).
+/// **Returns `(Router, HttpShutdown)`** and that value **must** be passed to
+/// `serve_router`. It carries two tokens on purpose — the listener's and rmcp's
+/// — because they are cancelled at different times. See [`HttpShutdown`] (#156).
 ///
 /// **Middleware request order (outermost to innermost):**
 ///
@@ -364,7 +363,7 @@ pub fn streamable_http_server_config(
 pub fn build_streamable_http_router<S, G>(
     service_factory: impl Fn() -> Result<S, std::io::Error> + Send + Sync + 'static,
     config: HttpTransportConfig<G>,
-) -> Result<(Router, CancellationToken), HttpTransportBuildError>
+) -> Result<(Router, HttpShutdown), HttpTransportBuildError>
 where
     S: ServerHandler + Send + 'static,
     G: Grant,
@@ -391,10 +390,19 @@ where
         config.identity.target_keys.clone(),
         Some(session_manager.tracker()),
     );
+    // rmcp gets its OWN token, deliberately not `config.shutdown`.
+    //
+    // rmcp terminates every active session the instant its token is cancelled,
+    // and an MCP response travels back over that session's SSE stream. Handing
+    // rmcp the same token as the listener therefore cut every stream at the
+    // moment shutdown began, so no in-flight call could deliver its response and
+    // the drain deadline was decorative. `serve_router` cancels this one at the
+    // deadline instead, which is where the hard cut belongs.
+    let sessions = CancellationToken::new();
     let service = StreamableHttpService::new(
         service_factory,
         session_manager,
-        streamable_http_server_config(&config.host_origin, &config.limits, config.shutdown.clone()),
+        streamable_http_server_config(&config.host_origin, &config.limits, sessions.clone()),
     );
 
     // Build the /mcp service router, starting from the innermost layer
@@ -445,7 +453,13 @@ where
     // route-specific logic.
     router = apply_ip_rate_limit(router, &limits);
 
-    Ok((router, config.shutdown))
+    Ok((
+        router,
+        HttpShutdown {
+            listener: config.shutdown,
+            sessions,
+        },
+    ))
 }
 
 /// Host and Origin header validation middleware (whole-router protection).
@@ -656,6 +670,37 @@ pub enum HttpServeError {
     },
 }
 
+/// The two halves of a graceful shutdown, produced by
+/// [`build_streamable_http_router`] and consumed by [`serve_router`].
+///
+/// They are deliberately distinct tokens, cancelled at **different times**:
+///
+/// - `listener` is the caller's own token — whatever SIGTERM cancels. When it
+///   fires, the listener stops accepting and in-flight requests are given
+///   `shutdown_timeout` to finish.
+/// - `sessions` is rmcp's, and is cancelled only when that deadline expires.
+///
+/// Cancelling both at once is the obvious-looking mistake, and it was shipped:
+/// rmcp ends every session the instant its token fires, and an MCP response
+/// travels back over that session's SSE stream, so every in-flight call lost its
+/// response the moment shutdown began and the deadline never did anything. A
+/// tool call that completes during the drain must still be able to answer.
+///
+/// The consequence to know: while any SSE stream is open, shutdown takes the
+/// full `shutdown_timeout`. Keep it well under systemd's `TimeoutStopSec`.
+#[derive(Debug, Clone)]
+pub struct HttpShutdown {
+    listener: CancellationToken,
+    sessions: CancellationToken,
+}
+
+impl HttpShutdown {
+    /// The token the caller cancels to begin draining.
+    #[must_use]
+    pub fn listener(&self) -> &CancellationToken {
+        &self.listener
+    }
+}
 /// Serve a composed router over plain HTTP or a supplied rustls configuration.
 ///
 /// Both plain and TLS paths support graceful shutdown via the `shutdown` signal.
@@ -663,13 +708,14 @@ pub enum HttpServeError {
 /// waits up to `shutdown_timeout` for in-flight requests to complete. Requests
 /// that do not finish within the timeout are dropped.
 ///
-/// **The `shutdown` token must be the one returned from `build_streamable_http_router`.**
-/// Using a different token would cause rmcp's SSE streams to persist past the drain
-/// timeout, defeating graceful shutdown (#156).
+/// **The `shutdown` value must be the one returned from
+/// `build_streamable_http_router`**, which is why it is a distinct type rather
+/// than a bare token: the two halves must stay paired (#156).
 ///
-/// The timeout is a backstop: rmcp terminates every active session on the same
-/// `CancellationToken`, so SSE streams end immediately when shutdown is triggered.
-/// The timeout bounds stuck connections well under systemd's `TimeoutStopSec`.
+/// The timeout is load-bearing, not a backstop. rmcp's sessions are held open
+/// for its whole duration so an in-flight call can still write its response,
+/// and terminated when it expires so a stream that never ends cannot hold
+/// shutdown open. Keep it well under systemd's `TimeoutStopSec`.
 ///
 /// # Example
 ///
@@ -702,7 +748,7 @@ pub enum HttpServeError {
 ///     router,
 ///     address,
 ///     None, // No TLS
-///     shutdown, // Must be the token from build_streamable_http_router
+///     shutdown, // Must be the HttpShutdown from build_streamable_http_router
 ///     std::time::Duration::from_secs(10),
 /// ).await?;
 /// # Ok(())
@@ -712,7 +758,7 @@ pub async fn serve_router(
     router: Router,
     address: SocketAddr,
     tls: Option<Arc<rustls::ServerConfig>>,
-    shutdown: CancellationToken,
+    shutdown: HttpShutdown,
     shutdown_timeout: std::time::Duration,
 ) -> Result<(), HttpServeError> {
     // Both listeners run on axum_server so they share one forced deadline.
@@ -730,9 +776,20 @@ pub async fn serve_router(
     tokio::spawn({
         let handle = handle.clone();
         async move {
-            shutdown.cancelled().await;
-            tracing::info!("shutdown signal received, draining connections");
+            shutdown.listener.cancelled().await;
+            tracing::info!(
+                timeout_secs = shutdown_timeout.as_secs(),
+                "shutdown signal received, draining connections"
+            );
             handle.graceful_shutdown(Some(shutdown_timeout));
+
+            // Hold rmcp's sessions open for the whole drain window, then cut.
+            // Cancelling here rather than above is the entire point: an MCP
+            // response rides its session's SSE stream, so killing sessions at
+            // t=0 would drop the very responses the drain exists to deliver.
+            tokio::time::sleep(shutdown_timeout).await;
+            tracing::info!("drain deadline reached, terminating remaining sessions");
+            shutdown.sessions.cancel();
         }
     });
 
@@ -1317,6 +1374,59 @@ mod tests {
         // Server should have stopped
         let result = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
         assert!(result.is_ok(), "server should have stopped gracefully");
+    }
+
+    /// rmcp's sessions must outlive the *start* of the drain and die at its end.
+    ///
+    /// An MCP response travels back over its session's SSE stream. 0.7.0 and
+    /// 0.7.1 handed rmcp the same token as the listener, so every session ended
+    /// the instant shutdown began and no in-flight call could ever answer — the
+    /// drain deadline had nothing left to protect. Verified against a live
+    /// server: a tool call in flight at SIGTERM got 28 bytes of SSE preamble and
+    /// no response, indistinguishable from having been dropped outright.
+    #[tokio::test]
+    async fn sessions_outlive_the_start_of_the_drain_and_end_at_its_deadline() {
+        let listener_token = CancellationToken::new();
+        let config = HttpTransportConfig::<NoGrant>::new(
+            TransportIdentity::new("testmcp", "test", "test", ["device"]),
+            LimitsConfig::default(),
+            HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
+            listener_token.clone(),
+        );
+        let (router, shutdown) =
+            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+                .expect("router build failed");
+        let sessions = shutdown.sessions.clone();
+
+        let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let bound = std::net::TcpListener::bind(address).expect("bind failed");
+        let bound_address = bound.local_addr().expect("local_addr");
+        drop(bound);
+
+        let drain = Duration::from_millis(600);
+        let server = tokio::spawn(serve_router(router, bound_address, None, shutdown, drain));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        listener_token.cancel();
+
+        // Mid-drain: the listener is closing, but sessions must still be able to
+        // carry a response back.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !sessions.is_cancelled(),
+            "rmcp sessions were cut at the start of the drain, so an in-flight \
+             call could never deliver its response"
+        );
+
+        // Past the deadline: the hard cut, so a stream that never ends cannot
+        // hold shutdown open forever.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            sessions.is_cancelled(),
+            "rmcp sessions must be terminated once the drain deadline expires"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
     }
 
     #[tokio::test]
