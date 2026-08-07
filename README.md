@@ -35,6 +35,12 @@ apply) and the modern crate hygiene. Neither benefits from the other.
 
 ## Status
 
+**0.6.1 — twelve crates; `mecmcp-scp` added.** A native SCP1 file-transfer
+client for devices that disable SFTP-over-SSH (Junos among them), so a server
+can move files without spawning `scp` — which is what lets a consumer run on a
+distroless image with no shell. Unix-only, gated at the module export. Additive:
+nothing from 0.6.0 changed.
+
 **0.6.0 — eleven crates; extraction milestone 2 landed.** The cloud-foundations
 programme (#90) shipped `mecmcp-secret`, `mecmcp-http`, `mecmcp-job` and
 `mecmcp-openapi`; `mecmcp-changeset` gained multi-target change sets;
