@@ -108,7 +108,7 @@ impl GracefulShutdown {
     #[must_use]
     pub fn subscribe(&self) -> ShutdownSignal {
         ShutdownSignal {
-            token: self.token.clone(),
+            inner: Box::pin(self.token.clone().cancelled_owned()),
         }
     }
 
@@ -127,14 +127,22 @@ impl GracefulShutdown {
 ///
 /// If shutdown was already triggered before this signal was created,
 /// it completes immediately (latched behavior).
+///
+/// The wait future is constructed **once**, in `subscribe`, and held across
+/// polls. It must not be recreated per poll: `CancellationToken::cancelled()`
+/// registers its waker with the token on first poll and *deregisters it on
+/// drop*, so a fresh future built inside `poll` unregisters the waker it just
+/// installed, and nothing ever wakes the task again. That is not a theoretical
+/// concern — it shipped in 0.7.0 and stopped SIGTERM from ever reaching
+/// `serve_router`, so no server drained.
 pub struct ShutdownSignal {
-    token: CancellationToken,
+    inner: std::pin::Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
 }
 
 impl ShutdownSignal {
     /// Wait for the shutdown signal.
     pub async fn wait(self) {
-        self.token.cancelled().await;
+        self.await;
     }
 }
 
@@ -142,12 +150,10 @@ impl std::future::Future for ShutdownSignal {
     type Output = ();
 
     fn poll(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let fut = self.token.cancelled();
-        tokio::pin!(fut);
-        fut.poll(cx)
+        self.inner.as_mut().poll(cx)
     }
 }
 
@@ -222,6 +228,39 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(200), signal)
             .await
             .expect("shutdown signal should complete as future");
+    }
+
+    /// The signal must wake a task that is *parked on it*, with nothing else
+    /// scheduled to wake that task.
+    ///
+    /// Every other test here wraps the signal in `tokio::time::timeout`, whose
+    /// own timer re-polls the task at the deadline — so they pass even when the
+    /// signal's waker was never registered. That is exactly how 0.7.0 shipped a
+    /// `Future` impl that could never complete: it rebuilt `cancelled()` inside
+    /// `poll` and dropped it, deregistering the waker each time. Live servers
+    /// then hung on SIGTERM instead of draining.
+    ///
+    /// Here the waiter task's only wake source is the token, and the timeout
+    /// applies to the *oneshot*, so it cannot substitute for a missing waker.
+    #[tokio::test]
+    async fn signal_wakes_a_parked_task_without_another_timer() {
+        let shutdown = GracefulShutdown::new().expect("shutdown coordinator");
+        let signal = shutdown.subscribe();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            signal.await;
+            let _ = tx.send(());
+        });
+
+        // Let the waiter reach its await point and park.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.trigger();
+
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("a parked waiter must be woken by the signal itself")
+            .expect("waiter task must not be dropped");
     }
 
     // SIGTERM handler installation is verified by successful construction.

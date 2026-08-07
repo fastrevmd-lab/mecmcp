@@ -35,6 +35,16 @@ apply) and the modern crate hygiene. Neither benefits from the other.
 
 ## Status
 
+**0.7.1 — the 0.7.0 drain never fired. Upgrade past 0.7.0.** `ShutdownSignal`'s
+`Future` impl rebuilt `CancellationToken::cancelled()` on every poll and dropped
+it at the end of the poll, deregistering the waker it had just installed. Nothing
+ever woke the task, so `subscribe().await` never completed and SIGTERM never
+reached `serve_router`. Caught on a lab box, not in CI: the four existing unit
+tests all wrapped the signal in `tokio::time::timeout`, whose own timer re-polled
+the task at the deadline — by which point the token was already cancelled, so
+they passed against a future that could not complete. The new test parks a task
+on the signal with the token as its only wake source.
+
 **0.7.0 — extraction milestone 3: HTTP transport assembly.** A consumer no
 longer hand-assembles its router: `HostOriginPolicy`, `HttpTransportConfig`,
 `build_streamable_http_router` and `serve_router` compose the whole protected
