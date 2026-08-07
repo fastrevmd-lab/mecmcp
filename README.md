@@ -35,13 +35,95 @@ apply) and the modern crate hygiene. Neither benefits from the other.
 
 ## Status
 
-**0.3.8 — eleven crates, extraction complete.** Both the original extraction and
-the cloud-foundations programme (#90) have landed: `mecmcp-secret`,
-`mecmcp-http`, `mecmcp-job` and `mecmcp-openapi` are new, and `mecmcp-changeset`
-gained multi-target change sets.
+**0.6.0 — eleven crates; extraction milestone 2 landed.** The cloud-foundations
+programme (#90) shipped `mecmcp-secret`, `mecmcp-http`, `mecmcp-job` and
+`mecmcp-openapi`; `mecmcp-changeset` gained multi-target change sets;
+`mecmcp-server` (milestone 1) and now the bearer boundary (milestone 2) replace
+what consumers were reimplementing locally. Milestones 3 (HTTP transport
+assembly) and 4 (preflight) remain.
 
 Not published to crates.io. Consumers depend on this repository directly and pin
 an exact version.
+
+### Upgrading to 0.6.0
+
+**Extraction milestone 2: the bearer boundary.** All 22 issues (#96, #97,
+#103–#108, #118, #129–#141) land in this tag, because partial availability
+would mean a consumer maintaining both paths. `rustsdcmcp` can now delete
+`compat/bearer.rs` rather than adapt it.
+
+**New API.** `mecmcp-auth` gains `BearerSyntax`, `BearerHeaderError` and
+`parse_bearer_header`. `mecmcp-transport` gains `BearerAuthenticator`,
+`BearerBoundary`, `BearerResponseProfile`, `apply_bearer_boundary`,
+`AuthenticatedToken` and `CallerScopes`.
+
+**Breaking, in the order a consumer will hit them:**
+
+1. **`ScopePreflight::check` takes `CallerScopes<'_>`, not `&CallerCtx`.** The
+   scope-only view is what lets one `dyn`-safe implementation serve
+   `CallerCtx<G>` for any grant type. Field access is identical; change the
+   parameter type. **All three servers implement this trait** —
+   `rust-panosmcp/src/http_transport.rs`, `rust-junosmcp/src/http_transport.rs`,
+   and `rustsdcmcp`'s compat copy.
+2. **`apply_bearer_boundary` takes a `BoundaryAccounting`,** not a closure. The
+   crate now owns the layer order rather than accepting an opaque
+   `FnOnce(Router) -> Router` it cannot inspect.
+3. **`concurrency_middleware` is deprecated,** split into
+   `token_concurrency_middleware` (non-buffering, runs before the body limit)
+   and `target_concurrency_middleware` (buffering, runs after authorization).
+   Consumers passing `BoundaryAccounting` call neither directly.
+4. **`apply_rate_limit` is deprecated,** split into `apply_ip_rate_limit`
+   (outside the boundary, before authentication) and `apply_token_rate_limit`
+   (inside it, after authentication).
+5. **A 403's `WWW-Authenticate` no longer carries the preflight reason.** It is
+   a fixed `error="insufficient_scope"`, with the reason in the JSON body — a
+   reason containing a quote corrupted the challenge, and a control character
+   turned an intended 403 into a 500.
+6. **`BearerResponseProfile` gains `try_detailed`/`try_compact`** returning
+   `Result`. Use those for a configuration value; the infallible constructors
+   take `&'static str`.
+
+The boundary builds everything from `authenticate` inwards, so a consumer cannot
+get that part wrong. **Per-IP rate limiting is the one layer the consumer still
+applies itself**, because it must run *before* authentication — a request with a
+missing, malformed or unknown token has no identity to charge, and metering it is
+what stops an authentication flood:
+
+```rust
+let limits = Arc::new(limits_config);
+let accounting = BoundaryAccounting::new(
+    ConcurrencyState::new(&limits, target_keys, Some(session_tracker)),
+    Arc::clone(&limits),
+);
+
+let app = apply_bearer_boundary(app, boundary, accounting);
+let app = apply_ip_rate_limit(app, &limits); // outermost: runs first
+```
+
+Use `BoundaryAccounting::none()` for a deployment with no per-token accounting.
+
+Axum runs the last-applied layer first, so `apply_ip_rate_limit` must be applied
+*after* `apply_bearer_boundary` to sit outside it. Omitting it leaves
+unauthenticated requests unmetered.
+
+The resulting order:
+
+```
+IP rate limit (consumer) → authenticate → token rate limit → token concurrency
+  → body limit → preflight → target concurrency → handler
+```
+
+**Security fixes worth naming**, all found by review rather than by tests:
+
+- Per-token concurrency and session caps were bypassed for grant-bearing
+  callers — `concurrency_middleware` looked up `CallerCtx<NoGrant>` while the
+  boundary inserted `CallerCtx<G>`, and extension lookup is type-specific.
+- A preflight rejection cost the caller nothing, and an unauthenticated request
+  charged no per-IP bucket, so both could be flooded for free.
+- A token scoped to target A could acquire target B's concurrency permit before
+  the scope check rejected it, starving authorized B traffic.
+- `body_limit` was defeated whenever per-target concurrency buffered the request
+  ahead of the cap.
 
 ### Upgrading to 0.5.0
 
