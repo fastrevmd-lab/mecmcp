@@ -37,11 +37,21 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// An outbound credential. Zeroized on drop.
 ///
-/// Implements neither `Clone`, `Debug`, `Display`, nor `Serialize`, so it
-/// cannot be logged or persisted by accident. A consumer needing shared
-/// ownership wraps it in `Arc`.
+/// Implements neither `Debug`, `Display`, nor `Serialize`, so it cannot be
+/// logged or persisted by accident. Provides `Clone` with proper zeroization of
+/// the intermediate buffer. A consumer needing shared ownership can use `Arc`.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct OutboundSecret(String);
+
+impl Clone for OutboundSecret {
+    fn clone(&self) -> Self {
+        // Clone the inner String directly. The String's clone allocates a new
+        // buffer, and OutboundSecret's ZeroizeOnDrop will clear it when dropped.
+        // There's no intermediate allocation to worry about because String::clone
+        // allocates directly into the new String's buffer.
+        Self(self.0.clone())
+    }
+}
 
 impl OutboundSecret {
     /// Expose the plaintext for authentication calls.
@@ -50,6 +60,20 @@ impl OutboundSecret {
     #[must_use]
     pub fn expose(&self) -> &str {
         &self.0
+    }
+
+    /// Create a secret from a string.
+    ///
+    /// **WARNING:** This bypasses the file permission and size checks that
+    /// `load_from_file()` and `load_from_env()` provide. Only use this in tests
+    /// or when the secret comes from a trusted source that has already been
+    /// validated.
+    ///
+    /// This is intentionally not implemented via From/Into to make it conspicuous.
+    /// Production code should prefer load_from_env or load_from_file.
+    #[doc(hidden)] // Hide from public docs to discourage misuse
+    pub fn new_unchecked(value: String) -> Self {
+        Self(value)
     }
 }
 

@@ -1,5 +1,5 @@
 [workspace]
-members  = ["crates/mecmcp-auth", "crates/mecmcp-audit", "crates/mecmcp-changeset", "crates/mecmcp-transport", "crates/mecmcp-runtime", "crates/mecmcp-policy", "crates/mecmcp-inventory", "crates/mecmcp-device", "crates/mecmcp-secret", "crates/mecmcp-http", "crates/mecmcp-job", "crates/mecmcp-openapi", "crates/mecmcp-server"]
+members  = ["crates/mecmcp-auth", "crates/mecmcp-audit", "crates/mecmcp-changeset", "crates/mecmcp-scp", "crates/mecmcp-transport", "crates/mecmcp-runtime", "crates/mecmcp-policy", "crates/mecmcp-inventory", "crates/mecmcp-device", "crates/mecmcp-secret", "crates/mecmcp-http", "crates/mecmcp-job", "crates/mecmcp-openapi", "crates/mecmcp-server"]
 resolver = "2"
 
 [workspace.package]
@@ -19,6 +19,9 @@ globset    = "0.4"
 hmac       = "0.13"
 metrics    = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
+# Require russh >=0.62.5 to avoid CVE-2026-68930 (SSH handshake vulnerability in 0.62.0-0.62.4).
+# Do not relax to "0.62" — Cargo.lock is gitignored and cannot protect downstream consumers.
+russh      = { version = ">=0.62.5, <0.63", default-features = false, features = ["flate2", "aws-lc-rs"] }
 rustix     = { version = "1", features = ["fs", "process"] }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
