@@ -14,6 +14,7 @@ mecmcp-auth = { version = "0.6.1", path = "../mecmcp-auth" }
 rustix      = { workspace = true, features = ["process", "fs"] }
 thiserror   = { workspace = true }
 tokio       = { version = "1", features = ["rt", "signal", "sync"] }
+tokio-util  = { workspace = true }
 tracing     = { workspace = true }
 
 [dev-dependencies]

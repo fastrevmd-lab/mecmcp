@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 axum        = { version = "0.8", default-features = false, features = ["tokio", "json"] }
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 dashmap     = "6.1"
 futures     = "0.3"
 http        = "1"

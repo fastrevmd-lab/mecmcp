@@ -529,7 +529,7 @@ impl HttpBody for GuardedBody {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-#[allow(deprecated)] // Tests for old concurrency_middleware
+#[allow(deprecated)] // Tests for old concurrency_middleware and old streamable_http_server_config
 mod tests {
     use super::*;
     use crate::config::streamable_http_server_config;

@@ -230,12 +230,13 @@ impl BearerResponseProfile {
 
 /// Configuration for the shared authenticated request boundary.
 ///
-/// Combines bearer authentication, body size limits, response profile, and an
-/// optional synchronous scope preflight into one middleware configuration.
+/// Combines bearer authentication, response profile, and an optional synchronous
+/// scope preflight. The body size limit is derived from `LimitsConfig` (passed via
+/// `BoundaryAccounting` to `apply_bearer_boundary`) to prevent mismatch between
+/// boundary and config caps.
 pub struct BearerBoundary<G: Grant> {
     authenticator: BearerAuthenticator<G>,
     responses: BearerResponseProfile,
-    body_limit: usize,
     preflight: OptionalPreflight,
 }
 
@@ -244,7 +245,6 @@ impl<G: Grant> Clone for BearerBoundary<G> {
         Self {
             authenticator: self.authenticator.clone(),
             responses: self.responses.clone(),
-            body_limit: self.body_limit,
             preflight: self.preflight.clone(),
         }
     }
@@ -253,8 +253,9 @@ impl<G: Grant> Clone for BearerBoundary<G> {
 impl<G: Grant> BearerBoundary<G> {
     /// Construct a bearer boundary.
     ///
-    /// `body_limit` caps the request body size in bytes. A value of `0` means
-    /// unlimited. The preflight is `None` by default; use
+    /// The body size limit is derived from `LimitsConfig` when the boundary is
+    /// applied via `apply_bearer_boundary`, ensuring the middleware and rmcp caps
+    /// cannot disagree. The preflight is `None` by default; use
     /// [`with_preflight`](Self::with_preflight) to install one.
     ///
     /// # Example
@@ -270,19 +271,13 @@ impl<G: Grant> BearerBoundary<G> {
     /// let boundary = BearerBoundary::new(
     ///     authenticator,
     ///     BearerResponseProfile::detailed("test"),
-    ///     16 * 1024,
     /// );
     /// ```
     #[must_use]
-    pub fn new(
-        authenticator: BearerAuthenticator<G>,
-        responses: BearerResponseProfile,
-        body_limit: usize,
-    ) -> Self {
+    pub fn new(authenticator: BearerAuthenticator<G>, responses: BearerResponseProfile) -> Self {
         Self {
             authenticator,
             responses,
-            body_limit,
             preflight: None,
         }
     }
@@ -316,7 +311,6 @@ impl<G: Grant> BearerBoundary<G> {
     /// let boundary = BearerBoundary::new(
     ///     authenticator,
     ///     BearerResponseProfile::detailed("test"),
-    ///     1024,
     /// ).with_preflight(AlwaysAllow);
     /// ```
     #[must_use]
@@ -375,7 +369,7 @@ impl BoundaryAccounting {
 ///   they reach accounting, preventing anonymous requests from charging token budgets.
 /// - **Token rate limit (non-buffering)**: Checks per-token RPS limit before body is read.
 /// - **Token concurrency (non-buffering)**: Checks per-token in-flight limit before body is read.
-/// - **Body limit**: Enforces `boundary.body_limit` bytes before any buffering occurs
+/// - **Body limit**: Enforces `accounting.limits.max_request_body_bytes` before any buffering occurs
 ///   (preventing unbounded allocation in per-target concurrency or preflight).
 /// - **Preflight (authorization)**: Buffers body and checks scopes. Runs AFTER token accounting,
 ///   so rejected requests still consume per-token budget (preventing bypass via out-of-scope requests).
@@ -400,7 +394,6 @@ impl BoundaryAccounting {
 /// let boundary = BearerBoundary::new(
 ///     authenticator,
 ///     BearerResponseProfile::detailed("test"),
-///     1024,
 /// );
 ///
 /// let limits = Arc::new(LimitsConfig::default());
@@ -441,11 +434,13 @@ pub fn apply_bearer_boundary<G: Grant>(
     // Body limit layer: enforce streaming limit before any buffering.
     // Applied here so it runs AFTER token accounting (non-buffering sees Content-Length)
     // and BEFORE preflight + target concurrency (all buffering is bounded).
-    let router = if boundary.body_limit > 0 {
+    // Derive the cap from LimitsConfig (via accounting) so boundary and rmcp caps cannot disagree.
+    let body_limit = accounting.limits.max_request_body_bytes;
+    let router = if body_limit > 0 {
         router
             // Enforce the limit with our custom middleware that marks+counts (applied first, runs second/inner)
             .layer(axum::middleware::from_fn_with_state(
-                boundary.body_limit,
+                body_limit,
                 body_limit_middleware,
             ))
             // Ensure marked 413s are JSON (applied second, runs first/outer)

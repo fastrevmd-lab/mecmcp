@@ -76,7 +76,7 @@ fn boundary(profile: BearerResponseProfile) -> BearerBoundary<TestGrant> {
     let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
         (candidate == "secret").then(caller)
     });
-    BearerBoundary::new(authenticator, profile, 1024).with_preflight(TestScopePreflight {
+    BearerBoundary::new(authenticator, profile).with_preflight(TestScopePreflight {
         allowed_devices: vec!["tenant-a".to_owned()],
     })
 }
@@ -95,7 +95,17 @@ fn app(profile: BearerResponseProfile) -> Router {
         ),
     );
     // No per-token accounting
-    apply_bearer_boundary(router, boundary(profile), BoundaryAccounting::none())
+    apply_bearer_boundary(
+        router,
+        boundary(profile),
+        BoundaryAccounting {
+            concurrency: None,
+            limits: Arc::new(LimitsConfig {
+                max_request_body_bytes: 1024,
+                ..Default::default()
+            }),
+        },
+    )
 }
 
 fn request(authorization: Option<&str>, body: &'static str) -> Request<Body> {
@@ -334,7 +344,7 @@ async fn grant_bearing_caller_inserts_authenticated_token() {
     let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
         (candidate == "secret").then(caller)
     });
-    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"), 1024);
+    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"));
 
     let app = apply_bearer_boundary(
         Router::new().route(
@@ -385,7 +395,7 @@ async fn body_stream_failure_returns_400_not_413() {
     let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
         (candidate == "secret").then(caller)
     });
-    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"), 1024);
+    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"));
 
     let app = apply_bearer_boundary(
         Router::new().route("/", post(|| async { StatusCode::OK })),
@@ -431,7 +441,7 @@ async fn preflight_reason_with_quote_cannot_inject_header() {
     let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
         (candidate == "secret").then(caller)
     });
-    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"), 1024)
+    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"))
         .with_preflight(QuoteInReason);
 
     let app = apply_bearer_boundary(
@@ -502,7 +512,7 @@ async fn preflight_reason_with_control_chars_cannot_inject_headers() {
     let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
         (candidate == "secret").then(caller)
     });
-    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"), 1024)
+    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"))
         .with_preflight(ControlInReason);
 
     let app = apply_bearer_boundary(
@@ -609,7 +619,7 @@ async fn preflight_rejection_consumes_per_token_budget() {
     let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
         (candidate == "secret").then(caller)
     });
-    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"), 1024)
+    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"))
         .with_preflight(DenyAll);
 
     // Create concurrency state with max_per_token = 1
@@ -678,7 +688,7 @@ async fn unauthenticated_request_does_not_consume_any_budget() {
     let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
         (candidate == "secret").then(caller)
     });
-    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"), 1024);
+    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"));
 
     // Create concurrency state with max_per_token = 1
     let limits = Arc::new(LimitsConfig {
@@ -743,7 +753,7 @@ async fn authenticated_successful_request_consumes_budget() {
     let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
         (candidate == "secret").then(caller)
     });
-    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"), 1024);
+    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"));
 
     // Create concurrency state with max_per_token = 1
     let limits = Arc::new(LimitsConfig {
@@ -808,16 +818,18 @@ async fn content_length_over_limit_returns_json_413() {
     let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
         (candidate == "secret").then(caller)
     });
-    let boundary = BearerBoundary::new(
-        authenticator,
-        BearerResponseProfile::compact("test"),
-        10, // 10 byte limit
-    );
+    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"));
 
     let app = apply_bearer_boundary(
         Router::new().route("/", post(|| async { "ok" })),
         boundary,
-        BoundaryAccounting::none(),
+        BoundaryAccounting {
+            concurrency: None,
+            limits: Arc::new(LimitsConfig {
+                max_request_body_bytes: 10,
+                ..Default::default()
+            }),
+        },
     );
 
     // Send request with Content-Length: 100 (exceeds 10 byte limit)
@@ -857,7 +869,7 @@ async fn handler_413_response_survives_unchanged() {
     let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
         (candidate == "secret").then(caller)
     });
-    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"), 1024);
+    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"));
 
     // Handler that returns its own 413 with custom header and body
     let app = apply_bearer_boundary(
@@ -916,7 +928,7 @@ async fn handler_text_plain_413_survives_unchanged() {
     let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
         (candidate == "secret").then(caller)
     });
-    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"), 1024);
+    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"));
 
     // Handler that returns its own text/plain 413
     let app = apply_bearer_boundary(
@@ -974,13 +986,14 @@ async fn per_target_chunked_body_over_limit_is_marked_and_counted() {
     let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
         (candidate == "secret").then(caller)
     });
-    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"), 512);
+    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"));
 
     // Enable per-target limiting
     let limits = Arc::new(LimitsConfig {
         max_inflight_requests: 0,
         max_inflight_requests_per_token: 0,
-        max_inflight_requests_per_device: 4, // Enable per-target
+        max_inflight_requests_per_device: 4,
+        max_request_body_bytes: 512,
         ..LimitsConfig::default()
     });
     let concurrency = ConcurrencyState::new(&limits, vec!["device".to_string()], None);
@@ -1025,7 +1038,7 @@ async fn streamed_body_through_preflight_is_marked_and_counted() {
     let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
         (candidate == "secret").then(caller)
     });
-    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"), 512)
+    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"))
         .with_preflight(TestScopePreflight {
             allowed_devices: vec!["tenant-a".to_owned()],
         });
@@ -1033,7 +1046,13 @@ async fn streamed_body_through_preflight_is_marked_and_counted() {
     let app = apply_bearer_boundary(
         Router::new().route("/", post(|| async { "ok" })),
         boundary,
-        BoundaryAccounting::none(),
+        BoundaryAccounting {
+            concurrency: None,
+            limits: Arc::new(LimitsConfig {
+                max_request_body_bytes: 512,
+                ..Default::default()
+            }),
+        },
     );
 
     // Streamed body (no Content-Length) over limit
@@ -1075,13 +1094,14 @@ async fn content_length_over_limit_with_token_rate_limiting() {
     let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
         (candidate == "secret").then(caller)
     });
-    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"), 512);
+    let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::compact("test"));
 
     // Enable per-token concurrency with limit 1
     let limits = Arc::new(LimitsConfig {
         max_inflight_requests: 0,
         max_inflight_requests_per_token: 1,
         max_inflight_requests_per_device: 0,
+        max_request_body_bytes: 512,
         ..LimitsConfig::default()
     });
     let concurrency = ConcurrencyState::new(&limits, vec![], None);

@@ -14,6 +14,7 @@ mod metrics;
 mod overload;
 pub mod preflight;
 mod rate_limit;
+mod server;
 mod session;
 mod target;
 pub mod tls;
@@ -36,6 +37,7 @@ pub use concurrency::{
     ConcurrencyState, apply_body_limit, concurrency_middleware, target_concurrency_middleware,
     token_concurrency_middleware,
 };
+#[allow(deprecated)]
 pub use config::{LimitsConfig, LimitsConfigError, streamable_http_server_config};
 pub use identity::TransportIdentity;
 pub use metrics::PrometheusRuntime;
@@ -43,6 +45,11 @@ pub use overload::overload_response;
 pub use preflight::{CallerScopes, OptionalPreflight, ScopePreflight};
 #[allow(deprecated)]
 pub use rate_limit::{apply_ip_rate_limit, apply_rate_limit, apply_token_rate_limit};
+pub use server::{
+    HostOriginPolicy, HttpServeError, HttpTransportBuildError, HttpTransportConfig,
+    build_streamable_http_router, loopback_origins, serve_router,
+    streamable_http_server_config as build_rmcp_server_config,
+};
 pub use session::{LimitedSessionManager, LimitedSessionManagerError, SessionTracker};
 pub use target::{TargetLimiter, extract_targets};
 pub use tls::{TlsError, load as load_tls};
