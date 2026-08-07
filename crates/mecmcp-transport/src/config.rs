@@ -173,6 +173,13 @@ impl LimitsConfig {
 
 /// Build rmcp's `StreamableHttpServerConfig` from this crate's [`LimitsConfig`].
 ///
+/// # Deprecated
+///
+/// This function is deprecated in favor of the three-parameter
+/// `mecmcp_transport::build_rmcp_server_config` which also configures
+/// Host/Origin policy and shutdown token. It is kept for internal tests that
+/// verify the body-size mapping in isolation.
+///
 /// Use this rather than `StreamableHttpServerConfig::default()`. rmcp 3 added
 /// its own `max_request_body_bytes`, defaulting to **4 MiB**, enforced *inside*
 /// rmcp after this crate's `apply_body_limit` layer has already accepted the
@@ -187,6 +194,10 @@ impl LimitsConfig {
 /// handshake and `Mcp-Session-Id` stay available for pre-2026-07-28 clients,
 /// while clients declaring `2026-07-28` are routed statelessly per request.
 /// Both are served simultaneously; this is not a cutover.
+#[deprecated(
+    since = "0.7.0",
+    note = "Use mecmcp_transport::build_rmcp_server_config instead"
+)]
 pub fn streamable_http_server_config(
     cfg: &LimitsConfig,
 ) -> rmcp::transport::streamable_http_server::StreamableHttpServerConfig {
