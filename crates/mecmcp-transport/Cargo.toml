@@ -19,6 +19,7 @@ futures     = "0.3"
 http        = "1"
 http-body   = "1"
 http-body-util = "0.1"
+mecmcp-audit = { version = "0.8.0", path = "../mecmcp-audit" }
 mecmcp-auth = { version = "0.8.0", path = "../mecmcp-auth" }
 metrics     = { workspace = true }
 # metrics-exporter-prometheus must have default-features = false to avoid
@@ -49,10 +50,14 @@ ureq        = { version = "3", default-features = false, features = ["json"] }
 zeroize     = "1"
 
 [dev-dependencies]
+# Test-only: `test-util` exposes audit capture helpers. It must NOT be enabled
+# on the normal dependency above — that ships test scaffolding in production
+# binaries and widens the attack surface for no runtime benefit. Cargo unifies
+# features per build, so `cargo test` gets it and `cargo build` does not.
+mecmcp-audit = { version = "0.8.0", path = "../mecmcp-audit", features = ["test-util"] }
 # Test-only: rmcp's `EventStore` is an `#[async_trait]` trait, so the fake store
 # that proves `LimitedSessionManager` forwards `event_store()` needs the macro.
 async-trait = { workspace = true }
-mecmcp-audit = { version = "0.8.0", path = "../mecmcp-audit" }
 # Test-only: the exporter is used solely to render metrics in unit tests.
 # It must NOT be a normal dependency — its default features pull an HTTP
 # listener and hyper-rustls, which enables rustls's aws-lc-rs backend and
