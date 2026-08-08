@@ -12,7 +12,8 @@ use axum::{
 use mecmcp_audit::AuditScope;
 use mecmcp_auth::{BearerSyntax, CallerCtx, Grant, parse_bearer_header};
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// Errors that can occur when constructing a bearer authentication profile.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -618,42 +619,76 @@ pub async fn bearer_preflight_middleware<G: Grant>(
         .await
 }
 
+/// Cap on distinct tool names ever interned, and on the length of one.
+///
+/// The name comes from the request body, which is attacker-controlled, and is
+/// read *before* the preflight has checked that the caller may call it — so an
+/// authenticated caller with no scopes at all still reaches this code. Without
+/// a bound, every novel name would leak a fresh allocation for the life of the
+/// process and add a distinct value to audit output, which is both a memory
+/// exhaustion path and an unbounded metrics-cardinality path.
+const MAX_INTERNED_TOOL_NAMES: usize = 256;
+const MAX_TOOL_NAME_LEN: usize = 128;
+
+/// Placeholder recorded when a name is implausible or the intern table is full.
+///
+/// Auditing "a tools/call reached dispatch" is the guarantee (#32); recording an
+/// unbounded attacker-chosen string is not part of it.
+const UNREGISTERED_TOOL: &str = "unregistered";
+
+static INTERNED_TOOL_NAMES: LazyLock<Mutex<HashSet<&'static str>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Intern a tool name into a bounded set, returning a `&'static str`.
+///
+/// `AuditScope` requires `&'static str`. Leaking each parsed name unconditionally
+/// would satisfy the type and nothing else: names are not a "finite, small set"
+/// when they arrive from a request body rather than from the tool registry.
+fn intern_tool_name(name: &str) -> &'static str {
+    if name.is_empty()
+        || name.len() > MAX_TOOL_NAME_LEN
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return UNREGISTERED_TOOL;
+    }
+    let Ok(mut names) = INTERNED_TOOL_NAMES.lock() else {
+        return UNREGISTERED_TOOL;
+    };
+    if let Some(existing) = names.get(name) {
+        return existing;
+    }
+    if names.len() >= MAX_INTERNED_TOOL_NAMES {
+        return UNREGISTERED_TOOL;
+    }
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.insert(leaked);
+    leaked
+}
+
 /// Extract the tool name from a `tools/call` JSON-RPC request.
 ///
-/// Returns `Some(&'static str)` containing the tool name if the body parses as
-/// a `tools/call` request. Returns `None` for other methods, malformed JSON,
-/// or non-`tools/call` requests.
+/// Returns the interned name for the first `tools/call` in the body, or `None`
+/// for other methods and malformed JSON. Names are bounded by
+/// [`intern_tool_name`]; see there for why that matters.
 ///
-/// This function is load-bearing for audit coverage (mecmcp#32): every tool
-/// that reaches dispatch must produce an audit event, and this is the seam
-/// where that guarantee is enforced. The transport emits an event here; the
-/// handler enriches it with action, targets, and outcome.
-///
-/// # Why `&'static str`
-///
-/// `AuditScope` requires a `&'static str` for the tool name (interned for the
-/// lifetime of the process). Returning `String` would require the caller to
-/// leak it, which is both awkward and easy to get wrong. This function performs
-/// the lookup and returns the static reference directly.
-///
-/// The tool name is parsed from the JSON body but must match a tool registered
-/// in the server's tool list. For now, we leak the parsed string to satisfy the
-/// `&'static` requirement. A future optimization could intern tool names in a
-/// static set if allocation becomes a concern.
+/// This function is load-bearing for audit coverage (mecmcp#32): every tool that
+/// reaches dispatch must produce an audit event, and this is the seam where that
+/// guarantee is enforced. The transport emits an event here; the handler
+/// enriches it with action, targets, and outcome.
 fn extract_tool_name(body: &[u8]) -> Option<&'static str> {
     let value: Value = serde_json::from_slice(body).ok()?;
 
-    // Handle both single requests and batched requests
+    // Handle both single requests and batched requests.
     let requests = match &value {
         Value::Array(requests) => requests.as_slice(),
         single => std::slice::from_ref(single),
     };
 
-    // Extract tool name from the first tools/call request in the batch.
-    // Batched requests are uncommon, and all requests in a batch typically
-    // call the same tool or closely related tools. Emitting one audit event
-    // for the first tool provides coverage without duplicating events for
-    // every request in a batch.
+    // One event for the first tools/call in a batch. Batches are uncommon and
+    // typically call the same or closely related tools, so this gives coverage
+    // without emitting an event per element.
     for request in requests {
         if request.get("method").and_then(Value::as_str) == Some("tools/call")
             && let Some(tool) = request
@@ -661,11 +696,7 @@ fn extract_tool_name(body: &[u8]) -> Option<&'static str> {
                 .and_then(|p| p.get("name"))
                 .and_then(Value::as_str)
         {
-            // Leak the string to get a &'static str. This is safe because tool
-            // names are a finite, small set (dozens, not millions), and we only
-            // leak each unique name once. A future optimization could use a static
-            // interner if this becomes a concern.
-            return Some(Box::leak(tool.to_owned().into_boxed_str()));
+            return Some(intern_tool_name(tool));
         }
     }
     None
@@ -959,6 +990,53 @@ mod tests {
         let body = b"not json";
         let tool = extract_tool_name(body);
         assert_eq!(tool, None);
+    }
+
+    /// An attacker-chosen tool name must not leak unboundedly.
+    ///
+    /// The name is read from the request body before the preflight has decided
+    /// whether the caller may call anything, so a token with no scopes can drive
+    /// this path. The first version of #32 did `Box::leak` on every parsed name,
+    /// reasoning that tool names are "a finite, small set (dozens, not
+    /// millions)" — true of the tool *registry*, false of a request field.
+    #[test]
+    fn implausible_tool_names_are_not_interned() {
+        let long = "a".repeat(MAX_TOOL_NAME_LEN + 1);
+        assert_eq!(intern_tool_name(&long), UNREGISTERED_TOOL);
+        assert_eq!(intern_tool_name(""), UNREGISTERED_TOOL);
+        assert_eq!(intern_tool_name("has space"), UNREGISTERED_TOOL);
+        assert_eq!(intern_tool_name("semi;colon"), UNREGISTERED_TOOL);
+        assert_eq!(intern_tool_name("uni\u{00e7}ode"), UNREGISTERED_TOOL);
+    }
+
+    /// A plausible name interns once and returns the same pointer thereafter,
+    /// so repeated calls do not allocate again.
+    #[test]
+    fn plausible_tool_names_intern_once() {
+        let first = intern_tool_name("get_router_list");
+        let second = intern_tool_name("get_router_list");
+        assert_eq!(first, "get_router_list");
+        assert!(std::ptr::eq(first, second), "name should intern once");
+    }
+
+    /// Beyond the cap, novel names collapse to the placeholder rather than
+    /// growing the table — bounding both the leak and audit cardinality.
+    #[test]
+    fn interning_is_capped() {
+        for index in 0..MAX_INTERNED_TOOL_NAMES + 50 {
+            intern_tool_name(&format!("capfill_{index}"));
+        }
+        let names = INTERNED_TOOL_NAMES.lock().expect("intern table");
+        assert!(
+            names.len() <= MAX_INTERNED_TOOL_NAMES,
+            "intern table grew past its cap: {}",
+            names.len()
+        );
+        drop(names);
+        assert_eq!(
+            intern_tool_name("a_name_after_the_cap_is_reached"),
+            UNREGISTERED_TOOL
+        );
     }
 
     /// Regression test for mecmcp#32: tools/call requests emit transport audit events.
