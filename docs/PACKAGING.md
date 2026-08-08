@@ -9,6 +9,10 @@ Settling it once is cheaper than reconciling four repos later.
 
 Tracked in [#6](https://github.com/fastrevmd-lab/mecmcp/issues/6).
 
+**See also:**
+- [FILESYSTEM-LAYOUT.md](FILESYSTEM-LAYOUT.md) — directory structure, config vs state split, service naming (#28)
+- [RELEASE-ARTIFACTS.md](RELEASE-ARTIFACTS.md) — artifact naming, archive layout, BUILD-INFO, SBOM, reproducible builds (#30)
+
 ---
 
 ## 1. Container image
