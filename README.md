@@ -35,6 +35,26 @@ apply) and the modern crate hygiene. Neither benefits from the other.
 
 ## Status
 
+**0.8.0 — extraction milestone 4: generic scope preflight + shared test client.**
+Four consumers (Junos, PAN-OS, SDC, Mist) had near-identical preflights differing
+only in argument field names (Junos: `router`/`routers`, PAN-OS: `device`, SDC:
+`tenant`, Mist: org/site). `ToolScopePreflight` is the generic implementation,
+configured with `TargetField`s. Also added: `test_client::McpClient`, a shared
+SSE-aware HTTP client for integration tests, replacing product-local helpers.
+
+### Upgrading to 0.8.0
+
+**mecmcp-transport 0.8.0:**
+- **New exports:** `MalformedArgumentsPolicy`, `MalformedTargetPolicy`,
+  `TargetValueShape`, `TargetField`, `ToolScopePreflight` (#109–113, #142–147).
+  Configure with `TargetField::scalar("device")` or custom shapes.
+- **New `test_client` module:** `McpClient` for integration tests (#184). Handles
+  initialize handshake, SSE parsing, and session ID tracking.
+- All workspace crates bumped to `0.8.0`. Update path dependencies.
+
+**Breaking:** None. All additions are additive. Existing preflight implementations
+continue to work.
+
 **0.7.3 — axum-server 0.8, dropping the unmaintained `rustls-pemfile`.**
 0.7.2 put `axum-server` into every consumer's tree, which brought
 `rustls-pemfile` with it and tripped RUSTSEC-2025-0134 (unmaintained) in two
