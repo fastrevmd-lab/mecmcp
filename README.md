@@ -35,6 +35,22 @@ apply) and the modern crate hygiene. Neither benefits from the other.
 
 ## Status
 
+**0.8.1 — audit by construction (#32), with the tool name bounded.**
+The bearer boundary now emits a transport audit event for every `tools/call`
+before dispatch, so a tool is audited because it went through the transport, not
+because someone remembered. Handlers still emit their own enriched event —
+action, resolved device targets, outcome — correlated by request id; the
+transport cannot know any of those.
+
+The tool name is read from the request body, which is attacker-controlled and is
+parsed *before* the preflight has decided whether the caller may call anything.
+It is interned into a table capped at 256 entries of at most 128 bytes each,
+restricted to `[A-Za-z0-9_-]`; anything else records as `unregistered`. An
+earlier revision leaked every parsed name for the life of the process on the
+reasoning that tool names are "a finite, small set" — true of the registry,
+false of a request field, and both a memory-exhaustion and an
+unbounded-cardinality path.
+
 **0.8.0 — extraction milestone 4: generic scope preflight + shared test client.**
 Four consumers (Junos, PAN-OS, SDC, Mist) had near-identical preflights differing
 only in argument field names (Junos: `router`/`routers`, PAN-OS: `device`, SDC:
