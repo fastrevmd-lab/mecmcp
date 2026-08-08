@@ -17,6 +17,7 @@ mod rate_limit;
 mod server;
 mod session;
 mod target;
+pub mod test_client;
 pub mod tls;
 
 pub use auth::{
@@ -42,7 +43,10 @@ pub use config::{LimitsConfig, LimitsConfigError, streamable_http_server_config}
 pub use identity::TransportIdentity;
 pub use metrics::PrometheusRuntime;
 pub use overload::overload_response;
-pub use preflight::{CallerScopes, OptionalPreflight, ScopePreflight};
+pub use preflight::{
+    CallerScopes, MalformedArgumentsPolicy, MalformedTargetPolicy, OptionalPreflight,
+    ScopePreflight, TargetField, TargetValueShape, ToolScopePreflight,
+};
 #[allow(deprecated)]
 pub use rate_limit::{apply_ip_rate_limit, apply_rate_limit, apply_token_rate_limit};
 pub use server::{
