@@ -727,118 +727,23 @@ mod tests {
         ));
     }
 
-    // ==========================================================================
-    // SABOTAGE TESTS: Prove each guard catches its failure mode
-    // ==========================================================================
+    // Each guard above was verified by breaking it and confirming the test went
+    // red, then restoring it. Recorded here because the verification is the
+    // reason to trust the tests, and a reader cannot see it from the code:
     //
-    // These tests break a guard, confirm the test fails, restore, and report.
-    // They are NOT run in CI — they serve as evidence that the guards work.
-    // Instructions say: "For every security-relevant guard you add, prove the
-    // test protects it: break the guard, confirm the test FAILS, restore, and
-    // report exactly which test went red and what it said."
-
-    #[test]
-    #[ignore] // Only run manually: cargo test -- --ignored sabotage
-    fn sabotage_out_of_scope_target_protection() {
-        // SABOTAGE: Change `!target_value_in_scope` to `target_value_in_scope`
-        // in `request_exceeds_scope` line 221, making it allow out-of-scope
-        // targets instead of denying them.
-        //
-        // EXPECTED FAILURE: test `tool_scope_preflight_rejects_out_of_scope_target`
-        // should fail with assertion error showing the out-of-scope request
-        // was incorrectly allowed.
-        //
-        // TO VERIFY:
-        // 1. Change line 221 from:
-        //    .is_some_and(|value| !target_value_in_scope(value, *field, caller.devices))
-        //    to:
-        //    .is_some_and(|value| target_value_in_scope(value, *field, caller.devices))
-        // 2. Run: cargo test tool_scope_preflight_rejects_out_of_scope_target
-        // 3. Observe failure
-        // 4. Restore the `!`
-        // 5. Confirm test passes
-        panic!("Sabotage test: see comment for instructions");
-    }
-
-    #[test]
-    #[ignore]
-    fn sabotage_wildcard_write_tool_protection() {
-        // SABOTAGE: Remove the `!write_tools.contains(&name)` check in
-        // `allows_tool` (mecmcp-auth/src/scope.rs line 46), making wildcard
-        // tool scopes grant write authority.
-        //
-        // EXPECTED FAILURE: test `wildcard_tool_scope_excludes_write_tools`
-        // should fail showing the write tool was incorrectly allowed.
-        //
-        // TO VERIFY:
-        // 1. In mecmcp-auth/src/scope.rs, change line 46 from:
-        //    Self::Wildcard => !write_tools.contains(&name),
-        //    to:
-        //    Self::Wildcard => true,
-        // 2. Run: cargo test wildcard_tool_scope_excludes_write_tools
-        // 3. Observe failure
-        // 4. Restore the check
-        panic!("Sabotage test: see comment for instructions");
-    }
-
-    #[test]
-    #[ignore]
-    fn sabotage_malformed_arguments_protection() {
-        // SABOTAGE: Change `MalformedArgumentsPolicy::Deny` check in
-        // `request_exceeds_scope` line 219 to always return false, making
-        // malformed arguments pass through.
-        //
-        // EXPECTED FAILURE: test `malformed_arguments_policy` should fail
-        // showing non-object arguments were incorrectly allowed with Deny policy.
-        //
-        // TO VERIFY:
-        // 1. Change line 219 from:
-        //    return self.malformed_arguments == MalformedArgumentsPolicy::Deny;
-        //    to:
-        //    return false;
-        // 2. Run: cargo test malformed_arguments_policy
-        // 3. Observe failure on the Deny assertion
-        // 4. Restore the check
-        panic!("Sabotage test: see comment for instructions");
-    }
-
-    #[test]
-    #[ignore]
-    fn sabotage_malformed_target_protection() {
-        // SABOTAGE: Remove the `field.malformed == MalformedTargetPolicy::Deny`
-        // check in `target_value_in_scope` line 264, making malformed targets
-        // always pass.
-        //
-        // EXPECTED FAILURE: test `malformed_target_policy` should fail showing
-        // non-string device was incorrectly allowed with Deny policy.
-        //
-        // TO VERIFY:
-        // 1. Change line 264 from:
-        //    valid || field.malformed == MalformedTargetPolicy::Ignore && !value_has_shape(value, field.shape)
-        //    to:
-        //    true
-        // 2. Run: cargo test malformed_target_policy
-        // 3. Observe failure on the Deny assertion
-        // 4. Restore the check
-        panic!("Sabotage test: see comment for instructions");
-    }
-
-    #[test]
-    #[ignore]
-    fn sabotage_empty_array_protection() {
-        // SABOTAGE: Remove the `!names.is_empty()` check in `target_value_in_scope`
-        // line 256, making empty arrays pass scope checks.
-        //
-        // EXPECTED FAILURE: test `non_empty_array_shape` should fail showing
-        // an empty array was incorrectly allowed.
-        //
-        // TO VERIFY:
-        // 1. Change line 256 from:
-        //    !names.is_empty() &&
-        //    to: (remove the check entirely)
-        // 2. Run: cargo test non_empty_array_shape
-        // 3. Observe failure on empty array assertion
-        // 4. Restore the check
-        panic!("Sabotage test: see comment for instructions");
-    }
+    //   out-of-scope target   dropped the `!` in request_exceeds_scope
+    //                         -> tool_scope_preflight_rejects_out_of_scope_target
+    //   wildcard excludes     made ScopeSet::Wildcard return true unconditionally
+    //   write tools           -> wildcard_tool_scope_excludes_write_tools
+    //   malformed arguments   flipped the Deny policy to allow
+    //                         -> malformed_arguments_policy
+    //   malformed target      made the shape check always true
+    //                         -> malformed_target_policy
+    //   empty array           removed the emptiness check
+    //                         -> non_empty_array_shape
+    //
+    // This was previously five #[ignore]d tests whose bodies were a bare panic!.
+    // They asserted nothing, inflated the test count, and would have failed
+    // confusingly if ever run. A comment is the honest form for a record of work
+    // already done.
 }
