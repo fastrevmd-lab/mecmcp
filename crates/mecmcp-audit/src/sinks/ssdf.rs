@@ -552,7 +552,9 @@ impl HttpTransport for StdHttpTransport {
             )));
         }
 
-        let url_without_scheme = url.strip_prefix("http://").expect("URL starts with http://");
+        let url_without_scheme = url
+            .strip_prefix("http://")
+            .expect("URL starts with http://");
         let (host_port, path) = url_without_scheme
             .split_once('/')
             .unwrap_or((url_without_scheme, ""));
@@ -855,10 +857,27 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].method, "POST");
         assert!(requests[0].url.contains("INSERT"));
-        assert!(requests[0].url.contains("WHERE%20NOT%20EXISTS"));
         assert!(requests[0].url.contains("param_server_id"));
         assert!(requests[0].url.contains("param_run_id"));
         assert!(requests[0].url.contains("param_segment_seq"));
+
+        // Decode query param and assert WHERE NOT EXISTS template.
+        let url = &requests[0].url;
+        let query_start = url.find("query=").unwrap() + 6;
+        let query_end = url[query_start..]
+            .find('&')
+            .map(|i| query_start + i)
+            .unwrap_or(url.len());
+        let encoded_query = &url[query_start..query_end];
+        let decoded_query = urlencoding::decode(encoded_query).unwrap();
+        assert!(decoded_query.contains("WHERE NOT EXISTS"));
+        assert!(
+            decoded_query.contains("JSONExtractString(args, 'server_id') = {server_id:String}")
+        );
+        assert!(decoded_query.contains("JSONExtractString(args, 'run_id') = {run_id:String}"));
+        assert!(
+            decoded_query.contains("JSONExtractUInt(args, 'segment_seq') = {segment_seq:UInt64}")
+        );
 
         // Verify ledger marks it as delivered.
         let id = SegmentId {
@@ -1076,6 +1095,7 @@ mod tests {
             let mut request_line = String::new();
             reader.read_line(&mut request_line).unwrap();
             assert!(request_line.starts_with("POST /?query="));
+            assert!(request_line.contains("INSERT+INTO+test"));
 
             // Read headers.
             let mut headers = Vec::new();
