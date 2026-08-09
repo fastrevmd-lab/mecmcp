@@ -164,7 +164,199 @@ fn byte_pinned_canonical_rendering() {
 
     // Pinned hash — if this fails, canonicalization changed and hash chain is broken
     let expected_hash = "sha256:9c7373989867be8be09d066de75f93ccbe9e4753d844aab63c0bc2b8a71a34b2";
-    assert_eq!(hash, expected_hash, "Record hash changed — canonicalization broken");
+    assert_eq!(
+        hash, expected_hash,
+        "Record hash changed — canonicalization broken"
+    );
+}
+
+/// CRITICAL fix test: path traversal via server_id.
+#[test]
+fn path_traversal_server_id_rejected() {
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let chains_dir = temp_dir.path().join("chains");
+    let pubkeys_dir = temp_dir.path().join("pubkeys");
+    let manifest_path = temp_dir.path().join("manifest.json");
+
+    fs::create_dir(&chains_dir).unwrap();
+    fs::create_dir(&pubkeys_dir).unwrap();
+
+    // Create malicious manifest with path traversal
+    let malicious_manifest = json!({
+        "run_id": "run_traversal",
+        "cutoff": "2026-08-09T14:00:00Z",
+        "servers": [
+            {
+                "server_id": "../../../etc/passwd",
+                "segments": []
+            }
+        ]
+    });
+
+    fs::write(
+        &manifest_path,
+        serde_json::to_string(&malicious_manifest).unwrap(),
+    )
+    .unwrap();
+
+    // Run mecmcp-verify
+    let output = Command::new("cargo")
+        .args(&[
+            "run",
+            "--bin",
+            "mecmcp-verify",
+            "--",
+            "--run",
+            "run_traversal",
+            "--chains",
+            chains_dir.to_str().unwrap(),
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--pubkeys",
+            pubkeys_dir.to_str().unwrap(),
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+
+    // Must exit 2 (usage/IO error) and report unsafe server_id
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsafe characters"),
+        "Expected server_id validation error, got: {}",
+        stderr
+    );
+}
+
+/// IMPORTANT fix test: empty-run false positive.
+#[test]
+fn empty_chain_file_with_expecting_manifest_fails() {
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let chains_dir = temp_dir.path().join("chains");
+    let pubkeys_dir = temp_dir.path().join("pubkeys");
+    let manifest_path = temp_dir.path().join("manifest.json");
+
+    fs::create_dir(&chains_dir).unwrap();
+    fs::create_dir(&pubkeys_dir).unwrap();
+
+    // Create empty chain file
+    fs::write(chains_dir.join("server_a.jsonl"), "").unwrap();
+
+    // Manifest expects a segment
+    let manifest = json!({
+        "run_id": "run_empty",
+        "cutoff": "2026-08-09T14:00:00Z",
+        "servers": [
+            {
+                "server_id": "server_a",
+                "segments": [
+                    {
+                        "segment_seq": 0,
+                        "final_seq": 0,
+                        "head_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    }
+                ]
+            }
+        ]
+    });
+
+    fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+    // Generate a pubkey
+    let (_, verifying_key) = mecmcp_audit::signing::generate_keypair();
+    fs::write(
+        pubkeys_dir.join("server_a.pub"),
+        mecmcp_audit::signing::encode_verifying_key(&verifying_key),
+    )
+    .unwrap();
+
+    // Run mecmcp-verify
+    let output = Command::new("cargo")
+        .args(&[
+            "run",
+            "--bin",
+            "mecmcp-verify",
+            "--",
+            "--run",
+            "run_empty",
+            "--chains",
+            chains_dir.to_str().unwrap(),
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--pubkeys",
+            pubkeys_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+
+    // Must exit 1 (violation) not 0 (pass)
+    assert_eq!(output.status.code(), Some(1));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(result["passed"], false);
+
+    // Must have a MissingServerChain violation
+    let violations = result["violations"].as_array().unwrap();
+    assert!(!violations.is_empty());
+    assert_eq!(violations[0]["violation_type"], "missing_server_chain");
+}
+
+/// MINOR fix test: duplicate segment_seq.
+#[test]
+fn duplicate_segment_seq_fails() {
+    let fixture = create_intact_run_fixture();
+
+    // Load the server_a chain and duplicate the first segment
+    let chain_path = fixture.chains_dir.join("server_a.jsonl");
+    let chain_content = fs::read_to_string(&chain_path).unwrap();
+    let duplicated = format!("{}{}", chain_content, chain_content);
+    fs::write(&chain_path, duplicated).unwrap();
+
+    // Run mecmcp-verify
+    use std::process::Command;
+    let output = Command::new("cargo")
+        .args(&[
+            "run",
+            "--bin",
+            "mecmcp-verify",
+            "--",
+            "--run",
+            "run_golden_intact",
+            "--chains",
+            fixture.chains_dir.to_str().unwrap(),
+            "--manifest",
+            fixture.manifest_path.to_str().unwrap(),
+            "--pubkeys",
+            fixture.pubkeys_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+
+    // Must exit 1 (violation)
+    assert_eq!(output.status.code(), Some(1));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(result["passed"], false);
+
+    // Must have a DuplicateSegmentSeq violation
+    let violations = result["violations"].as_array().unwrap();
+    let has_duplicate = violations
+        .iter()
+        .any(|v| v["violation_type"] == "duplicate_segment_seq");
+    assert!(has_duplicate, "Expected DuplicateSegmentSeq violation");
 }
 
 /// Test fixture: intact run with 2 servers, device log, signatures.

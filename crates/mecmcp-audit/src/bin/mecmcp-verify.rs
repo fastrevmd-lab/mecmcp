@@ -178,6 +178,14 @@ pub enum Violation {
         /// Request identifier.
         request_id: String,
     },
+    /// Duplicate segment_seq in chain file.
+    #[serde(rename = "duplicate_segment_seq")]
+    DuplicateSegmentSeq {
+        /// Audit server identifier.
+        server_id: String,
+        /// Duplicate segment sequence number.
+        segment_seq: u64,
+    },
 }
 
 /// Verification result.
@@ -335,6 +343,29 @@ fn print_usage(program: &str) {
     eprintln!("  -h, --help                  Show this help message");
 }
 
+/// Validate a server_id (or any filename-contributing field) against a safe charset.
+///
+/// Allowed: [A-Za-z0-9_-]+
+/// Rejects: empty, path traversal (..), absolute paths, or any unsafe characters.
+fn validate_server_id(server_id: &str) -> Result<(), String> {
+    if server_id.is_empty() {
+        return Err("server_id is empty".to_string());
+    }
+
+    // Allow only alphanumeric, underscore, and hyphen
+    if !server_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "server_id '{}' contains unsafe characters (only [A-Za-z0-9_-] allowed)",
+            server_id
+        ));
+    }
+
+    Ok(())
+}
+
 fn verify_run(
     run_id: &str,
     chains_dir: &std::path::Path,
@@ -357,6 +388,15 @@ fn verify_run(
     let mut violations = Vec::new();
     let mut total_segments = 0;
     let mut total_records = 0;
+    let mut expected_segments_count = 0;
+
+    // Validate all server_ids before ANY path construction (path traversal defense)
+    for server_manifest in &manifest.servers {
+        if let Err(e) = validate_server_id(&server_manifest.server_id) {
+            return Err(format!("Invalid server_id in manifest: {}", e).into());
+        }
+        expected_segments_count += server_manifest.segments.len();
+    }
 
     // Load all server chains
     let mut server_chains: HashMap<String, Vec<ClosedSegment>> = HashMap::new();
@@ -370,7 +410,32 @@ fn verify_run(
             continue;
         }
 
-        let segments = load_chain_segments(&chain_file, run_id)?;
+        let segments = match load_chain_segments(&chain_file, run_id) {
+            Ok(segs) => segs,
+            Err(e) => {
+                // Check if it's a duplicate segment_seq error
+                if let Some(dup_msg) = e.to_string().strip_prefix("Duplicate segment_seq ")
+                    && let Ok(seq) = dup_msg.parse::<u64>()
+                {
+                    violations.push(Violation::DuplicateSegmentSeq {
+                        server_id: server_manifest.server_id.clone(),
+                        segment_seq: seq,
+                    });
+                    continue;
+                }
+                // Other errors are I/O or parse failures — propagate as exit-2
+                return Err(e);
+            }
+        };
+
+        // Empty-run guard: if manifest expects segments but chain loaded zero, FAIL
+        if !server_manifest.segments.is_empty() && segments.is_empty() {
+            violations.push(Violation::MissingServerChain {
+                server_id: server_manifest.server_id.clone(),
+            });
+            continue;
+        }
+
         server_chains.insert(server_manifest.server_id.clone(), segments);
     }
 
@@ -502,6 +567,16 @@ fn verify_run(
         0
     };
 
+    // Summary invariant: total_segments must be >= expected_segments_count
+    // (unless violations already exist, which explains the shortfall)
+    if violations.is_empty() && total_segments < expected_segments_count {
+        return Err(format!(
+            "Verification invariant violated: loaded {} segments but manifest expects {}",
+            total_segments, expected_segments_count
+        )
+        .into());
+    }
+
     let result = VerificationResult {
         passed: violations.is_empty(),
         violations,
@@ -517,6 +592,9 @@ fn verify_run(
 }
 
 /// Load chain segments for a specific run from a JSONL file.
+///
+/// Returns an error if duplicate segment_seq values are found (caller should
+/// convert to a DuplicateSegmentSeq violation).
 fn load_chain_segments(
     path: &std::path::Path,
     run_id: &str,
@@ -540,6 +618,13 @@ fn load_chain_segments(
 
     // Sort by segment_seq
     segments.sort_by_key(|s| s.segment_seq);
+
+    // Check for duplicate segment_seq (sort brings them adjacent)
+    for i in 1..segments.len() {
+        if segments[i].segment_seq == segments[i - 1].segment_seq {
+            return Err(format!("Duplicate segment_seq {}", segments[i].segment_seq).into());
+        }
+    }
 
     Ok(segments)
 }
@@ -858,6 +943,15 @@ fn format_violation(v: &Violation) -> String {
             format!(
                 "Orphaned audit record: {} request_id {} (not in device commits)",
                 server_id, request_id
+            )
+        }
+        Violation::DuplicateSegmentSeq {
+            server_id,
+            segment_seq,
+        } => {
+            format!(
+                "Duplicate segment_seq: {} seg{} appears multiple times",
+                server_id, segment_seq
             )
         }
     }
