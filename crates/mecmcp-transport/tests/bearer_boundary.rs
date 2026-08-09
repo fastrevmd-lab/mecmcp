@@ -8,8 +8,8 @@ use axum::{
 };
 use mecmcp_auth::{ActorType, BearerSyntax, CallerCtx, Grant, GrantError, ScopeSet};
 use mecmcp_transport::{
-    BearerAuthenticator, BearerBoundary, BearerResponseProfile, BoundaryAccounting,
-    ConcurrencyState, LimitsConfig, ScopePreflight, apply_bearer_boundary,
+    BearerAuthenticator, BearerBoundary, BearerResponseProfile, BoundaryAccounting, ClientInfo,
+    ConcurrencyState, LimitsConfig, ScopePreflight, SessionTracker, apply_bearer_boundary,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -99,6 +99,7 @@ fn app(profile: BearerResponseProfile) -> Router {
         router,
         boundary(profile),
         BoundaryAccounting {
+            session_tracker: None,
             concurrency: None,
             limits: Arc::new(LimitsConfig {
                 max_request_body_bytes: 1024,
@@ -824,6 +825,7 @@ async fn content_length_over_limit_returns_json_413() {
         Router::new().route("/", post(|| async { "ok" })),
         boundary,
         BoundaryAccounting {
+            session_tracker: None,
             concurrency: None,
             limits: Arc::new(LimitsConfig {
                 max_request_body_bytes: 10,
@@ -1047,6 +1049,7 @@ async fn streamed_body_through_preflight_is_marked_and_counted() {
         Router::new().route("/", post(|| async { "ok" })),
         boundary,
         BoundaryAccounting {
+            session_tracker: None,
             concurrency: None,
             limits: Arc::new(LimitsConfig {
                 max_request_body_bytes: 512,
@@ -1166,4 +1169,159 @@ async fn content_length_over_limit_with_token_rate_limiting() {
         // Proves the Content-Length 413 consumed a concurrency permit
         // (This is the happy path - the test passes if we reach here)
     }
+}
+
+// ---------------------------------------------------------------------------
+// mecmcp#53: the captured client name must reach the transport audit event.
+//
+// These tests exist because the first version of the propagation shipped with
+// only a unit test on `Attribution::with_client_name`. Deleting the entire
+// lookup block from `bearer_preflight_middleware` — the only code that
+// implements the feature — left the whole suite green. A test that never sends
+// a request through the assembled router cannot detect that, so these do.
+// ---------------------------------------------------------------------------
+
+fn app_with_tracker(tracker: Option<Arc<SessionTracker>>) -> Router {
+    let router = Router::new().route("/", post(|| async { "ok" }));
+    apply_bearer_boundary(
+        router,
+        boundary(BearerResponseProfile::detailed("mecmcp")),
+        BoundaryAccounting {
+            session_tracker: tracker,
+            concurrency: None,
+            limits: Arc::new(LimitsConfig {
+                max_request_body_bytes: 4096,
+                ..Default::default()
+            }),
+        },
+    )
+}
+
+/// A `tools/call` that passes preflight, optionally carrying a session id.
+fn tools_call(session: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header(header::AUTHORIZATION, "Bearer secret");
+    if let Some(id) = session {
+        builder = builder.header("Mcp-Session-Id", id);
+    }
+    builder
+        .body(Body::from(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read","arguments":{"device":"tenant-a"}}}"#,
+        ))
+        .expect("request")
+}
+
+fn tracker_with_client(session: &str, client: &str) -> (Arc<SessionTracker>, Arc<str>) {
+    let tracker = Arc::new(SessionTracker::new(&LimitsConfig::default()));
+    let session_id: Arc<str> = Arc::from(session);
+    assert!(
+        tracker.try_register(session_id.clone(), std::time::Instant::now()),
+        "session must register"
+    );
+    let info = ClientInfo::from_initialize_params(&json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": {"name": client, "version": "1"}
+    }))
+    .expect("clientInfo parses");
+    tracker.set_client_info(&session_id, info);
+    (tracker, session_id)
+}
+
+/// The whole path: header -> `SessionTracker` -> audit event.
+#[test]
+fn session_client_name_reaches_the_transport_audit_event() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (tracker, session_id) = tracker_with_client("audit-session", "acceptance-client");
+    assert_eq!(
+        tracker.client_name(&session_id),
+        Some("acceptance-client"),
+        "capture side must work before the propagation can be tested"
+    );
+
+    let app = app_with_tracker(Some(tracker));
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        runtime.block_on(async {
+            let response = app
+                .oneshot(tools_call(Some("audit-session")))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    });
+
+    assert!(
+        captured.contains("client_name=acceptance-client"),
+        "the transport audit event must carry the session's captured client name; \
+         if this fails, the lookup in bearer_preflight_middleware is not wired: {captured}"
+    );
+}
+
+/// An unknown session must leave the field empty rather than invent a value.
+///
+/// The failure this guards against is a placeholder like `unknown` reaching a
+/// SIEM as though the client had asserted it.
+#[test]
+fn an_unknown_session_leaves_the_client_name_empty() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (tracker, _id) = tracker_with_client("known-session", "registered-client");
+
+    let app = app_with_tracker(Some(tracker));
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        runtime.block_on(async {
+            let response = app
+                .oneshot(tools_call(Some("some-other-session")))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    });
+
+    assert!(
+        captured.contains("client_name="),
+        "the audit event must still be emitted: {captured}"
+    );
+    assert!(
+        !captured.contains("registered-client"),
+        "a different session's client name must never be attributed here: {captured}"
+    );
+    assert!(
+        !captured.contains("client_name=unknown"),
+        "an absent client name must stay empty, not become a placeholder: {captured}"
+    );
+}
+
+/// With no session header at all, the event is still emitted and still empty.
+#[test]
+fn no_session_header_still_audits_with_an_empty_client_name() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (tracker, _id) = tracker_with_client("unused-session", "unused-client");
+
+    let app = app_with_tracker(Some(tracker));
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        runtime.block_on(async {
+            let response = app.oneshot(tools_call(None)).await.expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    });
+
+    assert!(
+        captured.contains("client_name="),
+        "the audit event must still be emitted without a session: {captured}"
+    );
+    assert!(
+        !captured.contains("unused-client"),
+        "no session header must mean no client name: {captured}"
+    );
 }
