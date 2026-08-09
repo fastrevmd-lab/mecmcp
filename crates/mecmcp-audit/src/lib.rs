@@ -11,6 +11,7 @@ mod init;
 mod redact;
 mod schema;
 mod scope;
+pub mod signing;
 pub mod testutil;
 
 pub use attribution::{
