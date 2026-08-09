@@ -5,6 +5,7 @@
 //! a device is or what configuration it holds.
 
 mod attribution;
+pub mod evidence;
 mod init;
 mod redact;
 mod schema;
@@ -13,6 +14,10 @@ pub mod testutil;
 
 pub use attribution::{
     ActorType, AgentIdentity, Attribution, Principal, Tier, TokenVerifiedFields,
+};
+pub use evidence::{
+    ApplyIntentRecord, ApprovalRecord, ChainSegment, ClosedSegment, EvidenceError, EvidenceRecord,
+    GENESIS_PREV_HASH, ProposalRecord, ResultReceipt, SegmentArchive, append, close,
 };
 pub use init::{AuditConfig, AuditFileSink, AuditFormat, FileHandle, init_tracing};
 pub use redact::{
