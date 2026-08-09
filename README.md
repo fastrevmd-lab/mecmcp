@@ -35,6 +35,27 @@ apply) and the modern crate hygiene. Neither benefits from the other.
 
 ## Status
 
+**0.8.2 — the MCP client name reaches the audit record (#53).**
+`AgentIdentity.client_name` existed but nothing populated it, so every audit
+event emitted `"client_name":""`. MCP's `initialize` already carries
+`clientInfo`, which needs no client cooperation beyond the standard handshake.
+It is now captured onto the session and attached to the transport audit event
+for every `tools/call` on that session.
+
+The name is client-asserted and stays that way: it is never added to
+`token_verified_fields`, so a caller's claim cannot be read back as
+server-verified. Like the tool name, it arrives from a request body, so it is
+interned into a bounded table — 64 entries — rather than leaked per distinct
+value. An unknown session leaves the field empty; nothing is invented, and no
+placeholder is substituted.
+
+This identifies the *client program*, not the model and not the user.
+`claude-code` tells you the request came from Claude Code and says nothing about
+which model drove it. `model_id` and `session_id` remain unwired.
+
+Additive over 0.8.1. Consumers get the field populated with no code change once
+they move their pin; nothing is required of them.
+
 **0.8.1 — audit by construction (#32), with the tool name bounded.**
 The bearer boundary now emits a transport audit event for every `tools/call`
 before dispatch, so a tool is audited because it went through the transport, not
