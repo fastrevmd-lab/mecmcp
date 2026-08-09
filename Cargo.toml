@@ -13,7 +13,9 @@ authors      = ["fastrevmd-lab"]
 [workspace.dependencies]
 arc-swap   = "1"
 async-trait = "0.1"
+base64     = "0.22"
 chrono     = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 getrandom  = "0.4"
 globset    = "0.4"
 hmac       = "0.13"

@@ -13,15 +13,20 @@ workspace = true
 
 [dependencies]
 mecmcp-auth = { version = "0.8.2", path = "../mecmcp-auth" }
+base64      = { workspace = true }
+ed25519-dalek = { workspace = true }
 hex         = "0.4"
 hmac        = { workspace = true }
 metrics     = { workspace = true }
+rand_core   = { version = "0.6", features = ["getrandom"] }
+rustix      = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 sha2        = { workspace = true }
 tempfile    = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
+zeroize     = { workspace = true }
 # Both already in the graph via tracing-subscriber's default features, so naming
 # them directly adds no crate. Needed because `init_tracing` installs the
 # subscriber and the `log` bridge as separate steps — see the note there.
