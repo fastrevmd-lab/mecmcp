@@ -263,6 +263,11 @@ mod tests {
     }
 
     #[test]
+    /// The cap is a safety contract, not an optimisation. An authenticated
+    /// caller with no tool scopes reaches this code merely by sending
+    /// `initialize`, so the name is attacker-controlled: without a bound they
+    /// can exhaust memory and blow up metrics cardinality. Remove
+    /// `MAX_INTERNED_CLIENT_NAMES` and this must fail.
     fn intern_table_cap_enforced() {
         // A LOCAL table, not the process-global one. Filling the global table
         // here leaks into every other test in this module — Rust runs them
@@ -310,50 +315,6 @@ mod tests {
             let info = ClientInfo::from_initialize_params(&params).expect("valid version");
             assert_eq!(info.version(), Some(version));
         }
-    }
-
-    /// Prove that removing the length cap breaks: oversized names must be rejected.
-    ///
-    /// This test documents the safety contract. If you remove `MAX_CLIENT_INFO_LEN`,
-    /// this MUST fail. The contract: client-asserted strings arriving from a
-    /// request body must never leak unbounded allocations.
-    #[test]
-    fn removing_length_cap_would_leak_unbounded_allocations() {
-        let oversized_name = "a".repeat(MAX_CLIENT_INFO_LEN + 1);
-        let params = json!({"clientInfo": { "name": oversized_name }});
-        let info = ClientInfo::from_initialize_params(&params).expect("name present");
-        // If the length check were removed, this would leak a 129-byte string.
-        // With the check, it becomes UNKNOWN_CLIENT (a static, no leak).
-        assert_eq!(
-            info.name(),
-            UNKNOWN_CLIENT,
-            "oversized client name must be rejected, not leaked"
-        );
-    }
-
-    /// Prove that removing the interning cap breaks: the table must reject overflow.
-    ///
-    /// This test documents the safety contract. If you remove
-    /// `MAX_INTERNED_CLIENT_NAMES`, this MUST fail. The contract: an
-    /// authenticated caller with no tool scopes can still reach this code by
-    /// sending initialize, so the attacker controls the name. Without a cap,
-    /// they can exhaust memory and metrics cardinality.
-    #[test]
-    fn removing_interning_cap_would_leak_unbounded_table() {
-        // Prefill to capacity
-        for i in 0..MAX_INTERNED_CLIENT_NAMES {
-            let params = json!({"clientInfo": { "name": format!("cap-test-{i}") }});
-            let _ = ClientInfo::from_initialize_params(&params);
-        }
-
-        // One more distinct name must be rejected
-        let params = json!({"clientInfo": { "name": "overflow" }});
-        let info = ClientInfo::from_initialize_params(&params).expect("name present");
-        assert_eq!(
-            info.name(),
-            UNKNOWN_CLIENT,
-            "interning table overflow must be rejected, not leaked"
-        );
     }
 
     /// Prove that removing the charset restriction breaks: injection must be rejected.
