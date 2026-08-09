@@ -645,6 +645,18 @@ static INTERNED_TOOL_NAMES: LazyLock<Mutex<HashSet<&'static str>>> =
 /// would satisfy the type and nothing else: names are not a "finite, small set"
 /// when they arrive from a request body rather than from the tool registry.
 fn intern_tool_name(name: &str) -> &'static str {
+    intern_tool_into(&INTERNED_TOOL_NAMES, name)
+}
+
+/// Intern into a caller-supplied table.
+///
+/// Split out so the cap can be exercised without filling the process-global
+/// table. A cap test that fills the global one leaks into every other test in
+/// the module — Rust runs them concurrently, so a test asserting a specific name
+/// back can get `unregistered` depending on scheduling. The equivalent defect in
+/// `client_info` failed roughly one run in six and was only caught in CI; this
+/// one has not fired yet, which is luck rather than correctness.
+fn intern_tool_into(names_table: &Mutex<HashSet<&'static str>>, name: &str) -> &'static str {
     if name.is_empty()
         || name.len() > MAX_TOOL_NAME_LEN
         || !name
@@ -653,7 +665,7 @@ fn intern_tool_name(name: &str) -> &'static str {
     {
         return UNREGISTERED_TOOL;
     }
-    let Ok(mut names) = INTERNED_TOOL_NAMES.lock() else {
+    let Ok(mut names) = names_table.lock() else {
         return UNREGISTERED_TOOL;
     };
     if let Some(existing) = names.get(name) {
@@ -1023,20 +1035,27 @@ mod tests {
     /// growing the table — bounding both the leak and audit cardinality.
     #[test]
     fn interning_is_capped() {
+        // A LOCAL table. Filling the process-global one leaks into every other
+        // test in this module, and Rust runs them concurrently, so a test
+        // asserting a specific name back would get `unregistered` depending on
+        // scheduling. The same defect in client_info failed one run in six.
+        let table: Mutex<HashSet<&'static str>> = Mutex::new(HashSet::new());
         for index in 0..MAX_INTERNED_TOOL_NAMES + 50 {
-            intern_tool_name(&format!("capfill_{index}"));
+            intern_tool_into(&table, &format!("capfill_{index}"));
         }
-        let names = INTERNED_TOOL_NAMES.lock().expect("intern table");
-        assert!(
-            names.len() <= MAX_INTERNED_TOOL_NAMES,
-            "intern table grew past its cap: {}",
-            names.len()
+        let names = table.lock().expect("intern table");
+        assert_eq!(
+            names.len(),
+            MAX_INTERNED_TOOL_NAMES,
+            "intern table must stop exactly at its cap"
         );
         drop(names);
         assert_eq!(
-            intern_tool_name("a_name_after_the_cap_is_reached"),
+            intern_tool_into(&table, "a_name_after_the_cap_is_reached"),
             UNREGISTERED_TOOL
         );
+        // An already-interned name still resolves once the cap is reached.
+        assert_eq!(intern_tool_into(&table, "capfill_0"), "capfill_0");
     }
 
     /// Regression test for mecmcp#32: tools/call requests emit transport audit events.
