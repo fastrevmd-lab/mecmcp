@@ -307,6 +307,35 @@ impl Attribution {
             token_verified_fields: TokenVerifiedFields::none(),
         }
     }
+
+    /// Attach a client name to this attribution.
+    ///
+    /// If this attribution has an `AgentIdentity`, the name is set on it. If
+    /// there is no `AgentIdentity` yet, one is created with `provider` and
+    /// `provider_tier` set to their defaults ("unknown" and `Tier::Public`)
+    /// and other client-asserted fields left empty — this matches the defaults
+    /// used throughout the audit system and ensures consistency.
+    ///
+    /// The client name is ALWAYS client-asserted and can never be server-verified,
+    /// regardless of what `token_verified_fields` says. Callers must NOT add
+    /// `client_name` to the verified fields marker.
+    pub fn with_client_name(&mut self, name: &'static str) {
+        if let Some(ref mut agent) = self.agent {
+            agent.client_name = Some(name.to_string());
+        } else {
+            // No AgentIdentity exists yet. Create one with the client name and
+            // defaults that match existing audit conventions: provider="unknown",
+            // provider_tier=Public, all other client-asserted fields empty.
+            self.agent = Some(AgentIdentity {
+                model_id: String::new(),
+                session_id: String::new(),
+                client_name: Some(name.to_string()),
+                provider: default_provider(),
+                provider_tier: Tier::default(),
+                skills_used: Vec::new(),
+            });
+        }
+    }
 }
 
 #[cfg(test)]

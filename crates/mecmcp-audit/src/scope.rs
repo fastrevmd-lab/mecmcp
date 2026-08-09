@@ -91,6 +91,16 @@ impl AuditScope {
     pub fn deny(&mut self, reason: &'static str) {
         self.outcome = AuditOutcome::Denied { reason };
     }
+
+    /// Attach a client name to this audit scope.
+    ///
+    /// The name is always client-asserted and will never be marked as
+    /// server-verified. This method is intended for transport-level audit
+    /// emission where the client name was captured from the MCP `initialize`
+    /// handshake and looked up via the session tracker.
+    pub fn attach_client_name(&mut self, name: &'static str) {
+        self.attribution.with_client_name(name);
+    }
 }
 
 /// The default name for the tool-duration histogram.

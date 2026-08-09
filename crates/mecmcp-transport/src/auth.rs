@@ -333,6 +333,8 @@ pub struct BoundaryAccounting {
     pub concurrency: Option<crate::concurrency::ConcurrencyState>,
     /// Rate limiting configuration.
     pub limits: std::sync::Arc<crate::config::LimitsConfig>,
+    /// Session tracker for client name lookup (optional).
+    pub session_tracker: Option<std::sync::Arc<crate::session::SessionTracker>>,
 }
 
 impl BoundaryAccounting {
@@ -344,7 +346,18 @@ impl BoundaryAccounting {
         Self {
             concurrency: Some(concurrency),
             limits,
+            session_tracker: None,
         }
+    }
+
+    /// Attach a session tracker for client name capture in audit events.
+    #[must_use]
+    pub fn with_session_tracker(
+        mut self,
+        tracker: std::sync::Arc<crate::session::SessionTracker>,
+    ) -> Self {
+        self.session_tracker = Some(tracker);
+        self
     }
 
     /// No accounting (empty config for testing or minimal deployments).
@@ -352,6 +365,7 @@ impl BoundaryAccounting {
         Self {
             concurrency: None,
             limits: std::sync::Arc::new(crate::config::LimitsConfig::default()),
+            session_tracker: None,
         }
     }
 }
@@ -428,6 +442,7 @@ pub fn apply_bearer_boundary<G: Grant>(
         PreflightState::<G> {
             preflight: boundary.preflight.clone(),
             realm: boundary.responses.realm.clone(),
+            session_tracker: accounting.session_tracker.clone(),
             _grant: std::marker::PhantomData,
         },
         bearer_preflight_middleware::<G>,
@@ -508,6 +523,7 @@ pub struct AuthState<G: Grant> {
 pub struct PreflightState<G: Grant> {
     pub preflight: OptionalPreflight,
     pub realm: String,
+    pub session_tracker: Option<std::sync::Arc<crate::session::SessionTracker>>,
     pub _grant: std::marker::PhantomData<G>,
 }
 
@@ -608,6 +624,21 @@ pub async fn bearer_preflight_middleware<G: Grant>(
     if let Some(tool) = extract_tool_name(&body_bytes) {
         let mut scope = AuditScope::from_caller(caller, tool, "transport", Vec::new());
         scope.meta("layer", "preflight");
+
+        // Propagate captured client name from the session (mecmcp#53).
+        // The Mcp-Session-Id header identifies the session; if present and a
+        // client name was captured during initialize, attach it to the audit event.
+        if let Some(tracker) = &state.session_tracker
+            && let Some(session_id_value) = parts.headers.get("Mcp-Session-Id")
+            && let Ok(session_id_str) = session_id_value.to_str()
+        {
+            let session_id: rmcp::transport::common::server_side_http::SessionId =
+                session_id_str.into();
+            if let Some(client_name) = tracker.client_name(&session_id) {
+                scope.attach_client_name(client_name);
+            }
+        }
+
         scope.succeed();
     }
 
@@ -1146,6 +1177,58 @@ mod tests {
             captured.contains("tool=get_config"),
             "SABOTAGE DETECTED: Transport audit emission was removed or bypassed. \
              Every tools/call must produce an audit event (mecmcp#32). Got: {captured}"
+        );
+    }
+
+    /// Verify that client_name is never marked as server-verified (mecmcp#53).
+    ///
+    /// The client name is ALWAYS client-asserted, regardless of whether it came
+    /// from a session or any other source. This test proves that attaching a
+    /// client name to an Attribution does NOT add `client_name` to
+    /// `token_verified_fields`, even when other fields are verified.
+    #[test]
+    fn client_name_is_never_server_verified() {
+        use mecmcp_audit::Attribution;
+        use mecmcp_auth::{ActorType, CallerCtx, NoGrant, ScopeSet};
+
+        // Start with an attribution that HAS server-verified fields.
+        let caller = CallerCtx::<NoGrant> {
+            token_name: "agent-token".to_owned(),
+            devices: ScopeSet::Wildcard,
+            tools: ScopeSet::Wildcard,
+            grant: None,
+            provider: Some("anthropic".to_owned()),
+            provider_tier: Some(mecmcp_auth::Tier::Public),
+            on_behalf_of: Some("user@example.com".to_owned()),
+            actor_type: ActorType::Agent,
+        };
+        let mut attr = Attribution::from_caller(&caller);
+
+        // Attach a client name (simulating what the transport does when it
+        // looks up a session).
+        attr.with_client_name("Claude for Desktop/1.0.0");
+
+        // The client name must NOT be in token_verified_fields. Capture the
+        // audit event to prove the field list does not include it.
+        let captured = run_with_capture(|| {
+            let mut scope = AuditScope::new(attr, "test_tool", "test", Vec::new());
+            scope.succeed();
+        });
+
+        // token_verified_fields should list the fields that ARE verified.
+        assert!(
+            captured.contains("token_verified_fields=actor_type,on_behalf_of,provider"),
+            "token_verified_fields must list only the server-verified fields: {captured}"
+        );
+        // It must NOT contain a marker for client_name.
+        assert!(
+            !captured.contains("client_name_verified"),
+            "client_name must never be marked as verified: {captured}"
+        );
+        // But the client name itself should still be emitted.
+        assert!(
+            captured.contains("client_name=Claude for Desktop/1.0.0"),
+            "client name must be present in the audit event: {captured}"
         );
     }
 }

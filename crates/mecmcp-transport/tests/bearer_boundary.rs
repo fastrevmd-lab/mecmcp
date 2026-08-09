@@ -99,6 +99,7 @@ fn app(profile: BearerResponseProfile) -> Router {
         router,
         boundary(profile),
         BoundaryAccounting {
+            session_tracker: None,
             concurrency: None,
             limits: Arc::new(LimitsConfig {
                 max_request_body_bytes: 1024,
@@ -824,6 +825,7 @@ async fn content_length_over_limit_returns_json_413() {
         Router::new().route("/", post(|| async { "ok" })),
         boundary,
         BoundaryAccounting {
+            session_tracker: None,
             concurrency: None,
             limits: Arc::new(LimitsConfig {
                 max_request_body_bytes: 10,
@@ -1047,6 +1049,7 @@ async fn streamed_body_through_preflight_is_marked_and_counted() {
         Router::new().route("/", post(|| async { "ok" })),
         boundary,
         BoundaryAccounting {
+            session_tracker: None,
             concurrency: None,
             limits: Arc::new(LimitsConfig {
                 max_request_body_bytes: 512,
