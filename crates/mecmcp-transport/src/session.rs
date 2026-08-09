@@ -1,6 +1,7 @@
 //! Session count cap + idle/lifetime reaper layered over any rmcp
 //! `SessionManager` (default `LocalSessionManager`).
 
+use crate::client_info::ClientInfo;
 use crate::config::LimitsConfig;
 use crate::metrics;
 use dashmap::DashMap;
@@ -23,6 +24,7 @@ use tokio_util::task::AbortOnDropHandle;
 struct SessionMeta {
     created_at: Instant,
     last_active: Instant,
+    client_info: Option<ClientInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,6 +254,7 @@ impl SessionTracker {
             SessionMeta {
                 created_at: now,
                 last_active: now,
+                client_info: None,
             },
         );
         if let Some(names) = metrics::metric_names() {
@@ -265,6 +268,29 @@ impl SessionTracker {
         if let Some(mut m) = self.activity.get_mut(id) {
             m.last_active = now;
         }
+    }
+
+    /// Store client info for a session.
+    ///
+    /// Called when the `initialize` request carries `clientInfo`. Idempotent:
+    /// repeated calls with the same or different info overwrite. This is safe
+    /// because the initialize handshake can only succeed once per session, and
+    /// if a client somehow sends multiple initializes with different info, the
+    /// last one wins (which is no worse than picking the first).
+    pub fn set_client_info(&self, id: &SessionId, client_info: ClientInfo) {
+        if let Some(mut m) = self.activity.get_mut(id) {
+            m.client_info = Some(client_info);
+        }
+    }
+
+    /// Retrieve the client name for a session, if available.
+    ///
+    /// Returns `None` if the session doesn't exist or never provided `clientInfo`.
+    #[must_use]
+    pub fn client_name(&self, id: &SessionId) -> Option<&'static str> {
+        self.activity
+            .get(id)
+            .and_then(|m| m.client_info.as_ref().map(ClientInfo::name))
     }
 
     /// Drop a session from tracking and decrement the gauge.
@@ -480,6 +506,18 @@ impl<S: SessionManager> SessionManager for LimitedSessionManager<S> {
         message: ClientJsonRpcMessage,
     ) -> Result<ServerJsonRpcMessage, Self::Error> {
         self.tracker.touch(id, Instant::now());
+
+        // Capture clientInfo from the initialize params before forwarding.
+        // This is the one place where MCP tells us who the client program is.
+        // The initialize request is structured; we extract it by matching the enum.
+        if let rmcp::model::JsonRpcMessage::Request(ref req) = message
+            && let Ok(json) = serde_json::to_value(&req.request)
+            && let Some(params) = json.get("params")
+            && let Some(client_info) = ClientInfo::from_initialize_params(params)
+        {
+            self.tracker.set_client_info(id, client_info);
+        }
+
         self.inner
             .initialize_session(id, message)
             .await
@@ -1594,5 +1632,100 @@ mod tests {
         }
         assert_eq!(tracker.active_for_token("alice"), 0);
         assert_eq!(tracker.active(), 0);
+    }
+
+    #[test]
+    fn session_client_info_round_trips() {
+        use crate::ClientInfo;
+
+        let tracker = SessionTracker::new(&LimitsConfig::default());
+        let session = id("session-with-client");
+        let now = Instant::now();
+        assert!(tracker.try_register(session.clone(), now));
+
+        // Client info is not set yet
+        assert_eq!(tracker.client_name(&session), None);
+
+        // Set client info
+        let params = serde_json::json!({
+            "protocolVersion": "2025-03-26",
+            "clientInfo": { "name": "claude-code", "version": "1.0.0" }
+        });
+        let client_info = ClientInfo::from_initialize_params(&params).unwrap();
+        tracker.set_client_info(&session, client_info);
+
+        // Retrieve it
+        assert_eq!(tracker.client_name(&session), Some("claude-code"));
+
+        // Unregister clears it
+        tracker.unregister(&session);
+        assert_eq!(tracker.client_name(&session), None);
+    }
+
+    /// Prove that the client_name bound is enforced: oversized names become "unknown".
+    ///
+    /// This test verifies the contract from `ClientInfo`: client-asserted strings
+    /// must not leak unbounded allocations. If the length cap were removed, this
+    /// MUST fail.
+    #[test]
+    fn session_client_info_enforces_length_bound() {
+        use crate::ClientInfo;
+
+        let tracker = SessionTracker::new(&LimitsConfig::default());
+        let session = id("bounded-session");
+        assert!(tracker.try_register(session.clone(), Instant::now()));
+
+        // Oversized client name
+        let long_name = "a".repeat(200);
+        let params = serde_json::json!({
+            "protocolVersion": "2025-03-26",
+            "clientInfo": { "name": long_name }
+        });
+        let client_info = ClientInfo::from_initialize_params(&params).unwrap();
+        tracker.set_client_info(&session, client_info);
+
+        // Must be rejected as "unknown", not leaked
+        assert_eq!(
+            tracker.client_name(&session),
+            Some("unknown"),
+            "oversized client names must become 'unknown', not leaked"
+        );
+    }
+
+    /// Prove that removing the interning cap breaks: the table must reject overflow.
+    ///
+    /// This test verifies the contract from `ClientInfo`: the interning table has
+    /// a bounded size. If `MAX_INTERNED_CLIENT_NAMES` were removed, this MUST fail.
+    #[test]
+    fn session_client_info_enforces_interning_cap() {
+        use crate::ClientInfo;
+
+        let tracker = SessionTracker::new(&LimitsConfig::default());
+
+        // Prefill the intern table to capacity (64 names as of this writing)
+        for i in 0..64 {
+            let session = id(&format!("cap-session-{i}"));
+            tracker.try_register(session.clone(), Instant::now());
+            let params = serde_json::json!({
+                "clientInfo": { "name": format!("cap-client-{i}") }
+            });
+            let client_info = ClientInfo::from_initialize_params(&params).unwrap();
+            tracker.set_client_info(&session, client_info);
+        }
+
+        // One more distinct name must be rejected
+        let overflow_session = id("overflow-session");
+        tracker.try_register(overflow_session.clone(), Instant::now());
+        let params = serde_json::json!({
+            "clientInfo": { "name": "overflow-client" }
+        });
+        let client_info = ClientInfo::from_initialize_params(&params).unwrap();
+        tracker.set_client_info(&overflow_session, client_info);
+
+        assert_eq!(
+            tracker.client_name(&overflow_session),
+            Some("unknown"),
+            "interning table overflow must be rejected as 'unknown'"
+        );
     }
 }

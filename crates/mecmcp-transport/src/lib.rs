@@ -7,6 +7,7 @@
 
 mod auth;
 mod caller;
+mod client_info;
 mod concurrency;
 mod config;
 mod identity;
@@ -24,6 +25,7 @@ pub use auth::{
     BearerAuthError, BearerAuthenticator, BearerBoundary, BearerResponseProfile,
     BearerResponseStyle, BoundaryAccounting, apply_bearer_boundary,
 };
+pub use client_info::ClientInfo;
 
 // Internal types and functions exported only for testing
 #[doc(hidden)]
