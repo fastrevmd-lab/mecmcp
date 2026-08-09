@@ -19,6 +19,16 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Handle help flags
+    if args[1] == "-h" || args[1] == "--help" {
+        println!("Usage: {} <private-key-path>", args[0]);
+        println!();
+        println!("Generates a new Ed25519 keypair for evidence signing.");
+        println!("The private key is written to <private-key-path> with mode 0600.");
+        println!("The public key is printed to stdout for distribution.");
+        std::process::exit(0);
+    }
+
     let private_key_path = PathBuf::from(&args[1]);
 
     // Generate keypair

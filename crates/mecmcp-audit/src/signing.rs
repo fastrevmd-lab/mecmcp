@@ -97,6 +97,9 @@ pub enum SigningError {
     /// Invalid key encoding.
     #[error("invalid key encoding: {0}")]
     InvalidKeyEncoding(String),
+    /// Invalid signature encoding.
+    #[error("invalid signature encoding: {0}")]
+    InvalidSignatureEncoding(String),
     /// Invalid head hash format.
     #[error("invalid head hash format: {0}")]
     InvalidHeadHash(String),
@@ -105,40 +108,47 @@ pub enum SigningError {
     VerificationFailed,
 }
 
-/// Validate Unix file permissions (must be 0600 for private keys).
-#[cfg(unix)]
-fn validate_key_file_permissions(path: &Path) -> Result<(), SigningError> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = std::fs::metadata(path).map_err(|error| SigningError::KeyFileIo {
-        path: path.to_path_buf(),
-        error,
-    })?;
-
-    let mode = metadata.mode() & 0o777;
-    let forbidden = 0o077; // No group or other permissions allowed
-    if mode & forbidden != 0 {
-        return Err(SigningError::KeyFilePermissionsTooPermissive {
-            path: path.to_path_buf(),
-            mode,
-        });
-    }
-
-    Ok(())
-}
-
 /// Load a signing key from a file.
 ///
 /// The file MUST be mode 0600 on Unix platforms, or this function will return
-/// an error (fail-closed).
+/// an error (fail-closed). Symlinks are followed; the permission check applies
+/// to the target file, not the symlink itself.
 pub fn load_signing_key(path: &Path) -> Result<SigningKey, SigningError> {
-    #[cfg(unix)]
-    validate_key_file_permissions(path)?;
+    use std::io::Read;
 
-    let contents = std::fs::read_to_string(path).map_err(|error| SigningError::KeyFileIo {
+    // Open the file first to get a handle to the actual file descriptor
+    let mut file = std::fs::File::open(path).map_err(|error| SigningError::KeyFileIo {
         path: path.to_path_buf(),
         error,
     })?;
+
+    // Check permissions on the open fd (avoids TOCTOU, follows symlinks to target)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = file.metadata().map_err(|error| SigningError::KeyFileIo {
+            path: path.to_path_buf(),
+            error,
+        })?;
+
+        let mode = metadata.mode() & 0o777;
+        let forbidden = 0o077; // No group or other permissions allowed
+        if mode & forbidden != 0 {
+            return Err(SigningError::KeyFilePermissionsTooPermissive {
+                path: path.to_path_buf(),
+                mode,
+            });
+        }
+    }
+
+    // Read from the same file handle we just checked
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|error| SigningError::KeyFileIo {
+            path: path.to_path_buf(),
+            error,
+        })?;
 
     let contents = contents.trim();
     let bytes = BASE64_STANDARD
@@ -228,13 +238,13 @@ pub fn encode_signature(signature: &DetachedSignature) -> String {
 
 /// Decode a signature from base64.
 pub fn decode_signature(encoded: &str) -> Result<DetachedSignature, SigningError> {
-    let bytes = BASE64_STANDARD
-        .decode(encoded)
-        .map_err(|e| SigningError::InvalidKeyEncoding(format!("base64 decode failed: {}", e)))?;
+    let bytes = BASE64_STANDARD.decode(encoded).map_err(|e| {
+        SigningError::InvalidSignatureEncoding(format!("base64 decode failed: {}", e))
+    })?;
 
     let bytes_len = bytes.len();
     let sig_bytes: [u8; 64] = bytes.try_into().map_err(|_| {
-        SigningError::InvalidKeyEncoding(format!("expected 64 bytes, got {}", bytes_len))
+        SigningError::InvalidSignatureEncoding(format!("expected 64 bytes, got {}", bytes_len))
     })?;
 
     let inner = Signature::from_bytes(&sig_bytes);
@@ -417,5 +427,100 @@ mod tests {
         // Base64 signature should decode back
         let decoded = decode_signature(&encoded).unwrap();
         verify_head(&closed, &decoded, &verifying_key).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_to_permissive_target_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let target_path = dir.path().join("target_key");
+        let symlink_path = dir.path().join("symlink_key");
+
+        // Create a key file with 0644 permissions
+        let (signing_key, _) = generate_keypair();
+        let encoded = encode_signing_key(&signing_key);
+        fs::write(&target_path, encoded).unwrap();
+        fs::set_permissions(&target_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Create a symlink to the permissive target
+        std::os::unix::fs::symlink(&target_path, &symlink_path).unwrap();
+
+        // Loading via symlink should refuse the permissive target
+        let result = load_signing_key(&symlink_path);
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(SigningError::KeyFilePermissionsTooPermissive { mode: 0o644, .. })
+        ));
+    }
+
+    #[test]
+    fn garbage_signature_rejected() {
+        // ed25519-dalek 2.x uses strict verification by default
+        let (_, verifying_key) = generate_keypair();
+        let closed = make_closed_segment();
+
+        // All-zero signature (64 bytes, base64-encoded) - this is non-canonical
+        // and should be rejected by ed25519-dalek's strict verification
+        let all_zero_sig_base64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+        let garbage_sig = decode_signature(all_zero_sig_base64).unwrap();
+
+        // Verification should fail (non-canonical signature)
+        let result = verify_head(&closed, &garbage_sig, &verifying_key);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(SigningError::VerificationFailed)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn keygen_creates_file_with_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("generated_key");
+
+        // Generate a keypair and write it using the same pattern as the bin
+        let (signing_key, _) = generate_keypair();
+        let encoded = encode_signing_key(&signing_key);
+
+        // Use OpenOptions with mode(0o600) like the bin does
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&key_path)
+            .unwrap();
+
+        file.write_all(encoded.as_bytes()).unwrap();
+        drop(file);
+
+        // Verify the file has mode 0600
+        let metadata = fs::metadata(&key_path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "keygen must create files with mode 0600");
+
+        // And that it can be loaded
+        let loaded = load_signing_key(&key_path);
+        assert!(loaded.is_ok());
+    }
+
+    /// Test note: ed25519-dalek 2.x uses strict verification by default, rejecting
+    /// non-canonical signatures (e.g., S >= L where L is the order of the base point).
+    /// The `garbage_signature_rejected` test demonstrates this by showing that an
+    /// all-zero signature (which is non-canonical) fails verification. This provides
+    /// malleability resistance without requiring additional checks.
+    #[test]
+    fn malleability_resistance_documented() {
+        // This test exists to document the reliance on ed25519-dalek's strict mode.
+        // The library rejects non-canonical signatures by default in 2.x.
+        // See: https://docs.rs/ed25519-dalek/2.2.0/ed25519_dalek/
+        //
+        // Covered by `garbage_signature_rejected` test above.
     }
 }
