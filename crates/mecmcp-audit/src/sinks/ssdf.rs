@@ -378,11 +378,26 @@ impl SsdfSink {
         Ok(())
     }
 
+    /// Compute the hash of a single evidence record.
+    ///
+    /// This uses the same canonical digest logic as the evidence chain: the record
+    /// is serialized to JSON with its prev_hash included, then hashed with SHA-256.
+    fn compute_record_hash(
+        record: &crate::evidence::EvidenceRecord,
+    ) -> Result<String, SsdfSinkError> {
+        // Build envelope: record + prev_hash for linking (prev_hash is already in the record)
+        let envelope = serde_json::to_value(record).map_err(|e| {
+            SsdfSinkError::InvalidSegment(format!("record serialization failed: {}", e))
+        })?;
+        crate::canonical::digest_of(&envelope)
+            .map_err(|e| SsdfSinkError::InvalidSegment(format!("hash computation failed: {}", e)))
+    }
+
     /// Convert an evidence record to an SSDF row.
     fn record_to_ssdf_row(
         &self,
         record: &crate::evidence::EvidenceRecord,
-        segment: &ClosedSegment,
+        _segment: &ClosedSegment,
     ) -> Result<SsdfRow, SsdfSinkError> {
         use crate::evidence::EvidenceRecord;
 
@@ -413,7 +428,7 @@ impl SsdfSink {
                     row_count: 1,
                     error: "".to_string(),
                     prev_hash: r.prev_hash.clone(),
-                    row_hash: segment.head_hash.clone(),
+                    row_hash: Self::compute_record_hash(record)?,
                 })
             }
             EvidenceRecord::Approval(r) => {
@@ -442,7 +457,7 @@ impl SsdfSink {
                     row_count: 1,
                     error: "".to_string(),
                     prev_hash: r.prev_hash.clone(),
-                    row_hash: segment.head_hash.clone(),
+                    row_hash: Self::compute_record_hash(record)?,
                 })
             }
             EvidenceRecord::ApplyIntent(r) => {
@@ -470,7 +485,7 @@ impl SsdfSink {
                     row_count: 1,
                     error: "".to_string(),
                     prev_hash: r.prev_hash.clone(),
-                    row_hash: segment.head_hash.clone(),
+                    row_hash: Self::compute_record_hash(record)?,
                 })
             }
             EvidenceRecord::ResultReceipt(r) => {
@@ -498,7 +513,7 @@ impl SsdfSink {
                     row_count: 1,
                     error: r.error.clone().unwrap_or_default(),
                     prev_hash: r.prev_hash.clone(),
-                    row_hash: segment.head_hash.clone(),
+                    row_hash: Self::compute_record_hash(record)?,
                 })
             }
         }
@@ -1147,5 +1162,103 @@ mod tests {
 
         // Wait for the server thread to finish.
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn per_record_row_hash_chains_correctly() {
+        use crate::evidence::ApprovalRecord;
+
+        let dir = TempDir::new().unwrap();
+        let config = make_test_config(&dir);
+        let transport = Arc::new(MockHttpTransport::new());
+        let sleep = MockSleep::new();
+        let sink =
+            SsdfSink::new_with_transport(config.clone(), transport.clone(), sleep.as_fn()).unwrap();
+
+        // Create a segment with TWO records to verify they get different row_hash values.
+        let mut seg = ChainSegment::new(
+            "run_test".to_string(),
+            "server_test".to_string(),
+            0,
+            GENESIS_PREV_HASH.to_string(),
+        );
+
+        let hash1 = append(
+            &mut seg,
+            EvidenceRecord::Proposal(ProposalRecord {
+                request_id: "req_test".to_string(),
+                changeset_id: "cs_test".to_string(),
+                device_id: "dev_test".to_string(),
+                principal: "agent:test".to_string(),
+                diff_hash: "sha256:abcd1234".to_string(),
+                timestamp: "2026-08-09T12:00:00Z".to_string(),
+                run_id: String::new(),
+                server_id: String::new(),
+                segment_seq: 0,
+                prev_hash: String::new(),
+                metadata: None,
+            }),
+        )
+        .unwrap();
+
+        let hash2 = append(
+            &mut seg,
+            EvidenceRecord::Approval(ApprovalRecord {
+                request_id: "req_test".to_string(),
+                changeset_id: "cs_test".to_string(),
+                device_id: "dev_test".to_string(),
+                principal: "approver:test".to_string(),
+                approver: "approver:test".to_string(),
+                decision: "approved".to_string(),
+                diff_hash: "sha256:abcd1234".to_string(),
+                timestamp: "2026-08-09T12:01:00Z".to_string(),
+                run_id: String::new(),
+                server_id: String::new(),
+                segment_seq: 0,
+                prev_hash: String::new(),
+                metadata: None,
+            }),
+        )
+        .unwrap();
+
+        let segment = close(seg).unwrap();
+
+        // Verify the chain hashes are different.
+        assert_ne!(hash1, hash2, "two records must have different hashes");
+
+        sink.spool(segment.clone()).unwrap();
+        let delivered = sink.attempt_delivery().unwrap();
+        assert_eq!(delivered, 1);
+
+        // Parse the NDJSON body and verify each row has its own row_hash.
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "should have 2 SSDF rows");
+
+        let row1: SsdfRow = serde_json::from_str(lines[0]).unwrap();
+        let row2: SsdfRow = serde_json::from_str(lines[1]).unwrap();
+
+        // Each row should have its own hash, not the segment head_hash.
+        assert_eq!(
+            row1.row_hash, hash1,
+            "first row must use first record's hash"
+        );
+        assert_eq!(
+            row2.row_hash, hash2,
+            "second row must use second record's hash"
+        );
+        assert_ne!(
+            row1.row_hash, row2.row_hash,
+            "two rows must have different row_hash values"
+        );
+
+        // Verify prev_hash chains correctly: second row's prev_hash = first row's row_hash.
+        assert_eq!(
+            row2.prev_hash, hash1,
+            "second row's prev_hash must equal first row's hash"
+        );
     }
 }

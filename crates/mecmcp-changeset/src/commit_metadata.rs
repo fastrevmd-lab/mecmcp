@@ -107,7 +107,7 @@ pub fn apply_commit_metadata(
         Some(agent) => {
             let prov_str = agent.provenance_string(attribution.on_behalf_of.as_deref());
             // Include the request ID so Task 10's verify can join on it
-            format!("{} [req:{}]", prov_str, attribution.request_id)
+            format!("{} request.id={}", prov_str, attribution.request_id)
         }
         None => {
             // No agent identity means no provenance to attach. This is not an
@@ -234,7 +234,7 @@ mod tests {
 
         let recorded = sink.recorded.unwrap();
         assert!(
-            recorded.contains("[req:550e8400-e29b-41d4-a716-446655440000]"),
+            recorded.contains("request.id=550e8400-e29b-41d4-a716-446655440000"),
             "request ID must be included for Task 10 join: {}",
             recorded
         );
