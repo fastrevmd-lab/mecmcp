@@ -33,8 +33,14 @@ static INTERNED_CLIENT_NAMES: LazyLock<DashMap<&'static str, ()>> =
 /// identifies the **client program** (e.g. "claude-code"), not the model or the
 /// user. It must never be used for authorization decisions or scope checks.
 ///
-/// Captured per-session and propagated to `AgentIdentity.client_name` for audit
-/// attribution only.
+/// Captured per-session by `LimitedSessionManager::initialize_session`.
+///
+/// **Not yet propagated to `AgentIdentity.client_name`.** That bridge between the
+/// session and auth layers is follow-up work, so audit events still show an empty
+/// client name today — which is what rustjunosmcp#267 is waiting on. The capture
+/// and its bounds land first because the bounds are the security-relevant half:
+/// the name arrives in a request body, and mecmcp has already shipped one
+/// unbounded `Box::leak` on attacker-controlled input (see `intern_tool_name`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientInfo {
     /// Interned client name, bounded and validated.
