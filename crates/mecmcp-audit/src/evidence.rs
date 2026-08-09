@@ -3,16 +3,12 @@
 //! Implements the ssdf.audit evidence contract v1.0: proposal, approval, apply
 //! intent, and result receipt records linked into per-run tamper-evident chains.
 
+use crate::canonical::{self, CanonicalError};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as Sha256Digest, Sha256};
 use thiserror::Error;
 
-/// The `prev_hash` of the first record in any chain.
-pub const GENESIS_PREV_HASH: &str =
-    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-
-/// Maximum nesting depth accepted by canonical JSON.
-const MAX_CANONICAL_DEPTH: usize = 128;
+// Re-export GENESIS_PREV_HASH for convenience
+pub use crate::canonical::GENESIS_PREV_HASH;
 
 /// Configuration change proposed by an agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +25,14 @@ pub struct ProposalRecord {
     pub diff_hash: String,
     /// Evidence event timestamp (UTC, RFC3339).
     pub timestamp: String,
+    /// Audit run identifier (for deduplication).
+    pub run_id: String,
+    /// Originating audit server identifier.
+    pub server_id: String,
+    /// Sequence number within this run (0-based).
+    pub segment_seq: u64,
+    /// Previous record hash (empty for first record).
+    pub prev_hash: String,
     /// Optional commit message or change summary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
@@ -49,6 +53,14 @@ pub struct ApprovalRecord {
     pub diff_hash: String,
     /// Evidence event timestamp (UTC, RFC3339).
     pub timestamp: String,
+    /// Audit run identifier (for deduplication).
+    pub run_id: String,
+    /// Originating audit server identifier.
+    pub server_id: String,
+    /// Sequence number within this run (0-based).
+    pub segment_seq: u64,
+    /// Previous record hash (empty for first record).
+    pub prev_hash: String,
     /// Approving user identity.
     pub approver: String,
     /// Approval outcome: "approved" or "rejected".
@@ -73,6 +85,14 @@ pub struct ApplyIntentRecord {
     pub diff_hash: String,
     /// Evidence event timestamp (UTC, RFC3339).
     pub timestamp: String,
+    /// Audit run identifier (for deduplication).
+    pub run_id: String,
+    /// Originating audit server identifier.
+    pub server_id: String,
+    /// Sequence number within this run (0-based).
+    pub segment_seq: u64,
+    /// Previous record hash (empty for first record).
+    pub prev_hash: String,
     /// Optional commit message or change summary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
@@ -93,6 +113,14 @@ pub struct ResultReceipt {
     pub diff_hash: String,
     /// Evidence event timestamp (UTC, RFC3339).
     pub timestamp: String,
+    /// Audit run identifier (for deduplication).
+    pub run_id: String,
+    /// Originating audit server identifier.
+    pub server_id: String,
+    /// Sequence number within this run (0-based).
+    pub segment_seq: u64,
+    /// Previous record hash (empty for first record).
+    pub prev_hash: String,
     /// Execution outcome: "success" or "failure".
     pub outcome: String,
     /// Error detail (execution failures only).
@@ -130,10 +158,10 @@ pub struct ChainSegment {
     pub server_id: String,
     /// Sequence number within this run (0-based).
     pub segment_seq: u64,
-    /// Previous record hash (empty for first record).
+    /// Previous segment hash (for cross-segment linking).
     pub prev_hash: String,
     /// Evidence records in this segment.
-    pub records: Vec<EvidenceRecord>,
+    records: Vec<EvidenceRecord>,
     /// Hash of the last appended record (for linking the next append).
     #[serde(skip)]
     last_hash: Option<String>,
@@ -148,10 +176,10 @@ pub struct ClosedSegment {
     pub server_id: String,
     /// Sequence number within this run (0-based).
     pub segment_seq: u64,
-    /// Previous record hash (empty for first record).
+    /// Previous segment hash (for cross-segment linking).
     pub prev_hash: String,
     /// Evidence records in this segment.
-    pub records: Vec<EvidenceRecord>,
+    records: Vec<EvidenceRecord>,
     /// Hash of the final record in this segment (segment head).
     pub head_hash: String,
 }
@@ -203,9 +231,9 @@ impl SegmentArchive {
 /// Errors that can occur when working with evidence records.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum EvidenceError {
-    /// The value nested deeper than the canonicalization limit.
-    #[error("value nests deeper than the {MAX_CANONICAL_DEPTH} level canonicalisation limit")]
-    TooDeep,
+    /// Canonical JSON error.
+    #[error("canonical JSON error: {0}")]
+    Canonical(#[from] CanonicalError),
     /// Run ID monotonicity violation.
     #[error("run_id must be monotonically increasing: got {new_run_id} after {current_run_id}")]
     RunIdNotMonotonic {
@@ -214,67 +242,6 @@ pub enum EvidenceError {
         /// The new run_id that was attempted.
         new_run_id: String,
     },
-}
-
-/// Render a JSON value canonically: sorted object keys, compact separators.
-fn canonical_json(value: &serde_json::Value) -> Result<String, EvidenceError> {
-    let mut out = String::new();
-    write_canonical(value, &mut out, 0)?;
-    Ok(out)
-}
-
-fn write_canonical(
-    value: &serde_json::Value,
-    out: &mut String,
-    depth: usize,
-) -> Result<(), EvidenceError> {
-    if depth > MAX_CANONICAL_DEPTH {
-        return Err(EvidenceError::TooDeep);
-    }
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            out.push('{');
-            for (i, key) in keys.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                // Reuse serde_json for correct string escaping.
-                out.push_str(&serde_json::Value::String((*key).clone()).to_string());
-                out.push(':');
-                write_canonical(&map[*key], out, depth + 1)?;
-            }
-            out.push('}');
-        }
-        serde_json::Value::Array(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_canonical(item, out, depth + 1)?;
-            }
-            out.push(']');
-        }
-        scalar => out.push_str(&scalar.to_string()),
-    }
-    Ok(())
-}
-
-/// Hex-encoded SHA-256 of arbitrary bytes, without a prefix.
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
-
-/// SHA-256 over the canonical rendering of a value, as a `sha256:`-prefixed string.
-fn digest_of(value: &serde_json::Value) -> Result<String, EvidenceError> {
-    Ok(format!(
-        "sha256:{}",
-        sha256_hex(canonical_json(value)?.as_bytes())
-    ))
 }
 
 /// Compute the hash of an evidence record.
@@ -287,7 +254,7 @@ fn compute_record_hash(record: &EvidenceRecord, prev_hash: &str) -> Result<Strin
             serde_json::Value::String(prev_hash.to_string()),
         );
     }
-    digest_of(&envelope)
+    Ok(canonical::digest_of(&envelope)?)
 }
 
 impl ChainSegment {
@@ -302,13 +269,54 @@ impl ChainSegment {
             last_hash: None,
         }
     }
+
+    /// Get the evidence records in this segment.
+    pub fn records(&self) -> &[EvidenceRecord] {
+        &self.records
+    }
+}
+
+impl ClosedSegment {
+    /// Get the evidence records in this segment.
+    pub fn records(&self) -> &[EvidenceRecord] {
+        &self.records
+    }
 }
 
 /// Append an evidence record to a chain segment, linking it to the previous record.
 ///
 /// Returns the hash of the newly appended record.
-pub fn append(seg: &mut ChainSegment, record: EvidenceRecord) -> Result<String, EvidenceError> {
+pub fn append(seg: &mut ChainSegment, mut record: EvidenceRecord) -> Result<String, EvidenceError> {
     let prev = seg.last_hash.as_ref().unwrap_or(&seg.prev_hash);
+
+    // Inject envelope fields into the record
+    match &mut record {
+        EvidenceRecord::Proposal(r) => {
+            r.run_id = seg.run_id.clone();
+            r.server_id = seg.server_id.clone();
+            r.segment_seq = seg.segment_seq;
+            r.prev_hash = prev.clone();
+        }
+        EvidenceRecord::Approval(r) => {
+            r.run_id = seg.run_id.clone();
+            r.server_id = seg.server_id.clone();
+            r.segment_seq = seg.segment_seq;
+            r.prev_hash = prev.clone();
+        }
+        EvidenceRecord::ApplyIntent(r) => {
+            r.run_id = seg.run_id.clone();
+            r.server_id = seg.server_id.clone();
+            r.segment_seq = seg.segment_seq;
+            r.prev_hash = prev.clone();
+        }
+        EvidenceRecord::ResultReceipt(r) => {
+            r.run_id = seg.run_id.clone();
+            r.server_id = seg.server_id.clone();
+            r.segment_seq = seg.segment_seq;
+            r.prev_hash = prev.clone();
+        }
+    }
+
     let hash = compute_record_hash(&record, prev)?;
     seg.records.push(record);
     seg.last_hash = Some(hash.clone());
@@ -341,6 +349,10 @@ mod tests {
             principal: "agent:mechub-config-agent".to_string(),
             diff_hash: "sha256:fedcba9876543210".to_string(),
             timestamp: "2026-08-09T14:32:10.500Z".to_string(),
+            run_id: String::new(), // Will be injected by append()
+            server_id: String::new(),
+            segment_seq: 0,
+            prev_hash: String::new(),
             metadata: None,
         }
     }
@@ -353,6 +365,10 @@ mod tests {
             principal: "agent:mechub-config-agent".to_string(),
             diff_hash: "sha256:fedcba9876543210".to_string(),
             timestamp: "2026-08-09T14:33:10.500Z".to_string(),
+            run_id: String::new(),
+            server_id: String::new(),
+            segment_seq: 0,
+            prev_hash: String::new(),
             approver: "alice@mechub.org".to_string(),
             decision: "approved".to_string(),
             metadata: None,
@@ -367,6 +383,10 @@ mod tests {
             principal: "agent:mechub-config-agent".to_string(),
             diff_hash: "sha256:fedcba9876543210".to_string(),
             timestamp: "2026-08-09T14:34:10.500Z".to_string(),
+            run_id: String::new(),
+            server_id: String::new(),
+            segment_seq: 0,
+            prev_hash: String::new(),
             metadata: None,
         }
     }
@@ -379,6 +399,10 @@ mod tests {
             principal: "agent:mechub-config-agent".to_string(),
             diff_hash: "sha256:fedcba9876543210".to_string(),
             timestamp: "2026-08-09T14:35:10.500Z".to_string(),
+            run_id: String::new(),
+            server_id: String::new(),
+            segment_seq: 0,
+            prev_hash: String::new(),
             outcome: "success".to_string(),
             error: None,
             metadata: None,
@@ -444,12 +468,12 @@ mod tests {
 
         let hash1 = append(&mut seg, EvidenceRecord::Proposal(proposal_fixture())).unwrap();
         assert!(hash1.starts_with("sha256:"));
-        assert_eq!(seg.records.len(), 1);
+        assert_eq!(seg.records().len(), 1);
 
         let hash2 = append(&mut seg, EvidenceRecord::Approval(approval_fixture())).unwrap();
         assert!(hash2.starts_with("sha256:"));
         assert_ne!(hash1, hash2);
-        assert_eq!(seg.records.len(), 2);
+        assert_eq!(seg.records().len(), 2);
     }
 
     #[test]
@@ -466,7 +490,7 @@ mod tests {
 
         let closed = close(seg.clone()).unwrap();
         assert!(closed.head_hash.starts_with("sha256:"));
-        assert_eq!(closed.records.len(), 2);
+        assert_eq!(closed.records().len(), 2);
 
         // Closing the same segment again should produce the same head hash
         let closed2 = close(seg).unwrap();
@@ -484,26 +508,6 @@ mod tests {
 
         let closed = close(seg).unwrap();
         assert_eq!(closed.head_hash, GENESIS_PREV_HASH);
-    }
-
-    #[test]
-    fn canonical_json_sorts_keys() {
-        let value = serde_json::json!({
-            "z": 1,
-            "a": 2,
-            "m": {"y": 1, "x": 2}
-        });
-        let canonical = canonical_json(&value).unwrap();
-        assert_eq!(canonical, r#"{"a":2,"m":{"x":2,"y":1},"z":1}"#);
-    }
-
-    #[test]
-    fn canonical_json_rejects_deep_nesting() {
-        let mut value = serde_json::json!(1);
-        for _ in 0..(MAX_CANONICAL_DEPTH + 10) {
-            value = serde_json::json!({ "n": value });
-        }
-        assert_eq!(canonical_json(&value), Err(EvidenceError::TooDeep));
     }
 
     #[test]
@@ -536,7 +540,7 @@ mod tests {
             tampered.segment_seq,
             tampered.prev_hash.clone(),
         );
-        for record in &tampered.records {
+        for record in tampered.records() {
             append(&mut recompute_seg, record.clone()).unwrap();
         }
         let recomputed = close(recompute_seg).unwrap();
@@ -675,5 +679,39 @@ mod tests {
 
         assert!(archive.archive(closed2).is_ok());
         assert_eq!(archive.len(), 2);
+    }
+
+    #[test]
+    fn contract_fields_present_in_serialized_records() {
+        // C1: Verify per-record JSON contains exactly the contract's required fields
+        let mut seg = ChainSegment::new(
+            "run_20260809_143210".to_string(),
+            "rustsdcmcp-606".to_string(),
+            0,
+            GENESIS_PREV_HASH.to_string(),
+        );
+
+        append(&mut seg, EvidenceRecord::Proposal(proposal_fixture())).unwrap();
+        let closed = close(seg).unwrap();
+
+        // Serialize the first record
+        let record_json = serde_json::to_value(closed.records().first().unwrap()).unwrap();
+        let obj = record_json.as_object().unwrap();
+
+        // Verify all contract-required fields are present
+        assert!(obj.contains_key("request_id"), "missing request_id");
+        assert!(obj.contains_key("changeset_id"), "missing changeset_id");
+        assert!(obj.contains_key("device_id"), "missing device_id");
+        assert!(obj.contains_key("diff_hash"), "missing diff_hash");
+        assert!(obj.contains_key("run_id"), "missing run_id");
+        assert!(obj.contains_key("server_id"), "missing server_id");
+        assert!(obj.contains_key("segment_seq"), "missing segment_seq");
+        assert!(obj.contains_key("prev_hash"), "missing prev_hash");
+
+        // Verify values match what was injected
+        assert_eq!(obj["run_id"], "run_20260809_143210");
+        assert_eq!(obj["server_id"], "rustsdcmcp-606");
+        assert_eq!(obj["segment_seq"], 0);
+        assert_eq!(obj["prev_hash"], GENESIS_PREV_HASH);
     }
 }

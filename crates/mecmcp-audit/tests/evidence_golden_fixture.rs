@@ -4,8 +4,8 @@
 //! for a complete evidence lifecycle: proposal → approval → apply_intent → result_receipt.
 
 use mecmcp_audit::{
-    ApplyIntentRecord, ApprovalRecord, ChainSegment, EvidenceRecord, ProposalRecord,
-    ResultReceipt, SegmentArchive, GENESIS_PREV_HASH, append, close,
+    ApplyIntentRecord, ApprovalRecord, ChainSegment, EvidenceRecord, GENESIS_PREV_HASH,
+    ProposalRecord, ResultReceipt, SegmentArchive, append, close,
 };
 
 #[test]
@@ -26,13 +26,17 @@ fn golden_fixture_full_segment_roundtrip() {
         principal: "agent:mechub-config-agent".to_string(),
         diff_hash: "sha256:fedcba9876543210abcdef0123456789".to_string(),
         timestamp: "2026-08-09T14:32:10.500Z".to_string(),
+        run_id: String::new(), // Will be injected by append()
+        server_id: String::new(),
+        segment_seq: 0,
+        prev_hash: String::new(),
         metadata: Some(serde_json::json!({
             "commit_message": "Fix NAT rule source address",
             "change_summary": "Updated policy-nat-1"
         })),
     };
 
-    let hash1 = append(&mut seg, EvidenceRecord::Proposal(proposal.clone())).unwrap();
+    let hash1 = append(&mut seg, EvidenceRecord::Proposal(proposal)).unwrap();
     assert!(hash1.starts_with("sha256:"));
     assert_eq!(hash1.len(), 71); // "sha256:" + 64 hex chars
 
@@ -44,12 +48,16 @@ fn golden_fixture_full_segment_roundtrip() {
         principal: "agent:mechub-config-agent".to_string(),
         diff_hash: "sha256:fedcba9876543210abcdef0123456789".to_string(),
         timestamp: "2026-08-09T14:33:15.200Z".to_string(),
+        run_id: String::new(),
+        server_id: String::new(),
+        segment_seq: 0,
+        prev_hash: String::new(),
         approver: "alice@mechub.org".to_string(),
         decision: "approved".to_string(),
         metadata: None,
     };
 
-    let hash2 = append(&mut seg, EvidenceRecord::Approval(approval.clone())).unwrap();
+    let hash2 = append(&mut seg, EvidenceRecord::Approval(approval)).unwrap();
     assert!(hash2.starts_with("sha256:"));
     assert_ne!(hash1, hash2, "each record must have a unique hash");
 
@@ -61,10 +69,14 @@ fn golden_fixture_full_segment_roundtrip() {
         principal: "agent:mechub-config-agent".to_string(),
         diff_hash: "sha256:fedcba9876543210abcdef0123456789".to_string(),
         timestamp: "2026-08-09T14:34:20.100Z".to_string(),
+        run_id: String::new(),
+        server_id: String::new(),
+        segment_seq: 0,
+        prev_hash: String::new(),
         metadata: None,
     };
 
-    let hash3 = append(&mut seg, EvidenceRecord::ApplyIntent(apply_intent.clone())).unwrap();
+    let hash3 = append(&mut seg, EvidenceRecord::ApplyIntent(apply_intent)).unwrap();
     assert!(hash3.starts_with("sha256:"));
     assert_ne!(hash2, hash3);
 
@@ -76,19 +88,23 @@ fn golden_fixture_full_segment_roundtrip() {
         principal: "agent:mechub-config-agent".to_string(),
         diff_hash: "sha256:fedcba9876543210abcdef0123456789".to_string(),
         timestamp: "2026-08-09T14:35:25.300Z".to_string(),
+        run_id: String::new(),
+        server_id: String::new(),
+        segment_seq: 0,
+        prev_hash: String::new(),
         outcome: "success".to_string(),
         error: None,
         metadata: None,
     };
 
-    let hash4 = append(&mut seg, EvidenceRecord::ResultReceipt(result.clone())).unwrap();
+    let hash4 = append(&mut seg, EvidenceRecord::ResultReceipt(result)).unwrap();
     assert!(hash4.starts_with("sha256:"));
     assert_ne!(hash3, hash4);
 
     // Close the segment and verify head hash
     let closed = close(seg).unwrap();
     assert_eq!(closed.head_hash, hash4, "head hash must match last record");
-    assert_eq!(closed.records.len(), 4);
+    assert_eq!(closed.records().len(), 4);
     assert_eq!(closed.segment_seq, 0);
 
     // Serialize to JSON (for golden fixture)
@@ -105,7 +121,7 @@ fn golden_fixture_full_segment_roundtrip() {
         closed.segment_seq,
         closed.prev_hash.clone(),
     );
-    for record in &closed.records {
+    for record in closed.records() {
         append(&mut verify_seg, record.clone()).unwrap();
     }
     let verify_closed = close(verify_seg).unwrap();
@@ -145,8 +161,13 @@ fn golden_fixture_segment_continuation() {
         changeset_id: "cs_001".to_string(),
         device_id: "vsrx-prod".to_string(),
         principal: "agent:mechub-config-agent".to_string(),
-        diff_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+        diff_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+            .to_string(),
         timestamp: "2026-08-09T14:32:10.500Z".to_string(),
+        run_id: String::new(),
+        server_id: String::new(),
+        segment_seq: 0,
+        prev_hash: String::new(),
         metadata: None,
     };
 
@@ -167,8 +188,13 @@ fn golden_fixture_segment_continuation() {
         changeset_id: "cs_001".to_string(),
         device_id: "vsrx-prod".to_string(),
         principal: "agent:mechub-config-agent".to_string(),
-        diff_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+        diff_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+            .to_string(),
         timestamp: "2026-08-09T14:33:15.200Z".to_string(),
+        run_id: String::new(),
+        server_id: String::new(),
+        segment_seq: 0,
+        prev_hash: String::new(),
         approver: "alice@mechub.org".to_string(),
         decision: "approved".to_string(),
         metadata: None,

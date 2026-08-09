@@ -5,6 +5,7 @@
 //! a device is or what configuration it holds.
 
 mod attribution;
+pub mod canonical;
 pub mod evidence;
 mod init;
 mod redact;
