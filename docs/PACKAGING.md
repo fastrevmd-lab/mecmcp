@@ -9,6 +9,9 @@ Settling it once is cheaper than reconciling four repos later.
 
 Tracked in [#6](https://github.com/fastrevmd-lab/mecmcp/issues/6).
 
+**See also:** [FILESYSTEM-LAYOUT.md](FILESYSTEM-LAYOUT.md) for the standard
+directory structure, config vs state split, and service naming (#28).
+
 ---
 
 ## 1. Container image
