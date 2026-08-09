@@ -14,3 +14,7 @@ tokens.json
 .DS_Store
 tem_todo
 docs/codex.thoughts
+# Local-only working documents. Untracked on purpose — keep them out of any
+# `git add -A`, and do not overwrite them.
+docs/ARCHITECTURE.md
+docs/ONBOARDING.md
