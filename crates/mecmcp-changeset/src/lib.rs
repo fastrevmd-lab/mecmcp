@@ -9,6 +9,7 @@
 
 pub mod apply;
 pub mod changeset;
+pub mod commit_metadata;
 pub mod coordinator;
 pub mod digest;
 pub mod lifecycle;
@@ -21,6 +22,9 @@ pub mod types;
 
 pub use apply::ApplyOutput;
 pub use changeset::ChangeSetOutput;
+pub use commit_metadata::{
+    AttachOutcome, CommitMetaError, CommitMetadataSink, apply_commit_metadata,
+};
 pub use coordinator::{ChangesetCoordinator, CoordinatorError, StagedRecovery};
 pub use lifecycle::{ChangeSetState, LifecycleState};
 pub use operation::StageOutput;
