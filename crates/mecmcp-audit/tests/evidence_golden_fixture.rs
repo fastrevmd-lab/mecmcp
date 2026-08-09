@@ -115,6 +115,7 @@ fn golden_fixture_full_segment_roundtrip() {
     assert_eq!(closed, deserialized);
 
     // Verify chain integrity: recompute from records
+    // Note: We need to clear envelope fields before re-appending since they're already set
     let mut verify_seg = ChainSegment::new(
         closed.run_id.clone(),
         closed.server_id.clone(),
@@ -122,7 +123,35 @@ fn golden_fixture_full_segment_roundtrip() {
         closed.prev_hash.clone(),
     );
     for record in closed.records() {
-        append(&mut verify_seg, record.clone()).unwrap();
+        let mut cleared_record = record.clone();
+        // Clear envelope fields so append() can validate and inject them
+        match &mut cleared_record {
+            EvidenceRecord::Proposal(r) => {
+                r.run_id.clear();
+                r.server_id.clear();
+                r.segment_seq = 0;
+                r.prev_hash.clear();
+            }
+            EvidenceRecord::Approval(r) => {
+                r.run_id.clear();
+                r.server_id.clear();
+                r.segment_seq = 0;
+                r.prev_hash.clear();
+            }
+            EvidenceRecord::ApplyIntent(r) => {
+                r.run_id.clear();
+                r.server_id.clear();
+                r.segment_seq = 0;
+                r.prev_hash.clear();
+            }
+            EvidenceRecord::ResultReceipt(r) => {
+                r.run_id.clear();
+                r.server_id.clear();
+                r.segment_seq = 0;
+                r.prev_hash.clear();
+            }
+        }
+        append(&mut verify_seg, cleared_record).unwrap();
     }
     let verify_closed = close(verify_seg).unwrap();
     assert_eq!(

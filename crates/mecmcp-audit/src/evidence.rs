@@ -242,6 +242,18 @@ pub enum EvidenceError {
         /// The new run_id that was attempted.
         new_run_id: String,
     },
+    /// Envelope field mismatch between record and segment.
+    #[error(
+        "envelope field {field} mismatch: record has {record_value}, segment requires {segment_value}"
+    )]
+    EnvelopeMismatch {
+        /// The name of the mismatched field.
+        field: String,
+        /// The value in the record.
+        record_value: String,
+        /// The value required by the segment.
+        segment_value: String,
+    },
 }
 
 /// Compute the hash of an evidence record.
@@ -285,35 +297,98 @@ impl ClosedSegment {
 
 /// Append an evidence record to a chain segment, linking it to the previous record.
 ///
+/// Envelope fields (`run_id`, `server_id`, `segment_seq`, `prev_hash`) are injected
+/// from the segment. If a record arrives with non-empty envelope fields, they must
+/// match the segment's values or an error is returned. Empty fields (the normal
+/// construction path) are accepted and populated.
+///
+/// `prev_hash` is always library-owned: any non-empty incoming `prev_hash` is treated
+/// as a mismatch and rejected, as only the segment knows the correct link.
+///
 /// Returns the hash of the newly appended record.
 pub fn append(seg: &mut ChainSegment, mut record: EvidenceRecord) -> Result<String, EvidenceError> {
     let prev = seg.last_hash.as_ref().unwrap_or(&seg.prev_hash);
 
-    // Inject envelope fields into the record
+    // Helper to validate and inject envelope fields
+    let validate_and_inject = |run_id: &mut String,
+                               server_id: &mut String,
+                               segment_seq: &mut u64,
+                               prev_hash: &mut String|
+     -> Result<(), EvidenceError> {
+        // Check run_id
+        if !run_id.is_empty() && run_id != &seg.run_id {
+            return Err(EvidenceError::EnvelopeMismatch {
+                field: "run_id".to_string(),
+                record_value: run_id.clone(),
+                segment_value: seg.run_id.clone(),
+            });
+        }
+        // Check server_id
+        if !server_id.is_empty() && server_id != &seg.server_id {
+            return Err(EvidenceError::EnvelopeMismatch {
+                field: "server_id".to_string(),
+                record_value: server_id.clone(),
+                segment_value: seg.server_id.clone(),
+            });
+        }
+        // Check segment_seq
+        if *segment_seq != 0 && *segment_seq != seg.segment_seq {
+            return Err(EvidenceError::EnvelopeMismatch {
+                field: "segment_seq".to_string(),
+                record_value: segment_seq.to_string(),
+                segment_value: seg.segment_seq.to_string(),
+            });
+        }
+        // prev_hash is always library-owned: any non-empty value is a mismatch
+        if !prev_hash.is_empty() {
+            return Err(EvidenceError::EnvelopeMismatch {
+                field: "prev_hash".to_string(),
+                record_value: prev_hash.clone(),
+                segment_value: prev.clone(),
+            });
+        }
+
+        // Inject correct values
+        *run_id = seg.run_id.clone();
+        *server_id = seg.server_id.clone();
+        *segment_seq = seg.segment_seq;
+        *prev_hash = prev.clone();
+        Ok(())
+    };
+
+    // Validate and inject envelope fields per record type
     match &mut record {
         EvidenceRecord::Proposal(r) => {
-            r.run_id = seg.run_id.clone();
-            r.server_id = seg.server_id.clone();
-            r.segment_seq = seg.segment_seq;
-            r.prev_hash = prev.clone();
+            validate_and_inject(
+                &mut r.run_id,
+                &mut r.server_id,
+                &mut r.segment_seq,
+                &mut r.prev_hash,
+            )?;
         }
         EvidenceRecord::Approval(r) => {
-            r.run_id = seg.run_id.clone();
-            r.server_id = seg.server_id.clone();
-            r.segment_seq = seg.segment_seq;
-            r.prev_hash = prev.clone();
+            validate_and_inject(
+                &mut r.run_id,
+                &mut r.server_id,
+                &mut r.segment_seq,
+                &mut r.prev_hash,
+            )?;
         }
         EvidenceRecord::ApplyIntent(r) => {
-            r.run_id = seg.run_id.clone();
-            r.server_id = seg.server_id.clone();
-            r.segment_seq = seg.segment_seq;
-            r.prev_hash = prev.clone();
+            validate_and_inject(
+                &mut r.run_id,
+                &mut r.server_id,
+                &mut r.segment_seq,
+                &mut r.prev_hash,
+            )?;
         }
         EvidenceRecord::ResultReceipt(r) => {
-            r.run_id = seg.run_id.clone();
-            r.server_id = seg.server_id.clone();
-            r.segment_seq = seg.segment_seq;
-            r.prev_hash = prev.clone();
+            validate_and_inject(
+                &mut r.run_id,
+                &mut r.server_id,
+                &mut r.segment_seq,
+                &mut r.prev_hash,
+            )?;
         }
     }
 
@@ -534,6 +609,7 @@ mod tests {
         let tampered: ClosedSegment = serde_json::from_slice(tampered_bytes).unwrap();
 
         // Recompute the head hash from the tampered records
+        // Clear envelope fields before re-appending (they'll be injected by append)
         let mut recompute_seg = ChainSegment::new(
             tampered.run_id.clone(),
             tampered.server_id.clone(),
@@ -541,7 +617,35 @@ mod tests {
             tampered.prev_hash.clone(),
         );
         for record in tampered.records() {
-            append(&mut recompute_seg, record.clone()).unwrap();
+            let mut cleared_record = record.clone();
+            // Clear envelope fields so append() can inject them
+            match &mut cleared_record {
+                EvidenceRecord::Proposal(r) => {
+                    r.run_id.clear();
+                    r.server_id.clear();
+                    r.segment_seq = 0;
+                    r.prev_hash.clear();
+                }
+                EvidenceRecord::Approval(r) => {
+                    r.run_id.clear();
+                    r.server_id.clear();
+                    r.segment_seq = 0;
+                    r.prev_hash.clear();
+                }
+                EvidenceRecord::ApplyIntent(r) => {
+                    r.run_id.clear();
+                    r.server_id.clear();
+                    r.segment_seq = 0;
+                    r.prev_hash.clear();
+                }
+                EvidenceRecord::ResultReceipt(r) => {
+                    r.run_id.clear();
+                    r.server_id.clear();
+                    r.segment_seq = 0;
+                    r.prev_hash.clear();
+                }
+            }
+            append(&mut recompute_seg, cleared_record).unwrap();
         }
         let recomputed = close(recompute_seg).unwrap();
 
@@ -713,5 +817,74 @@ mod tests {
         assert_eq!(obj["server_id"], "rustsdcmcp-606");
         assert_eq!(obj["segment_seq"], 0);
         assert_eq!(obj["prev_hash"], GENESIS_PREV_HASH);
+    }
+
+    #[test]
+    fn prepopulated_matching_envelope_fields_accepted() {
+        let mut seg = ChainSegment::new(
+            "run_20260809_143210".to_string(),
+            "rustsdcmcp-606".to_string(),
+            0,
+            GENESIS_PREV_HASH.to_string(),
+        );
+
+        // Pre-populate with matching values
+        let mut proposal = proposal_fixture();
+        proposal.run_id = "run_20260809_143210".to_string();
+        proposal.server_id = "rustsdcmcp-606".to_string();
+        proposal.segment_seq = 0;
+        // prev_hash left empty (library-owned)
+
+        let result = append(&mut seg, EvidenceRecord::Proposal(proposal));
+        assert!(
+            result.is_ok(),
+            "matching envelope fields should be accepted"
+        );
+    }
+
+    #[test]
+    fn mismatched_run_id_rejected() {
+        let mut seg = ChainSegment::new(
+            "run_20260809_143210".to_string(),
+            "rustsdcmcp-606".to_string(),
+            0,
+            GENESIS_PREV_HASH.to_string(),
+        );
+
+        // Pre-populate with mismatched run_id
+        let mut proposal = proposal_fixture();
+        proposal.run_id = "run_DIFFERENT".to_string();
+
+        let result = append(&mut seg, EvidenceRecord::Proposal(proposal));
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(EvidenceError::EnvelopeMismatch {
+                field,
+                record_value,
+                segment_value
+            }) if field == "run_id" && record_value == "run_DIFFERENT" && segment_value == "run_20260809_143210"
+        ));
+    }
+
+    #[test]
+    fn nonempty_prev_hash_rejected() {
+        let mut seg = ChainSegment::new(
+            "run_20260809_143210".to_string(),
+            "rustsdcmcp-606".to_string(),
+            0,
+            GENESIS_PREV_HASH.to_string(),
+        );
+
+        // Pre-populate with non-empty prev_hash
+        let mut proposal = proposal_fixture();
+        proposal.prev_hash = "sha256:bogus".to_string();
+
+        let result = append(&mut seg, EvidenceRecord::Proposal(proposal));
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(EvidenceError::EnvelopeMismatch { field, .. }) if field == "prev_hash"
+        ));
     }
 }
