@@ -99,6 +99,18 @@ impl ClientInfo {
 /// `UNKNOWN_CLIENT`. This prevents unbounded memory growth and metrics
 /// cardinality from attacker-controlled input.
 fn intern_client_name(name: &str) -> &'static str {
+    intern_into(&INTERNED_CLIENT_NAMES, name)
+}
+
+/// Intern into a caller-supplied table.
+///
+/// Split out from [`intern_client_name`] so the cap can be tested without
+/// touching the process-global table. It genuinely mattered: the cap test fills
+/// the table to capacity and never empties it, Rust runs tests in a module
+/// concurrently, and any test asserting a specific name back would then get
+/// `unknown` depending on scheduling. That reproduced as roughly one failure in
+/// six runs, passed locally often enough to look fine, and failed in CI.
+fn intern_into(table: &DashMap<&'static str, ()>, name: &str) -> &'static str {
     if name.is_empty() || name.len() > MAX_CLIENT_INFO_LEN {
         return UNKNOWN_CLIENT;
     }
@@ -112,17 +124,17 @@ fn intern_client_name(name: &str) -> &'static str {
     }
 
     // Fast path: already interned
-    if let Some(entry) = INTERNED_CLIENT_NAMES.get(name) {
+    if let Some(entry) = table.get(name) {
         return entry.key();
     }
 
     // Slow path: try to intern
-    if INTERNED_CLIENT_NAMES.len() >= MAX_INTERNED_CLIENT_NAMES {
+    if table.len() >= MAX_INTERNED_CLIENT_NAMES {
         return UNKNOWN_CLIENT;
     }
 
     let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
-    INTERNED_CLIENT_NAMES.insert(leaked, ());
+    table.insert(leaked, ());
     leaked
 }
 
@@ -252,16 +264,28 @@ mod tests {
 
     #[test]
     fn intern_table_cap_enforced() {
-        // Prefill the intern table to capacity
+        // A LOCAL table, not the process-global one. Filling the global table
+        // here leaks into every other test in this module — Rust runs them
+        // concurrently, so any test asserting a specific name back would then
+        // get `unknown` depending on scheduling. That is not hypothetical: it
+        // failed about one run in six and took a CI failure to notice.
+        let table: DashMap<&'static str, ()> = DashMap::new();
         for i in 0..MAX_INTERNED_CLIENT_NAMES {
             let name = format!("client-{i}");
-            let _ = intern_client_name(&name);
+            assert_ne!(
+                intern_into(&table, &name),
+                UNKNOWN_CLIENT,
+                "names below the cap must intern"
+            );
         }
+        assert_eq!(table.len(), MAX_INTERNED_CLIENT_NAMES);
 
-        // Next unique name should be rejected
-        let params = json!({"clientInfo": { "name": "overflow-client" }});
-        let info = ClientInfo::from_initialize_params(&params).expect("name present");
-        assert_eq!(info.name(), UNKNOWN_CLIENT);
+        // The next distinct name is refused rather than growing the table.
+        assert_eq!(intern_into(&table, "overflow-client"), UNKNOWN_CLIENT);
+        assert_eq!(table.len(), MAX_INTERNED_CLIENT_NAMES);
+
+        // An already-interned name still resolves, cap or no cap.
+        assert_eq!(intern_into(&table, "client-0"), "client-0");
     }
 
     #[test]
