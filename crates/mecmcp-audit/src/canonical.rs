@@ -92,6 +92,7 @@ pub fn digest_of(value: &serde_json::Value) -> Result<String, CanonicalError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use serde_json::json;

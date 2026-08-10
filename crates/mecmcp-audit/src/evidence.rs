@@ -413,6 +413,7 @@ pub fn close(seg: ChainSegment) -> Result<ClosedSegment, EvidenceError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
