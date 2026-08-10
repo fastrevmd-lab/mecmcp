@@ -283,6 +283,7 @@ pub fn encode_verifying_key(key: &VerifyingKey) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::evidence::{
