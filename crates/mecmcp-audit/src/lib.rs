@@ -6,6 +6,7 @@
 
 mod attribution;
 pub mod canonical;
+pub mod device_log;
 pub mod evidence;
 mod init;
 mod redact;

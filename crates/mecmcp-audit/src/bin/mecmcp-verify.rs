@@ -717,52 +717,10 @@ fn verify_device_join(
     server_chains: &HashMap<String, Vec<ClosedSegment>>,
     violations: &mut Vec<Violation>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    use std::io::{BufRead, BufReader};
+    use mecmcp_audit::device_log::parse_device_log_file;
 
-    let file = std::fs::File::open(device_log_path)?;
-    let reader = BufReader::new(file);
-
-    // Parse device commits: extract (device_id, commit_sha, request_id)
-    let mut device_commits: Vec<(String, String, String)> = Vec::new();
-    let mut current_commit_sha: Option<String> = None;
-    let mut current_device_id: Option<String> = None;
-
-    for line in reader.lines() {
-        let line = line?;
-
-        // Example: "commit abc123def456"
-        if line.starts_with("commit ")
-            && let Some(sha) = line.strip_prefix("commit ").map(|s| s.trim().to_string())
-        {
-            current_commit_sha = Some(sha);
-            current_device_id = None;
-        }
-
-        // Example: "Device: vsrx-prod"
-        if line.contains("Device:")
-            && let Some(device) = line.split("Device:").nth(1).map(|s| s.trim().to_string())
-        {
-            current_device_id = Some(device);
-        }
-
-        // Example: "Provenance: request.id=550e8400-e29b-41d4-a716-446655440000, ..."
-        if line.contains("request.id=")
-            && let (Some(sha), Some(device)) = (&current_commit_sha, &current_device_id)
-        {
-            // Extract request_id
-            if let Some(req_id_part) = line.split("request.id=").nth(1) {
-                let req_id = req_id_part
-                    .split(',')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if !req_id.is_empty() {
-                    device_commits.push((device.clone(), sha.clone(), req_id));
-                }
-            }
-        }
-    }
+    // Parse device commits using the library function
+    let device_commits = parse_device_log_file(device_log_path)?;
 
     // Collect all request_ids from audit records
     let mut audit_request_ids: HashSet<String> = HashSet::new();
@@ -782,12 +740,12 @@ fn verify_device_join(
     }
 
     // Check for orphaned device commits (not in audit)
-    for (device_id, commit_sha, request_id) in &device_commits {
-        if !audit_request_ids.contains(request_id) {
+    for commit_ref in &device_commits {
+        if !audit_request_ids.contains(&commit_ref.request_id) {
             violations.push(Violation::OrphanedDeviceCommit {
-                device_id: device_id.clone(),
-                commit_sha: commit_sha.clone(),
-                request_id: request_id.clone(),
+                device_id: commit_ref.device_id.clone(),
+                commit_sha: commit_ref.commit_sha.clone(),
+                request_id: commit_ref.request_id.clone(),
             });
         }
     }
@@ -795,7 +753,7 @@ fn verify_device_join(
     // Check for orphaned audit records (not in device commits)
     let device_request_ids: HashSet<String> = device_commits
         .iter()
-        .map(|(_, _, req_id)| req_id.clone())
+        .map(|c| c.request_id.clone())
         .collect();
 
     for (server_id, segments) in server_chains {
