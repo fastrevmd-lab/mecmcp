@@ -12,6 +12,7 @@ mod redact;
 mod schema;
 mod scope;
 pub mod signing;
+pub mod sinks;
 pub mod testutil;
 
 pub use attribution::{
@@ -29,3 +30,4 @@ pub use schema::{AuditOutcome, AuditValue};
 pub use scope::{
     AuditScope, DEFAULT_DURATION_METRIC, duration_metric_name, install_duration_metric_name,
 };
+pub use sinks::{DeliveryLedger, DeliveryStatus, SsdfSink, SsdfSinkConfig, SsdfSinkError};
