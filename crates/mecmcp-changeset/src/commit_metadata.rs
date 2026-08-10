@@ -135,6 +135,7 @@ pub fn apply_commit_metadata(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use mecmcp_audit::{ActorType, AgentIdentity, Principal, Tier, TokenVerifiedFields};

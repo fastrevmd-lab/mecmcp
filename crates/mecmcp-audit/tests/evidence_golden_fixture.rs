@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! Golden fixture conformance test for evidence records.
 //!
 //! This test captures the expected serialization and hash-chain behavior
