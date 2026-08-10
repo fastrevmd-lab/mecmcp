@@ -385,10 +385,15 @@ where
 
     let session_manager =
         LimitedSessionManager::new(LocalSessionManager::default(), &config.limits);
+    // Bound before `session_manager` moves into the rmcp service below. The
+    // bearer boundary needs the same tracker the session manager writes
+    // `clientInfo` into, or the transport audit event has nothing to read
+    // (mecmcp#53).
+    let session_tracker = session_manager.tracker();
     let concurrency = ConcurrencyState::new(
         &config.limits,
         config.identity.target_keys.clone(),
-        Some(session_manager.tracker()),
+        Some(Arc::clone(&session_tracker)),
     );
     // rmcp gets its OWN token, deliberately not `config.shutdown`.
     //
@@ -414,7 +419,7 @@ where
     // This applies the complete authenticated stack: auth → token_rate →
     // token_concurrency → body_limit → preflight → target_concurrency.
     if let Some(bearer) = config.bearer {
-        let accounting = BoundaryAccounting::new(concurrency, Arc::clone(&limits));
+        let accounting = authenticated_accounting(concurrency, &limits, &session_tracker);
         router = apply_bearer_boundary(router, bearer, accounting);
     } else {
         // For unauthenticated servers, install the split concurrency middleware
@@ -820,9 +825,55 @@ pub async fn serve_router(
     Ok(())
 }
 
+/// Build the accounting the bearer boundary runs with.
+///
+/// Extracted so the tracker wiring is testable. `BoundaryAccounting::new`
+/// leaves `session_tracker` at `None`, and the transport audit event reads the
+/// captured `clientInfo` back out of exactly that tracker (mecmcp#53). When the
+/// assembly forgot to attach it, every consumer of
+/// `build_streamable_http_router` emitted `client_name=""` while the middleware,
+/// its unit tests, and the end-to-end test that attached a tracker by hand all
+/// passed — the feature was correct and unreachable.
+fn authenticated_accounting(
+    concurrency: ConcurrencyState,
+    limits: &Arc<crate::config::LimitsConfig>,
+    session_tracker: &Arc<crate::session::SessionTracker>,
+) -> BoundaryAccounting {
+    BoundaryAccounting::new(concurrency, Arc::clone(limits))
+        .with_session_tracker(Arc::clone(session_tracker))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    /// The assembly must attach the session tracker to the bearer boundary.
+    ///
+    /// Regression guard for mecmcp#53's second half. The propagation middleware
+    /// reads the captured `clientInfo` out of `BoundaryAccounting.session_tracker`,
+    /// and `BoundaryAccounting::new` leaves that `None`. Because
+    /// `build_streamable_http_router` never attached it, every consumer emitted
+    /// `client_name=""` while every test passed — including an end-to-end one
+    /// that attached a tracker by hand and so exercised the middleware rather
+    /// than the assembly.
+    ///
+    /// This asserts the helper the assembly calls, not the assembly itself; the
+    /// crate has no harness that stands up a real rmcp service. Proving it truly
+    /// end to end still means driving a consumer, which is how the gap was
+    /// found. See the tracking issue for that harness.
+    #[test]
+    fn the_authenticated_boundary_is_given_the_session_tracker() {
+        let limits = std::sync::Arc::new(crate::config::LimitsConfig::default());
+        let tracker = std::sync::Arc::new(crate::session::SessionTracker::new(&limits));
+        let concurrency =
+            ConcurrencyState::new(&limits, Vec::new(), Some(std::sync::Arc::clone(&tracker)));
+        let accounting = super::authenticated_accounting(concurrency, &limits, &tracker);
+        assert!(
+            accounting.session_tracker.is_some(),
+            "the bearer boundary must receive the session tracker, or the transport \
+             audit event has nothing to read clientInfo from and client_name stays empty"
+        );
+    }
+
     use super::*;
     use crate::{BearerAuthenticator, BearerResponseProfile};
     use axum::body::Body;
