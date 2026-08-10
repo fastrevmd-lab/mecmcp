@@ -35,6 +35,26 @@ apply) and the modern crate hygiene. Neither benefits from the other.
 
 ## Status
 
+**0.8.3 — 0.8.2's client name never actually reached anyone. Upgrade past 0.8.2.**
+The propagation was correct and unreachable. The middleware reads the captured
+`clientInfo` out of `BoundaryAccounting.session_tracker`;
+`BoundaryAccounting::new` leaves that `None`, and `build_streamable_http_router`
+never called `with_session_tracker`. Every consumer goes through that assembly,
+so every one of them kept emitting `client_name=""` exactly as before 0.8.2
+shipped.
+
+Found by bumping a consumer to 0.8.2 and reading a real audit event, not by any
+test here. Nothing in this repo could see it: the middleware unit tests build a
+`BoundaryAccounting` directly, and the end-to-end test attaches a tracker by
+hand — both prove the middleware works *when wired*, neither observes the
+assembly that does the wiring. The missing harness is tracked in #251.
+
+Also fixes the workspace lint: `cargo clippy --all-targets` had been failing on
+111 `unwrap_used` errors in test code, so every PR was red regardless of its own
+diff.
+
+Additive over 0.8.2. If you are on 0.8.2 for `client_name`, you need this.
+
 **0.8.2 — the MCP client name reaches the audit record (#53).**
 `AgentIdentity.client_name` existed but nothing populated it, so every audit
 event emitted `"client_name":""`. MCP's `initialize` already carries
