@@ -360,6 +360,7 @@ async fn p1_issue1_discard_rereads_after_guard() {
             "set",
             None,
             policy_sig,
+            None,
             &cancellation,
         )
         .await
@@ -477,6 +478,7 @@ async fn p1_issue2_validate_rereads_after_guard() {
             "set",
             None,
             policy_sig,
+            None,
             &cancellation,
         )
         .await
@@ -577,6 +579,7 @@ async fn p1_issue3_discard_persists_before_unlock() {
             "set",
             None,
             policy_sig,
+            None,
             &cancellation,
         )
         .await
@@ -653,6 +656,7 @@ async fn p1_issue4_unsupported_unlock_becomes_indeterminate() {
             "set",
             None,
             policy_sig,
+            None,
             &cancellation,
         )
         .await
@@ -737,6 +741,7 @@ async fn p2_issue5_stage_validates_fingerprint_early() {
             "set",
             None,
             policy_sig,
+            None,
             &cancellation,
         )
         .await;
@@ -789,6 +794,7 @@ async fn p2_issue6_stage_persists_lock_risk() {
             "set",
             None,
             policy_sig,
+            None,
             &cancellation,
         )
         .await
@@ -843,6 +849,7 @@ async fn p2_issue7_failed_commit_preserves_lock() {
             "set",
             None,
             policy_sig,
+            None,
             &cancellation,
         )
         .await
@@ -941,6 +948,7 @@ async fn p2_issue8_confirmed_commit_persists_deadline() {
             "set",
             None,
             policy_sig,
+            None,
             &cancellation,
         )
         .await
@@ -1038,6 +1046,7 @@ async fn p2_issue9_attribution_includes_agent_identity() {
             "set",
             None,
             policy_sig,
+            None,
             &cancellation,
         )
         .await

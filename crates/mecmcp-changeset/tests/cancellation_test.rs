@@ -161,6 +161,7 @@ async fn staged(transaction: &CountingTransaction) -> (Arc<ChangesetCoordinator>
             "set",
             None,
             POLICY,
+            None,
             &CancellationToken::new(),
         )
         .await

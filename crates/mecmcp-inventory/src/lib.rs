@@ -11,7 +11,10 @@
 //!
 //! All three normalize to a name-indexed device map plus optional policy.
 
+mod authority;
 mod file;
+
+pub use authority::{ConfigAuthority, LocalAuthority};
 pub use file::FileInventory;
 
 use std::error::Error;

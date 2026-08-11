@@ -130,6 +130,16 @@ impl ChangesetCoordinator {
     /// into the commit log. The parameter is on this signature so the call site
     /// carries it from the start rather than acquiring it later — but be aware that
     /// today an apply records no attribution of its own.
+    ///
+    /// # Config authority
+    ///
+    /// `config_authority` records who owns the device's configuration. Pass the
+    /// string representation of the authority discriminant from the device's
+    /// `ConfigAuthority<A>` field (e.g., `"local"`, `"mist"`, `"panorama"`).
+    /// When the authority is not `"local"`, changes may be overwritten by the
+    /// owning management plane. This value is stored in the operation record
+    /// and should be included in audit events to distinguish durable changes
+    /// from transient ones.
     #[allow(clippy::too_many_arguments)]
     pub async fn apply_change_set<T: DeviceTransaction>(
         &self,
@@ -142,6 +152,7 @@ impl ChangesetCoordinator {
         transaction: &T,
         primary_action_discriminator: &str,
         vendor_primary_target: Option<&str>,
+        config_authority: Option<String>,
         _attribution: &Attribution,
         cancellation: &CancellationToken,
     ) -> Result<ApplyOutput<T::Staged>, CoordinatorError> {
@@ -331,6 +342,7 @@ impl ChangesetCoordinator {
             policy_signature: change_set.policy_signature.clone(),
             attribution: None,
             rollback_deadline_unix: None,
+            config_authority,
         };
 
         self.insert(operation_record).await?;

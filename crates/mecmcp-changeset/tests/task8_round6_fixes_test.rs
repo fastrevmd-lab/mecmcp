@@ -234,6 +234,7 @@ async fn test_endpoint_check_prevents_concurrent_mutations() {
             "set",
             None,
             policy_sig,
+            None,
             &cancellation,
         )
         .await
@@ -258,6 +259,7 @@ async fn test_endpoint_check_prevents_concurrent_mutations() {
             "set",
             None,
             policy_sig,
+            None,
             &cancellation,
         )
         .await;
@@ -304,6 +306,7 @@ async fn test_device_check_still_enforced() {
             "set",
             None,
             policy_sig,
+            None,
             &cancellation,
         )
         .await
@@ -327,6 +330,7 @@ async fn test_device_check_still_enforced() {
             "set",
             None,
             policy_sig,
+            None,
             &cancellation,
         )
         .await;
@@ -379,6 +383,7 @@ async fn test_xpath_persisted_in_operation_record() {
             "set",
             xpath,
             policy_sig,
+            None,
             &cancellation,
         )
         .await
@@ -424,6 +429,7 @@ async fn test_xpath_omitted_for_junos() {
             "configure",
             None, // Junos has no xpath
             policy_sig,
+            None,
             &cancellation,
         )
         .await
@@ -488,6 +494,7 @@ async fn test_awaiting_confirmation_clears_lock_flag() {
             "configure",
             None,
             policy_sig,
+            None,
             &cancellation,
         )
         .await

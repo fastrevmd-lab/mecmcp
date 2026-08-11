@@ -172,6 +172,7 @@ async fn stage(
             "set",
             None,
             "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -294,6 +295,7 @@ async fn staged_recovery_policy_decides_whether_a_restart_demotes_an_operation()
             "set",
             None,
             "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            None,
             &CancellationToken::new(),
         )
         .await
