@@ -363,6 +363,69 @@ impl ChangesetCoordinator {
 
         Ok(record.into())
     }
+
+    /// Cancels a change set, freeing the per-principal pending slot.
+    ///
+    /// A change set may be cancelled by its owner or by an approver-class principal.
+    /// Valid from states `Planned` or `Approved` (not yet applied). Transitions the
+    /// record to a terminal `Cancelled` state and frees the per-principal pending slot,
+    /// allowing a new change set to be created immediately. Records are never deleted —
+    /// the audit trail is preserved.
+    ///
+    /// Idempotent: cancelling an already-`Cancelled` set returns its current state
+    /// without error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The change set does not exist or belongs to another device
+    /// - The principal is neither the owner nor an approver
+    /// - The change set is in `Applied` or `Applying` state (cannot cancel an in-flight or completed apply)
+    /// - Persistence fails
+    pub async fn cancel_change_set(
+        &self,
+        change_set_id: String,
+        device: String,
+        principal: String,
+    ) -> Result<ChangeSetOutput, CoordinatorError> {
+        let mut record = self.change_set(&change_set_id, &device).await?;
+
+        // Idempotent: return current state if already cancelled
+        if record.state == ChangeSetState::Cancelled {
+            return Ok(record.into());
+        }
+
+        // Check authorization: principal must be owner or approver
+        let is_owner = record.owner == principal;
+        let is_approver = record.approver.as_ref() == Some(&principal);
+
+        if !is_owner && !is_approver {
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                "only the change-set owner or approver may cancel it",
+            ));
+        }
+
+        // Reject if state is Applying or Applied
+        if matches!(
+            record.state,
+            ChangeSetState::Applying | ChangeSetState::Applied
+        ) {
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                format!(
+                    "cannot cancel a change set in state {:?}",
+                    record.state.as_str()
+                ),
+            ));
+        }
+
+        // Transition to Cancelled (valid from Planned, Approved, Expired, or Failed)
+        record.state = ChangeSetState::Cancelled;
+        self.update_change_set(record.clone()).await?;
+
+        Ok(record.into())
+    }
 }
 
 #[cfg(test)]

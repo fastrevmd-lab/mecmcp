@@ -66,6 +66,8 @@ pub enum ChangeSetState {
     Expired,
     /// Change set apply failed.
     Failed,
+    /// Change set was cancelled by the owner or an approver.
+    Cancelled,
 }
 
 impl ChangeSetState {
@@ -79,6 +81,7 @@ impl ChangeSetState {
             Self::Applied => "applied",
             Self::Expired => "expired",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 }

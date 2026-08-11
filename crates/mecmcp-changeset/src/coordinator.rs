@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Whether a change set still occupies the one-pending-per-principal slot.
 ///
-/// `Expired`, `Applied` and `Failed` are terminal and block nothing.
+/// `Expired`, `Applied`, `Failed`, and `Cancelled` are terminal and block nothing.
 fn is_pending(state: ChangeSetState) -> bool {
     matches!(
         state,
@@ -519,7 +519,10 @@ impl ChangesetCoordinator {
             state.change_sets.retain(|_, existing| {
                 let terminal = matches!(
                     existing.state,
-                    ChangeSetState::Applied | ChangeSetState::Expired | ChangeSetState::Failed
+                    ChangeSetState::Applied
+                        | ChangeSetState::Expired
+                        | ChangeSetState::Failed
+                        | ChangeSetState::Cancelled
                 );
                 if terminal {
                     evicted.push(existing.clone());
