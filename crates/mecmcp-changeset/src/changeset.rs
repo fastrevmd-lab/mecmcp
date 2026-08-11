@@ -39,6 +39,17 @@ pub struct ChangeSetOutput {
     /// approved this yet" from "this was deliberately approved without review".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_waiver: Option<String>,
+    /// The staged actions, when requested for review.
+    ///
+    /// Absent by default. Populated only when the caller explicitly requests the
+    /// actions via `change_set_status_with_actions`. This allows approvers to see
+    /// what they are approving, and SIEM to audit terminal change sets.
+    ///
+    /// Exposure is gated server-side (e.g., `--web-enabled-approver` in
+    /// rust-junosmcp) — not all deployments want staged config content readable
+    /// through the status tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<serde_json::Value>>,
 }
 
 impl From<ChangeSetRecord> for ChangeSetOutput {
@@ -57,6 +68,7 @@ impl From<ChangeSetRecord> for ChangeSetOutput {
                 .as_ref()
                 .and_then(|approval| approval.waived.as_ref())
                 .map(|waiver| waiver.reason.clone()),
+            actions: None,
         }
     }
 }
@@ -362,6 +374,46 @@ impl ChangesetCoordinator {
         }
 
         Ok(record.into())
+    }
+
+    /// Retrieves the status of a change set WITH the stored actions, auto-expiring if needed.
+    ///
+    /// This is the review-enabled variant of `change_set_status`. It returns the same
+    /// metadata as the base method but also populates the `actions` field with the
+    /// exact stored actions. This allows approvers to see what they are approving and
+    /// SIEM to audit terminal change sets.
+    ///
+    /// Authorization semantics are identical to `change_set_status` — no additional
+    /// principal checks. Exposure is gated server-side (e.g., via `--web-enabled-approver`
+    /// in rust-junosmcp).
+    ///
+    /// If the change set is in `Planned` state and the current time is past
+    /// `expires_at_unix`, it is transitioned to `Expired` and persisted before
+    /// returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The change set does not exist or belongs to another device
+    /// - Persistence fails (when auto-expiring)
+    pub async fn change_set_status_with_actions(
+        &self,
+        change_set_id: String,
+        device: String,
+    ) -> Result<ChangeSetOutput, CoordinatorError> {
+        let mut record = self.change_set(&change_set_id, &device).await?;
+
+        if record.state == ChangeSetState::Planned {
+            let now = now_unix()?;
+            if now >= record.expires_at_unix {
+                record.state = ChangeSetState::Expired;
+                self.update_change_set(record.clone()).await?;
+            }
+        }
+
+        let mut output: ChangeSetOutput = record.clone().into();
+        output.actions = Some(record.actions);
+        Ok(output)
     }
 
     /// Cancels a change set, freeing the per-principal pending slot.

@@ -278,6 +278,17 @@ impl<C> ParsedCli<C> {
     }
 }
 
+/// Server-common approver-tooling switches. Flatten into a server's CLI with
+/// `#[command(flatten)]` so every mecmcp-based server exposes the same flag.
+#[derive(Debug, Clone, Copy, Default, clap::Args)]
+pub struct WebApproverArgs {
+    /// Include staged actions in change-set status responses (approver
+    /// tooling, e.g. the mechub approval webapp). Off by default: exposes
+    /// staged config content to any caller with status scope.
+    #[arg(long)]
+    pub web_enabled_approver: bool,
+}
+
 /// Common CLI arguments for MCP servers.
 ///
 /// This struct holds only the flags every vendor needs. Vendor servers
@@ -732,5 +743,53 @@ mod composition_tests {
             1,
             "a global typed once must be reported once: {mappings:?}"
         );
+    }
+
+    #[test]
+    fn web_approver_args_defaults_to_false() {
+        let args = WebApproverArgs::default();
+        assert!(!args.web_enabled_approver);
+    }
+
+    #[test]
+    fn web_approver_args_parses_flag() {
+        #[derive(Debug, Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            approver: WebApproverArgs,
+        }
+
+        let cli = TestCli::parse_from(["test", "--web-enabled-approver"]);
+        assert!(cli.approver.web_enabled_approver);
+    }
+
+    #[test]
+    fn web_approver_args_flattens_without_conflict() {
+        #[derive(Debug, Parser)]
+        struct ServerCli {
+            #[command(flatten)]
+            shared: Cli,
+            #[command(flatten)]
+            approver: WebApproverArgs,
+            #[arg(long, default_value_t = 900)]
+            approval_timeout_secs: u64,
+        }
+
+        let parsed: ParsedCli<ServerCli> = try_parse_from(
+            "consumer-mcp",
+            "9.9.9",
+            [
+                "consumer-mcp",
+                "--web-enabled-approver",
+                "--approval-timeout-secs",
+                "60",
+            ],
+        )
+        .expect("WebApproverArgs must flatten without conflict");
+
+        assert!(parsed.cli.approver.web_enabled_approver);
+        assert_eq!(parsed.cli.approval_timeout_secs, 60);
+        assert!(parsed.was_supplied("web_enabled_approver"));
+        assert!(parsed.was_supplied("approval_timeout_secs"));
     }
 }
