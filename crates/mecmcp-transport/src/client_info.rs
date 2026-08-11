@@ -35,12 +35,15 @@ static INTERNED_CLIENT_NAMES: LazyLock<DashMap<&'static str, ()>> =
 ///
 /// Captured per-session by `LimitedSessionManager::initialize_session`.
 ///
-/// **Not yet propagated to `AgentIdentity.client_name`.** That bridge between the
-/// session and auth layers is follow-up work, so audit events still show an empty
-/// client name today — which is what rustjunosmcp#267 is waiting on. The capture
-/// and its bounds land first because the bounds are the security-relevant half:
-/// the name arrives in a request body, and mecmcp has already shipped one
-/// unbounded `Box::leak` on attacker-controlled input (see `intern_tool_name`).
+/// Propagated to `AgentIdentity.client_name` as of #253: the middleware reads the
+/// captured name off the session and sets it on `CallerCtx`, so handler-side audit
+/// events carry the same name the transport event does. Before that, only the
+/// transport event had it and the handler event showed empty.
+///
+/// The bounds below are the security-relevant half and landed first, because the
+/// name arrives in a request body. `intern_tool_name` is bounded the same way
+/// (256 names, 128 bytes, falling back to a placeholder) — an earlier revision of
+/// this comment described it as an unbounded `Box::leak`, which is no longer true.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientInfo {
     /// Interned client name, bounded and validated.
