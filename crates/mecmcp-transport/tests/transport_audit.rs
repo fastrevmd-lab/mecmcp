@@ -30,7 +30,7 @@ fn extract_tool_name_for_test(body: &[u8]) -> Option<&'static str> {
 }
 
 /// Simulate the audit emission that the middleware performs.
-fn emit_transport_audit(tool: &'static str) {
+fn emit_transport_audit(tool: &'static str, client_name: Option<&'static str>) {
     use mecmcp_auth::{ActorType, CallerCtx, NoGrant, ScopeSet};
 
     let caller = CallerCtx::<NoGrant> {
@@ -42,6 +42,7 @@ fn emit_transport_audit(tool: &'static str) {
         provider_tier: None,
         on_behalf_of: None,
         actor_type: ActorType::Human,
+        client_name,
     };
 
     let mut scope = mecmcp_audit::AuditScope::from_caller(&caller, tool, "transport", Vec::new());
@@ -66,7 +67,7 @@ fn tools_call_produces_transport_audit_event() {
 
         let captured = run_with_capture(|| {
             if let Some(tool_name) = extract_tool_name_for_test(body.as_bytes()) {
-                emit_transport_audit(tool_name);
+                emit_transport_audit(tool_name, None);
             }
         });
 
@@ -95,7 +96,7 @@ fn batched_tools_call_produces_audit_event() {
 
     let captured = run_with_capture(|| {
         if let Some(tool) = extract_tool_name_for_test(batch_body) {
-            emit_transport_audit(tool);
+            emit_transport_audit(tool, None);
         }
     });
 
@@ -120,7 +121,7 @@ fn non_tools_call_produces_no_audit_event() {
 
     let captured = run_with_capture(|| {
         if let Some(tool) = extract_tool_name_for_test(tools_list_body) {
-            emit_transport_audit(tool);
+            emit_transport_audit(tool, None);
         }
     });
 
@@ -142,7 +143,7 @@ fn malformed_json_produces_no_audit_event() {
 
     let captured = run_with_capture(|| {
         if let Some(tool) = extract_tool_name_for_test(malformed_body) {
-            emit_transport_audit(tool);
+            emit_transport_audit(tool, None);
         }
     });
 

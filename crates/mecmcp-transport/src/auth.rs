@@ -613,41 +613,59 @@ pub async fn bearer_preflight_middleware<G: Grant>(
     // documents the ordering requirement: preflight middleware must run inside
     // the authentication layer (which would have already rejected unauthenticated
     // requests with 401, so an unauthenticated request can never reach here).
-    let caller = parts
+    let mut caller = parts
         .extensions
         .get::<CallerCtx<G>>()
-        .expect("preflight layer must run after authentication layer");
+        .expect("preflight layer must run after authentication layer")
+        .clone();
+
+    // Populate client name from session (mecmcp#253).
+    // The Mcp-Session-Id header identifies the session; if present and a client
+    // name was captured during initialize, attach it to CallerCtx so handlers can
+    // populate it in their audit events without re-implementing session lookup.
+    let captured_client_name = if let Some(tracker) = &state.session_tracker
+        && let Some(session_id_value) = parts.headers.get("Mcp-Session-Id")
+        && let Ok(session_id_str) = session_id_value.to_str()
+    {
+        let session_id: rmcp::transport::common::server_side_http::SessionId =
+            session_id_str.into();
+        tracker.client_name(&session_id)
+    } else {
+        None
+    };
+
+    if let Some(client_name) = captured_client_name {
+        caller.client_name = Some(client_name);
+    }
 
     // Emit transport-level audit event for tools/call requests (mecmcp#32).
     // The handler will emit its own enriched event with action, targets, outcome.
     // Both events share the same request_id for correlation.
     if let Some(tool) = extract_tool_name(&body_bytes) {
-        let mut scope = AuditScope::from_caller(caller, tool, "transport", Vec::new());
+        let mut scope = AuditScope::from_caller(&caller, tool, "transport", Vec::new());
         scope.meta("layer", "preflight");
 
         // Propagate captured client name from the session (mecmcp#53).
-        // The Mcp-Session-Id header identifies the session; if present and a
-        // client name was captured during initialize, attach it to the audit event.
-        if let Some(tracker) = &state.session_tracker
-            && let Some(session_id_value) = parts.headers.get("Mcp-Session-Id")
-            && let Ok(session_id_str) = session_id_value.to_str()
-        {
-            let session_id: rmcp::transport::common::server_side_http::SessionId =
-                session_id_str.into();
-            if let Some(client_name) = tracker.client_name(&session_id) {
-                scope.attach_client_name(client_name);
-            }
+        // Now that CallerCtx carries the client name (mecmcp#253), the transport
+        // audit event already has it via from_caller. This explicit attachment
+        // remains for backward compatibility with the pre-#253 event shape.
+        if let Some(client_name) = captured_client_name {
+            scope.attach_client_name(client_name);
         }
 
         scope.succeed();
     }
 
-    if let Err(reason) = run_preflight(&state.preflight, &body_bytes, caller) {
+    if let Err(reason) = run_preflight(&state.preflight, &body_bytes, &caller) {
         return forbidden(&state.realm, &reason);
     }
 
-    next.run(Request::from_parts(parts, Body::from(body_bytes)))
-        .await
+    // Re-insert the potentially updated CallerCtx with client_name populated.
+    // The parts are mutable here, so we can replace the extension.
+    let mut request = Request::from_parts(parts, Body::from(body_bytes));
+    request.extensions_mut().insert(caller);
+
+    next.run(request).await
 }
 
 /// Cap on distinct tool names ever interned, and on the length of one.
@@ -1108,6 +1126,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: ActorType::Human,
+            client_name: None,
         };
 
         let body = br#"{"method":"tools/call","params":{"name":"list_devices","arguments":{}}}"#;
@@ -1159,6 +1178,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: ActorType::Human,
+            client_name: None,
         };
 
         let body = br#"{"method":"tools/call","params":{"name":"get_config","arguments":{}}}"#;
@@ -1201,6 +1221,7 @@ mod tests {
             provider_tier: Some(mecmcp_auth::Tier::Public),
             on_behalf_of: Some("user@example.com".to_owned()),
             actor_type: ActorType::Agent,
+            client_name: None,
         };
         let mut attr = Attribution::from_caller(&caller);
 

@@ -258,6 +258,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Unknown,
+            client_name: None,
         }
     }
 
@@ -477,6 +478,7 @@ mod tests {
             provider_tier: Some(mecmcp_auth::Tier::Public),
             on_behalf_of: Some("fastrevmd@gmail.com".into()),
             actor_type: mecmcp_auth::ActorType::Agent,
+            client_name: None,
         };
         let out = run_with_capture(|| {
             let mut a = AuditScope::from_caller(&ctx, "commit_config", "commit", vec!["r1".into()]);

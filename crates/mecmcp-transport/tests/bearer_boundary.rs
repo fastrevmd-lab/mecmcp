@@ -44,6 +44,7 @@ fn caller() -> CallerCtx<TestGrant> {
         provider_tier: None,
         on_behalf_of: None,
         actor_type: ActorType::Human,
+        client_name: None,
     }
 }
 

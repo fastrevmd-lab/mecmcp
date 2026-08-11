@@ -630,6 +630,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Human,
+            client_name: None,
         }
     }
 
