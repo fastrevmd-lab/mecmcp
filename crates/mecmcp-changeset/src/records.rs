@@ -71,6 +71,21 @@ pub struct OperationRecord {
     /// before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback_deadline_unix: Option<u64>,
+    /// Configuration authority owning this device.
+    ///
+    /// Records who owns the device's configuration: `"local"` (this server),
+    /// a management plane (`"mist"`, `"panorama"`, `"strata-cloud-manager"`,
+    /// etc.), or `"unknown"` when unset. Vendor-neutral string representation
+    /// of the authority discriminant from `mecmcp_inventory::ConfigAuthority`.
+    ///
+    /// When the authority is not `"local"`, changes made through this server
+    /// may be overwritten by the owning plane at its next push. Audit events
+    /// record this field to distinguish durable changes from transient ones.
+    ///
+    /// Optional for backward compatibility — records written before this field
+    /// existed have no config authority and must still load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_authority: Option<String>,
 }
 
 /// The attribution fields worth keeping in the state file.

@@ -98,6 +98,12 @@ impl ChangesetCoordinator {
     /// - The expected fingerprint does not match the device's actual state
     /// - The transaction's `stage()` method fails
     /// - Persistence fails
+    ///
+    /// # Config authority
+    ///
+    /// `config_authority` records who owns the device's configuration. Pass the
+    /// string representation of the authority discriminant (e.g., `"local"`,
+    /// `"mist"`, `"panorama"`). When not `"local"`, changes may be overwritten.
     #[allow(clippy::too_many_arguments)]
     pub async fn stage_operation<T: DeviceTransaction>(
         &self,
@@ -110,6 +116,7 @@ impl ChangesetCoordinator {
         primary_action_discriminator: &str,
         vendor_primary_target: Option<&str>,
         policy_signature: &str,
+        config_authority: Option<String>,
         cancellation: &CancellationToken,
     ) -> Result<StageOutput<T::Staged>, CoordinatorError> {
         // P2-a: Validate non-empty actions
@@ -164,6 +171,7 @@ impl ChangesetCoordinator {
             policy_signature: policy_signature.to_owned(),
             attribution: None,
             rollback_deadline_unix: None,
+            config_authority,
         };
 
         // Insert the record early so restart recovery can see it
