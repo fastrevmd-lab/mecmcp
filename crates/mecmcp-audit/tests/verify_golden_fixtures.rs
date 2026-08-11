@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! Golden fixture tests for mecmcp-verify.
 //!
 //! These tests verify the complete verification workflow using pinned fixtures:
@@ -9,12 +10,9 @@
 //! - Manifest-absent-server fails
 
 use mecmcp_audit::evidence::{
-    ApplyIntentRecord, ApprovalRecord, ChainSegment, ClosedSegment, EvidenceRecord,
-    GENESIS_PREV_HASH, ProposalRecord, ResultReceipt, append, close,
+    ApprovalRecord, ChainSegment, EvidenceRecord, GENESIS_PREV_HASH, ProposalRecord, append, close,
 };
-use mecmcp_audit::signing::{
-    encode_signature, encode_signing_key, encode_verifying_key, generate_keypair, sign_head,
-};
+use mecmcp_audit::signing::{encode_signature, encode_verifying_key, generate_keypair, sign_head};
 use serde_json::json;
 use std::fs::{self, File};
 use std::io::Write;
@@ -204,7 +202,7 @@ fn path_traversal_server_id_rejected() {
 
     // Run mecmcp-verify
     let output = Command::new("cargo")
-        .args(&[
+        .args([
             "run",
             "--bin",
             "mecmcp-verify",
@@ -279,7 +277,7 @@ fn empty_chain_file_with_expecting_manifest_fails() {
 
     // Run mecmcp-verify
     let output = Command::new("cargo")
-        .args(&[
+        .args([
             "run",
             "--bin",
             "mecmcp-verify",
@@ -325,7 +323,7 @@ fn duplicate_segment_seq_fails() {
     // Run mecmcp-verify
     use std::process::Command;
     let output = Command::new("cargo")
-        .args(&[
+        .args([
             "run",
             "--bin",
             "mecmcp-verify",
@@ -377,6 +375,7 @@ struct RunManifest {
 
 #[derive(serde::Deserialize)]
 struct ServerManifest {
+    #[allow(dead_code)]
     server_id: String,
 }
 
@@ -550,8 +549,7 @@ fn create_intact_run_fixture() -> TestFixture {
 
     // Create device log
     let device_log_path = temp_dir.path().join("device.log");
-    let device_log_content = format!(
-        r#"commit abc123def456
+    let device_log_content = r#"commit abc123def456
 Author: Alice <alice@mechub.org>
 Date:   Fri Aug 9 14:01:00 2026 +0000
 
@@ -564,8 +562,7 @@ Date:   Fri Aug 9 14:00:30 2026 +0000
 
 Device: vsrx-lab
     Provenance: request.id=req_golden_002, agent:mechub-config-agent
-"#
-    );
+"#;
 
     fs::write(&device_log_path, device_log_content).unwrap();
 
