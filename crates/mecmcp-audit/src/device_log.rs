@@ -13,11 +13,11 @@ use std::path::Path;
 /// Used by mecmcp-verify to join device commits with audit records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceCommitRef {
-    /// Device identifier (from "Device: <id>" line).
+    /// Device identifier (from `Device: <id>` line).
     pub device_id: String,
-    /// Commit SHA (from "commit <sha>" line).
+    /// Commit SHA (from `commit <sha>` line).
     pub commit_sha: String,
-    /// Request identifier extracted from "request.id=<uuid>" in provenance line.
+    /// Request identifier extracted from `request.id=<uuid>` in provenance line.
     pub request_id: String,
 }
 
