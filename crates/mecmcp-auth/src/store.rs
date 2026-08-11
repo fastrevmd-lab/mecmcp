@@ -123,6 +123,16 @@ pub struct CallerCtx<G: Grant = NoGrant> {
     pub on_behalf_of: Option<String>,
     /// Server-verified actor type from the token entry.
     pub actor_type: crate::ActorType,
+    /// Client-asserted MCP client name from `initialize` request.
+    ///
+    /// Captured from the MCP session identified by `Mcp-Session-Id` header.
+    /// This field is ALWAYS client-asserted and can never be server-verified,
+    /// regardless of what token-bound provenance fields say. Populated by the
+    /// bearer preflight middleware when a session exists and provided clientInfo.
+    ///
+    /// `None` for the very first request (initialize itself, before the session
+    /// has a captured name) or when the client did not provide `clientInfo`.
+    pub client_name: Option<&'static str>,
 }
 
 impl<G: Grant> From<&TokenEntry<G>> for CallerCtx<G> {
@@ -136,6 +146,7 @@ impl<G: Grant> From<&TokenEntry<G>> for CallerCtx<G> {
             provider_tier: entry.provider_tier,
             on_behalf_of: entry.on_behalf_of.clone(),
             actor_type: entry.effective_actor_type(),
+            client_name: None,
         }
     }
 }
@@ -254,6 +265,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: crate::ActorType::Human,
+            client_name: None,
         };
         let visible =
             filter_device_names(Some(&ctx), vec!["edge-fw".to_owned(), "core-fw".to_owned()]);
@@ -280,6 +292,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: crate::ActorType::Human,
+            client_name: None,
         };
         let visible = filter_device_names(Some(&ctx), vec!["edge-fw".to_owned()]);
         assert!(visible.is_empty());
@@ -298,6 +311,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: crate::ActorType::Human,
+            client_name: None,
         };
         let names = vec!["edge-fw".to_owned(), "core-fw".to_owned()];
         let visible = filter_device_names(Some(&ctx), names.clone());

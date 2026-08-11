@@ -230,9 +230,11 @@ impl Attribution {
     /// Propagates server-verified provenance fields from the token entry:
     /// `actor_type`, `on_behalf_of`, and when the token declares a provider,
     /// an `AgentIdentity` populated with the verified `provider` and
-    /// `provider_tier`. Client-asserted fields (`model_id`, `session_id`,
-    /// `client_name`, `skills_used`) are left at their empty defaults —
-    /// they are not knowable at this point and must not be invented.
+    /// `provider_tier`. The client-asserted `client_name` is populated from
+    /// `CallerCtx` when available (captured from the MCP session). Other
+    /// client-asserted fields (`model_id`, `session_id`, `skills_used`) are
+    /// left at their empty defaults — they are not knowable at this point
+    /// and must not be invented.
     pub fn from_caller<G>(ctx: &mecmcp_auth::CallerCtx<G>) -> Self
     where
         G: mecmcp_auth::Grant,
@@ -245,12 +247,13 @@ impl Attribution {
         };
 
         // When the token declares a provider, populate an AgentIdentity with
-        // server-verified fields only. Client-asserted fields remain empty.
+        // server-verified fields. The client_name is populated from CallerCtx
+        // if available (captured from the MCP session during bearer preflight).
         let agent = match (&ctx.provider, ctx.provider_tier) {
             (Some(provider), Some(tier)) => Some(AgentIdentity {
                 model_id: String::new(),
                 session_id: String::new(),
-                client_name: None,
+                client_name: ctx.client_name.map(String::from),
                 provider: provider.clone(),
                 provider_tier: match tier {
                     mecmcp_auth::Tier::Public => Tier::Public,
@@ -258,7 +261,14 @@ impl Attribution {
                 },
                 skills_used: Vec::new(),
             }),
-            _ => None,
+            _ => ctx.client_name.map(|name| AgentIdentity {
+                model_id: String::new(),
+                session_id: String::new(),
+                client_name: Some(name.to_string()),
+                provider: default_provider(),
+                provider_tier: Tier::default(),
+                skills_used: Vec::new(),
+            }),
         };
 
         // The token entry is the server's own record, so anything it declared is
@@ -354,6 +364,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Unknown,
+            client_name: None,
         }
     }
 
@@ -591,6 +602,7 @@ mod tests {
             provider_tier: Some(mecmcp_auth::Tier::Public),
             on_behalf_of: Some("fastrevmd@gmail.com".into()),
             actor_type: mecmcp_auth::ActorType::Agent,
+            client_name: None,
         };
         let a = Attribution::from_caller(&ctx);
 
@@ -644,6 +656,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: Some("alice@example.com".into()),
             actor_type: mecmcp_auth::ActorType::Human,
+            client_name: None,
         };
         let a = Attribution::from_caller(&ctx);
 
@@ -670,6 +683,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Unknown, // defaulted, not explicit
+            client_name: None,
         };
         let a = Attribution::from_caller(&c);
         assert_eq!(a.actor_type, ActorType::Unknown);
@@ -694,6 +708,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Agent, // explicit
+            client_name: None,
         };
         let a = Attribution::from_caller(&c);
         assert_eq!(a.actor_type, ActorType::Agent);
@@ -720,6 +735,7 @@ mod tests {
             provider_tier: Some(mecmcp_auth::Tier::Public),
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Agent,
+            client_name: None,
         };
         let a = Attribution::from_caller(&c);
         assert_eq!(
@@ -748,6 +764,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: Some("alice@example.com".into()),
             actor_type: mecmcp_auth::ActorType::Agent,
+            client_name: None,
         };
         let a = Attribution::from_caller(&c);
         assert_eq!(

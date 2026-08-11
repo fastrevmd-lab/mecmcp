@@ -37,6 +37,7 @@ fn both_transports_emit_the_same_tool_and_action() {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: ActorType::Human,
+            client_name: None,
         };
         let mut authenticated = audit_scope(
             Some(&caller),
