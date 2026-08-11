@@ -215,6 +215,7 @@ fn test_require_operation_policy_accepts_matching() {
         policy_signature: policy_sig.to_string(),
         attribution: None,
         rollback_deadline_unix: None,
+        config_authority: None,
     };
 
     let result = require_operation_policy(&record, policy_sig);
@@ -242,6 +243,7 @@ fn test_require_operation_policy_rejects_mismatch() {
         policy_signature: record_sig.to_string(),
         attribution: None,
         rollback_deadline_unix: None,
+        config_authority: None,
     };
 
     let result = require_operation_policy(&record, current_sig);
@@ -273,6 +275,7 @@ fn test_require_operation_fingerprint_accepts_matching() {
         policy_signature: "sha256:policy".to_string(),
         attribution: None,
         rollback_deadline_unix: None,
+        config_authority: None,
     };
 
     let result = require_operation_fingerprint(&record, fingerprint, fingerprint);
@@ -300,6 +303,7 @@ fn test_require_operation_fingerprint_rejects_current_mismatch() {
         policy_signature: "sha256:policy".to_string(),
         attribution: None,
         rollback_deadline_unix: None,
+        config_authority: None,
     };
 
     let result = require_operation_fingerprint(&record, expected, actual);
@@ -332,6 +336,7 @@ fn test_require_operation_fingerprint_rejects_record_mismatch() {
         policy_signature: "sha256:policy".to_string(),
         attribution: None,
         rollback_deadline_unix: None,
+        config_authority: None,
     };
 
     let result = require_operation_fingerprint(&record, expected, expected);
@@ -363,6 +368,7 @@ fn test_operation_record_xpath_optional_roundtrip() {
         policy_signature: "sha256:policy".to_string(),
         attribution: None,
         rollback_deadline_unix: None,
+        config_authority: None,
     };
 
     let serialized = serde_json::to_string(&panos_record).unwrap();
@@ -396,6 +402,7 @@ fn test_operation_record_xpath_optional_roundtrip() {
         policy_signature: "sha256:policy2".to_string(),
         attribution: None,
         rollback_deadline_unix: None,
+        config_authority: None,
     };
 
     let junos_serialized = serde_json::to_string(&junos_record).unwrap();

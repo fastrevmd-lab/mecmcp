@@ -327,6 +327,7 @@ async fn test_discard_persists_before_rollback() {
             "set",
             None,
             "policy123",
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -412,6 +413,7 @@ async fn test_discard_cancellation_after_guard_acquisition() {
             "set",
             None,
             "policy123",
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -483,6 +485,7 @@ async fn test_diff_rejects_committed_state() {
             "set",
             None,
             "policy123",
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -575,6 +578,7 @@ async fn test_stage_device_touched_after_lock_persist() {
             "set",
             None,
             "policy123",
+            None,
             &CancellationToken::new(),
         )
         .await;

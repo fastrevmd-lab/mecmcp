@@ -31,6 +31,7 @@ fn make_operation_record(id: &str, state: LifecycleState) -> OperationRecord {
             .to_string(),
         attribution: None,
         rollback_deadline_unix: None,
+        config_authority: None,
     }
 }
 

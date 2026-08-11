@@ -59,6 +59,7 @@ fn make_operation_record(
             .to_string(),
         attribution: None,
         rollback_deadline_unix: None,
+        config_authority: None,
     }
 }
 

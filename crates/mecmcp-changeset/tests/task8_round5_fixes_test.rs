@@ -145,6 +145,7 @@ async fn test_primary_action_discriminator() {
             "set", // Primary action discriminator
             None,
             "sha256:policy",
+            None,
             &cancellation,
         )
         .await
@@ -209,6 +210,7 @@ async fn test_commit_cancellation_after_guard() {
             "set",
             None,
             "sha256:policy",
+            None,
             &cancellation,
         )
         .await
@@ -315,6 +317,7 @@ async fn test_post_stage_persistence_failure() {
             "set",
             None,
             "sha256:policy",
+            None,
             &cancellation,
         )
         .await;
@@ -370,6 +373,7 @@ async fn test_discard_unsupported_unlock_returns_error() {
             "set",
             None,
             "sha256:policy",
+            None,
             &cancellation,
         )
         .await
@@ -448,6 +452,7 @@ async fn test_device_guard_keys_on_device_name() {
             "set",
             None,
             "sha256:policy",
+            None,
             &cancellation,
         )
         .await
@@ -466,6 +471,7 @@ async fn test_device_guard_keys_on_device_name() {
             "set",
             None,
             "sha256:policy",
+            None,
             &cancellation,
         )
         .await;
@@ -520,6 +526,7 @@ async fn test_principal_variant_persisted() {
             "set",
             None,
             "sha256:policy",
+            None,
             &cancellation,
         )
         .await
@@ -597,6 +604,7 @@ async fn test_principal_variant_persisted() {
             "set",
             None,
             "sha256:policy",
+            None,
             &cancellation,
         )
         .await
@@ -749,6 +757,7 @@ async fn test_stage_failure_includes_operation_id() {
             "set",
             None,
             "sha256:policy",
+            None,
             &cancellation,
         )
         .await;

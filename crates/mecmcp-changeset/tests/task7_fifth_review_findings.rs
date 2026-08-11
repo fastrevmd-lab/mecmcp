@@ -404,6 +404,7 @@ async fn finding_1_lock_risk_persisted_before_drift_check() {
             &transaction,
             "set",
             None,
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -527,6 +528,7 @@ async fn finding_2_operation_record_write_failure_returns_handle() {
             &transaction,
             "set",
             None,
+            None,
             &test_attribution(owner),
             &CancellationToken::new(),
         )
@@ -602,6 +604,7 @@ async fn finding_3_staged_converted_to_indeterminate_on_restart() {
             initial_fp.clone(),
             &transaction,
             "set",
+            None,
             None,
             &test_attribution(owner),
             &CancellationToken::new(),
