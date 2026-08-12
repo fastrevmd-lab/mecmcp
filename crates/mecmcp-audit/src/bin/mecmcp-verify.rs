@@ -226,6 +226,7 @@ fn main() {
     let mut manifest_path: Option<PathBuf> = None;
     let mut pubkeys_dir: Option<PathBuf> = None;
     let mut device_log_path: Option<PathBuf> = None;
+    let mut device_id: Option<String> = None;
     let mut json_output = false;
 
     let mut i = 1;
@@ -271,6 +272,14 @@ fn main() {
                 device_log_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
+            "--device-id" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: --device-id requires a value");
+                    std::process::exit(2);
+                }
+                device_id = Some(args[i + 1].clone());
+                i += 2;
+            }
             "--json" => {
                 json_output = true;
                 i += 1;
@@ -308,6 +317,7 @@ fn main() {
         &manifest_path,
         &pubkeys_dir,
         device_log_path.as_deref(),
+        device_id.as_deref(),
     ) {
         Ok(result) => {
             if json_output {
@@ -339,6 +349,9 @@ fn print_usage(program: &str) {
     eprintln!();
     eprintln!("Optional arguments:");
     eprintln!("  --device-log <file>         Device commit log for join verification");
+    eprintln!("                              (git log or Junos native format)");
+    eprintln!("  --device-id <id>            Device identifier for Junos native logs");
+    eprintln!("                              (ignored for git format)");
     eprintln!("  --json                      Output verification result as JSON");
     eprintln!("  -h, --help                  Show this help message");
 }
@@ -372,6 +385,7 @@ fn verify_run(
     manifest_path: &std::path::Path,
     pubkeys_dir: &std::path::Path,
     device_log_path: Option<&std::path::Path>,
+    device_id: Option<&str>,
 ) -> Result<VerificationResult, Box<dyn std::error::Error>> {
     // Load manifest
     let manifest_json = std::fs::read_to_string(manifest_path)?;
@@ -562,7 +576,7 @@ fn verify_run(
 
     // Verify device↔audit join if device log provided
     let device_commits_checked = if let Some(device_log) = device_log_path {
-        verify_device_join(device_log, &server_chains, &mut violations)?
+        verify_device_join(device_log, device_id, &server_chains, &mut violations)?
     } else {
         0
     };
@@ -708,19 +722,21 @@ fn verify_segment_records(segment: &ClosedSegment) -> Result<(), Violation> {
 
 /// Verify device↔audit join: parse request_ids from device log and match with audit records.
 ///
-/// The device log is expected to contain git commit messages with lines like:
-/// ```
-/// Provenance: request.id=<uuid>, ...
-/// ```
+/// The device log can be in two formats:
+/// - Git log format with `commit <sha>` and `Device: <id>` lines
+/// - Junos native format from `show system commit` (requires device_id parameter)
+///
+/// Both formats extract `request.id=<uuid>` from provenance lines.
 fn verify_device_join(
     device_log_path: &std::path::Path,
+    device_id: Option<&str>,
     server_chains: &HashMap<String, Vec<ClosedSegment>>,
     violations: &mut Vec<Violation>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    use mecmcp_audit::device_log::parse_device_log_file;
+    use mecmcp_audit::device_log::parse_device_log_file_auto;
 
-    // Parse device commits using the library function
-    let device_commits = parse_device_log_file(device_log_path)?;
+    // Parse device commits with automatic format detection
+    let device_commits = parse_device_log_file_auto(device_log_path, device_id)?;
 
     // Collect all request_ids from audit records
     let mut audit_request_ids: HashSet<String> = HashSet::new();
