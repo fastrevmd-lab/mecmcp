@@ -1326,3 +1326,86 @@ fn no_session_header_still_audits_with_an_empty_client_name() {
         "no session header must mean no client name: {captured}"
     );
 }
+
+/// A denied request must be audited as denied (mecmcp#268).
+///
+/// The transport emits one audit event per `tools/call`. When the preflight
+/// refuses the call, that event is the *only* record of it — the handler never
+/// runs, so nothing downstream can correct an optimistic outcome. If it says
+/// `allowed`/`ok`, the audit trail asserts something false about a request that
+/// was answered with 403.
+///
+/// This drives the real `apply_bearer_boundary` stack rather than re-emitting a
+/// copy of the middleware's audit call. `transport_audit.rs` does the latter,
+/// which is why it passed while the ordering was wrong: a simulated emission
+/// cannot observe where the real one sits relative to the preflight.
+#[test]
+fn preflight_denial_is_audited_as_denied_not_allowed() {
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let denied = app(BearerResponseProfile::compact("test"))
+                .oneshot(request(
+                    Some("Bearer secret"),
+                    r#"{"method":"tools/call","params":{"name":"read","arguments":{"device":"tenant-b"}}}"#,
+                ))
+                .await
+                .expect("denied");
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        });
+    });
+
+    assert!(
+        captured.contains("tool=read"),
+        "the denied tools/call must still be audited, got: {captured}"
+    );
+    assert!(
+        captured.contains("authorization=denied"),
+        "a preflight denial must be audited as denied, got: {captured}"
+    );
+    assert!(
+        !captured.contains("authorization=allowed"),
+        "a request answered with 403 must never be audited as allowed, got: {captured}"
+    );
+    assert!(
+        !captured.contains("result=ok"),
+        "a request answered with 403 must never be audited as ok, got: {captured}"
+    );
+}
+
+/// The allowed path keeps its `succeed()` outcome (mecmcp#268 regression guard).
+///
+/// Fixing the denial path by moving the outcome after the preflight must not
+/// leave passing calls `unsettled`, which would trade one wrong record for
+/// another.
+#[test]
+fn preflight_pass_is_still_audited_as_allowed() {
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let allowed = app(BearerResponseProfile::compact("test"))
+                .oneshot(request(
+                    Some("Bearer secret"),
+                    r#"{"method":"tools/call","params":{"name":"read","arguments":{"device":"tenant-a"}}}"#,
+                ))
+                .await
+                .expect("allowed");
+            assert_eq!(allowed.status(), StatusCode::OK);
+        });
+    });
+
+    assert!(
+        captured.contains("authorization=allowed") && captured.contains("result=ok"),
+        "an accepted tools/call must still audit as allowed/ok, got: {captured}"
+    );
+    assert!(
+        !captured.contains("result=unsettled"),
+        "the outcome must be settled before the scope drops, got: {captured}"
+    );
+}

@@ -3,6 +3,21 @@
 //! Every `tools/call` request must produce an audit event. The transport
 //! guarantees this by emitting an event in `bearer_preflight_middleware`
 //! before dispatch. Handlers enrich with action, targets, and outcome.
+//!
+//! # What these tests cannot tell you
+//!
+//! They **simulate** the middleware's emission with a local copy of it, so they
+//! observe the shape of the event and nothing about where the real one sits in
+//! the request path. That gap shipped mecmcp#268: the middleware settled the
+//! outcome with `succeed()` *before* running the preflight, so a denied call
+//! audited as allowed — and every test here still passed, because
+//! `emit_transport_audit` below hardcodes `succeed()` and never consults a
+//! preflight at all.
+//!
+//! Outcome correctness is therefore covered where the real stack runs, in
+//! `bearer_boundary.rs`: `preflight_denial_is_audited_as_denied_not_allowed`
+//! and `preflight_pass_is_still_audited_as_allowed`. Add outcome assertions
+//! there, not here.
 
 use mecmcp_audit::testutil::run_with_capture;
 
