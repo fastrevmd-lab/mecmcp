@@ -640,8 +640,13 @@ pub async fn bearer_preflight_middleware<G: Grant>(
 
     // Emit transport-level audit event for tools/call requests (mecmcp#32).
     // The handler will emit its own enriched event with action, targets, outcome.
-    // Both events share the same request_id for correlation.
-    if let Some(tool) = extract_tool_name(&body_bytes) {
+    //
+    // The scope is built here but deliberately left unsettled until the
+    // preflight has run (mecmcp#268). When the preflight refuses, this event is
+    // the *only* record of the call — the handler never runs, so nothing
+    // downstream can correct an optimistic outcome, and a `succeed()` here
+    // would assert that a request answered with 403 was allowed.
+    let mut scope = extract_tool_name(&body_bytes).map(|tool| {
         let mut scope = AuditScope::from_caller(&caller, tool, "transport", Vec::new());
         scope.meta("layer", "preflight");
 
@@ -653,10 +658,31 @@ pub async fn bearer_preflight_middleware<G: Grant>(
             scope.attach_client_name(client_name);
         }
 
-        scope.succeed();
+        scope
+    });
+
+    let preflight = run_preflight(&state.preflight, &body_bytes, &caller);
+
+    if let Some(scope) = scope.as_mut() {
+        match &preflight {
+            Ok(()) => scope.succeed(),
+            // `deny` takes a `&'static str`, and the preflight's reason is
+            // supplied by the consumer's `ScopePreflight` — it may embed
+            // peer-influenced text, which does not belong in log output
+            // (mecmcp#181). The audit records the fixed wire reason; the
+            // specific one still reaches the caller in the 403 body.
+            Err(_) => scope.deny("insufficient_scope"),
+        }
     }
 
-    if let Err(reason) = run_preflight(&state.preflight, &body_bytes, &caller) {
+    // Emit before dispatch rather than at end of function. The transport event
+    // describes what the transport knew before the handler ran, and its
+    // `duration_ms` is preflight time; holding the scope across `next.run`
+    // would inflate that to the whole request and emit it after the handler's
+    // own event.
+    drop(scope);
+
+    if let Err(reason) = preflight {
         return forbidden(&state.realm, &reason);
     }
 
