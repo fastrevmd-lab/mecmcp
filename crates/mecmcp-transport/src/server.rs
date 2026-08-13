@@ -185,14 +185,15 @@ impl<G: Grant> HttpTransportConfig<G> {
     /// Construct transport settings for a listener that serves without
     /// authentication.
     ///
-    /// Requires a [`NoAuthAcknowledgement`], which exists so that "the operator
-    /// chose this" and "the consumer forgot" are different values. Before
-    /// mecmcp#273 they were the same one, and a consumer could serve the LAN
-    /// unauthenticated without any code path recording a decision.
+    /// Requires a [`NoAuthAcknowledgement`](crate::NoAuthAcknowledgement),
+    /// which exists so that "the operator chose this" and "the consumer forgot"
+    /// are different values. Before mecmcp#273 they were the same one, and a
+    /// consumer could serve the LAN unauthenticated without any code path
+    /// recording a decision.
     ///
     /// The acknowledgement does **not** permit an off-loopback bind:
     /// `serve_router` refuses that with
-    /// [`ListenerRefusal::UnauthenticatedOffLoopback`].
+    /// [`ListenerRefusal::UnauthenticatedOffLoopback`](crate::ListenerRefusal::UnauthenticatedOffLoopback).
     ///
     /// # Example
     ///
