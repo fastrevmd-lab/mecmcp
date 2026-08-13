@@ -1,4 +1,14 @@
 //! Validates the parsed CLI args against the design's refusal matrix.
+//!
+//! # This is a courtesy pre-check, not the control
+//!
+//! Since mecmcp#273 the listener admission checks live in
+//! `mecmcp_transport::serve_router`, which every consumer must call to obtain a
+//! socket. Calling `validate` first is still worth doing — it fails a bad CLI
+//! before anything is constructed, and its messages name the flags rather than
+//! the transport concepts — but skipping it now costs a startup refusal instead
+//! of an open port. Do not reintroduce the assumption that calling this is what
+//! makes a deployment safe.
 
 use crate::cli::{Cli, Transport};
 use std::net::IpAddr;
@@ -62,15 +72,10 @@ pub enum CliRefusal {
 /// This function validates the common CLI arguments that apply to all vendors.
 /// Vendor-specific validation should be performed separately.
 ///
-/// An off-loopback listener must supply `--allowed-host`. It is **not** required
-/// to supply `--allowed-origin` here: a consumer whose transport enforces
-/// browser-Origin policy calls [`validate_with_origin_policy`] instead.
-///
-/// That split is deliberate. Requiring `--allowed-origin` unconditionally broke
-/// a deployed server whose transport applies only `allowed_host` — and would
-/// have been satisfied by any dummy value, enabling nothing. `docs/PACKAGING.md`
-/// already states the rule this violated: a flag that is present but ignored is
-/// worse than one that is absent, because the operator cannot tell.
+/// An off-loopback listener must supply both `--allowed-host` and
+/// `--allowed-origin`. Since 0.7.0 the shared transport applies Origin policy
+/// for every consumer, so the weaker check that accepted a listener with no
+/// Origin allowlist is itself an instance of the defect class in mecmcp#273.
 pub fn validate(cli: &Cli) -> Result<(), CliRefusal> {
     // Stdio needs no transport validation.
     if cli.transport == Transport::Stdio {
@@ -124,40 +129,12 @@ pub fn validate(cli: &Cli) -> Result<(), CliRefusal> {
         });
     }
 
-    Ok(())
-}
-
-/// Validate, and additionally require an Origin allowlist off-loopback.
-///
-/// For a consumer whose Streamable HTTP transport actually applies
-/// browser-Origin policy. An empty Origin list disables that check entirely, so
-/// where it *is* applied, requiring one is the same fail-closed argument that
-/// governs `--allowed-host`.
-///
-/// A consumer whose transport ignores Origin must not call this: it would refuse
-/// startup over a value that changes nothing, which is worse than not asking.
-///
-/// # Errors
-/// Returns [`CliRefusal`] for everything [`validate`] refuses, plus
-/// [`CliRefusal::AllowedOriginRequired`] when an off-loopback listener supplies
-/// no usable Origin.
-pub fn validate_with_origin_policy(cli: &Cli) -> Result<(), CliRefusal> {
-    validate(cli)?;
-
-    let host_is_loopback = cli
-        .host
-        .parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false);
-
-    if cli.transport != Transport::Stdio
-        && !host_is_loopback
-        && !has_usable_entry(&cli.allowed_origin)
-    {
+    if !host_is_loopback && !has_usable_entry(&cli.allowed_origin) {
         return Err(CliRefusal::AllowedOriginRequired {
             host: cli.host.clone(),
         });
     }
+
     Ok(())
 }
 
@@ -302,14 +279,15 @@ mod tests {
         }
     }
 
-    /// The Origin requirement lives on the opt-in path now.
+    /// The Origin requirement is now unconditional.
     ///
-    /// `validate` must NOT refuse a missing Origin: LXC 609 runs off-loopback
-    /// with `--allowed-host` and no `--allowed-origin`, and its transport does
-    /// not apply Origin policy at all. Requiring it there would have refused a
-    /// working deployment at startup over a value that changes nothing.
+    /// Before mecmcp#273 `validate` did NOT refuse a missing Origin: LXC 609 ran
+    /// off-loopback with `--allowed-host` and no `--allowed-origin`, and its
+    /// transport did not apply Origin policy. Since 0.7.0 the shared transport
+    /// applies Origin policy for every consumer, so the weaker check is itself
+    /// an instance of the defect class in mecmcp#273.
     #[test]
-    fn plain_validate_does_not_require_an_origin() {
+    fn plain_validate_now_requires_an_origin() {
         let r = validate(&parse(&[
             "-t",
             "streamable-http",
@@ -321,7 +299,10 @@ mod tests {
             "--allowed-host",
             "192.168.1.194",
         ]));
-        assert!(r.is_ok(), "609's shape must keep validating: {r:?}");
+        assert!(
+            matches!(r, Err(CliRefusal::AllowedOriginRequired { .. })),
+            "got {r:?}"
+        );
     }
 
     /// The Host requirement is unconditional — every transport applies it.
@@ -344,7 +325,7 @@ mod tests {
 
     #[test]
     fn origin_policy_path_still_requires_a_host() {
-        let r = validate_with_origin_policy(&parse(&[
+        let r = validate(&parse(&[
             "-t",
             "streamable-http",
             "--tokens-file",
@@ -363,7 +344,7 @@ mod tests {
 
     #[test]
     fn origin_policy_path_is_satisfied_when_both_are_supplied() {
-        let r = validate_with_origin_policy(&parse(&[
+        let r = validate(&parse(&[
             "-t",
             "streamable-http",
             "--tokens-file",
@@ -381,9 +362,9 @@ mod tests {
 
     #[test]
     fn origin_policy_path_exempts_loopback_and_stdio() {
-        assert!(validate_with_origin_policy(&parse(&["-t", "stdio"])).is_ok());
+        assert!(validate(&parse(&["-t", "stdio"])).is_ok());
         for host in ["127.0.0.1", "::1"] {
-            let r = validate_with_origin_policy(&parse(&[
+            let r = validate(&parse(&[
                 "-t",
                 "streamable-http",
                 "--tokens-file",
@@ -412,7 +393,7 @@ mod tests {
             args.extend(extra.iter());
             args.extend(["--allowed-host", "server.example.org:8443"]);
 
-            let r = validate_with_origin_policy(&parse(&args));
+            let r = validate(&parse(&args));
             assert!(
                 matches!(r, Err(CliRefusal::AllowedOriginRequired { .. })),
                 "expected an Origin refusal for {extra:?}, got {r:?}"
@@ -510,5 +491,28 @@ mod tests {
             "::1",
         ]));
         assert!(r.is_ok());
+    }
+
+    #[test]
+    fn validate_requires_an_origin_allowlist_off_loopback() {
+        let cli = Cli::try_parse_from([
+            "test",
+            "--transport",
+            "streamable-http",
+            "--host",
+            "192.168.1.5",
+            "--tokens-file",
+            "/tmp/tokens.json",
+            "--allow-insecure-bind",
+            "--allowed-host",
+            "192.168.1.5",
+        ])
+        .expect("parse");
+
+        assert!(
+            matches!(validate(&cli), Err(CliRefusal::AllowedOriginRequired { .. })),
+            "since 0.7.0 the shared transport applies Origin policy for every \
+             consumer, so the weaker check is itself the defect class in mecmcp#273"
+        );
     }
 }
