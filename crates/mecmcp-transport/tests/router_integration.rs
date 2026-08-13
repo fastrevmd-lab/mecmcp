@@ -6,8 +6,9 @@
 
 use mecmcp_auth::NoGrant;
 use mecmcp_transport::{
-    HostOriginPolicy, HttpTransportConfig, LimitsConfig, TransportIdentity,
-    build_streamable_http_router, test_client::McpClient,
+    HostOriginPolicy, HttpTransportConfig, LimitsConfig, NoAuthAcknowledgement,
+    TransportIdentity, build_streamable_http_router, serve_router,
+    test_client::McpClient,
 };
 use rmcp::ServerHandler;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -35,33 +36,33 @@ impl ServerHandler for TestServer {
 /// wired the session tracker. This test would have caught it.
 #[tokio::test]
 async fn router_assembly_mounts_session_management() {
-    let config = HttpTransportConfig::<NoGrant>::new(
+    let shutdown = CancellationToken::new();
+    let config = HttpTransportConfig::<NoGrant>::unauthenticated(
         TransportIdentity::new("testmcp", "test", "test", ["device"]),
         LimitsConfig::default(),
         HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
-        CancellationToken::new(),
+        shutdown.clone(),
+        NoAuthAcknowledgement::operator_allowed_no_auth(),
     );
 
-    let (router, _shutdown) =
+    let plan =
         build_streamable_http_router(|| Ok::<_, std::io::Error>(TestServer), config)
             .expect("router build failed");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind failed");
-    let addr = listener.local_addr().expect("no local addr");
-    let port = addr.port();
+    let port = listener.local_addr().expect("no local addr").port();
+    drop(listener);
 
-    tokio::spawn(async move {
-        let app = router.into_make_service();
-        axum_server::from_tcp(listener.into_std().expect("into_std failed"))
-            .expect("from_tcp failed")
-            .serve(app)
-            .await
-            .expect("serve failed");
-    });
+    let serving = tokio::spawn(serve_router(
+        plan,
+        format!("127.0.0.1:{port}").parse().expect("address"),
+        None,
+        std::time::Duration::from_millis(50),
+    ));
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Run blocking HTTP client in spawn_blocking
     let session_id = tokio::task::spawn_blocking(move || {
@@ -75,6 +76,9 @@ async fn router_assembly_mounts_session_management() {
     .expect("blocking task failed");
 
     assert!(!session_id.is_empty(), "session ID should not be empty");
+
+    shutdown.cancel();
+    serving.await.expect("serving task failed").expect("serve_router failed");
 }
 
 /// Unauthenticated routers serve requests without bearer middleware.
@@ -83,33 +87,33 @@ async fn router_assembly_mounts_session_management() {
 /// when no bearer boundary is configured.
 #[tokio::test]
 async fn unauthenticated_router_serves_requests() {
-    let config = HttpTransportConfig::<NoGrant>::new(
+    let shutdown = CancellationToken::new();
+    let config = HttpTransportConfig::<NoGrant>::unauthenticated(
         TransportIdentity::new("testmcp", "test", "test", ["device"]),
         LimitsConfig::default(),
         HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
-        CancellationToken::new(),
+        shutdown.clone(),
+        NoAuthAcknowledgement::operator_allowed_no_auth(),
     );
 
-    let (router, _shutdown) =
+    let plan =
         build_streamable_http_router(|| Ok::<_, std::io::Error>(TestServer), config)
             .expect("router build failed");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind failed");
-    let addr = listener.local_addr().expect("no local addr");
-    let port = addr.port();
+    let port = listener.local_addr().expect("no local addr").port();
+    drop(listener);
 
-    tokio::spawn(async move {
-        let app = router.into_make_service();
-        axum_server::from_tcp(listener.into_std().expect("into_std failed"))
-            .expect("from_tcp failed")
-            .serve(app)
-            .await
-            .expect("serve failed");
-    });
+    let serving = tokio::spawn(serve_router(
+        plan,
+        format!("127.0.0.1:{port}").parse().expect("address"),
+        None,
+        std::time::Duration::from_millis(50),
+    ));
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     let session_id = tokio::task::spawn_blocking(move || {
         let client =
@@ -125,4 +129,7 @@ async fn unauthenticated_router_serves_requests() {
         !session_id.is_empty(),
         "unauthenticated session ID should not be empty"
     );
+
+    shutdown.cancel();
+    serving.await.expect("serving task failed").expect("serve_router failed");
 }
