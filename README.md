@@ -189,6 +189,42 @@ an exact version.
 
 ### Upgrading to 0.6.0
 
+> **Superseded in part by 0.7.0's transport assembly.** This section documents
+> the consumer applying the bearer boundary and the per-IP rate limit by hand,
+> which was correct at 0.6.0. Since 0.7.0, `build_streamable_http_router` does
+> all three itself — it applies the boundary, applies the IP rate limit, and
+> builds the `BoundaryAccounting`. **On 0.7.0 or later, do not apply them
+> yourself: you get both layers twice, which silently halves the per-IP budget
+> and stacks the boundary.**
+>
+> The pattern below is the 0.6.0 pattern, kept for readers upgrading through
+> this release. **It is not a complete recipe for hand-assembling a router on
+> 0.7.0+**, and it is not an alternative to `build_streamable_http_router`.
+> Beyond the double-apply, it omits two things the builder installs:
+>
+> - **Host and Origin validation outside `/mcp`.** `build_rmcp_server_config`
+>   gives rmcp the Host allowlist, but that only guards the service nested at
+>   `/mcp`. The builder additionally layers this crate's own Host/Origin
+>   middleware over the *entire* router, which is what stops an attacker-
+>   controlled page reading the unauthenticated `/metrics` endpoint with a
+>   foreign Host header. That middleware is private and installed only by
+>   `build_streamable_http_router`. A hand assembly therefore keeps the Host
+>   guard on `/mcp` and loses it everywhere else — and loses Origin checking
+>   entirely, since `build_rmcp_server_config` deliberately empties rmcp's
+>   `allowed_origins` on the assumption that this crate will check it. (An
+>   empty `allowed_origins` disables the Origin check by design, builder or
+>   not; the loss bites a consumer who configured one.)
+> - **The session tracker.** From 0.8.3 the builder wires it via
+>   `authenticated_accounting`, which calls `with_session_tracker`.
+>   `BoundaryAccounting::new` alone leaves `session_tracker` as `None`, and
+>   passing a tracker to `ConcurrencyState` does not populate the field the
+>   audit preflight reads — so a hand assembly on 0.8.3+ emits an empty
+>   `client_name`. This is the 0.8.3 defect: 0.8.2 shipped
+>   `with_session_tracker` without the builder calling it. Releases before
+>   0.8.2 had neither the field nor client-name propagation at all.
+>
+> Use `build_streamable_http_router` on 0.7.0+.
+
 **Extraction milestone 2: the bearer boundary.** All 22 issues (#96, #97,
 #103–#108, #118, #129–#141) land in this tag, because partial availability
 would mean a consumer maintaining both paths. `rustsdcmcp` can now delete
@@ -226,10 +262,15 @@ would mean a consumer maintaining both paths. `rustsdcmcp` can now delete
    take `&'static str`.
 
 The boundary builds everything from `authenticate` inwards, so a consumer cannot
-get that part wrong. **Per-IP rate limiting is the one layer the consumer still
-applies itself**, because it must run *before* authentication — a request with a
-missing, malformed or unknown token has no identity to charge, and metering it is
-what stops an authentication flood:
+get that part wrong. **At 0.6.x, per-IP rate limiting was the one layer the
+consumer still applied itself**, because it must run *before* authentication — a
+request with a missing, malformed or unknown token has no identity to charge, and
+metering it is what stops an authentication flood.
+
+**Pre-0.7.0 only.** At 0.7.0 and later `build_streamable_http_router` applies
+both layers; running this by hand as well double-applies them. This snippet is
+not the 0.7.0+ hand-assembly recipe either — see the note at the head of this
+section for what it leaves out.
 
 ```rust
 let limits = Arc::new(limits_config);
@@ -245,13 +286,14 @@ let app = apply_ip_rate_limit(app, &limits); // outermost: runs first
 Use `BoundaryAccounting::none()` for a deployment with no per-token accounting.
 
 Axum runs the last-applied layer first, so `apply_ip_rate_limit` must be applied
-*after* `apply_bearer_boundary` to sit outside it. Omitting it leaves
-unauthenticated requests unmetered.
+*after* `apply_bearer_boundary` to sit outside it. On a hand-assembled router,
+omitting it leaves unauthenticated requests unmetered.
 
-The resulting order:
+The resulting order — unchanged at 0.7.0+, where the router builder produces it
+rather than the consumer:
 
 ```
-IP rate limit (consumer) → authenticate → token rate limit → token concurrency
+IP rate limit → authenticate → token rate limit → token concurrency
   → body limit → preflight → target concurrency → handler
 ```
 
@@ -300,6 +342,16 @@ defaults to 10 MiB here, so on a plain `default()` every request between 4 and
 10 MiB starts failing with a 413 from a limit the operator never set and cannot
 see in their own config. `streamable_http_server_config` derives it from
 `LimitsConfig` and maps `0` (unlimited) to `usize::MAX`.
+
+> **Superseded by 0.7.0.** The `&limits`-only `streamable_http_server_config` is
+> `#[deprecated]` since 0.7.0, replaced by
+> `build_rmcp_server_config(&policy, &limits, shutdown)`, which took the Host
+> allowlist and the shutdown token alongside the body cap. On 0.7.0 or later
+> `build_streamable_http_router` calls it for you, so a consumer using the
+> builder needs no call at all. Note that it populates rmcp's `allowed_hosts`
+> but deliberately leaves `allowed_origins` empty — Origin is checked by this
+> crate's own middleware, which only the builder installs, and only when an
+> Origin allowlist is configured.
 
 **Session capacity is now protocol-aware.** rmcp computes
 `use_session = legacy_session_mode && is_legacy_request(..)`, so a client
