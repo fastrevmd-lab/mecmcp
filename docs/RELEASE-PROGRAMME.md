@@ -178,7 +178,12 @@ Deferred, not blockers: **#275** (blocks `rustproxmoxmcp` 0.3 only), **#222**,
 **#91**, **#48**, and the four MCP-spec issues (#164/#167/#168/#169), which are
 their own programme.
 
-### Phase 2 — Converge every consumer onto 0.9.0
+### Phase 2 — Converge every consumer onto 0.9.1 — **COMPLETE 2026-08-13**
+
+All six merged, all six pinned to `v0.9.1`. The drift is closed.
+
+(Originally written as 0.9.0; 0.9.1 shipped mid-phase and the family moved to it
+so the result would be one pin rather than two.)
 
 The phase that pays: five pins collapse to one, and the two servers on v0.8.0
 pick up eight releases of fixes. Deployed servers first:
