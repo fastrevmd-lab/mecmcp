@@ -151,19 +151,27 @@ unrepresentable; **no local patch is needed**.
 
 ## Phases
 
-### Phase 0 — Unblock
+### Phase 0 — Unblock — **COMPLETE 2026-08-13**
 
 Nothing releases until these clear. Independent of each other.
 
 | # | Action | Repo |
 |---|---|---|
-| 0.1 | Land or drop PR #300 and get off `fix/provenance-request-id`. Without it, `parse_device_log` has no `request.id` to join on. | `rustjunosmcp` |
-| 0.2 | Add `--allowed-origin` to LXC 950's drop-in override. 0.9.0 refuses an off-loopback listener with no Origin allowlist, so the service will not start. Tagged `protected` — snapshot first. | fleet |
-| 0.3 | Tag v0.1.0 / v0.1.1, or correct the CHANGELOG. It links to release URLs for tags that do not exist. | `rustproxmoxmcp` |
+| 0.1 | **Done.** Merged PR #300 and get off `fix/provenance-request-id`. Without it, `parse_device_log` has no `request.id` to join on. | `rustjunosmcp` |
+| 0.2 | **Done.** Added `--allowed-origin http://192.168.1.127` and `http://192.168.1.108` (this host and `strix`) to LXC 950's drop-in override; snapshot `pre-allowed-origin` taken first; verified by a live MCP call returning all 36 devices. 0.9.0 refuses an off-loopback listener with no Origin allowlist, so the service will not start. Tagged `protected` — snapshot first. | fleet |
+| 0.3 | **Done.** Tagged `v0.1.0` at 26fbad0 and `v0.1.1` at d5b3e7b retroactively and pushed. It links to release URLs for tags that do not exist. | `rustproxmoxmcp` |
 
-### Phase 1 — `mecmcp` 0.9.0
+### Phase 1 — `mecmcp` 0.9.0 — **COMPLETE 2026-08-13**
 
-Fold **#266** in first — `token revoke` reports success while the running
+**Released: `v0.9.0` tagged and pushed** (PR #279). #266 shipped with it.
+
+Ruling on #266's shape: a loud stderr warning on `revoke` and `rotate`, not
+auto-discover-and-SIGHUP. This estate runs the same binary as a
+production/rehearsal pair (950 and 600, 960 and 601), and a revoke that
+signalled the wrong process would be worse than one that signalled none. Exit
+stays 0 because the revoke did succeed.
+
+Original plan follows. Fold **#266** in first — `token revoke` reports success while the running
 server keeps accepting the credential. Consumers re-pin once for both.
 
 Deferred, not blockers: **#275** (blocks `rustproxmoxmcp` 0.3 only), **#222**,
