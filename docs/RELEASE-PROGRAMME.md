@@ -186,6 +186,46 @@ pick up eight releases of fixes. Deployed servers first:
 `rustjunosmcp` → `rustpanosmcp` → `rustsdcmcp` → `rustmistmcp` →
 `rustproxmoxmcp` → `rustsdonpremmcp`
 
+### Phase 2 findings — recorded because they cost real time
+
+**`ServePlan`'s opacity needed an upstream affordance, and did not have one.**
+0.9.0 sealed the `Router` so a consumer cannot serve it directly and skip the
+admission checks. Correct — but four consumer repositories migrating on the same
+day each worked around it in a worse way: two **deleted** their HTTP boundary
+tests, one disabled four test files **and relaxed `unsafe_code` from `forbid` to
+`warn`**, and one wrote an `unsafe` helper that assumed the struct's field layout
+and **segfaulted**. Four independent attempts reaching for something bad means
+the affordance was missing upstream, not that four engineers erred. Fixed in
+**0.9.1** as `test_harness::serve_on_loopback`, which serves the plan on a
+loopback port and never exposes the `Router`.
+
+Design rule this leaves behind: when sealing an API for safety, ship the
+supported replacement path in the same release. A seal without an affordance
+exports the cost to every consumer, and they will pay it in the cheapest way
+available.
+
+**The family converges on ONE pin, deliberately.** All six repositories moved to
+`v0.9.1`, including the four that had already landed on `v0.9.0`. Stopping at two
+pins would have restarted precisely the drift this phase existed to end.
+
+**Gates that exist but do not run keep turning up.** Four more this phase, on top
+of the `cli_validate` case that opened the programme:
+
+- `rustsdcmcp`'s `scripts/verify-packaging.sh` invoked `rg`, absent on the CI
+  runner. Both `if rg …; then fail` branches never fired, so the checks that
+  production Rust must not spawn processes and that the installer must not start
+  the service had **never run**. Switched to `grep`.
+- `cargo fmt --check` and `cargo doc` are CI gates that `cargo test` and
+  `cargo clippy` do not cover — each was missed for a full branch.
+- `cargo clippy` without `--all-targets` misses test-target warnings entirely.
+- CI runs `cargo test --locked`; a plain `cargo test` does not exercise the same
+  lockfile path, so a stale dependency-contract constant passed locally and
+  failed on CI.
+
+The verification list for any change in this family is therefore: `build
+--all-targets`, `test --locked`, `clippy --all-targets`, `fmt --check`, `doc`,
+plus whatever repo-local policy script exists.
+
 ### Phase 3 — Release what is deployed
 
 - **`rustpanosmcp`** — 9 unreleased commits including a breaking fail-closed
