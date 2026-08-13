@@ -1,0 +1,28 @@
+error[E0599]: no associated function or constant named `new` found for struct `HttpTransportConfig<G>` in the current scope
+  --> tests/ui/unauthenticated_without_acknowledgement.rs:10:51
+   |
+10 |     let _config = HttpTransportConfig::<NoGrant>::new(
+   |                                                   ^^^ associated function or constant not found in `HttpTransportConfig<NoGrant>`
+   |
+note: if you're trying to build a new `HttpTransportConfig<NoGrant>` consider using one of the following associated functions:
+      HttpTransportConfig::<G>::authenticated
+      HttpTransportConfig::<G>::unauthenticated
+  --> src/server.rs
+   |
+   | /     pub fn authenticated(
+   | |         identity: TransportIdentity,
+   | |         limits: LimitsConfig,
+   | |         host_origin: HostOriginPolicy,
+   | |         shutdown: CancellationToken,
+   | |         bearer: BearerBoundary<G>,
+   | |     ) -> Self {
+   | |_____________^
+...
+   | /     pub fn unauthenticated(
+   | |         identity: TransportIdentity,
+   | |         limits: LimitsConfig,
+   | |         host_origin: HostOriginPolicy,
+   | |         shutdown: CancellationToken,
+   | |         _acknowledgement: crate::consent::NoAuthAcknowledgement,
+   | |     ) -> Self {
+   | |_____________^
