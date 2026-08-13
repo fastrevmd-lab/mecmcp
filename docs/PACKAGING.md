@@ -124,6 +124,29 @@ approval lifetime (mecmcp#162). The rule is:
 2. **Otherwise product configuration wins**, if the server has such a file.
 3. **Otherwise the built-in default.**
 
+##### `--lab-mode` is exempt: CLI only, never product configuration
+
+**Decided mecmcp#267, closing #162's decision 6.** The rule above governs
+`--approval-timeout-secs` and its kind. It does **not** extend to `--lab-mode`,
+which may only be enabled on the command line. A server must never read it from
+a configuration file.
+
+`--lab-mode` is not a tunable — it disables two-person control. The reasoning is
+already in this document, one section down: a relaxed security control should be
+visible where someone will see it, not inferred from flags typed weeks ago. A
+flag typed weeks ago is at least still in the unit file. **A boolean in a
+product config file is strictly less visible than that**, not more — it persists
+across restarts and package upgrades, and it survives long after anyone
+remembers editing it.
+
+The containerised case does not argue the other way. Where the config file is
+the managed artefact and the unit is generated, the flag belongs in whatever
+generates the invocation — the compose file, the Kubernetes manifest, the
+systemd drop-in. Those are as durable as a config file and reviewed the same
+way; what matters is that enabling it stays an explicit act on the command that
+starts the process, where `--help`, `ps`, and the startup warning all agree
+about it.
+
 The trap is step 1. A defaulted flag is indistinguishable from a supplied one by
 value alone — clap hands you `900` either way, and
 `--approval-timeout-secs 900` is a legitimate thing to type. Comparing against
