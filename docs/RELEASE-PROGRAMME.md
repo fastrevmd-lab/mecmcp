@@ -78,13 +78,23 @@ fronting a fleet of Security Director deployments — not code reuse.
   mutation returns a job handle against one target and completes synchronously
   against another, the calling agent must be able to tell which it got. The
   abstraction models the difference; it does not hide it.
-- **The inventory must express credential lifecycle.** Open question, to verify
-  before the design settles: whether SD On-Prem can issue a credential
-  programmatically, or only as a browser-copied short-lived JWT. If the latter,
-  the inventory needs to express "this target's credential expires and a human
-  must refresh it" — a property no other server in this family has. If On-Prem
-  has a proper API token, this constraint disappears. **Do not design around
-  this until it is checked against the On-Prem API documentation.**
+- **Credential lifecycle — resolved 2026-08-13.** SD On-Prem *can* mint a
+  credential programmatically: a `curl` exchange of username and password
+  returns a key. The earlier concern — that the inventory would have to express
+  "this target's credential expires and a human must refresh it" — **does not
+  apply**. Both backends can self-refresh, so no other server in this family
+  gains a new operational property.
+
+  This trades one problem for a smaller but real one: **On-Prem targets require
+  the server to hold a username and password, where Cloud targets hold an API
+  key.** A password is a higher-value secret than a scoped token — it is
+  reusable outside this server and typically grants more than the API surface.
+  The inventory design must therefore treat On-Prem credentials as a distinct
+  sensitivity class: never logged, never echoed into audit attribution, stored
+  the way `mecmcp-secret` handles material rather than as ordinary config, and
+  ideally exchanged for a key once at startup so the password is not held in
+  memory for the process lifetime. Verify against the On-Prem key's TTL and
+  whether re-minting requires the password each time or supports refresh.
 
 ### What would overturn this decision
 
