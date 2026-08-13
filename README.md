@@ -195,9 +195,24 @@ an exact version.
 > all three itself — it applies the boundary, applies the IP rate limit, and
 > builds the `BoundaryAccounting`. **On 0.7.0 or later, do not apply them
 > yourself: you get both layers twice, which silently halves the per-IP budget
-> and stacks the boundary.** The manual pattern below applies only to a
-> pre-0.7.0 consumer, or to one assembling a router without
-> `build_streamable_http_router`.
+> and stacks the boundary.**
+>
+> The pattern below is the 0.6.0 pattern, kept for readers upgrading through
+> this release. **It is not a complete recipe for hand-assembling a router on
+> 0.7.0+**, and it is not an alternative to `build_streamable_http_router`.
+> Beyond the double-apply, it omits two things the builder installs:
+>
+> - **Origin validation.** `build_rmcp_server_config` deliberately discards
+>   `allowed_origins` and empties rmcp's own list, because the exact-match check
+>   is performed here instead — in middleware private to this crate, applied
+>   only by `build_streamable_http_router`. A hand-assembled router therefore
+>   has *no* Origin enforcement, which is the DNS-rebinding guard.
+> - **The session tracker.** `BoundaryAccounting::new` leaves `session_tracker`
+>   as `None`, and passing a tracker to `ConcurrencyState` does not populate the
+>   field the audit preflight reads. Without `with_session_tracker`, every audit
+>   event carries an empty `client_name` — the 0.8.3 defect, reintroduced.
+>
+> Use `build_streamable_http_router` on 0.7.0+.
 
 **Extraction milestone 2: the bearer boundary.** All 22 issues (#96, #97,
 #103–#108, #118, #129–#141) land in this tag, because partial availability
@@ -242,7 +257,9 @@ request with a missing, malformed or unknown token has no identity to charge, an
 metering it is what stops an authentication flood.
 
 **Pre-0.7.0 only.** At 0.7.0 and later `build_streamable_http_router` applies
-both layers; running this by hand as well double-applies them.
+both layers; running this by hand as well double-applies them. This snippet is
+not the 0.7.0+ hand-assembly recipe either — see the note at the head of this
+section for what it leaves out.
 
 ```rust
 let limits = Arc::new(limits_config);
@@ -316,11 +333,13 @@ see in their own config. `streamable_http_server_config` derives it from
 `LimitsConfig` and maps `0` (unlimited) to `usize::MAX`.
 
 > **Superseded by 0.7.0.** The `&limits`-only `streamable_http_server_config` is
-> `#[deprecated]` since 0.7.0. On 0.7.0 or later, `build_streamable_http_router`
-> builds the rmcp server config itself, so a consumer using it needs no call at
-> all; a consumer assembling a router by hand calls
-> `build_rmcp_server_config(&policy, &limits, shutdown)`, which took over the
-> host/origin concern along with the body cap.
+> `#[deprecated]` since 0.7.0, replaced by
+> `build_rmcp_server_config(&policy, &limits, shutdown)`, which took the Host
+> allowlist and the shutdown token alongside the body cap. On 0.7.0 or later
+> `build_streamable_http_router` calls it for you, so a consumer using the
+> builder needs no call at all. Note that it populates rmcp's `allowed_hosts`
+> but deliberately leaves `allowed_origins` empty — Origin is checked by this
+> crate's own middleware, which only the builder installs.
 
 **Session capacity is now protocol-aware.** rmcp computes
 `use_session = legacy_session_mode && is_legacy_request(..)`, so a client
