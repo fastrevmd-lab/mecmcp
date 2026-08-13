@@ -10,7 +10,9 @@ mod caller;
 mod client_info;
 mod concurrency;
 mod config;
+mod consent;
 mod identity;
+mod listener;
 mod metrics;
 mod overload;
 pub mod preflight;
@@ -42,7 +44,9 @@ pub use concurrency::{
 };
 #[allow(deprecated)]
 pub use config::{LimitsConfig, LimitsConfigError, streamable_http_server_config};
+pub use consent::{InsecureBindAcknowledgement, NoAuthAcknowledgement};
 pub use identity::TransportIdentity;
+pub use listener::ListenerRefusal;
 pub use metrics::PrometheusRuntime;
 pub use overload::overload_response;
 pub use preflight::{
@@ -53,7 +57,7 @@ pub use preflight::{
 pub use rate_limit::{apply_ip_rate_limit, apply_rate_limit, apply_token_rate_limit};
 pub use server::{
     HostOriginPolicy, HttpServeError, HttpShutdown, HttpTransportBuildError, HttpTransportConfig,
-    build_streamable_http_router, loopback_origins, serve_router,
+    ServePlan, build_streamable_http_router, loopback_origins, serve_router,
     streamable_http_server_config as build_rmcp_server_config,
 };
 pub use session::{LimitedSessionManager, LimitedSessionManagerError, SessionTracker};
