@@ -5,6 +5,7 @@ use crate::grant::{Grant, NoGrant};
 use crate::scope::ScopeSet;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
+use uuid::Uuid;
 
 /// Maximum entries, keeping the linear authenticate scan bounded.
 pub const MAX_TOKENS: usize = 1024;
@@ -133,6 +134,20 @@ pub struct CallerCtx<G: Grant = NoGrant> {
     /// `None` for the very first request (initialize itself, before the session
     /// has a captured name) or when the client did not provide `clientInfo`.
     pub client_name: Option<&'static str>,
+    /// Correlation ID shared by every audit event for this one request.
+    ///
+    /// One authenticated `tools/call` emits two audit events — the transport
+    /// preflight event and the handler's enriched event (mecmcp#32). Both read
+    /// this field via `Attribution::from_caller`, so a SIEM consumer can join
+    /// the preflight attribution (who called, from which client) to the handler
+    /// outcome (what it did, to which targets).
+    ///
+    /// **This is per-request state, not per-caller state.** It is minted in
+    /// `From<&TokenEntry>`, which the bearer middleware runs once per request.
+    /// A consumer that builds one `CallerCtx` and reuses it across requests
+    /// would make the ID identify nothing — build a fresh context per request,
+    /// as the middleware does (mecmcp#269).
+    pub request_id: Uuid,
 }
 
 impl<G: Grant> From<&TokenEntry<G>> for CallerCtx<G> {
@@ -147,6 +162,10 @@ impl<G: Grant> From<&TokenEntry<G>> for CallerCtx<G> {
             on_behalf_of: entry.on_behalf_of.clone(),
             actor_type: entry.effective_actor_type(),
             client_name: None,
+            // Minted here rather than at the audit layer: authentication runs
+            // once per request, so this is the point at which "one request"
+            // is a fact rather than an assumption (mecmcp#269).
+            request_id: Uuid::new_v4(),
         }
     }
 }
@@ -266,6 +285,7 @@ mod tests {
             on_behalf_of: None,
             actor_type: crate::ActorType::Human,
             client_name: None,
+            request_id: uuid::Uuid::new_v4(),
         };
         let visible =
             filter_device_names(Some(&ctx), vec!["edge-fw".to_owned(), "core-fw".to_owned()]);
@@ -293,6 +313,7 @@ mod tests {
             on_behalf_of: None,
             actor_type: crate::ActorType::Human,
             client_name: None,
+            request_id: uuid::Uuid::new_v4(),
         };
         let visible = filter_device_names(Some(&ctx), vec!["edge-fw".to_owned()]);
         assert!(visible.is_empty());
@@ -312,6 +333,7 @@ mod tests {
             on_behalf_of: None,
             actor_type: crate::ActorType::Human,
             client_name: None,
+            request_id: uuid::Uuid::new_v4(),
         };
         let names = vec!["edge-fw".to_owned(), "core-fw".to_owned()];
         let visible = filter_device_names(Some(&ctx), names.clone());

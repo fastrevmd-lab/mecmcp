@@ -81,7 +81,10 @@ The bearer boundary now emits a transport audit event for every `tools/call`
 before dispatch, so a tool is audited because it went through the transport, not
 because someone remembered. Handlers still emit their own enriched event —
 action, resolved device targets, outcome — correlated by request id; the
-transport cannot know any of those.
+transport cannot know any of those. (**The correlation described here did not
+work until #269.** `Attribution::from_caller` minted a fresh request id on every
+call, so through 0.8.8 the two events for one request carried different ids and
+could not be joined.)
 
 The tool name is read from the request body, which is attacker-controlled and is
 parsed *before* the preflight has decided whether the caller may call anything.
