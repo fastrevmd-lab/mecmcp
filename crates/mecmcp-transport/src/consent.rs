@@ -10,6 +10,18 @@
 /// **This acknowledgement is loopback-only.** It does not permit an
 /// off-loopback bind; `serve_router` refuses that regardless
 /// (`ListenerRefusal::UnauthenticatedOffLoopback`).
+///
+/// The tuple field is private, so this does not compile:
+///
+/// ```compile_fail
+/// let _ = mecmcp_transport::NoAuthAcknowledgement(());
+/// ```
+///
+/// And there is no `Default`, so neither does this:
+///
+/// ```compile_fail
+/// let _: mecmcp_transport::NoAuthAcknowledgement = Default::default();
+/// ```
 #[derive(Clone, Copy)]
 pub struct NoAuthAcknowledgement(());
 
@@ -34,6 +46,18 @@ impl NoAuthAcknowledgement {
 ///
 /// Absence is fail-closed: without this, `serve_router` refuses to bind an
 /// off-loopback address that has no TLS.
+///
+/// The tuple field is private, so this does not compile:
+///
+/// ```compile_fail
+/// let _ = mecmcp_transport::InsecureBindAcknowledgement(());
+/// ```
+///
+/// And there is no `Default`, so neither does this:
+///
+/// ```compile_fail
+/// let _: mecmcp_transport::InsecureBindAcknowledgement = Default::default();
+/// ```
 #[derive(Clone, Copy)]
 pub struct InsecureBindAcknowledgement(());
 
@@ -56,7 +80,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn acknowledgements_are_constructible_only_by_their_named_constructor() {
+    fn acknowledgements_are_copy_and_debug() {
         let no_auth = NoAuthAcknowledgement::operator_allowed_no_auth();
         let insecure = InsecureBindAcknowledgement::operator_allowed_insecure_bind();
         // Copy semantics: passing one to a config must not move it away from a caller
