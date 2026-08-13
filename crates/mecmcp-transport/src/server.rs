@@ -256,14 +256,15 @@ impl<G: Grant> HttpTransportConfig<G> {
     ///
     /// ```
     /// use mecmcp_auth::NoGrant;
-    /// use mecmcp_transport::{HttpTransportConfig, HostOriginPolicy, LimitsConfig, TransportIdentity};
+    /// use mecmcp_transport::{HttpTransportConfig, HostOriginPolicy, LimitsConfig, NoAuthAcknowledgement, TransportIdentity};
     /// use tokio_util::sync::CancellationToken;
     ///
-    /// let config = HttpTransportConfig::<NoGrant>::new(
+    /// let config = HttpTransportConfig::<NoGrant>::unauthenticated(
     ///     TransportIdentity::new("testmcp", "test", "test", ["device"]),
     ///     LimitsConfig::default(),
     ///     HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
     ///     CancellationToken::new(),
+    ///     NoAuthAcknowledgement::operator_allowed_no_auth(),
     /// ).with_metrics(true);
     /// ```
     #[must_use]
@@ -364,7 +365,7 @@ pub fn streamable_http_server_config(
 ///
 /// ```
 /// use mecmcp_auth::NoGrant;
-/// use mecmcp_transport::{HttpTransportConfig, HostOriginPolicy, LimitsConfig, TransportIdentity, build_streamable_http_router};
+/// use mecmcp_transport::{HttpTransportConfig, HostOriginPolicy, LimitsConfig, NoAuthAcknowledgement, TransportIdentity, build_streamable_http_router};
 /// use rmcp::{ServerHandler, model::{Implementation, ServerCapabilities, ServerInfo}};
 /// use tokio_util::sync::CancellationToken;
 ///
@@ -378,11 +379,12 @@ pub fn streamable_http_server_config(
 /// # }
 /// # #[tokio::main]
 /// # async fn main() {
-/// let config = HttpTransportConfig::<NoGrant>::new(
+/// let config = HttpTransportConfig::<NoGrant>::unauthenticated(
 ///     TransportIdentity::new("testmcp", "test", "test", ["device"]),
 ///     LimitsConfig::default(),
 ///     HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
 ///     CancellationToken::new(),
+///     NoAuthAcknowledgement::operator_allowed_no_auth(),
 /// );
 ///
 /// let (router, shutdown) = build_streamable_http_router(
@@ -759,7 +761,7 @@ impl HttpShutdown {
 /// ```no_run
 /// use std::net::SocketAddr;
 /// use std::time::Duration;
-/// use mecmcp_transport::{build_streamable_http_router, serve_router, HttpTransportConfig, HostOriginPolicy, LimitsConfig, TransportIdentity};
+/// use mecmcp_transport::{build_streamable_http_router, serve_router, HttpTransportConfig, HostOriginPolicy, LimitsConfig, NoAuthAcknowledgement, TransportIdentity};
 /// use mecmcp_auth::NoGrant;
 /// use rmcp::{ServerHandler, model::{Implementation, ServerCapabilities, ServerInfo}};
 ///
@@ -772,11 +774,12 @@ impl HttpShutdown {
 /// #     }
 /// # }
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = HttpTransportConfig::<NoGrant>::new(
+/// let config = HttpTransportConfig::<NoGrant>::unauthenticated(
 ///     TransportIdentity::new("testmcp", "test", "test", ["device"]),
 ///     LimitsConfig::default(),
 ///     HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
 ///     tokio_util::sync::CancellationToken::new(),
+///     NoAuthAcknowledgement::operator_allowed_no_auth(),
 /// );
 /// let (router, shutdown) = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)?;
 /// let address: SocketAddr = "127.0.0.1:8080".parse()?;
