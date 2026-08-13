@@ -10,6 +10,7 @@ mod caller;
 mod client_info;
 mod concurrency;
 mod config;
+mod consent;
 mod identity;
 mod metrics;
 mod overload;
@@ -42,6 +43,7 @@ pub use concurrency::{
 };
 #[allow(deprecated)]
 pub use config::{LimitsConfig, LimitsConfigError, streamable_http_server_config};
+pub use consent::{InsecureBindAcknowledgement, NoAuthAcknowledgement};
 pub use identity::TransportIdentity;
 pub use metrics::PrometheusRuntime;
 pub use overload::overload_response;
