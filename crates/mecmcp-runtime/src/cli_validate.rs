@@ -510,7 +510,10 @@ mod tests {
         .expect("parse");
 
         assert!(
-            matches!(validate(&cli), Err(CliRefusal::AllowedOriginRequired { .. })),
+            matches!(
+                validate(&cli),
+                Err(CliRefusal::AllowedOriginRequired { .. })
+            ),
             "since 0.7.0 the shared transport applies Origin policy for every \
              consumer, so the weaker check is itself the defect class in mecmcp#273"
         );

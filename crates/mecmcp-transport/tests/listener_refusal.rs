@@ -9,9 +9,9 @@
 
 use mecmcp_auth::{BearerSyntax, NoGrant};
 use mecmcp_transport::{
-    BearerAuthenticator, BearerBoundary, BearerResponseProfile, HostOriginPolicy,
-    HttpServeError, HttpTransportConfig, LimitsConfig, ListenerRefusal, NoAuthAcknowledgement,
-    TransportIdentity, build_streamable_http_router, serve_router,
+    BearerAuthenticator, BearerBoundary, BearerResponseProfile, HostOriginPolicy, HttpServeError,
+    HttpTransportConfig, LimitsConfig, ListenerRefusal, NoAuthAcknowledgement, TransportIdentity,
+    build_streamable_http_router, serve_router,
 };
 use rmcp::ServerHandler;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};

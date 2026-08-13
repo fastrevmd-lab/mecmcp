@@ -6,9 +6,8 @@
 
 use mecmcp_auth::NoGrant;
 use mecmcp_transport::{
-    HostOriginPolicy, HttpTransportConfig, LimitsConfig, NoAuthAcknowledgement,
-    TransportIdentity, build_streamable_http_router, serve_router,
-    test_client::McpClient,
+    HostOriginPolicy, HttpTransportConfig, LimitsConfig, NoAuthAcknowledgement, TransportIdentity,
+    build_streamable_http_router, serve_router, test_client::McpClient,
 };
 use rmcp::ServerHandler;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -45,9 +44,8 @@ async fn router_assembly_mounts_session_management() {
         NoAuthAcknowledgement::operator_allowed_no_auth(),
     );
 
-    let plan =
-        build_streamable_http_router(|| Ok::<_, std::io::Error>(TestServer), config)
-            .expect("router build failed");
+    let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(TestServer), config)
+        .expect("router build failed");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -78,7 +76,10 @@ async fn router_assembly_mounts_session_management() {
     assert!(!session_id.is_empty(), "session ID should not be empty");
 
     shutdown.cancel();
-    serving.await.expect("serving task failed").expect("serve_router failed");
+    serving
+        .await
+        .expect("serving task failed")
+        .expect("serve_router failed");
 }
 
 /// Unauthenticated routers serve requests without bearer middleware.
@@ -96,9 +97,8 @@ async fn unauthenticated_router_serves_requests() {
         NoAuthAcknowledgement::operator_allowed_no_auth(),
     );
 
-    let plan =
-        build_streamable_http_router(|| Ok::<_, std::io::Error>(TestServer), config)
-            .expect("router build failed");
+    let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(TestServer), config)
+        .expect("router build failed");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -131,5 +131,8 @@ async fn unauthenticated_router_serves_requests() {
     );
 
     shutdown.cancel();
-    serving.await.expect("serving task failed").expect("serve_router failed");
+    serving
+        .await
+        .expect("serving task failed")
+        .expect("serve_router failed");
 }

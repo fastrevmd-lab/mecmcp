@@ -1041,9 +1041,8 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
         let router = plan.router;
 
         // Port-less Origin should be accepted (normalized to :443 on both sides)
@@ -1101,9 +1100,8 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
         let router = plan.router;
 
         let response = router
@@ -1139,9 +1137,8 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
         let router = plan.router;
 
         let response = router
@@ -1247,9 +1244,8 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
         let router = plan.router;
 
         let response = router
@@ -1279,10 +1275,7 @@ mod tests {
         let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
             (candidate == "secret").then(caller)
         });
-        let boundary = BearerBoundary::new(
-            authenticator,
-            BearerResponseProfile::detailed("test"),
-        );
+        let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::detailed("test"));
         let config = HttpTransportConfig::authenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
@@ -1290,9 +1283,8 @@ mod tests {
             CancellationToken::new(),
             boundary,
         );
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
         let router = plan.router;
 
         let response = router
@@ -1324,9 +1316,8 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
         let router = plan.router;
 
         // Both requests will be malformed (not valid rmcp), but the second
@@ -1380,9 +1371,8 @@ mod tests {
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         )
         .with_metrics(true);
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
         let router = plan.router;
 
         // Foreign Host should be rejected
@@ -1440,9 +1430,8 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
         let router = plan.router;
 
         // Send a request with body exceeding the limit
@@ -1475,9 +1464,8 @@ mod tests {
             shutdown.clone(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
 
         let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -1488,13 +1476,7 @@ mod tests {
 
         let shutdown_clone = shutdown.clone();
         let server_handle = tokio::spawn(async move {
-            serve_router(
-                plan,
-                bound_address,
-                None,
-                Duration::from_secs(1),
-            )
-            .await
+            serve_router(plan, bound_address, None, Duration::from_secs(1)).await
         });
 
         // Wait for server to start
@@ -1536,9 +1518,8 @@ mod tests {
             listener_token.clone(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
         let sessions = plan.shutdown.sessions.clone();
 
         let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1583,9 +1564,8 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
         let router = plan.router;
 
         // Request with authority in URI but no Host header (HTTP/2 pattern)
@@ -1623,9 +1603,8 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
         let router = plan.router;
 
         let response = router
@@ -1657,9 +1636,8 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
         let router = plan.router;
 
         let response = router
@@ -1692,9 +1670,8 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
         let router = plan.router;
 
         // Host with explicit port should be accepted
@@ -1747,9 +1724,8 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
         let router = plan.router;
 
         let response = router
@@ -1784,9 +1760,8 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build failed");
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
         let router = plan.router;
 
         // Construct request with invalid UTF-8 in Origin header
@@ -1838,9 +1813,8 @@ mod tests {
         // If IP rate limiter was applied in wrong order, router construction would fail.
         // Success proves correct order (all routes assembled, then Host/Origin validation,
         // then IP limiter outermost).
-        let _plan =
-            build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
-                .expect("router build should succeed with IP limiting enabled");
+        let _plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build should succeed with IP limiting enabled");
     }
 
     #[test]
@@ -1863,8 +1837,14 @@ mod tests {
             CancellationToken::new(),
             boundary,
         );
-        assert!(authed.bearer.is_some(), "authenticated config must carry the boundary");
-        assert!(authed.insecure_bind.is_none(), "insecure bind must default to unacknowledged");
+        assert!(
+            authed.bearer.is_some(),
+            "authenticated config must carry the boundary"
+        );
+        assert!(
+            authed.insecure_bind.is_none(),
+            "insecure bind must default to unacknowledged"
+        );
 
         let open = HttpTransportConfig::<NoGrant>::unauthenticated(
             identity(),

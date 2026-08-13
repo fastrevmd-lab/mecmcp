@@ -12,9 +12,7 @@ use std::net::SocketAddr;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ListenerRefusal {
     /// No bearer boundary was attached and the address is not loopback.
-    #[error(
-        "refusing to serve {address} without authentication: --allow-no-auth is loopback-only"
-    )]
+    #[error("refusing to serve {address} without authentication: --allow-no-auth is loopback-only")]
     UnauthenticatedOffLoopback {
         /// The address that would have been bound.
         address: SocketAddr,
@@ -117,7 +115,11 @@ mod tests {
 
     #[test]
     fn unauthenticated_off_loopback_is_refused() {
-        let result = check_listener(&policy(false, &["h"], &["o"]), addr("192.168.1.5:30031"), true);
+        let result = check_listener(
+            &policy(false, &["h"], &["o"]),
+            addr("192.168.1.5:30031"),
+            true,
+        );
         assert_eq!(
             result,
             Err(ListenerRefusal::UnauthenticatedOffLoopback {
@@ -136,7 +138,11 @@ mod tests {
 
     #[test]
     fn plaintext_off_loopback_needs_acknowledgement() {
-        let result = check_listener(&policy(true, &["h"], &["o"]), addr("192.168.1.5:30031"), false);
+        let result = check_listener(
+            &policy(true, &["h"], &["o"]),
+            addr("192.168.1.5:30031"),
+            false,
+        );
         assert_eq!(
             result,
             Err(ListenerRefusal::InsecureBindNotAcknowledged {
@@ -171,7 +177,11 @@ mod tests {
 
     #[test]
     fn whitespace_only_allowlist_entries_do_not_count() {
-        let result = check_listener(&policy(true, &["   "], &["o"]), addr("192.168.1.5:30031"), true);
+        let result = check_listener(
+            &policy(true, &["   "], &["o"]),
+            addr("192.168.1.5:30031"),
+            true,
+        );
         assert_eq!(
             result,
             Err(ListenerRefusal::AllowedHostRequired {
