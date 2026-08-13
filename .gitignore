@@ -5,6 +5,8 @@ Cargo.lock
 # Agent scratch: git worktrees for parallel task branches.
 /.claude/
 /.worktrees/
+# Agent scratch: subagent-driven-development ledgers, briefs, review packages.
+/.superpowers/
 
 # Never commit real authentication material, even hashed.
 tokens.json
