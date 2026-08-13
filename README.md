@@ -202,22 +202,26 @@ an exact version.
 > 0.7.0+**, and it is not an alternative to `build_streamable_http_router`.
 > Beyond the double-apply, it omits two things the builder installs:
 >
-> - **Origin validation.** `build_rmcp_server_config` passes the Host allowlist
->   through to rmcp — that is the DNS-rebinding guard, and it survives a hand
->   assembly. Origin is different: it deliberately empties rmcp's
->   `allowed_origins` because this crate does the exact-match check itself, in
->   middleware that is private and installed only by
->   `build_streamable_http_router`. So a consumer who *configured* an Origin
->   allowlist and then hand-assembled gets no Origin enforcement at all, with
->   the policy still sitting in their config. (An empty `allowed_origins`
->   disables the check by design, builder or not.)
+> - **Host and Origin validation outside `/mcp`.** `build_rmcp_server_config`
+>   gives rmcp the Host allowlist, but that only guards the service nested at
+>   `/mcp`. The builder additionally layers this crate's own Host/Origin
+>   middleware over the *entire* router, which is what stops an attacker-
+>   controlled page reading the unauthenticated `/metrics` endpoint with a
+>   foreign Host header. That middleware is private and installed only by
+>   `build_streamable_http_router`. A hand assembly therefore keeps the Host
+>   guard on `/mcp` and loses it everywhere else — and loses Origin checking
+>   entirely, since `build_rmcp_server_config` deliberately empties rmcp's
+>   `allowed_origins` on the assumption that this crate will check it. (An
+>   empty `allowed_origins` disables the Origin check by design, builder or
+>   not; the loss bites a consumer who configured one.)
 > - **The session tracker.** From 0.8.3 the builder wires it via
 >   `authenticated_accounting`, which calls `with_session_tracker`.
 >   `BoundaryAccounting::new` alone leaves `session_tracker` as `None`, and
 >   passing a tracker to `ConcurrencyState` does not populate the field the
 >   audit preflight reads — so a hand assembly on 0.8.3+ emits an empty
->   `client_name`. On 0.7.0–0.8.2 the builder did not attach it either; that
->   was the 0.8.3 defect, and hand-assembling reproduces it.
+>   `client_name`. This is the 0.8.3 defect: 0.8.2 shipped
+>   `with_session_tracker` without the builder calling it. Releases before
+>   0.8.2 had neither the field nor client-name propagation at all.
 >
 > Use `build_streamable_http_router` on 0.7.0+.
 
