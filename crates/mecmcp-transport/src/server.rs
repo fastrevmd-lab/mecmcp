@@ -387,17 +387,17 @@ pub fn streamable_http_server_config(
 ///     NoAuthAcknowledgement::operator_allowed_no_auth(),
 /// );
 ///
-/// let (router, shutdown) = build_streamable_http_router(
+/// let plan = build_streamable_http_router(
 ///     || Ok::<_, std::io::Error>(EmptyServer),
 ///     config,
 /// ).expect("router build failed");
-/// // Pass shutdown to serve_router to ensure rmcp and axum-server share the same token
+/// // Pass plan to serve_router; it carries the shutdown and the router together
 /// # }
 /// ```
 pub fn build_streamable_http_router<S, G>(
     service_factory: impl Fn() -> Result<S, std::io::Error> + Send + Sync + 'static,
     config: HttpTransportConfig<G>,
-) -> Result<(Router, HttpShutdown), HttpTransportBuildError>
+) -> Result<ServePlan, HttpTransportBuildError>
 where
     S: ServerHandler + Send + 'static,
     G: Grant,
@@ -449,6 +449,8 @@ where
 
     let limits = Arc::new(config.limits);
 
+    let bearer_was_attached = config.bearer.is_some();
+
     // Apply bearer boundary if authentication is enabled.
     // This applies the complete authenticated stack: auth → token_rate →
     // token_concurrency → body_limit → preflight → target_concurrency.
@@ -492,13 +494,18 @@ where
     // route-specific logic.
     router = apply_ip_rate_limit(router, &limits);
 
-    Ok((
+    Ok(ServePlan {
         router,
-        HttpShutdown {
+        shutdown: HttpShutdown {
             listener: config.shutdown,
             sessions,
         },
-    ))
+        policy: crate::listener::ListenerPolicy {
+            authenticated: bearer_was_attached,
+            host_origin: config.host_origin,
+            insecure_bind: config.insecure_bind,
+        },
+    })
 }
 
 /// Host and Origin header validation middleware (whole-router protection).
@@ -707,6 +714,9 @@ pub enum HttpServeError {
         #[source]
         error: std::io::Error,
     },
+    /// The listener configuration was refused before binding.
+    #[error(transparent)]
+    Refused(#[from] crate::listener::ListenerRefusal),
 }
 
 /// The two halves of a graceful shutdown, produced by
@@ -738,6 +748,26 @@ impl HttpShutdown {
     #[must_use]
     pub fn listener(&self) -> &CancellationToken {
         &self.listener
+    }
+}
+
+/// Everything needed to serve, including the facts `serve_router` must check.
+///
+/// There is deliberately no accessor that yields the `Router`. If the router
+/// could leave the plan, a consumer could serve it directly and skip the
+/// listener admission checks — which is the defect mecmcp#273 exists to close.
+/// Customise the router through [`HttpTransportConfig`] before building.
+pub struct ServePlan {
+    router: Router,
+    shutdown: HttpShutdown,
+    policy: crate::listener::ListenerPolicy,
+}
+
+impl ServePlan {
+    /// The shutdown pair, for wiring SIGTERM.
+    #[must_use]
+    pub fn shutdown(&self) -> &HttpShutdown {
+        &self.shutdown
     }
 }
 /// Serve a composed router over plain HTTP or a supplied rustls configuration.
@@ -781,26 +811,32 @@ impl HttpShutdown {
 ///     tokio_util::sync::CancellationToken::new(),
 ///     NoAuthAcknowledgement::operator_allowed_no_auth(),
 /// );
-/// let (router, shutdown) = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)?;
+/// let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)?;
 /// let address: SocketAddr = "127.0.0.1:8080".parse()?;
 ///
 /// serve_router(
-///     router,
+///     plan,
 ///     address,
 ///     None, // No TLS
-///     shutdown, // Must be the HttpShutdown from build_streamable_http_router
 ///     std::time::Duration::from_secs(10),
 /// ).await?;
 /// # Ok(())
 /// # }
 /// ```
 pub async fn serve_router(
-    router: Router,
+    plan: ServePlan,
     address: SocketAddr,
     tls: Option<Arc<rustls::ServerConfig>>,
-    shutdown: HttpShutdown,
     shutdown_timeout: std::time::Duration,
 ) -> Result<(), HttpServeError> {
+    // Before the socket exists. A refusal must cost nothing and leak nothing,
+    // so it happens ahead of the bind (mecmcp#273).
+    crate::listener::check_listener(&plan.policy, address, tls.is_some())?;
+
+    let ServePlan {
+        router, shutdown, ..
+    } = plan;
+
     // Both listeners run on axum_server so they share one forced deadline.
     // `axum::serve`'s `with_graceful_shutdown` takes a signal but no deadline:
     // it waits on every in-flight connection task forever, and an MCP SSE
@@ -1005,9 +1041,10 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let (router, _shutdown) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
+        let router = plan.router;
 
         // Port-less Origin should be accepted (normalized to :443 on both sides)
         let portless_response = router
@@ -1064,9 +1101,10 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let (router, _shutdown) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
+        let router = plan.router;
 
         let response = router
             .oneshot(
@@ -1101,9 +1139,10 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let (router, _shutdown) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
+        let router = plan.router;
 
         let response = router
             .oneshot(
@@ -1208,9 +1247,10 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let (router, _shutdown) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
+        let router = plan.router;
 
         let response = router
             .oneshot(
@@ -1250,9 +1290,10 @@ mod tests {
             CancellationToken::new(),
             boundary,
         );
-        let (router, _shutdown) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
+        let router = plan.router;
 
         let response = router
             .oneshot(
@@ -1283,9 +1324,10 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let (router, _shutdown) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
+        let router = plan.router;
 
         // Both requests will be malformed (not valid rmcp), but the second
         // should be rejected with 503 due to concurrency limit, not 400.
@@ -1338,9 +1380,10 @@ mod tests {
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         )
         .with_metrics(true);
-        let (router, _shutdown) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
+        let router = plan.router;
 
         // Foreign Host should be rejected
         let foreign_response = router
@@ -1397,9 +1440,10 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let (router, _shutdown) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
+        let router = plan.router;
 
         // Send a request with body exceeding the limit
         let response = router
@@ -1431,7 +1475,7 @@ mod tests {
             shutdown.clone(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let (router, shutdown_from_router) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
 
@@ -1445,10 +1489,9 @@ mod tests {
         let shutdown_clone = shutdown.clone();
         let server_handle = tokio::spawn(async move {
             serve_router(
-                router,
+                plan,
                 bound_address,
                 None,
-                shutdown_from_router,
                 Duration::from_secs(1),
             )
             .await
@@ -1493,10 +1536,10 @@ mod tests {
             listener_token.clone(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let (router, shutdown) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
-        let sessions = shutdown.sessions.clone();
+        let sessions = plan.shutdown.sessions.clone();
 
         let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let bound = std::net::TcpListener::bind(address).expect("bind failed");
@@ -1504,7 +1547,7 @@ mod tests {
         drop(bound);
 
         let drain = Duration::from_millis(600);
-        let server = tokio::spawn(serve_router(router, bound_address, None, shutdown, drain));
+        let server = tokio::spawn(serve_router(plan, bound_address, None, drain));
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         listener_token.cancel();
@@ -1540,9 +1583,10 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let (router, _shutdown) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
+        let router = plan.router;
 
         // Request with authority in URI but no Host header (HTTP/2 pattern)
         let response = router
@@ -1579,9 +1623,10 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let (router, _shutdown) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
+        let router = plan.router;
 
         let response = router
             .oneshot(
@@ -1612,9 +1657,10 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let (router, _shutdown) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
+        let router = plan.router;
 
         let response = router
             .oneshot(
@@ -1646,9 +1692,10 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let (router, _shutdown) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
+        let router = plan.router;
 
         // Host with explicit port should be accepted
         let with_port = router
@@ -1700,9 +1747,10 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let (router, _shutdown) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
+        let router = plan.router;
 
         let response = router
             .oneshot(
@@ -1736,9 +1784,10 @@ mod tests {
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        let (router, _shutdown) =
+        let plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
+        let router = plan.router;
 
         // Construct request with invalid UTF-8 in Origin header
         let mut request = Request::builder()
@@ -1789,7 +1838,7 @@ mod tests {
         // If IP rate limiter was applied in wrong order, router construction would fail.
         // Success proves correct order (all routes assembled, then Host/Origin validation,
         // then IP limiter outermost).
-        let (_router, _shutdown) =
+        let _plan =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build should succeed with IP limiting enabled");
     }
