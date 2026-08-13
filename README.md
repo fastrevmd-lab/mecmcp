@@ -35,6 +35,17 @@ apply) and the modern crate hygiene. Neither benefits from the other.
 
 ## Status
 
+**0.9.0 also warns when a revoke has not reached the server (#266).**
+`token revoke` removed the entry, printed `revoked '<name>'` and exited 0 —
+while a running server kept its store in memory and went on accepting the
+credential until signalled. Measured live: the token still returned 200
+immediately after the revoke, and 401 only after SIGHUP. The caching stays,
+deliberately — a failed reload must not take authentication offline — but
+`revoke` and `rotate` now say plainly that the credential is not dead yet and
+name `--server-pid`. Rotate needs it more than revoke: without the reload the
+server still accepts the *old* secret. The exit code stays 0, because the
+revoke did succeed.
+
 **0.9.0 — listener validation is unskippable (#273).** `mecmcp_runtime::cli_validate`
 refused two configurations that matter — unauthenticated off-loopback and
 off-loopback with no Origin allowlist — but had no call site anywhere in the repo,
