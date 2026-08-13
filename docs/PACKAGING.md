@@ -447,6 +447,16 @@ inventory, so every device's API-key environment variable had to be set before a
 token could be created — even though minting never contacts a device. That blocks
 an operator setting up before credentials are provisioned.
 
+**`mecmcp` 0.9.0 requires `--allowed-origin` off-loopback, which is a behavior
+change.** An empty Origin allowlist is currently valid and disables Origin
+checking by design. Fleet survey on 2026-08-13 found exactly one affected
+deployment: **LXC 950 (`rust-junosmcp`) binds `0.0.0.0` with `--allowed-host` and
+no `--allowed-origin`, and will be refused at startup on 0.9.0.** Add
+`--allowed-origin` to its drop-in override *before* installing the 0.9.0 binary.
+950 is tagged `protected`: snapshot it first. LXC 960 and 601 (`rust-panosmcp`)
+already pass an Origin allowlist and are unaffected; 952, 604, 600, and 606 bind
+`127.0.0.1` and are exempt.
+
 ---
 
 ## 4. README

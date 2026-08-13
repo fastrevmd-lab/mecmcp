@@ -35,6 +35,94 @@ apply) and the modern crate hygiene. Neither benefits from the other.
 
 ## Status
 
+**0.9.0 — listener validation is unskippable (#273).** `mecmcp_runtime::cli_validate`
+refused two configurations that matter — unauthenticated off-loopback and
+off-loopback with no Origin allowlist — but had no call site anywhere in the repo,
+so a consumer could serve unauthenticated on the LAN and nothing failed. This is
+the third instance of a class fixed in 0.8.1 (audit unskippable) and 0.8.3
+(`client_name` correct but unwired).
+
+The fix: authentication became a constructor choice (`authenticated` /
+`unauthenticated` + `NoAuthAcknowledgement`), `build_streamable_http_router`
+returns a `ServePlan` rather than a bare router, and `serve_router` refuses an
+inadmissible listener before it binds. Four refusals exist —
+`UnauthenticatedOffLoopback`, `InsecureBindNotAcknowledged`, `AllowedHostRequired`,
+`AllowedOriginRequired` — each with the condition stated in the error message.
+Loopback is exempt from all of them. **`--allow-no-auth` does not permit an
+off-loopback bind**: `serve_router` refuses that regardless.
+
+`cli_validate` remains a courtesy pre-check. It fails a bad CLI before anything
+is constructed, and its messages name the flags rather than the transport
+concepts. But it is no longer the control — skipping it costs a startup refusal
+instead of an open port. The generic `validate_with_origin_policy` is gone,
+folded into `validate`, which now always requires an Origin allowlist
+off-loopback.
+
+**Breaking:** consumers must migrate their `main.rs`. See Upgrading to 0.9.0 below.
+
+### Upgrading to 0.9.0
+
+**mecmcp-transport 0.9.0:**
+
+- **Authentication as a constructor choice.** The old builder flow is gone:
+
+  Before:
+  ```rust
+  let config = HttpTransportConfig::new(identity, limits, host_origin, shutdown)
+      .with_bearer(boundary);
+  ```
+
+  After (authenticated):
+  ```rust
+  let config = HttpTransportConfig::authenticated(
+      identity,
+      limits,
+      host_origin,
+      shutdown,
+      boundary,
+  );
+  ```
+
+  After (unauthenticated):
+  ```rust
+  let config = HttpTransportConfig::unauthenticated(
+      identity,
+      limits,
+      host_origin,
+      shutdown,
+      NoAuthAcknowledgement::operator_allowed_no_auth(),
+  );
+  ```
+
+- **`build_streamable_http_router` returns `ServePlan`, not `(Router, HttpShutdown)`.**
+  The plan carries the router, the shutdown, and the policy `serve_router` must
+  check. Extract what you need from the plan **before** passing it to
+  `serve_router`, which takes it by value:
+
+  Before:
+  ```rust
+  let (router, shutdown) = build_streamable_http_router(factory, config)?;
+  serve_router(router, addr, tls, shutdown, timeout).await?;
+  ```
+
+  After:
+  ```rust
+  let plan = build_streamable_http_router(factory, config)?;
+  // Clone the listener token before moving the plan (if wiring SIGTERM):
+  let listener_token = plan.shutdown().listener().clone();
+  serve_router(plan, addr, tls, timeout).await?;
+  ```
+
+- **Off-loopback listeners now require `--allowed-origin`.** This is a behavior
+  change: an empty Origin allowlist is currently valid and disables Origin
+  checking by design. Fleet survey (2026-08-13) found exactly one affected
+  deployment. **LXC 950 (`rust-junosmcp`) binds `0.0.0.0` with `--allowed-host`
+  and no `--allowed-origin`, and will be refused at startup on 0.9.0.** Add
+  `--allowed-origin` to its drop-in override before installing the 0.9.0 binary.
+  950 is tagged `protected`: snapshot it first. LXC 960 and 601
+  (`rust-panosmcp`) already pass an Origin allowlist and are unaffected; 952,
+  604, 600, and 606 bind `127.0.0.1` and are exempt.
+
 **0.8.3 — 0.8.2's client name never actually reached anyone. Upgrade past 0.8.2.**
 The propagation was correct and unreachable. The middleware reads the captured
 `clientInfo` out of `BoundaryAccounting.session_tracker`;
