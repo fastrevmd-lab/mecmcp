@@ -231,7 +231,17 @@ The verification list for any change in this family is therefore: `build
 --all-targets`, `test --locked`, `clippy --all-targets`, `fmt --check`, `doc`,
 plus whatever repo-local policy script exists.
 
-### Phase 3 — Release what is deployed
+### Phase 3 — Release what is deployed — **COMPLETE 2026-08-13** (deployment pending)
+
+`rustpanosmcp` **v0.9.0** and `rustjunosmcp` **v0.20.0** are tagged. The change-set
+risk cleared: `ChangesetState`, `OperationRecord` and `ChangeSetRecord` serialize
+identically between mecmcp v0.8.6 and v0.9.1, so LXC 960's `mutation-state.json`
+survives and in-flight change sets are not orphaned.
+
+**Not yet done: installing these on LXC 950 and 960.** Both are `protected`.
+Snapshot each, rehearse on the disposable rigs 600 and 601, then production.
+950's `--allowed-origin` is already in place and verified by a live MCP call.
+
 
 - **`rustpanosmcp`** — 9 unreleased commits including a breaking fail-closed
   HTTP change; LXC 960 is 9 behind. **Before upgrading 960:** confirm 0.9.0 does
@@ -242,7 +252,25 @@ plus whatever repo-local policy script exists.
 
 Both hosts are `protected`: snapshot, then rehearse on 601/600 before 960/950.
 
-### Phase 4 — First releases
+### Phase 4 — First releases — **PARTIALLY COMPLETE 2026-08-13**
+
+Released: `rustmistmcp` **v0.1.0** (first ever), `rustsdcmcp` **v0.1.0-lab.8**,
+`rustproxmoxmcp` **v0.1.2**, `rustsdonpremmcp` **v0.1.0-alpha.1**.
+
+**Scoping correction.** This phase originally listed "proxmox 0.2 (low-tier
+mutations)" and "sdc 0.2 (multi-instance)". Those are development projects, not
+releases: proxmox 0.2 means implementing 23 write tools against an authorization
+spine that has never run a real mutation, and sdc's multi-instance work is the
+subsystem that needs its own spec then plan. Neither is a version bump. They stay
+open as development, and the releases above are what was genuinely releasable.
+
+**Ruling:** mist's four WAN edge branches (two carrying 13 commits) were deferred
+past v0.1.0 rather than landed. They have no PRs and were never proposed for
+merge; landing unreviewed feature work as part of a tagging exercise would be
+reckless. v0.1.0 is the stable base they build on.
+
+Original plan follows.
+
 
 - **`rustmistmcp` 0.1.0** — never tagged; 19 commits, 6 unmerged WAN branches to
   land or close.
@@ -254,7 +282,20 @@ Both hosts are `protected`: snapshot, then rehearse on 601/600 before 960/950.
 - **`rustsdonpremmcp`** — per that decision, folded in as a backend rather than
   released separately.
 
-### Phase 5 — Issue burn-down
+### Phase 5 — Issue burn-down — **STARTED 2026-08-13**
+
+Closed today: **#274** (README supersession), **#273** (unskippable listener
+validation), **#269** (request_id correlation), **#266** (revoke propagation),
+**#267** (`--lab-mode` is CLI-only). Eight remain.
+
+What is left is not burn-down. **#275** changes a digest-bound field, so it alters
+verification of existing records — a 0.10.0 change needing its own design.
+**#222**, **#91** and **#48** are each substantial design work. **#164/#167/#168/
+#169** are the 2026-07-28 MCP spec migration, a programme in its own right and
+explicitly out of this one's scope.
+
+Original plan follows.
+
 
 `mecmcp` #275 (unblocks `rustproxmoxmcp` 0.3) → #222 → #91 → #48;
 `rustsdcmcp` #55, #21, #33, #34, #31; `rustjunosmcp` #267, #299, #203.
