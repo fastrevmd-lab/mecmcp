@@ -8,7 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-mecmcp-audit = { version = "0.9.0", path = "../mecmcp-audit" }
+mecmcp-audit = { version = "0.9.1", path = "../mecmcp-audit" }
 async-trait  = { workspace = true }
 hex          = "0.4"
 serde        = { workspace = true }
@@ -18,7 +18,7 @@ getrandom    = { workspace = true }
 tokio        = { version = "1", features = ["sync", "macros", "rt", "time"] }
 tokio-util   = { version = "0.7" }
 tempfile     = { workspace = true }
-mecmcp-secret = { version = "0.9.0", path = "../mecmcp-secret" }
+mecmcp-secret = { version = "0.9.1", path = "../mecmcp-secret" }
 rustix       = { workspace = true }
 url          = "2"
 
