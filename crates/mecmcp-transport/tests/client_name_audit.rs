@@ -19,6 +19,7 @@ fn emit_correlated_events(client_name: Option<&'static str>) {
         on_behalf_of: None,
         actor_type: ActorType::Agent,
         client_name,
+        request_id: uuid::Uuid::new_v4(),
     };
 
     // Transport event (emitted by bearer_preflight_middleware)
@@ -140,6 +141,7 @@ fn client_name_round_trips_from_caller_ctx_to_audit_event() {
         on_behalf_of: None,
         actor_type: ActorType::Agent,
         client_name: Some("claude-code"),
+        request_id: uuid::Uuid::new_v4(),
     };
 
     let captured = run_with_capture(|| {

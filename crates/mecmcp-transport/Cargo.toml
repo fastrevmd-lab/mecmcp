@@ -69,5 +69,7 @@ rcgen       = "0.13"
 # that the consuming application installs. Both current consumers use ring.
 rustls      = { version = "0.23", default-features = false, features = ["ring"] }
 tempfile    = "3"
+# Test-only: CallerCtx carries a per-request correlation ID (mecmcp#269).
+uuid        = { workspace = true }
 tokio       = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 tower       = { version = "0.5", features = ["util"] }
