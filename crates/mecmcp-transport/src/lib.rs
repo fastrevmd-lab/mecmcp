@@ -21,6 +21,7 @@ mod server;
 mod session;
 mod target;
 pub mod test_client;
+pub mod test_harness;
 pub mod tls;
 
 pub use auth::{
