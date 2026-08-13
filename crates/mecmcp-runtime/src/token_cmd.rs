@@ -401,6 +401,11 @@ where
             let removed = TokenStoreFile::<G>::revoke(&tokens_file, &name, &known)?;
             if removed {
                 eprintln!("revoked '{name}'");
+                // Only when something was actually removed. A no-op revoke has
+                // no stale credential to warn about (mecmcp#266).
+                if let Some(warning) = reload_warning(server_pid, "token removed", &tokens_file) {
+                    eprintln!("{warning}");
+                }
             } else {
                 eprintln!("no such token '{name}' (no-op)");
             }
@@ -415,6 +420,13 @@ where
             let secret = TokenStoreFile::<G>::rotate(&tokens_file, &name, &known)?;
             let mut out = std::io::stdout().lock();
             writeln!(out, "{}", secret.expose_secret())?;
+            // Rotate needs this more than revoke: without the reload the server
+            // still accepts the OLD secret, so an operator who believes they
+            // have retired it is wrong in the more dangerous direction
+            // (mecmcp#266).
+            if let Some(warning) = reload_warning(server_pid, "secret rotated", &tokens_file) {
+                eprintln!("{warning}");
+            }
             signal_reload(server_pid)?;
             Ok(())
         }
@@ -483,6 +495,39 @@ where
 ///
 /// Returns error if the PID is invalid or the signal fails.
 #[cfg(unix)]
+/// Warning text for a credential change that has not reached the running server.
+///
+/// Returns `None` when a PID was supplied, because [`signal_reload`] delivers
+/// SIGHUP and the change is live before the command exits.
+///
+/// # Why this exists (mecmcp#266)
+///
+/// `token revoke` removes the entry, prints `revoked '<name>'` and exits 0 —
+/// while a running server keeps its store in memory and goes on accepting the
+/// credential until it is signalled. An operator revoking a compromised token
+/// has every reason to read that output as "the credential is dead". Measured
+/// on a live server: immediately after `revoke` without `--server-pid` the
+/// token still returned 200; after SIGHUP it returned 401.
+///
+/// The reload design is deliberate — a failed reload must not take
+/// authentication offline — so the gap is the missing signal to the operator,
+/// not the caching. This supplies that signal.
+///
+/// The command still exits 0: the revoke genuinely succeeded, and failing it
+/// would misreport that and break scripts that check the exit status.
+fn reload_warning(server_pid: Option<i32>, effect: &str, tokens_file: &Path) -> Option<String> {
+    if server_pid.is_some() {
+        return None;
+    }
+    Some(format!(
+        "warning: {effect} in {}, but a running server holds its token store in \
+         memory and will keep accepting the old credential until it receives \
+         SIGHUP. The credential is NOT dead yet. Re-run with --server-pid <pid>, \
+         or signal the service directly (systemctl kill -s HUP <unit>).",
+        tokens_file.display()
+    ))
+}
+
 fn signal_reload(pid: Option<i32>) -> Result<(), TokenCommandError> {
     let Some(raw) = pid else {
         return Ok(());
@@ -519,6 +564,55 @@ fn signal_reload(pid: Option<i32>) -> Result<(), TokenCommandError> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A supplied PID means SIGHUP was delivered, so there is nothing to warn about.
+    #[test]
+    fn no_warning_when_the_server_was_signalled() {
+        assert!(
+            reload_warning(
+                Some(1234),
+                "token removed",
+                Path::new("/etc/jmcp/tokens.json")
+            )
+            .is_none()
+        );
+    }
+
+    /// Without a PID the operator must be told the credential is still live.
+    ///
+    /// Regression test for mecmcp#266: `revoke` printed success and exited 0
+    /// while the running server kept accepting the token, and nothing said so.
+    #[test]
+    fn warns_that_the_credential_is_not_dead_yet() {
+        let warning = reload_warning(None, "token removed", Path::new("/etc/jmcp/tokens.json"))
+            .expect("a revoke with no --server-pid must warn");
+
+        assert!(
+            warning.contains("NOT dead"),
+            "the warning must contradict the success message directly: {warning}"
+        );
+        assert!(
+            warning.contains("--server-pid"),
+            "the warning must name the flag that fixes it: {warning}"
+        );
+        assert!(
+            warning.contains("SIGHUP"),
+            "the warning must name the mechanism: {warning}"
+        );
+        assert!(
+            warning.contains("/etc/jmcp/tokens.json"),
+            "the warning must name the store that changed: {warning}"
+        );
+    }
+
+    /// Rotate carries its own wording; the old secret is what stays live.
+    #[test]
+    fn rotate_warning_names_its_own_effect() {
+        let warning = reload_warning(None, "secret rotated", Path::new("/tmp/t.json"))
+            .expect("a rotate with no --server-pid must warn");
+        assert!(warning.contains("secret rotated"), "{warning}");
+        assert!(warning.contains("old credential"), "{warning}");
+    }
 
     #[test]
     fn provenance_derives_agent_from_a_provider() {
