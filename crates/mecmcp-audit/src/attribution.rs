@@ -235,6 +235,10 @@ impl Attribution {
     /// client-asserted fields (`model_id`, `session_id`, `skills_used`) are
     /// left at their empty defaults — they are not knowable at this point
     /// and must not be invented.
+    ///
+    /// The `request_id` is taken from `CallerCtx`, so every attribution built
+    /// from one caller context shares it. That is what makes the transport
+    /// preflight event and the handler's enriched event joinable (mecmcp#269).
     pub fn from_caller<G>(ctx: &mecmcp_auth::CallerCtx<G>) -> Self
     where
         G: mecmcp_auth::Grant,
@@ -294,7 +298,11 @@ impl Attribution {
             agent,
             on_behalf_of: ctx.on_behalf_of.clone(),
             change_ref: None,
-            request_id: Uuid::new_v4(),
+            // Read from the caller context rather than minted here, so the
+            // transport preflight event and the handler's enriched event for
+            // one request carry the same ID and can be joined (mecmcp#269).
+            // Minting per call is what made that correlation impossible.
+            request_id: ctx.request_id,
             token_verified_fields,
         }
     }
@@ -365,6 +373,7 @@ mod tests {
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Unknown,
             client_name: None,
+            request_id: uuid::Uuid::new_v4(),
         }
     }
 
@@ -397,14 +406,41 @@ mod tests {
         assert_eq!(Principal::Unauthenticated.to_string(), "stdio");
     }
 
+    /// One caller context means one request, so its attributions must agree.
+    ///
+    /// This replaces `correlation_ids_are_unique`, which asserted the opposite —
+    /// that two attributions built from the *same* `CallerCtx` carry different
+    /// IDs. That is precisely the defect in mecmcp#269: it is what made the
+    /// transport event and the handler event for a single request impossible to
+    /// join. The old test encoded the bug as the intended contract, which is why
+    /// nothing here ever flagged it.
     #[test]
-    fn correlation_ids_are_unique() {
+    fn one_caller_context_yields_one_correlation_id() {
         let c = ctx("ci");
         let a1 = Attribution::from_caller(&c);
         let a2 = Attribution::from_caller(&c);
-        assert_ne!(
+        assert_eq!(
             a1.request_id, a2.request_id,
-            "sequential constructions must mint unique UUIDs"
+            "every attribution built from one caller context describes one \
+             request and must share its correlation ID"
+        );
+        assert_eq!(
+            a1.request_id, c.request_id,
+            "the ID must come from the caller context, not be minted here"
+        );
+    }
+
+    /// Distinct requests must still be distinguishable.
+    ///
+    /// Guards the other direction: sharing the ID within a request must not
+    /// collapse into sharing it across requests.
+    #[test]
+    fn separate_caller_contexts_yield_distinct_correlation_ids() {
+        let first = Attribution::from_caller(&ctx("ci"));
+        let second = Attribution::from_caller(&ctx("ci"));
+        assert_ne!(
+            first.request_id, second.request_id,
+            "two authentications are two requests and must not share an ID"
         );
     }
 
@@ -603,6 +639,7 @@ mod tests {
             on_behalf_of: Some("fastrevmd@gmail.com".into()),
             actor_type: mecmcp_auth::ActorType::Agent,
             client_name: None,
+            request_id: uuid::Uuid::new_v4(),
         };
         let a = Attribution::from_caller(&ctx);
 
@@ -657,6 +694,7 @@ mod tests {
             on_behalf_of: Some("alice@example.com".into()),
             actor_type: mecmcp_auth::ActorType::Human,
             client_name: None,
+            request_id: uuid::Uuid::new_v4(),
         };
         let a = Attribution::from_caller(&ctx);
 
@@ -684,6 +722,7 @@ mod tests {
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Unknown, // defaulted, not explicit
             client_name: None,
+            request_id: uuid::Uuid::new_v4(),
         };
         let a = Attribution::from_caller(&c);
         assert_eq!(a.actor_type, ActorType::Unknown);
@@ -709,6 +748,7 @@ mod tests {
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Agent, // explicit
             client_name: None,
+            request_id: uuid::Uuid::new_v4(),
         };
         let a = Attribution::from_caller(&c);
         assert_eq!(a.actor_type, ActorType::Agent);
@@ -736,6 +776,7 @@ mod tests {
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Agent,
             client_name: None,
+            request_id: uuid::Uuid::new_v4(),
         };
         let a = Attribution::from_caller(&c);
         assert_eq!(
@@ -765,6 +806,7 @@ mod tests {
             on_behalf_of: Some("alice@example.com".into()),
             actor_type: mecmcp_auth::ActorType::Agent,
             client_name: None,
+            request_id: uuid::Uuid::new_v4(),
         };
         let a = Attribution::from_caller(&c);
         assert_eq!(

@@ -641,6 +641,14 @@ pub async fn bearer_preflight_middleware<G: Grant>(
     // Emit transport-level audit event for tools/call requests (mecmcp#32).
     // The handler will emit its own enriched event with action, targets, outcome.
     //
+    // Both events carry the same `request_id`, so a SIEM can join them. That
+    // holds because the ID lives on `CallerCtx` (minted once, at authentication)
+    // and this scope is built from the same `caller` value that is re-inserted
+    // into the request extensions below — not because anything re-derives it.
+    // Until mecmcp#269 this comment claimed the correlation while
+    // `Attribution::from_caller` minted a fresh UUID per call, so the two events
+    // never matched; the claim is what stopped anyone checking.
+    //
     // The scope is built here but deliberately left unsettled until the
     // preflight has run (mecmcp#268). When the preflight refuses, this event is
     // the *only* record of the call — the handler never runs, so nothing
@@ -1153,6 +1161,7 @@ mod tests {
             on_behalf_of: None,
             actor_type: ActorType::Human,
             client_name: None,
+            request_id: uuid::Uuid::new_v4(),
         };
 
         let body = br#"{"method":"tools/call","params":{"name":"list_devices","arguments":{}}}"#;
@@ -1205,6 +1214,7 @@ mod tests {
             on_behalf_of: None,
             actor_type: ActorType::Human,
             client_name: None,
+            request_id: uuid::Uuid::new_v4(),
         };
 
         let body = br#"{"method":"tools/call","params":{"name":"get_config","arguments":{}}}"#;
@@ -1248,6 +1258,7 @@ mod tests {
             on_behalf_of: Some("user@example.com".to_owned()),
             actor_type: ActorType::Agent,
             client_name: None,
+            request_id: uuid::Uuid::new_v4(),
         };
         let mut attr = Attribution::from_caller(&caller);
 

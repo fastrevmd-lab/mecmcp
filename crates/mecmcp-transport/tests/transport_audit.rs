@@ -58,6 +58,7 @@ fn emit_transport_audit(tool: &'static str, client_name: Option<&'static str>) {
         on_behalf_of: None,
         actor_type: ActorType::Human,
         client_name,
+        request_id: uuid::Uuid::new_v4(),
     };
 
     let mut scope = mecmcp_audit::AuditScope::from_caller(&caller, tool, "transport", Vec::new());

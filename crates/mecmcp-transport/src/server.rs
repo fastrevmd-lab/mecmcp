@@ -979,6 +979,7 @@ mod tests {
             on_behalf_of: None,
             actor_type: ActorType::Human,
             client_name: None,
+            request_id: uuid::Uuid::new_v4(),
         }
     }
 
