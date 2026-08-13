@@ -135,52 +135,11 @@ pub struct HttpTransportConfig<G: Grant> {
     bearer: Option<BearerBoundary<G>>,
     enable_metrics: bool,
     shutdown: CancellationToken,
+    insecure_bind: Option<crate::consent::InsecureBindAcknowledgement>,
 }
 
 impl<G: Grant> HttpTransportConfig<G> {
-    /// Construct unauthenticated transport settings.
-    ///
-    /// `shutdown` is a required parameter because a listener without one can
-    /// never drain: it is the token the caller cancels on SIGTERM.
-    /// Off-loopback no-auth policy is a runtime CLI decision;
-    /// callers must validate it before building the router.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use mecmcp_transport::{HttpTransportConfig, HostOriginPolicy, LimitsConfig, TransportIdentity};
-    /// use mecmcp_auth::NoGrant;
-    /// use tokio_util::sync::CancellationToken;
-    ///
-    /// let config = HttpTransportConfig::<NoGrant>::new(
-    ///     TransportIdentity::new("testmcp", "test", "test", ["device"]),
-    ///     LimitsConfig::default(),
-    ///     HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
-    ///     CancellationToken::new(),
-    /// );
-    /// ```
-    #[must_use]
-    pub fn new(
-        identity: TransportIdentity,
-        limits: LimitsConfig,
-        host_origin: HostOriginPolicy,
-        shutdown: CancellationToken,
-    ) -> Self {
-        Self {
-            identity,
-            limits,
-            host_origin,
-            bearer: None,
-            enable_metrics: false,
-            shutdown,
-        }
-    }
-
-    /// Enable bearer authentication.
-    ///
-    /// When set, all requests must present a valid bearer token. The boundary
-    /// includes per-token rate and concurrency limits, body size limit,
-    /// optional scope preflight, and per-target concurrency.
+    /// Construct transport settings for an authenticated listener.
     ///
     /// # Example
     ///
@@ -192,24 +151,97 @@ impl<G: Grant> HttpTransportConfig<G> {
     /// };
     /// use tokio_util::sync::CancellationToken;
     ///
-    /// let authenticator = BearerAuthenticator::<NoGrant>::new(
-    ///     BearerSyntax::Strict,
-    ///     |_candidate| None,
+    /// let authenticator =
+    ///     BearerAuthenticator::<NoGrant>::new(BearerSyntax::Strict, |_candidate| None);
+    /// let boundary =
+    ///     BearerBoundary::new(authenticator, BearerResponseProfile::detailed("test"));
+    /// let config = HttpTransportConfig::authenticated(
+    ///     TransportIdentity::new("testmcp", "test", "test", ["device"]),
+    ///     LimitsConfig::default(),
+    ///     HostOriginPolicy::enforced(["host"], ["https://origin"]),
+    ///     CancellationToken::new(),
+    ///     boundary,
     /// );
-    /// let boundary = BearerBoundary::new(
-    ///     authenticator,
-    ///     BearerResponseProfile::detailed("test"),
-    /// );
-    /// let config = HttpTransportConfig::new(
+    /// ```
+    #[must_use]
+    pub fn authenticated(
+        identity: TransportIdentity,
+        limits: LimitsConfig,
+        host_origin: HostOriginPolicy,
+        shutdown: CancellationToken,
+        bearer: BearerBoundary<G>,
+    ) -> Self {
+        Self {
+            identity,
+            limits,
+            host_origin,
+            bearer: Some(bearer),
+            enable_metrics: false,
+            shutdown,
+            insecure_bind: None,
+        }
+    }
+
+    /// Construct transport settings for a listener that serves without
+    /// authentication.
+    ///
+    /// Requires a [`NoAuthAcknowledgement`], which exists so that "the operator
+    /// chose this" and "the consumer forgot" are different values. Before
+    /// mecmcp#273 they were the same one, and a consumer could serve the LAN
+    /// unauthenticated without any code path recording a decision.
+    ///
+    /// The acknowledgement does **not** permit an off-loopback bind:
+    /// `serve_router` refuses that with
+    /// [`ListenerRefusal::UnauthenticatedOffLoopback`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mecmcp_auth::NoGrant;
+    /// use mecmcp_transport::{
+    ///     HttpTransportConfig, HostOriginPolicy, LimitsConfig, NoAuthAcknowledgement,
+    ///     TransportIdentity,
+    /// };
+    /// use tokio_util::sync::CancellationToken;
+    ///
+    /// let config = HttpTransportConfig::<NoGrant>::unauthenticated(
     ///     TransportIdentity::new("testmcp", "test", "test", ["device"]),
     ///     LimitsConfig::default(),
     ///     HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
     ///     CancellationToken::new(),
-    /// ).with_bearer(boundary);
+    ///     NoAuthAcknowledgement::operator_allowed_no_auth(),
+    /// );
     /// ```
     #[must_use]
-    pub fn with_bearer(mut self, bearer: BearerBoundary<G>) -> Self {
-        self.bearer = Some(bearer);
+    pub fn unauthenticated(
+        identity: TransportIdentity,
+        limits: LimitsConfig,
+        host_origin: HostOriginPolicy,
+        shutdown: CancellationToken,
+        _acknowledgement: crate::consent::NoAuthAcknowledgement,
+    ) -> Self {
+        Self {
+            identity,
+            limits,
+            host_origin,
+            bearer: None,
+            enable_metrics: false,
+            shutdown,
+            insecure_bind: None,
+        }
+    }
+
+    /// Accept a plaintext listener on a non-loopback address.
+    ///
+    /// Without this, `serve_router` refuses to bind an off-loopback address
+    /// that has no TLS. Absence is the safe default, so this is a builder step
+    /// rather than a constructor parameter.
+    #[must_use]
+    pub fn with_insecure_bind(
+        mut self,
+        acknowledgement: crate::consent::InsecureBindAcknowledgement,
+    ) -> Self {
+        self.insecure_bind = Some(acknowledgement);
         self
     }
 
@@ -875,7 +907,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::{BearerAuthenticator, BearerResponseProfile};
+    use crate::{BearerAuthenticator, BearerResponseProfile, NoAuthAcknowledgement};
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use mecmcp_auth::{ActorType, BearerSyntax, CallerCtx, NoGrant, ScopeSet};
@@ -960,7 +992,7 @@ mod tests {
     async fn origin_validation_prevents_port_wildcarding() {
         // Middleware validates by comparing normalized tuples, so port-less allowlist
         // entry matches port-less browser Origin but NOT explicit non-default port.
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
             HostOriginPolicy::enforced(
@@ -968,6 +1000,7 @@ mod tests {
                 vec!["https://client.example".to_owned()], // No port
             ),
             CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
         let (router, _shutdown) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
@@ -1018,7 +1051,7 @@ mod tests {
     #[tokio::test]
     async fn origin_validation_accepts_portless_browser_origin() {
         // Browsers send port-less Origin for default ports (80/443)
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
             HostOriginPolicy::enforced(
@@ -1026,6 +1059,7 @@ mod tests {
                 vec!["https://app.example".to_owned()],
             ),
             CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
         let (router, _shutdown) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
@@ -1054,7 +1088,7 @@ mod tests {
     #[tokio::test]
     async fn origin_validation_handles_null_explicitly() {
         // Origin: null from sandboxed iframe, file://, etc.
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
             HostOriginPolicy::enforced(
@@ -1062,6 +1096,7 @@ mod tests {
                 vec!["null".to_owned()], // Explicitly allow null
             ),
             CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
         let (router, _shutdown) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
@@ -1163,11 +1198,12 @@ mod tests {
 
     #[tokio::test]
     async fn router_with_allowed_host_accepts_matching_request() {
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
             HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
             CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
         let (router, _shutdown) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
@@ -1200,16 +1236,17 @@ mod tests {
         let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, |candidate| {
             (candidate == "secret").then(caller)
         });
-        let config = HttpTransportConfig::new(
+        let boundary = BearerBoundary::new(
+            authenticator,
+            BearerResponseProfile::detailed("test"),
+        );
+        let config = HttpTransportConfig::authenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
             HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
             CancellationToken::new(),
-        )
-        .with_bearer(BearerBoundary::new(
-            authenticator,
-            BearerResponseProfile::detailed("test"),
-        ));
+            boundary,
+        );
         let (router, _shutdown) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
@@ -1236,13 +1273,13 @@ mod tests {
             max_inflight_requests: 1, // Allow only 1 concurrent request
             ..LimitsConfig::default()
         };
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             limits,
             HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
             CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        // No .with_bearer() call — unauthenticated
         let (router, _shutdown) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
@@ -1290,11 +1327,12 @@ mod tests {
     async fn metrics_endpoint_enforces_host_allowlist() {
         // Test that /metrics enforces the Host allowlist, preventing DNS rebinding
         // attacks where an attacker page requests /metrics with a foreign Host.
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
             HostOriginPolicy::enforced(["allowed.example.test"], Vec::<String>::new()),
             CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         )
         .with_metrics(true);
         let (router, _shutdown) =
@@ -1349,13 +1387,13 @@ mod tests {
             max_request_body_bytes: 64, // Small limit
             ..LimitsConfig::default()
         };
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             limits,
             HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
             CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
-        // No .with_bearer() — unauthenticated
         let (router, _shutdown) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build failed");
@@ -1383,11 +1421,12 @@ mod tests {
     #[tokio::test]
     async fn graceful_shutdown_stops_accepting_connections() {
         let shutdown = CancellationToken::new();
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
             HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
             shutdown.clone(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
         let (router, shutdown_from_router) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
@@ -1444,11 +1483,12 @@ mod tests {
     #[tokio::test]
     async fn sessions_outlive_the_start_of_the_drain_and_end_at_its_deadline() {
         let listener_token = CancellationToken::new();
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
             HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
             listener_token.clone(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
         let (router, shutdown) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
@@ -1490,11 +1530,12 @@ mod tests {
     async fn http2_authority_fallback_when_host_header_absent() {
         // HTTP/2 clients send :authority pseudo-header; hyper puts it in URI authority.
         // This test simulates that by omitting Host header and putting authority in URI.
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
             HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
             CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
         let (router, _shutdown) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
@@ -1528,11 +1569,12 @@ mod tests {
     #[tokio::test]
     async fn ipv6_host_parsing_handles_brackets_and_port() {
         // IPv6 addresses like [::1]:8080 must not split incorrectly on :
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
             HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
             CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
         let (router, _shutdown) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
@@ -1560,11 +1602,12 @@ mod tests {
     #[tokio::test]
     async fn explicit_port_host_rejects_different_port() {
         // An allowlist entry with explicit port should NOT match a different port
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
             HostOriginPolicy::enforced(vec!["mcp.example:8443".to_owned()], Vec::<String>::new()),
             CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
         let (router, _shutdown) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
@@ -1593,11 +1636,12 @@ mod tests {
     async fn portless_allowed_host_matches_any_port() {
         // A portless allowlist entry should match ANY port (production shape: LXC 609)
         // This differs from Origin handling where portless entries match only portless.
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
             HostOriginPolicy::enforced(vec!["192.168.1.194".to_owned()], Vec::<String>::new()),
             CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
         let (router, _shutdown) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
@@ -1646,11 +1690,12 @@ mod tests {
     #[tokio::test]
     async fn mixed_case_host_accepted() {
         // DNS names are case-insensitive (RFC 1035), so mixed case should match
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
             HostOriginPolicy::enforced(vec!["mcp.example.test".to_owned()], Vec::<String>::new()),
             CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
         let (router, _shutdown) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
@@ -1678,7 +1723,7 @@ mod tests {
     #[tokio::test]
     async fn non_utf8_origin_rejected() {
         // Non-UTF-8 Origin header should be rejected immediately (not fall through)
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
             HostOriginPolicy::enforced(
@@ -1686,6 +1731,7 @@ mod tests {
                 vec!["https://app.example".to_owned()],
             ),
             CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
         let (router, _shutdown) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
@@ -1729,11 +1775,12 @@ mod tests {
             max_request_burst_per_ip: 1,
             ..LimitsConfig::default()
         };
-        let config = HttpTransportConfig::<NoGrant>::new(
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             limits,
             HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
             CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
 
         // If IP rate limiter was applied in wrong order, router construction would fail.
@@ -1742,6 +1789,41 @@ mod tests {
         let (_router, _shutdown) =
             build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
                 .expect("router build should succeed with IP limiting enabled");
+    }
+
+    #[test]
+    fn authenticated_and_unauthenticated_configs_record_their_posture() {
+        use crate::consent::{InsecureBindAcknowledgement, NoAuthAcknowledgement};
+        use mecmcp_auth::{BearerSyntax, NoGrant};
+
+        let identity = || TransportIdentity::new("testmcp", "test", "test", ["device"]);
+        let policy = || HostOriginPolicy::enforced(vec!["h".to_owned()], vec!["o".to_owned()]);
+
+        let authenticator =
+            crate::BearerAuthenticator::<NoGrant>::new(BearerSyntax::Strict, |_| None);
+        let boundary =
+            crate::BearerBoundary::new(authenticator, crate::BearerResponseProfile::detailed("t"));
+
+        let authed = HttpTransportConfig::authenticated(
+            identity(),
+            LimitsConfig::default(),
+            policy(),
+            CancellationToken::new(),
+            boundary,
+        );
+        assert!(authed.bearer.is_some(), "authenticated config must carry the boundary");
+        assert!(authed.insecure_bind.is_none(), "insecure bind must default to unacknowledged");
+
+        let open = HttpTransportConfig::<NoGrant>::unauthenticated(
+            identity(),
+            LimitsConfig::default(),
+            policy(),
+            CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
+        )
+        .with_insecure_bind(InsecureBindAcknowledgement::operator_allowed_insecure_bind());
+        assert!(open.bearer.is_none());
+        assert!(open.insecure_bind.is_some());
     }
 
     // Graceful shutdown drain behavior is verified in rustsdcmcp's integration
