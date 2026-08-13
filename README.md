@@ -189,6 +189,16 @@ an exact version.
 
 ### Upgrading to 0.6.0
 
+> **Superseded in part by 0.7.0's transport assembly.** This section documents
+> the consumer applying the bearer boundary and the per-IP rate limit by hand,
+> which was correct at 0.6.0. Since 0.7.0, `build_streamable_http_router` does
+> all three itself — it applies the boundary, applies the IP rate limit, and
+> builds the `BoundaryAccounting`. **On 0.7.0 or later, do not apply them
+> yourself: you get both layers twice, which silently halves the per-IP budget
+> and stacks the boundary.** The manual pattern below applies only to a
+> pre-0.7.0 consumer, or to one assembling a router without
+> `build_streamable_http_router`.
+
 **Extraction milestone 2: the bearer boundary.** All 22 issues (#96, #97,
 #103–#108, #118, #129–#141) land in this tag, because partial availability
 would mean a consumer maintaining both paths. `rustsdcmcp` can now delete
@@ -226,10 +236,13 @@ would mean a consumer maintaining both paths. `rustsdcmcp` can now delete
    take `&'static str`.
 
 The boundary builds everything from `authenticate` inwards, so a consumer cannot
-get that part wrong. **Per-IP rate limiting is the one layer the consumer still
-applies itself**, because it must run *before* authentication — a request with a
-missing, malformed or unknown token has no identity to charge, and metering it is
-what stops an authentication flood:
+get that part wrong. **At 0.6.x, per-IP rate limiting was the one layer the
+consumer still applied itself**, because it must run *before* authentication — a
+request with a missing, malformed or unknown token has no identity to charge, and
+metering it is what stops an authentication flood.
+
+**Pre-0.7.0 only.** At 0.7.0 and later `build_streamable_http_router` applies
+both layers; running this by hand as well double-applies them.
 
 ```rust
 let limits = Arc::new(limits_config);
@@ -245,13 +258,14 @@ let app = apply_ip_rate_limit(app, &limits); // outermost: runs first
 Use `BoundaryAccounting::none()` for a deployment with no per-token accounting.
 
 Axum runs the last-applied layer first, so `apply_ip_rate_limit` must be applied
-*after* `apply_bearer_boundary` to sit outside it. Omitting it leaves
-unauthenticated requests unmetered.
+*after* `apply_bearer_boundary` to sit outside it. On a hand-assembled router,
+omitting it leaves unauthenticated requests unmetered.
 
-The resulting order:
+The resulting order — unchanged at 0.7.0+, where the router builder produces it
+rather than the consumer:
 
 ```
-IP rate limit (consumer) → authenticate → token rate limit → token concurrency
+IP rate limit → authenticate → token rate limit → token concurrency
   → body limit → preflight → target concurrency → handler
 ```
 
@@ -300,6 +314,13 @@ defaults to 10 MiB here, so on a plain `default()` every request between 4 and
 10 MiB starts failing with a 413 from a limit the operator never set and cannot
 see in their own config. `streamable_http_server_config` derives it from
 `LimitsConfig` and maps `0` (unlimited) to `usize::MAX`.
+
+> **Superseded by 0.7.0.** The `&limits`-only `streamable_http_server_config` is
+> `#[deprecated]` since 0.7.0. On 0.7.0 or later, `build_streamable_http_router`
+> builds the rmcp server config itself, so a consumer using it needs no call at
+> all; a consumer assembling a router by hand calls
+> `build_rmcp_server_config(&policy, &limits, shutdown)`, which took over the
+> host/origin concern along with the body cap.
 
 **Session capacity is now protocol-aware.** rmcp computes
 `use_session = legacy_session_mode && is_legacy_request(..)`, so a client
