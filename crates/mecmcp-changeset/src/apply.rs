@@ -54,6 +54,37 @@ fn canonicalize_endpoint(endpoint: &str) -> Result<String, CoordinatorError> {
     Ok(canonical)
 }
 
+/// Returns an error when `change_set` was approved by a waiver whose
+/// `expires_at_unix` has passed as of `now`.
+///
+/// Takes `now` rather than reading the clock so each call site can pass the
+/// instant it already observed: the pre-guard and post-guard checks are
+/// deliberately separated in time to detect TOCTOU attacks.
+///
+/// # Errors
+///
+/// Returns a `CoordinatorError` if the waiver has expired.
+fn waiver_expiry_error(
+    change_set: &crate::records::ChangeSetRecord,
+    now: u64,
+) -> Option<CoordinatorError> {
+    if let Some(expires_at) = change_set
+        .approval
+        .as_ref()
+        .and_then(|approval| approval.waived.as_ref())
+        .and_then(|waiver| waiver.expires_at_unix)
+        && now >= expires_at
+    {
+        Some(CoordinatorError::new(
+            "change_set_id",
+            "waiver expired: this change set was approved by a time-boxed waiver that has \
+             lapsed, so it requires a fresh approval or a new waiver",
+        ))
+    } else {
+        None
+    }
+}
+
 /// Output from applying a change set.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApplyOutput<S> {
@@ -186,18 +217,8 @@ impl ChangesetCoordinator {
         // is valid. Checked here rather than at waive time because expiry is a
         // property of the moment of use, not of the moment of grant.
         let now_for_waiver = now_unix()?;
-        if let Some(expires_at) = change_set
-            .approval
-            .as_ref()
-            .and_then(|approval| approval.waived.as_ref())
-            .and_then(|waiver| waiver.expires_at_unix)
-            && now_for_waiver > expires_at
-        {
-            return Err(CoordinatorError::new(
-                "change_set_id",
-                "waiver expired: this change set was approved by a time-boxed waiver that has \
-                 lapsed, so it requires a fresh approval or a new waiver",
-            ));
+        if let Some(error) = waiver_expiry_error(&change_set, now_for_waiver) {
+            return Err(error);
         }
 
         // Validate approval is present and either genuine or waived.
@@ -269,18 +290,8 @@ impl ChangesetCoordinator {
         // An approval obtained by a waiver is only an approval while the waiver
         // is valid. Checked here rather than at waive time because expiry is a
         // property of the moment of use, not of the moment of grant.
-        if let Some(expires_at) = change_set
-            .approval
-            .as_ref()
-            .and_then(|approval| approval.waived.as_ref())
-            .and_then(|waiver| waiver.expires_at_unix)
-            && now_after_guard > expires_at
-        {
-            return Err(CoordinatorError::new(
-                "change_set_id",
-                "waiver expired: this change set was approved by a time-boxed waiver that has \
-                 lapsed, so it requires a fresh approval or a new waiver",
-            ));
+        if let Some(error) = waiver_expiry_error(&change_set, now_after_guard) {
+            return Err(error);
         }
 
         // Check expiration after acquiring the guard. If the TTL elapses while waiting

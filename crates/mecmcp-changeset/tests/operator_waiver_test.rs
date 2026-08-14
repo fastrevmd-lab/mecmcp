@@ -810,8 +810,12 @@ async fn post_guard_waiver_expiry_check_detects_toctou_rewrite() {
             .await
     });
 
-    // Give apply time to reach the guard and block
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Give the scheduler chances to run the background apply task so it passes
+    // the pre-guard check and blocks on the held guard. Unlike sleep, yield_now
+    // is not wall-clock based and won't flake on loaded CI machines.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
 
     // While apply is blocked, rewrite the waiver to have a PAST expiry
     let past_expiry = now - 3600; // 1 hour ago
@@ -860,5 +864,95 @@ async fn post_guard_waiver_expiry_check_detects_toctou_rewrite() {
     assert!(
         message.contains("waiver expired"),
         "post-guard check must detect the TOCTOU rewrite: {message}"
+    );
+}
+
+/// Waiver expiry boundary: a waiver whose `expires_at_unix` equals the current
+/// time is treated as expired (consistent with change-set expiry everywhere else).
+#[tokio::test]
+async fn waiver_at_exact_expiry_instant_is_expired() {
+    let harness = planned_change_set_harness().await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_secs();
+
+    // Waiver expires at exactly now (not in the past, not in the future)
+    let waiver = WaiverRecord {
+        kind: WaiverKind::OperatorFile,
+        reason: "test boundary: expires at exactly now".to_owned(),
+        expires_at_unix: Some(now),
+        ticket: Some("BOUNDARY-123".to_owned()),
+    };
+
+    let waiver_digest = compute_waiver_digest_v3(
+        &harness.change_set_id,
+        &harness.digest,
+        &harness.owner,
+        now,
+        &waiver,
+    );
+
+    // Set up the change set with the waiver
+    let state_path = harness._temp_dir.path().join("state.json");
+    let mut state = read_state(&state_path, 8 * 1024 * 1024).expect("read state");
+    let change_set = state
+        .change_sets
+        .get_mut(&harness.change_set_id)
+        .expect("change set exists");
+    change_set.state = ChangeSetState::Approved;
+    change_set.approval = Some(ApprovalRecord {
+        approver: None,
+        approved_at_unix: now,
+        digest: waiver_digest,
+        waived: Some(waiver),
+    });
+    write_state(&state_path, &state, 8 * 1024 * 1024).expect("write state");
+
+    // Reload coordinator
+    let limits = OperationLimits {
+        max_operations: 1024,
+        max_change_sets: 1024,
+        max_actions_per_set: 64,
+        max_state_bytes: 8 * 1024 * 1024,
+        max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
+    };
+    let approval_ttl = Duration::from_secs(15 * 60);
+    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, true)
+        .expect("reload coordinator");
+
+    let cancellation = CancellationToken::new();
+    let fingerprint = harness
+        .transaction
+        .fingerprint()
+        .await
+        .expect("fingerprint");
+
+    // Apply must fail because the waiver's expiry is at exactly now, which is
+    // treated as expired (consistent with `now >= expires_at` everywhere else).
+    let error = coordinator
+        .apply_change_set(
+            harness.change_set_id,
+            harness.device,
+            "https://test-device.example.com".to_string(),
+            harness.owner,
+            harness.digest,
+            fingerprint,
+            &harness.transaction,
+            "set",
+            None,
+            None,
+            &test_attribution("alice"),
+            &cancellation,
+        )
+        .await
+        .expect_err("waiver with expires_at_unix == now must be treated as expired");
+
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("waiver expired"),
+        "boundary check: expires_at_unix == now must be expired, got: {message}"
     );
 }
