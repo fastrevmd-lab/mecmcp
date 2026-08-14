@@ -735,8 +735,8 @@ async fn pre_guard_waiver_expiry_check_fails_without_blocking() {
     let error = apply_result.expect_err("expired waiver must not authorize apply");
     let message = format!("{error:?}");
     assert!(
-        message.contains("waiver expired"),
-        "pre-guard check must detect the expired waiver: {message}"
+        message.contains("waiver expired") && message.contains("before device lock"),
+        "pre-guard check must detect the expired waiver with the pre-guard message: {message}"
     );
 }
 
@@ -840,8 +840,12 @@ async fn post_guard_waiver_expiry_check_detects_toctou_rewrite() {
     });
 
     // Give the scheduler chances to run the background apply task so it passes
-    // the pre-guard check and blocks on the held guard. Unlike sleep, yield_now
-    // is not wall-clock based and won't flake on loaded CI machines.
+    // the pre-guard check and blocks on the held guard. `yield_now` drives the
+    // cooperative scheduler forward without wall-clock delay. The `#[tokio::test]`
+    // macro uses a current-thread runtime so the ordering is deterministic:
+    // after ten yields, the spawned task has passed the pre-guard check and
+    // reached the device guard. The assertion on the post-guard message below
+    // proves which gate fired regardless of scheduler implementation.
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
@@ -891,8 +895,8 @@ async fn post_guard_waiver_expiry_check_detects_toctou_rewrite() {
     let error = result.expect_err("post-guard check must detect the expired waiver");
     let message = format!("{error:?}");
     assert!(
-        message.contains("waiver expired"),
-        "post-guard check must detect the TOCTOU rewrite: {message}"
+        message.contains("waiver expired") && message.contains("after acquiring device lock"),
+        "post-guard check must detect the TOCTOU rewrite with the post-guard message: {message}"
     );
 }
 
