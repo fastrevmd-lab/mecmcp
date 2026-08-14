@@ -2,7 +2,9 @@
 
 use crate::{
     coordinator::{ChangesetCoordinator, CoordinatorError},
-    digest::{change_set_digest, compute_approval_digest, compute_waiver_digest, validate_digest},
+    digest::{
+        change_set_digest, compute_approval_digest, compute_waiver_digest_v3, validate_digest,
+    },
     lifecycle::ChangeSetState,
     records::{ApprovalRecord, ChangeSetRecord, WaiverKind, WaiverRecord},
 };
@@ -327,9 +329,14 @@ impl ChangesetCoordinator {
             ));
         }
 
-        // Compute waiver digest: (change_set_id, plan_digest, owner, waived_at, "lab-mode-waived")
+        let waiver = WaiverRecord {
+            kind: WaiverKind::LabMode,
+            reason: "lab-mode".to_owned(),
+            expires_at_unix: None,
+            ticket: None,
+        };
         let waiver_digest =
-            compute_waiver_digest(&change_set_id, &record.digest, &record.owner, now);
+            compute_waiver_digest_v3(&change_set_id, &record.digest, &record.owner, now, &waiver);
 
         record.state = ChangeSetState::Approved;
         record.approver = None;
@@ -337,12 +344,113 @@ impl ChangesetCoordinator {
             approver: None,
             approved_at_unix: now,
             digest: waiver_digest,
-            waived: Some(WaiverRecord {
-                kind: WaiverKind::LabMode,
-                reason: "lab-mode".to_owned(),
-                expires_at_unix: None,
-                ticket: None,
-            }),
+            waived: Some(waiver),
+        });
+
+        self.update_change_set(record.clone()).await?;
+
+        Ok(record.into())
+    }
+
+    /// Grants an operator-level approval waiver for the specified change set.
+    ///
+    /// Unlike `waive_approval`, this method does **not** require lab mode and
+    /// records a documented exception granted under an active control. The
+    /// waiver binds a kind, optional expiry, and optional ticket reference into
+    /// its digest to prevent post-hoc relabelling or time-box extension.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The waiver `kind` is `WaiverKind::LabMode` (use `waive_approval` for that)
+    /// - The `expires_at_unix` is already in the past (configuration error, not a valid waiver)
+    /// - The change set does not exist or belongs to another device
+    /// - Only the change-set owner can grant the waiver
+    /// - The change set is not in `Planned` state
+    /// - The approval window has expired
+    /// - The expected digest does not match the stored digest
+    #[allow(clippy::too_many_arguments)]
+    pub async fn waive_approval_operator(
+        &self,
+        change_set_id: String,
+        device: String,
+        owner: String,
+        expected_digest: String,
+        kind: WaiverKind,
+        reason: String,
+        expires_at_unix: Option<u64>,
+        ticket: Option<String>,
+    ) -> Result<ChangeSetOutput, CoordinatorError> {
+        if kind == WaiverKind::LabMode {
+            return Err(CoordinatorError::new(
+                "kind",
+                "use waive_approval for a lab-mode waiver; this path records an \
+                 operator-granted exception under a control that is still on",
+            ));
+        }
+
+        validate_digest(&expected_digest, "expected_digest")
+            .map_err(|e| CoordinatorError::new("expected_digest", e.to_string()))?;
+
+        let mut record = self.change_set(&change_set_id, &device).await?;
+
+        if record.owner != owner {
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                "only the change-set owner can waive approval",
+            ));
+        }
+
+        if record.state != ChangeSetState::Planned {
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                "change set is not awaiting approval",
+            ));
+        }
+
+        let now = now_unix()?;
+        if now >= record.expires_at_unix {
+            record.state = ChangeSetState::Expired;
+            self.update_change_set(record).await?;
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                "change-set approval window expired",
+            ));
+        }
+
+        if record.digest != expected_digest {
+            return Err(CoordinatorError::new(
+                "expected_digest",
+                "digest does not match the exact stored change set",
+            ));
+        }
+
+        if let Some(expires) = expires_at_unix
+            && expires <= now
+        {
+            return Err(CoordinatorError::new(
+                "expires_at_unix",
+                "waiver expiry is already in the past; a waiver that is dead on \
+                 arrival is a configuration error, not a waiver",
+            ));
+        }
+
+        let waiver = WaiverRecord {
+            kind,
+            reason,
+            expires_at_unix,
+            ticket,
+        };
+        let waiver_digest =
+            compute_waiver_digest_v3(&change_set_id, &record.digest, &record.owner, now, &waiver);
+
+        record.state = ChangeSetState::Approved;
+        record.approver = None;
+        record.approval = Some(ApprovalRecord {
+            approver: None,
+            approved_at_unix: now,
+            digest: waiver_digest,
+            waived: Some(waiver),
         });
 
         self.update_change_set(record.clone()).await?;

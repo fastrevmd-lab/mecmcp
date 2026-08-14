@@ -956,3 +956,77 @@ async fn waiver_at_exact_expiry_instant_is_expired() {
         "boundary check: expires_at_unix == now must be expired, got: {message}"
     );
 }
+
+/// Lab mode keeps working untouched — no consumer changes to keep it.
+#[tokio::test]
+async fn lab_mode_waiver_still_records_lab_mode() {
+    let harness = planned_change_set_harness().await;
+    harness
+        .coordinator
+        .waive_approval(
+            harness.change_set_id.clone(),
+            harness.device.clone(),
+            harness.owner.clone(),
+            harness.digest.clone(),
+        )
+        .await
+        .expect("lab-mode waiver");
+
+    let record = harness
+        .coordinator
+        .change_set(&harness.change_set_id, &harness.device)
+        .await
+        .expect("retrieve change set");
+
+    let waiver = record
+        .approval
+        .as_ref()
+        .and_then(|approval| approval.waived.as_ref())
+        .expect("a waived approval");
+    assert_eq!(waiver.kind, WaiverKind::LabMode);
+    assert_eq!(waiver.expires_at_unix, None);
+}
+
+/// An operator waiver refuses an expiry already in the past. That is a
+/// configuration error, not a waiver that is instantly dead.
+#[tokio::test]
+async fn an_operator_waiver_refuses_an_expiry_in_the_past() {
+    let harness = planned_change_set_harness().await;
+    let error = harness
+        .coordinator
+        .waive_approval_operator(
+            harness.change_set_id.clone(),
+            harness.device.clone(),
+            harness.owner.clone(),
+            harness.digest.clone(),
+            WaiverKind::OperatorFile,
+            "authorised exception".to_owned(),
+            Some(1), // unix epoch + 1s, comfortably past
+            Some("CHG-1".to_owned()),
+        )
+        .await
+        .expect_err("an expiry in the past must be refused");
+    assert!(format!("{error:?}").contains("expires_at_unix"));
+}
+
+/// The operator waiver path must reject `WaiverKind::LabMode` — that kind
+/// belongs exclusively to `waive_approval`.
+#[tokio::test]
+async fn waive_approval_operator_refuses_lab_mode_kind() {
+    let harness = planned_change_set_harness().await;
+    let error = harness
+        .coordinator
+        .waive_approval_operator(
+            harness.change_set_id.clone(),
+            harness.device.clone(),
+            harness.owner.clone(),
+            harness.digest.clone(),
+            WaiverKind::LabMode,
+            "lab mode test".to_owned(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("LabMode kind must be refused");
+    assert!(format!("{error:?}").contains("waive_approval"));
+}

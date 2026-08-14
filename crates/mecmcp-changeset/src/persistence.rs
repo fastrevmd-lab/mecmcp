@@ -6,7 +6,6 @@ use crate::{
         compute_approval_digest, compute_waiver_digest, compute_waiver_digest_v3,
         validate_fingerprint,
     },
-    records::WaiverKind,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, io::Write, path::Path};
@@ -295,18 +294,17 @@ pub fn write_state(
         .operations
         .values()
         .any(|op| !op.endpoint.starts_with("https://"));
-    // A waiver that says anything beyond "lab mode with a reason" is a
-    // version-3 record. Same rule as v2: both record types are
-    // `deny_unknown_fields`, so a previous binary handed an unexpected key
-    // rejects the WHOLE file. A deployment that only ever waives in lab mode
-    // keeps producing files the older binary reads.
+    // Version 3 is required if any waiver record is present. `WaiverRecord::kind`
+    // always serializes (no `skip_serializing_if`), so every waiver — lab mode
+    // included — writes a `"kind"` key, and the pre-#275 `WaiverRecord` is
+    // `deny_unknown_fields` over `reason` alone. An older binary rejects any
+    // file containing any waiver regardless of version. Deployments with no
+    // waivers are unaffected and keep selecting v1/v2 by the existing rules.
     let waivers_need_v3 = state.change_sets.values().any(|cs| {
         cs.approval
             .as_ref()
             .and_then(|a| a.waived.as_ref())
-            .is_some_and(|w| {
-                w.kind != WaiverKind::LabMode || w.expires_at_unix.is_some() || w.ticket.is_some()
-            })
+            .is_some()
     });
     let version = if waivers_need_v3 {
         3
