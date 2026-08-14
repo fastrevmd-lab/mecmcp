@@ -735,7 +735,7 @@ async fn pre_guard_waiver_expiry_check_fails_without_blocking() {
     let error = apply_result.expect_err("expired waiver must not authorize apply");
     let message = format!("{error:?}");
     assert!(
-        message.contains("waiver expired") && message.contains("before device lock"),
+        message.contains("waiver expired") && message.contains("before device guard"),
         "pre-guard check must detect the expired waiver with the pre-guard message: {message}"
     );
 }
@@ -895,7 +895,7 @@ async fn post_guard_waiver_expiry_check_detects_toctou_rewrite() {
     let error = result.expect_err("post-guard check must detect the expired waiver");
     let message = format!("{error:?}");
     assert!(
-        message.contains("waiver expired") && message.contains("after acquiring device lock"),
+        message.contains("waiver expired") && message.contains("after acquiring device guard"),
         "post-guard check must detect the TOCTOU rewrite with the post-guard message: {message}"
     );
 }

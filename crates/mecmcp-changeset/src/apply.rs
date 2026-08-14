@@ -226,7 +226,7 @@ impl ChangesetCoordinator {
         // is valid. Checked here rather than at waive time because expiry is a
         // property of the moment of use, not of the moment of grant.
         let now_for_waiver = now_unix()?;
-        if let Some(error) = waiver_expiry_error(&change_set, now_for_waiver, "before device lock")
+        if let Some(error) = waiver_expiry_error(&change_set, now_for_waiver, "before device guard")
         {
             return Err(error);
         }
@@ -301,7 +301,7 @@ impl ChangesetCoordinator {
         // is valid. Checked here rather than at waive time because expiry is a
         // property of the moment of use, not of the moment of grant.
         if let Some(error) =
-            waiver_expiry_error(&change_set, now_after_guard, "after acquiring device lock")
+            waiver_expiry_error(&change_set, now_after_guard, "after acquiring device guard")
         {
             return Err(error);
         }
