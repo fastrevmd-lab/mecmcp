@@ -4,7 +4,7 @@ use crate::{
     coordinator::{ChangesetCoordinator, CoordinatorError},
     digest::{change_set_digest, compute_approval_digest, compute_waiver_digest, validate_digest},
     lifecycle::ChangeSetState,
-    records::{ApprovalRecord, ChangeSetRecord, WaiverRecord},
+    records::{ApprovalRecord, ChangeSetRecord, WaiverKind, WaiverRecord},
 };
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -338,7 +338,10 @@ impl ChangesetCoordinator {
             approved_at_unix: now,
             digest: waiver_digest,
             waived: Some(WaiverRecord {
+                kind: WaiverKind::LabMode,
                 reason: "lab-mode".to_owned(),
+                expires_at_unix: None,
+                ticket: None,
             }),
         });
 

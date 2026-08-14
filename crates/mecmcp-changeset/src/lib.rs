@@ -31,7 +31,7 @@ pub use operation::StageOutput;
 pub use persistence::{ChangesetState, PersistenceError, read_state, validate_state, write_state};
 pub use records::{
     ApprovalRecord, ChangeSetRecord, OperationRecord, PreviewError, PreviewRecord, RecordError,
-    TargetError, WaiverRecord, change_set_digest, change_set_digest_with_targets,
+    TargetError, WaiverKind, WaiverRecord, change_set_digest, change_set_digest_with_targets,
     mutation_policy_signature, preview_digest, require_operation_fingerprint,
     require_operation_policy, validate_change_set_actions, validate_targets,
 };
