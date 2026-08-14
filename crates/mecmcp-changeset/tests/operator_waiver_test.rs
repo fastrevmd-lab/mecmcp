@@ -325,6 +325,7 @@ impl Default for MockDeviceState {
     }
 }
 
+#[derive(Clone)]
 struct MockTransaction {
     state: Arc<Mutex<MockDeviceState>>,
 }
@@ -607,5 +608,257 @@ async fn an_expired_waiver_does_not_authorize_apply() {
         "the refusal must name expiry, not report a generic missing approval — \
          an operator sent looking for the wrong problem loses the time the \
          message was supposed to save: {message}"
+    );
+}
+
+/// The pre-guard waiver expiry check must fail fast without waiting for the
+/// device guard. Isolate it by pre-holding the guard: a dead check would block.
+#[tokio::test]
+async fn pre_guard_waiver_expiry_check_fails_without_blocking() {
+    let harness = planned_change_set_harness().await;
+
+    // Create an expired waiver
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_secs();
+    let expired_at = now - 3600; // 1 hour ago
+
+    let waiver = WaiverRecord {
+        kind: WaiverKind::OperatorFile,
+        reason: "test pre-guard expired waiver".to_owned(),
+        expires_at_unix: Some(expired_at),
+        ticket: Some("PRE-123".to_owned()),
+    };
+
+    let waiver_digest = compute_waiver_digest_v3(
+        &harness.change_set_id,
+        &harness.digest,
+        &harness.owner,
+        now,
+        &waiver,
+    );
+
+    // Set up the expired waiver
+    let state_path = harness._temp_dir.path().join("state.json");
+    let mut state = read_state(&state_path, 8 * 1024 * 1024).expect("read state");
+    let change_set = state
+        .change_sets
+        .get_mut(&harness.change_set_id)
+        .expect("change set exists");
+    change_set.state = ChangeSetState::Approved;
+    change_set.approval = Some(ApprovalRecord {
+        approver: None,
+        approved_at_unix: now,
+        digest: waiver_digest,
+        waived: Some(waiver),
+    });
+    write_state(&state_path, &state, 8 * 1024 * 1024).expect("write state");
+
+    // Reload coordinator
+    let limits = OperationLimits {
+        max_operations: 1024,
+        max_change_sets: 1024,
+        max_actions_per_set: 64,
+        max_state_bytes: 8 * 1024 * 1024,
+        max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
+    };
+    let approval_ttl = Duration::from_secs(15 * 60);
+    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, true)
+        .expect("reload coordinator");
+
+    // Pre-hold the device guard
+    let cancellation = CancellationToken::new();
+    let _guard = coordinator
+        .device_guard(&harness.device, &cancellation)
+        .await
+        .expect("acquire device guard");
+
+    // Attempt apply with a 2-second timeout. If the pre-guard check is working,
+    // it returns the expiry error immediately without waiting for the guard.
+    // If the check is dead, apply blocks waiting for the held guard and times out.
+    let fingerprint = harness
+        .transaction
+        .fingerprint()
+        .await
+        .expect("fingerprint");
+    let apply_result = tokio::time::timeout(
+        Duration::from_secs(2),
+        coordinator.apply_change_set(
+            harness.change_set_id.clone(),
+            harness.device.clone(),
+            "https://test-device.example.com".to_string(),
+            harness.owner.clone(),
+            harness.digest.clone(),
+            fingerprint,
+            &harness.transaction,
+            "set",
+            None,
+            None,
+            &test_attribution("alice"),
+            &cancellation,
+        ),
+    )
+    .await
+    .expect("pre-guard check must return immediately, not block on the held guard");
+
+    let error = apply_result.expect_err("expired waiver must not authorize apply");
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("waiver expired"),
+        "pre-guard check must detect the expired waiver: {message}"
+    );
+}
+
+/// The post-guard waiver expiry check must detect a TOCTOU attack: a waiver
+/// rewritten to an expired value while apply is blocked on the device guard.
+#[tokio::test]
+async fn post_guard_waiver_expiry_check_detects_toctou_rewrite() {
+    let harness = planned_change_set_harness().await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_secs();
+    let future_expiry = now + 3600; // 1 hour from now
+
+    // Start with a valid future expiry so the pre-guard check passes
+    let waiver = WaiverRecord {
+        kind: WaiverKind::OperatorFile,
+        reason: "test post-guard TOCTOU".to_owned(),
+        expires_at_unix: Some(future_expiry),
+        ticket: Some("POST-123".to_owned()),
+    };
+
+    let waiver_digest = compute_waiver_digest_v3(
+        &harness.change_set_id,
+        &harness.digest,
+        &harness.owner,
+        now,
+        &waiver,
+    );
+
+    // Set up the change set with a future-expiring waiver
+    let state_path = harness._temp_dir.path().join("state.json");
+    let mut state = read_state(&state_path, 8 * 1024 * 1024).expect("read state");
+    let change_set = state
+        .change_sets
+        .get_mut(&harness.change_set_id)
+        .expect("change set exists");
+    change_set.state = ChangeSetState::Approved;
+    change_set.approval = Some(ApprovalRecord {
+        approver: None,
+        approved_at_unix: now,
+        digest: waiver_digest,
+        waived: Some(waiver.clone()),
+    });
+    write_state(&state_path, &state, 8 * 1024 * 1024).expect("write state");
+
+    // Reload coordinator and wrap in Arc for sharing between tasks
+    let limits = OperationLimits {
+        max_operations: 1024,
+        max_change_sets: 1024,
+        max_actions_per_set: 64,
+        max_state_bytes: 8 * 1024 * 1024,
+        max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
+    };
+    let approval_ttl = Duration::from_secs(15 * 60);
+    let coordinator = Arc::new(
+        ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, true)
+            .expect("reload coordinator"),
+    );
+
+    // Pre-hold the device guard so apply will block
+    let cancellation = CancellationToken::new();
+    let guard = coordinator
+        .device_guard(&harness.device, &cancellation)
+        .await
+        .expect("acquire device guard");
+
+    // Spawn apply_change_set in the background; it will block on the held guard
+    let coordinator_clone = Arc::clone(&coordinator);
+    let change_set_id_clone = harness.change_set_id.clone();
+    let device_clone = harness.device.clone();
+    let owner_clone = harness.owner.clone();
+    let digest_clone = harness.digest.clone();
+    let transaction_clone = harness.transaction.clone();
+    let cancellation_clone = cancellation.clone();
+    let fingerprint = harness
+        .transaction
+        .fingerprint()
+        .await
+        .expect("fingerprint");
+
+    let apply_handle = tokio::spawn(async move {
+        coordinator_clone
+            .apply_change_set(
+                change_set_id_clone,
+                device_clone,
+                "https://test-device.example.com".to_string(),
+                owner_clone,
+                digest_clone,
+                fingerprint,
+                &transaction_clone,
+                "set",
+                None,
+                None,
+                &test_attribution("alice"),
+                &cancellation_clone,
+            )
+            .await
+    });
+
+    // Give apply time to reach the guard and block
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // While apply is blocked, rewrite the waiver to have a PAST expiry
+    let past_expiry = now - 3600; // 1 hour ago
+    let expired_waiver = WaiverRecord {
+        kind: WaiverKind::OperatorFile,
+        reason: "test post-guard TOCTOU".to_owned(),
+        expires_at_unix: Some(past_expiry),
+        ticket: Some("POST-123".to_owned()),
+    };
+
+    // Recompute the digest with the expired waiver
+    let expired_digest = compute_waiver_digest_v3(
+        &harness.change_set_id,
+        &harness.digest,
+        &harness.owner,
+        now,
+        &expired_waiver,
+    );
+
+    // Update the coordinator's in-memory state with the expired waiver
+    let mut updated_change_set = coordinator
+        .change_set(&harness.change_set_id, &harness.device)
+        .await
+        .expect("retrieve change set");
+    updated_change_set.approval = Some(ApprovalRecord {
+        approver: None,
+        approved_at_unix: now,
+        digest: expired_digest,
+        waived: Some(expired_waiver),
+    });
+    coordinator
+        .update_change_set(updated_change_set)
+        .await
+        .expect("update change set with expired waiver");
+
+    // Release the guard so apply can proceed
+    drop(guard);
+
+    // Wait for apply to complete; it should fail with the post-guard expiry error
+    let result = apply_handle
+        .await
+        .expect("apply task must complete without panic");
+
+    let error = result.expect_err("post-guard check must detect the expired waiver");
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("waiver expired"),
+        "post-guard check must detect the TOCTOU rewrite: {message}"
     );
 }
