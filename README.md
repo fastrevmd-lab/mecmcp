@@ -52,6 +52,11 @@ enforced at apply, at both the pre-guard and post-guard gates.
 **Breaking:** `WaiverRecord` struct-literal construction now needs `kind` (plus
 the two new `Option` fields `expires_at_unix` and `ticket`), and `validate_state`
 takes a version argument. Consumers that only call `waive_approval` need no change.
+Checked across the consumer repos: none constructs a `WaiverRecord`, references
+`WaiverKind`, or calls `validate_state`, so upgrading is a dependency bump with
+no code changes. Bump **both** strings on each entry — a `version = "0.9.x"`
+requirement does not accept `0.10.0`, so changing only `tag = "v0.9.1"` leaves
+the dependency unresolvable.
 
 **No data migration:** a live survey of LXC 950, 960, 601, 606, and 600 found 28
 change sets and **zero** waiver records, so changing the waiver digest invalidates
@@ -59,7 +64,7 @@ nothing that exists. The neighbouring approval digest was deliberately left alon
 for that reason and is tracked as #283. Any state file containing a waiver is now
 written as version 3; files with no waivers still select v1/v2 exactly as before.
 
-**0.9.1 — test consumers can serve a plan on an ephemeral loopback port (#276).**
+**0.9.1 — test consumers can serve a plan on an ephemeral loopback port (#280).**
 0.9.0 sealed the `Router` inside `ServePlan`, so `serve_router` became the only
 way to serve one. Four consumer migrations worked around that by cloning the
 listener token and driving `serve_router` in a background task, then racing their
