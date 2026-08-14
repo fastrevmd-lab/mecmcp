@@ -1069,41 +1069,58 @@ async fn waive_approval_operator_refuses_lab_mode_kind() {
 fn sabotage_defect_2_forged_v3_metadata_in_legacy_file() {
     use std::fs;
 
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let state_path = temp_dir.path().join("forged.json");
+    // Each field is forged ON ITS OWN. Forging all three at once only proves the
+    // first guard fires: `kind` is checked first, so it masks the other two and
+    // either could be deleted with the suite green.
+    for (field, forged, expected) in [
+        (
+            "kind",
+            serde_json::json!("operator_file"),
+            "v1 waiver cannot carry kind",
+        ),
+        (
+            "expires_at_unix",
+            serde_json::json!(1_800_000_000_u64),
+            "v1 waiver cannot carry expires_at_unix",
+        ),
+        (
+            "ticket",
+            serde_json::json!("FORGED-123"),
+            "v1 waiver cannot carry ticket",
+        ),
+    ] {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let state_path = temp_dir.path().join("forged.json");
 
-    // Load the v1 fixture and tamper it: relabel the waiver as operator_file with expiry and ticket
-    let mut fixture: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/waiver-v1.json")).expect("parse fixture");
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/waiver-v1.json")).expect("parse fixture");
 
-    let waiver = fixture["state"]["change_sets"]["0000000000000000000000000000000000000000000000000000000000000001"]["approval"]["waived"]
-        .as_object_mut()
-        .expect("waiver object");
+        let waiver = fixture["state"]["change_sets"]["0000000000000000000000000000000000000000000000000000000000000001"]["approval"]["waived"]
+            .as_object_mut()
+            .expect("waiver object");
+        waiver.insert(field.to_owned(), forged);
 
-    waiver.insert("kind".to_owned(), serde_json::json!("operator_file"));
-    waiver.insert("expires_at_unix".to_owned(), serde_json::json!(1800000000));
-    waiver.insert("ticket".to_owned(), serde_json::json!("FORGED-123"));
+        fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&fixture).expect("serialize"),
+        )
+        .expect("write forged file");
+        fs::set_permissions(
+            &state_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .expect("chmod");
 
-    fs::write(
-        &state_path,
-        serde_json::to_vec_pretty(&fixture).expect("serialize"),
-    )
-    .expect("write forged file");
-    fs::set_permissions(
-        &state_path,
-        std::os::unix::fs::PermissionsExt::from_mode(0o600),
-    )
-    .expect("chmod");
-
-    // Attempt to read — must fail with the specific v3-only metadata error
-    let error = read_state(&state_path, 128 * 1024)
-        .expect_err("forged v3 metadata in v1 file must be rejected");
-    let error_msg = format!("{:?}", error);
-    assert!(
-        error_msg.contains("v1 waiver cannot carry kind"),
-        "error must mention v3-only kind: {}",
-        error_msg
-    );
+        let error = match read_state(&state_path, 128 * 1024) {
+            Ok(_) => panic!("forging {field} alone in a v1 file must be rejected, but it loaded"),
+            Err(error) => error,
+        };
+        let error_msg = format!("{error:?}");
+        assert!(
+            error_msg.contains(expected),
+            "forging {field} alone must be refused with {expected:?}, got: {error_msg}"
+        );
+    }
 }
 
 /// Sabotage test for Defect 1: load/save cycle without migration bricks a legacy file.
