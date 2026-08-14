@@ -302,6 +302,62 @@ Original plan follows.
 
 ---
 
+
+## The deployment finding: a flag present and ignored, three times
+
+**2026-08-14. LXC 950 went down during its 0.20.0 upgrade, and the cause was
+this programme's own fix.**
+
+`rustjunosmcp` parsed `--allow-insecure-bind`, listed it in `--help`, forwarded
+it to `cli_validate` — and never converted it into an
+`InsecureBindAcknowledgement` for the transport. mecmcp 0.9.x refuses a
+plaintext off-loopback listener without that acknowledgement, so the server
+crash-looped on a flag its unit had carried since the host was built. Rolled
+back inside a minute from the `pre-0-20-0` snapshot; production restored on
+0.19.0 and verified by a live MCP call before anything else was attempted.
+
+Investigating found **a second one in the same file**: `main.rs` passed
+`Vec::new()` for origins with a comment claiming they were "empty by default",
+while the CLI has always accepted `--allowed-origin` and 950's unit passes two.
+The Origin entries added in Phase 0.2 were never reaching the transport. It had
+not bitten only because the insecure-bind check runs first.
+
+**The same gap existed in `rustpanosmcp` and `rustmistmcp`** — latent in both,
+purely because panos deployments run TLS and mist binds loopback, and each
+satisfies that admission branch by a different route. Three of six consumers
+parsed a flag and discarded it. Only the deployment shape decided who noticed.
+
+This is the defect class mecmcp#273 exists to close — *a flag that is present
+but ignored* — **reintroduced by the migration that closed it.** Making the
+acknowledgement mandatory upstream created a new way to get the same thing
+wrong downstream.
+
+### Why no rehearsal rig caught it
+
+| Rig | Shape | Why it passed |
+|---|---|---|
+| 600 | loopback | exempt from all four admission checks |
+| 601 | off-loopback **with TLS** | satisfies the same branch another way |
+| **950** | off-loopback, **no TLS**, `--allow-insecure-bind` | the one combination neither rig covers |
+
+A rehearsal estate only proves the shapes it contains. Before trusting one,
+enumerate which admission branches each rig actually exercises.
+
+### The regression tests needed three properties, and two attempts got it wrong
+
+Each of the three repos now has a test for this. Each needs, simultaneously:
+
+1. an **authenticated** fixture — otherwise `UnauthenticatedOffLoopback` fires
+   first and masks the branch under test;
+2. a **non-loopback** address — loopback short-circuits every check;
+3. an assertion on **`InsecureBindNotAcknowledged` specifically**, not on
+   `Refused` generally.
+
+Missing any one yields a test that passes with the fix reverted. The first junos
+and panos attempts each did exactly that, and were caught only by sabotage —
+reverting the fix and confirming the test fails. **Write the sabotage step into
+the work, not the intention.**
+
 ## Standing housekeeping
 
 - **Done 2026-08-13:** `rustjunosmcp` pruned from 20+ remote refs to 3;
