@@ -2,7 +2,11 @@
 
 use crate::{
     ChangeSetRecord, OperationRecord,
-    digest::{compute_approval_digest, compute_waiver_digest, validate_fingerprint},
+    digest::{
+        compute_approval_digest, compute_waiver_digest, compute_waiver_digest_v3,
+        validate_fingerprint,
+    },
+    records::WaiverKind,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, io::Write, path::Path};
@@ -80,14 +84,14 @@ pub fn read_state(path: &Path, max_state_bytes: u64) -> Result<ChangesetState, P
     let on_disk: OnDiskChangesetState = serde_json::from_slice(bytes)
         .map_err(|error| PersistenceError::new(format!("invalid changeset state JSON: {error}")))?;
 
-    if on_disk.version != 1 && on_disk.version != 2 {
+    if on_disk.version != 1 && on_disk.version != 2 && on_disk.version != 3 {
         return Err(PersistenceError::new(format!(
             "unsupported changeset state version {}",
             on_disk.version
         )));
     }
 
-    validate_state(&on_disk.state)?;
+    validate_state(&on_disk.state, on_disk.version)?;
     Ok(on_disk.state)
 }
 
@@ -96,7 +100,7 @@ pub fn read_state(path: &Path, max_state_bytes: u64) -> Result<ChangesetState, P
 /// # Errors
 ///
 /// Returns an error if the state contains invalid or inconsistent records.
-pub fn validate_state(state: &ChangesetState) -> Result<(), PersistenceError> {
+pub fn validate_state(state: &ChangesetState, version: u32) -> Result<(), PersistenceError> {
     const MAX_OPERATIONS: usize = 1024;
     const MAX_CHANGE_SETS: usize = 1024;
     const MAX_CHANGE_SET_ACTIONS: usize = 64;
@@ -207,8 +211,27 @@ pub fn validate_state(state: &ChangesetState) -> Result<(), PersistenceError> {
                     approver,
                     approval.approved_at_unix,
                 )
+            } else if let Some(waiver) = approval.waived.as_ref() {
+                // Version decides the rule outright. Accepting "either digest
+                // verifies" would let a forged legacy digest pass on a v3
+                // record, which defeats the point of binding the kind.
+                if version >= 3 {
+                    compute_waiver_digest_v3(
+                        id,
+                        &record.digest,
+                        &record.owner,
+                        approval.approved_at_unix,
+                        waiver,
+                    )
+                } else {
+                    compute_waiver_digest(
+                        id,
+                        &record.digest,
+                        &record.owner,
+                        approval.approved_at_unix,
+                    )
+                }
             } else {
-                // Waived approval in lab mode
                 compute_waiver_digest(id, &record.digest, &record.owner, approval.approved_at_unix)
             };
 
@@ -272,7 +295,22 @@ pub fn write_state(
         .operations
         .values()
         .any(|op| !op.endpoint.starts_with("https://"));
-    let version = if operations_need_v2 || change_sets_need_v2 || endpoints_need_v2 {
+    // A waiver that says anything beyond "lab mode with a reason" is a
+    // version-3 record. Same rule as v2: both record types are
+    // `deny_unknown_fields`, so a previous binary handed an unexpected key
+    // rejects the WHOLE file. A deployment that only ever waives in lab mode
+    // keeps producing files the older binary reads.
+    let waivers_need_v3 = state.change_sets.values().any(|cs| {
+        cs.approval
+            .as_ref()
+            .and_then(|a| a.waived.as_ref())
+            .is_some_and(|w| {
+                w.kind != WaiverKind::LabMode || w.expires_at_unix.is_some() || w.ticket.is_some()
+            })
+    });
+    let version = if waivers_need_v3 {
+        3
+    } else if operations_need_v2 || change_sets_need_v2 || endpoints_need_v2 {
         2
     } else {
         1

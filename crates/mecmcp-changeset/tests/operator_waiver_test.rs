@@ -7,7 +7,7 @@
 use mecmcp_changeset::digest::{
     compute_approval_digest, compute_waiver_digest, compute_waiver_digest_v3,
 };
-use mecmcp_changeset::{WaiverKind, WaiverRecord};
+use mecmcp_changeset::{ChangesetState, WaiverKind, WaiverRecord, validate_state};
 
 fn waiver(kind: WaiverKind, expires: Option<u64>, ticket: Option<&str>) -> WaiverRecord {
     WaiverRecord {
@@ -132,4 +132,22 @@ fn a_waiver_digest_is_never_an_approval_digest() {
 
     let legacy = compute_waiver_digest(ID, PLAN, OWNER, AT);
     assert_ne!(waived, legacy, "v3 must not reproduce the legacy digest");
+}
+
+/// v1 and v2 files must keep loading. On the evidence of a 2026-08-14 fleet
+/// survey no waiver record exists anywhere, so this path is unreachable today —
+/// but that is a statement about five hosts on one afternoon, not a property of
+/// the format.
+#[test]
+fn legacy_schema_versions_still_validate() {
+    for (fixture, version) in [
+        (include_str!("fixtures/waiver-v1.json"), 1_u32),
+        (include_str!("fixtures/waiver-v2.json"), 2_u32),
+    ] {
+        let parsed: serde_json::Value = serde_json::from_str(fixture).expect("fixture parses");
+        let state: ChangesetState =
+            serde_json::from_value(parsed["state"].clone()).expect("fixture state decodes");
+        validate_state(&state, version)
+            .unwrap_or_else(|error| panic!("version {version} must still validate: {error:?}"));
+    }
 }
