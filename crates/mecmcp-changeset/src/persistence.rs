@@ -91,7 +91,32 @@ pub fn read_state(path: &Path, max_state_bytes: u64) -> Result<ChangesetState, P
     }
 
     validate_state(&on_disk.state, on_disk.version)?;
-    Ok(on_disk.state)
+
+    // Defect 1 fix: migrate legacy waiver digests to v3 after successful validation.
+    // This is safe precisely because the legacy digest was just verified — we are
+    // re-signing evidence we have already authenticated. Without this migration, the
+    // next write_state would stamp the file version 3 (waivers_need_v3 triggers on
+    // any waiver), but the digest stays legacy, causing the next read_state to fail
+    // with a mismatch.
+    let mut state = on_disk.state;
+    if on_disk.version < 3 {
+        for record in state.change_sets.values_mut() {
+            if let Some(approval) = record.approval.as_mut()
+                && let Some(waiver) = approval.waived.as_ref()
+            {
+                // Re-compute the digest using v3 over the same inputs
+                approval.digest = crate::digest::compute_waiver_digest_v3(
+                    &record.id,
+                    &record.digest,
+                    &record.owner,
+                    approval.approved_at_unix,
+                    waiver,
+                );
+            }
+        }
+    }
+
+    Ok(state)
 }
 
 /// Validates the in-memory state for consistency.
@@ -211,6 +236,30 @@ pub fn validate_state(state: &ChangesetState, version: u32) -> Result<(), Persis
                     approval.approved_at_unix,
                 )
             } else if let Some(waiver) = approval.waived.as_ref() {
+                // Defect 2 fix: reject v1/v2 waivers carrying v3-only metadata.
+                // A genuine legacy waiver could not have carried kind != LabMode,
+                // expires_at_unix, or ticket. Accepting them here lets someone
+                // relabel a lab-mode waiver as operator_file and forge its authority.
+                if version < 3 {
+                    use crate::records::WaiverKind;
+                    if waiver.kind != WaiverKind::LabMode {
+                        return Err(PersistenceError::new(format!(
+                            "changeset state v{version} waiver cannot carry kind {:?} (v3-only metadata)",
+                            waiver.kind
+                        )));
+                    }
+                    if waiver.expires_at_unix.is_some() {
+                        return Err(PersistenceError::new(format!(
+                            "changeset state v{version} waiver cannot carry expires_at_unix (v3-only metadata)"
+                        )));
+                    }
+                    if waiver.ticket.is_some() {
+                        return Err(PersistenceError::new(format!(
+                            "changeset state v{version} waiver cannot carry ticket (v3-only metadata)"
+                        )));
+                    }
+                }
+
                 // Version decides the rule outright. Accepting "either digest
                 // verifies" would let a forged legacy digest pass on a v3
                 // record, which defeats the point of binding the kind.

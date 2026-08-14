@@ -154,6 +154,8 @@ fn a_waiver_digest_is_never_an_approval_digest() {
 /// the format.
 #[test]
 fn legacy_schema_versions_still_validate() {
+    use mecmcp_changeset::WaiverKind;
+
     for (fixture, version) in [
         (include_str!("fixtures/waiver-v1.json"), 1_u32),
         (include_str!("fixtures/waiver-v2.json"), 2_u32),
@@ -163,6 +165,33 @@ fn legacy_schema_versions_still_validate() {
             serde_json::from_value(parsed["state"].clone()).expect("fixture state decodes");
         validate_state(&state, version)
             .unwrap_or_else(|error| panic!("version {version} must still validate: {error:?}"));
+
+        // Verify the waiver actually loaded and has the expected legacy structure
+        let change_sets: Vec<_> = state.change_sets.values().collect();
+        assert_eq!(
+            change_sets.len(),
+            1,
+            "fixture must contain exactly one change set"
+        );
+
+        let cs = change_sets[0];
+        let approval = cs.approval.as_ref().expect("change set must have approval");
+        let waiver = approval.waived.as_ref().expect("approval must be waived");
+
+        assert_eq!(
+            waiver.kind,
+            WaiverKind::LabMode,
+            "legacy waiver must be LabMode"
+        );
+        assert_eq!(
+            waiver.expires_at_unix, None,
+            "legacy waiver must not have expiry"
+        );
+        assert_eq!(waiver.ticket, None, "legacy waiver must not have ticket");
+        assert_eq!(
+            waiver.reason, "lab-mode",
+            "fixture must use exact legacy reason"
+        );
     }
 }
 
@@ -1029,4 +1058,72 @@ async fn waive_approval_operator_refuses_lab_mode_kind() {
         .await
         .expect_err("LabMode kind must be refused");
     assert!(format!("{error:?}").contains("waive_approval"));
+}
+
+/// Sabotage test for Defect 2: v1/v2 waivers with v3-only metadata must be rejected.
+#[test]
+fn sabotage_defect_2_forged_v3_metadata_in_legacy_file() {
+    use std::fs;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = temp_dir.path().join("forged.json");
+
+    // Load the v1 fixture and tamper it: relabel the waiver as operator_file with expiry and ticket
+    let mut fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/waiver-v1.json")).expect("parse fixture");
+
+    let waiver = fixture["state"]["change_sets"]["0000000000000000000000000000000000000000000000000000000000000001"]["approval"]["waived"]
+        .as_object_mut()
+        .expect("waiver object");
+
+    waiver.insert("kind".to_owned(), serde_json::json!("operator_file"));
+    waiver.insert("expires_at_unix".to_owned(), serde_json::json!(1800000000));
+    waiver.insert("ticket".to_owned(), serde_json::json!("FORGED-123"));
+
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&fixture).expect("serialize"),
+    )
+    .expect("write forged file");
+    fs::set_permissions(
+        &state_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("chmod");
+
+    // Attempt to read — must fail with the specific v3-only metadata error
+    let error = read_state(&state_path, 128 * 1024)
+        .expect_err("forged v3 metadata in v1 file must be rejected");
+    let error_msg = format!("{:?}", error);
+    assert!(
+        error_msg.contains("v1 waiver cannot carry kind"),
+        "error must mention v3-only kind: {}",
+        error_msg
+    );
+}
+
+/// Sabotage test for Defect 1: load/save cycle without migration bricks a legacy file.
+#[test]
+fn sabotage_defect_1_load_save_cycle_without_migration() {
+    use std::fs;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = temp_dir.path().join("legacy.json");
+
+    // Write a v1 waiver fixture
+    fs::write(&state_path, include_str!("fixtures/waiver-v1.json")).expect("write fixture");
+    fs::set_permissions(
+        &state_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("chmod");
+
+    // Load it (with migration)
+    let state = read_state(&state_path, 128 * 1024).expect("load v1 file");
+
+    // Write it back (triggers v3 due to waivers_need_v3)
+    write_state(&state_path, &state, 128 * 1024).expect("write state");
+
+    // Load again — must succeed because migration happened
+    read_state(&state_path, 128 * 1024).expect("second load must succeed after migration");
 }
