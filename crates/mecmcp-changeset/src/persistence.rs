@@ -226,6 +226,18 @@ pub fn validate_state(state: &ChangesetState, version: u32) -> Result<(), Persis
                 |error| PersistenceError::new(format!("approval digest invalid: {error}")),
             )?;
 
+            // Defect 5 fix: reject records with both approver and waived set.
+            // These fields are mutually exclusive by construction — waive_approval
+            // sets approver = None. A record with both is malformed and likely an
+            // injection attempt. Rejecting this shape before the digest branch
+            // prevents the migration from corrupting a genuine approval that has
+            // a waived object injected.
+            if approval.approver.is_some() && approval.waived.is_some() {
+                return Err(PersistenceError::new(
+                    "changeset state approval record has both approver and waived fields set (mutually exclusive)",
+                ));
+            }
+
             let expected_approval_digest = if let Some(approver) = &approval.approver {
                 // Genuine two-person approval
                 compute_approval_digest(
@@ -256,6 +268,19 @@ pub fn validate_state(state: &ChangesetState, version: u32) -> Result<(), Persis
                     if waiver.ticket.is_some() {
                         return Err(PersistenceError::new(format!(
                             "changeset state v{version} waiver cannot carry ticket (v3-only metadata)"
+                        )));
+                    }
+                    // Defect 4 fix: reject v1/v2 waivers with unexpected reason text.
+                    // The legacy digest does NOT cover reason, so it can be edited
+                    // freely. The migration then re-signs with v3, which DOES include
+                    // reason, promoting unauthenticated text into signed evidence.
+                    // waive_approval emits the literal "lab-mode", so require exactly
+                    // that before re-signing. This check protects both validate_state
+                    // and the migration.
+                    if waiver.reason != "lab-mode" {
+                        return Err(PersistenceError::new(format!(
+                            "changeset state v{version} waiver has unexpected reason {:?} (expected \"lab-mode\")",
+                            waiver.reason
                         )));
                     }
                 }
