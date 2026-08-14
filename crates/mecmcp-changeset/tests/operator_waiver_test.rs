@@ -5,9 +5,14 @@
 // the digest functions are NOT — they live behind `pub mod digest`. Importing
 // them from the root does not compile.
 use mecmcp_changeset::digest::{
-    compute_approval_digest, compute_waiver_digest, compute_waiver_digest_v3,
+    change_set_digest, compute_approval_digest, compute_waiver_digest, compute_waiver_digest_v3,
 };
-use mecmcp_changeset::{ChangesetState, WaiverKind, WaiverRecord, validate_state};
+use mecmcp_changeset::persistence::{read_state, write_state};
+use mecmcp_changeset::{
+    ApprovalRecord, ChangeSetRecord, ChangeSetState, ChangesetState, WaiverKind, WaiverRecord,
+    validate_state,
+};
+use std::collections::BTreeMap;
 
 fn waiver(kind: WaiverKind, expires: Option<u64>, ticket: Option<&str>) -> WaiverRecord {
     WaiverRecord {
@@ -150,4 +155,113 @@ fn legacy_schema_versions_still_validate() {
         validate_state(&state, version)
             .unwrap_or_else(|error| panic!("version {version} must still validate: {error:?}"));
     }
+}
+
+/// A waiver with non-LabMode kind, expiry, or ticket triggers v3 write and v3
+/// verification. The v3 digest binds those fields; a forged legacy digest must
+/// fail.
+#[test]
+fn v3_waiver_round_trip_and_version_dependence() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = temp_dir.path().join("state.json");
+
+    let change_set_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let owner = "operator";
+    let device = "firewall-1";
+    let fingerprint = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let actions = vec![serde_json::json!({"set": "foo"})];
+    let approved_at = 1_723_000_000_u64;
+
+    // Compute the change-set digest
+    let plan_digest =
+        change_set_digest(owner, device, fingerprint, &actions).expect("compute digest");
+
+    // Build a waiver with all v3-triggering fields: non-LabMode kind, expiry, ticket
+    let waiver_record = WaiverRecord {
+        kind: WaiverKind::OperatorFile,
+        reason: "documented exception".to_owned(),
+        expires_at_unix: Some(1_723_999_999),
+        ticket: Some("CHG-12345".to_owned()),
+    };
+
+    let waiver_digest = compute_waiver_digest_v3(
+        change_set_id,
+        &plan_digest,
+        owner,
+        approved_at,
+        &waiver_record,
+    );
+
+    let change_set = ChangeSetRecord {
+        id: change_set_id.to_owned(),
+        owner: owner.to_owned(),
+        device: device.to_owned(),
+        expected_candidate_fingerprint: fingerprint.to_owned(),
+        actions,
+        digest: plan_digest.clone(),
+        state: ChangeSetState::Approved,
+        approver: None,
+        approval: Some(ApprovalRecord {
+            approver: None,
+            approved_at_unix: approved_at,
+            digest: waiver_digest.clone(),
+            waived: Some(waiver_record.clone()),
+        }),
+        expires_at_unix: approved_at + 900,
+        operation_id: None,
+        policy_signature: String::new(),
+        targets: vec![],
+        preview: None,
+    };
+
+    let mut state = ChangesetState {
+        operations: BTreeMap::new(),
+        change_sets: BTreeMap::new(),
+    };
+    state
+        .change_sets
+        .insert(change_set_id.to_owned(), change_set);
+
+    // Write the state
+    write_state(&state_path, &state, 8 * 1024 * 1024).expect("write state with v3 waiver");
+
+    // Assert the written file has version 3
+    let raw_json = std::fs::read_to_string(&state_path).expect("read written state");
+    let parsed: serde_json::Value = serde_json::from_str(&raw_json).expect("parse written state");
+    assert_eq!(
+        parsed["version"], 3,
+        "a waiver with non-LabMode kind, expiry, and ticket must trigger version 3"
+    );
+
+    // Verify it reads back successfully
+    let loaded_state =
+        read_state(&state_path, 8 * 1024 * 1024).expect("v3 waiver record must load");
+    assert_eq!(
+        loaded_state.change_sets.len(),
+        1,
+        "change set must survive round trip"
+    );
+
+    // CRITICAL: prove version-dependence. A legacy digest must NOT satisfy a v3 record.
+    let legacy_digest = compute_waiver_digest(change_set_id, &plan_digest, owner, approved_at);
+    let mut tampered_state = loaded_state;
+    tampered_state
+        .change_sets
+        .get_mut(change_set_id)
+        .expect("change set present")
+        .approval
+        .as_mut()
+        .expect("approval present")
+        .digest = legacy_digest;
+
+    let result = validate_state(&tampered_state, 3);
+    assert!(
+        result.is_err(),
+        "a legacy digest must NOT verify a v3 record — the version determines the rule"
+    );
+    let error_message = result.expect_err("already checked is_err").to_string();
+    assert!(
+        error_message.contains("approval digest mismatch"),
+        "expected digest mismatch, got: {error_message}"
+    );
 }
