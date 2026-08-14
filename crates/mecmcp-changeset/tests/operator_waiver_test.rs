@@ -4,15 +4,24 @@
 // `WaiverKind` and `WaiverRecord` are re-exported at the crate root (lib.rs:32);
 // the digest functions are NOT — they live behind `pub mod digest`. Importing
 // them from the root does not compile.
+use async_trait::async_trait;
+use mecmcp_audit::{ActorType, AgentIdentity, Attribution, Principal};
 use mecmcp_changeset::digest::{
     change_set_digest, compute_approval_digest, compute_waiver_digest, compute_waiver_digest_v3,
 };
 use mecmcp_changeset::persistence::{read_state, write_state};
 use mecmcp_changeset::{
-    ApprovalRecord, ChangeSetRecord, ChangeSetState, ChangesetState, WaiverKind, WaiverRecord,
-    validate_state,
+    ApprovalRecord, ChangeSetRecord, ChangeSetState, ChangesetCoordinator, ChangesetState,
+    CommitOptions, CommitOutcome, DeviceTransaction, OperationLimits, RollbackOutcome, RollbackRef,
+    WaiverKind, WaiverRecord, validate_state,
 };
+use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 fn waiver(kind: WaiverKind, expires: Option<u64>, ticket: Option<&str>) -> WaiverRecord {
     WaiverRecord {
@@ -263,5 +272,340 @@ fn v3_waiver_round_trip_and_version_dependence() {
     assert!(
         error_message.contains("approval digest mismatch"),
         "expected digest mismatch, got: {error_message}"
+    );
+}
+
+// ============================================================================
+// Mock transaction for apply tests
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MockActionType {
+    Set,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MockAction {
+    action: MockActionType,
+    path: String,
+    value: Option<String>,
+}
+
+#[derive(Debug)]
+struct MockStaged {
+    actions: Vec<MockAction>,
+    #[allow(dead_code)]
+    before_fp: String,
+    #[allow(dead_code)]
+    after_fp: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MockDiff {
+    changes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MockValidation {
+    succeeded: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MockDeviceState {
+    config: std::collections::HashMap<String, String>,
+}
+
+impl Default for MockDeviceState {
+    fn default() -> Self {
+        let mut config = std::collections::HashMap::new();
+        config.insert("/initial".to_string(), "value".to_string());
+        Self { config }
+    }
+}
+
+struct MockTransaction {
+    state: Arc<Mutex<MockDeviceState>>,
+}
+
+impl MockTransaction {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MockDeviceState::default())),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum MockError {
+    #[error("mock error: {0}")]
+    Generic(String),
+}
+
+#[async_trait]
+impl DeviceTransaction for MockTransaction {
+    type Action = MockAction;
+    type Staged = MockStaged;
+    type Diff = MockDiff;
+    type Validation = MockValidation;
+    type Error = MockError;
+
+    async fn fingerprint(&self) -> Result<String, Self::Error> {
+        let state = self.state.lock().expect("lock");
+        let mut keys: Vec<_> = state.config.keys().cloned().collect();
+        keys.sort();
+        let concatenated = keys.join(":");
+        let hash = sha2::Sha256::digest(concatenated.as_bytes());
+        Ok(format!("sha256:{}", hex::encode(hash)))
+    }
+
+    async fn stage(&self, actions: &[Self::Action]) -> Result<Self::Staged, Self::Error> {
+        let before_fp = self.fingerprint().await?;
+
+        {
+            let mut state = self.state.lock().expect("lock");
+            for action in actions {
+                match action.action {
+                    MockActionType::Set => {
+                        if let Some(ref value) = action.value {
+                            state.config.insert(action.path.clone(), value.clone());
+                        }
+                    }
+                    MockActionType::Delete => {
+                        state.config.remove(&action.path);
+                    }
+                }
+            }
+        }
+
+        let after_fp = self.fingerprint().await?;
+
+        Ok(MockStaged {
+            actions: actions.to_vec(),
+            before_fp,
+            after_fp,
+        })
+    }
+
+    async fn diff(&self, staged: &Self::Staged) -> Result<Self::Diff, Self::Error> {
+        let changes = staged
+            .actions
+            .iter()
+            .map(|a| format!("{:?} {}", a.action, a.path))
+            .collect();
+        Ok(MockDiff { changes })
+    }
+
+    async fn validate(&self, _staged: &Self::Staged) -> Result<Self::Validation, Self::Error> {
+        Ok(MockValidation { succeeded: true })
+    }
+
+    async fn commit(
+        &self,
+        _staged: &Self::Staged,
+        _attribution: &Attribution,
+        _options: &CommitOptions,
+    ) -> Result<CommitOutcome, Self::Error> {
+        Ok(CommitOutcome::Reconciled {
+            succeeded: true,
+            job_id: Some("mock-commit".to_string()),
+            details: None,
+        })
+    }
+
+    async fn rollback(&self, _to: RollbackRef) -> Result<RollbackOutcome, Self::Error> {
+        Ok(RollbackOutcome {
+            succeeded: true,
+            details: None,
+        })
+    }
+
+    async fn confirm_commit(
+        &self,
+        _operation_id: &str,
+        _attribution: &Attribution,
+    ) -> Result<CommitOutcome, Self::Error> {
+        Err(MockError::Generic(
+            "confirmed commit not supported in mock".to_string(),
+        ))
+    }
+}
+
+fn test_attribution(principal: &str) -> Attribution {
+    Attribution {
+        principal: Principal::Token(principal.into()),
+        actor_type: ActorType::Agent,
+        agent: Some(AgentIdentity {
+            model_id: "claude-opus-5".into(),
+            session_id: "sess-test".into(),
+            client_name: None,
+            provider: "anthropic".into(),
+            provider_tier: mecmcp_audit::Tier::Public,
+            skills_used: vec![],
+        }),
+        on_behalf_of: Some("fastrevmd@gmail.com".into()),
+        change_ref: Some("CHG0012345".into()),
+        request_id: Uuid::new_v4(),
+        token_verified_fields: mecmcp_audit::TokenVerifiedFields::none(),
+    }
+}
+
+/// Test harness providing a change set in Planned state with all necessary context.
+struct PlannedChangeSetHarness {
+    #[allow(dead_code)]
+    coordinator: ChangesetCoordinator,
+    change_set_id: String,
+    device: String,
+    owner: String,
+    digest: String,
+    transaction: MockTransaction,
+    _temp_dir: tempfile::TempDir,
+}
+
+async fn planned_change_set_harness() -> PlannedChangeSetHarness {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = temp_dir.path().join("state.json");
+
+    let limits = OperationLimits {
+        max_operations: 1024,
+        max_change_sets: 1024,
+        max_actions_per_set: 64,
+        max_state_bytes: 8 * 1024 * 1024,
+        max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
+    };
+    let approval_ttl = Duration::from_secs(15 * 60);
+
+    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, true)
+        .expect("coordinator");
+
+    let device = "test-device".to_string();
+    let owner = "alice".to_string();
+
+    // Use transaction to get the actual fingerprint
+    let transaction = MockTransaction::new();
+    let fingerprint = transaction.fingerprint().await.expect("fingerprint");
+
+    let actions = vec![MockAction {
+        action: MockActionType::Set,
+        path: "/test/path".to_string(),
+        value: Some("test-value".to_string()),
+    }];
+
+    let created = coordinator
+        .create_change_set(
+            device.clone(),
+            actions,
+            owner.clone(),
+            fingerprint.clone(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .expect("create");
+
+    PlannedChangeSetHarness {
+        coordinator,
+        change_set_id: created.change_set_id,
+        device,
+        owner,
+        digest: created.digest,
+        transaction,
+        _temp_dir: temp_dir,
+    }
+}
+
+/// A waiver whose expiry has passed must not authorize an apply.
+///
+/// Sabotage-verify this one: remove the expiry check in `apply.rs` and confirm
+/// this test fails. A time box that does not block anything is decoration.
+#[tokio::test]
+async fn an_expired_waiver_does_not_authorize_apply() {
+    let harness = planned_change_set_harness().await;
+
+    // Manually create an expired waiver and transition to Approved
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_secs();
+    let expired_at = now - 3600; // 1 hour ago
+
+    let waiver = WaiverRecord {
+        kind: WaiverKind::OperatorFile,
+        reason: "test expired waiver".to_owned(),
+        expires_at_unix: Some(expired_at),
+        ticket: Some("TEST-123".to_owned()),
+    };
+
+    let waiver_digest = compute_waiver_digest_v3(
+        &harness.change_set_id,
+        &harness.digest,
+        &harness.owner,
+        now,
+        &waiver,
+    );
+
+    // Directly manipulate the state to set the expired waiver
+    let state_path = harness._temp_dir.path().join("state.json");
+    let mut state = read_state(&state_path, 8 * 1024 * 1024).expect("read state");
+
+    let change_set = state
+        .change_sets
+        .get_mut(&harness.change_set_id)
+        .expect("change set exists");
+
+    change_set.state = ChangeSetState::Approved;
+    change_set.approval = Some(ApprovalRecord {
+        approver: None,
+        approved_at_unix: now,
+        digest: waiver_digest,
+        waived: Some(waiver),
+    });
+
+    write_state(&state_path, &state, 8 * 1024 * 1024).expect("write state");
+
+    // Reload coordinator to pick up the modified state
+    let limits = OperationLimits {
+        max_operations: 1024,
+        max_change_sets: 1024,
+        max_actions_per_set: 64,
+        max_state_bytes: 8 * 1024 * 1024,
+        max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
+    };
+    let approval_ttl = Duration::from_secs(15 * 60);
+    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, true)
+        .expect("reload coordinator");
+
+    // Attempt apply with the expired waiver
+    let fingerprint = harness
+        .transaction
+        .fingerprint()
+        .await
+        .expect("fingerprint");
+    let error = coordinator
+        .apply_change_set(
+            harness.change_set_id.clone(),
+            harness.device.clone(),
+            "https://test-device.example.com".to_string(),
+            harness.owner.clone(),
+            harness.digest.clone(),
+            fingerprint,
+            &harness.transaction,
+            "set",
+            None,
+            None,
+            &test_attribution("alice"),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("an expired waiver must not authorize apply");
+
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("waiver expired"),
+        "the refusal must name expiry, not report a generic missing approval — \
+         an operator sent looking for the wrong problem loses the time the \
+         message was supposed to save: {message}"
     );
 }

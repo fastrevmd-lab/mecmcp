@@ -182,6 +182,24 @@ impl ChangesetCoordinator {
             ));
         }
 
+        // An approval obtained by a waiver is only an approval while the waiver
+        // is valid. Checked here rather than at waive time because expiry is a
+        // property of the moment of use, not of the moment of grant.
+        let now_for_waiver = now_unix()?;
+        if let Some(expires_at) = change_set
+            .approval
+            .as_ref()
+            .and_then(|approval| approval.waived.as_ref())
+            .and_then(|waiver| waiver.expires_at_unix)
+            && now_for_waiver > expires_at
+        {
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                "waiver expired: this change set was approved by a time-boxed waiver that has \
+                 lapsed, so it requires a fresh approval or a new waiver",
+            ));
+        }
+
         // Validate approval is present and either genuine or waived.
         // Legacy compatibility: records created before the approval-digest feature have
         // `approver: Some(...)` but `approval: None`. Accept both forms.
@@ -245,6 +263,23 @@ impl ChangesetCoordinator {
             return Err(CoordinatorError::new(
                 "change_set_id",
                 "change set is no longer the exact unexpired approved plan",
+            ));
+        }
+
+        // An approval obtained by a waiver is only an approval while the waiver
+        // is valid. Checked here rather than at waive time because expiry is a
+        // property of the moment of use, not of the moment of grant.
+        if let Some(expires_at) = change_set
+            .approval
+            .as_ref()
+            .and_then(|approval| approval.waived.as_ref())
+            .and_then(|waiver| waiver.expires_at_unix)
+            && now_after_guard > expires_at
+        {
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                "waiver expired: this change set was approved by a time-boxed waiver that has \
+                 lapsed, so it requires a fresh approval or a new waiver",
             ));
         }
 
