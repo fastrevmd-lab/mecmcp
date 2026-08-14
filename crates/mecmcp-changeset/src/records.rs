@@ -474,9 +474,14 @@ pub struct ApprovalRecord {
     /// Tamper-evident digest.
     ///
     /// For genuine approvals: `(change_set_id, plan_digest, owner, approver, approved_at)`.
-    /// For waived approvals: `(change_set_id, plan_digest, owner, approved_at, "lab-mode-waived")`.
+    /// For waived approvals: [`crate::digest::compute_waiver_digest_v3`] over
+    /// `(change_set_id, plan_digest, owner, waived_at, waiver)`, which binds the
+    /// waiver's kind, expiry and ticket. Records written before schema v3 used
+    /// [`crate::digest::compute_waiver_digest`] instead, and are still verified
+    /// with it when the file declares version 1 or 2.
     pub digest: String,
-    /// Waiver record, present only when approval was waived in lab mode.
+    /// Waiver record, present when approval was waived — whether by lab mode or
+    /// by an operator-granted exception. See [`WaiverKind`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waived: Option<WaiverRecord>,
 }
