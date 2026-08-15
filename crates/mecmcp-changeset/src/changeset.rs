@@ -4,6 +4,7 @@ use crate::{
     coordinator::{ChangesetCoordinator, CoordinatorError},
     digest::{
         change_set_digest, compute_approval_digest, compute_waiver_digest_v3, validate_digest,
+        validate_principal_for_digest,
     },
     lifecycle::ChangeSetState,
     records::{ApprovalRecord, ChangeSetRecord, WaiverKind, WaiverRecord},
@@ -235,6 +236,13 @@ impl ChangesetCoordinator {
                 "digest does not match the exact stored change set",
             ));
         }
+
+        // Validate principals before computing the approval digest. The digest joins
+        // fields with '|', so a principal containing '|' creates ambiguous boundaries.
+        validate_principal_for_digest("owner", &record.owner)
+            .map_err(|msg| CoordinatorError::new("owner", msg))?;
+        validate_principal_for_digest("approver", &approver)
+            .map_err(|msg| CoordinatorError::new("approver", msg))?;
 
         // Compute approval digest: (change_set_id, plan_digest, owner, approver, approved_at)
         let approval_digest = compute_approval_digest(

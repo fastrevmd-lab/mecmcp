@@ -4,7 +4,7 @@ use crate::{
     ChangeSetRecord, OperationRecord,
     digest::{
         compute_approval_digest, compute_waiver_digest, compute_waiver_digest_v3,
-        validate_fingerprint,
+        validate_fingerprint, validate_principal_for_digest,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -239,7 +239,11 @@ pub fn validate_state(state: &ChangesetState, version: u32) -> Result<(), Persis
             }
 
             let expected_approval_digest = if let Some(approver) = &approval.approver {
-                // Genuine two-person approval
+                // Genuine two-person approval: validate principals before digest computation.
+                validate_principal_for_digest("owner", &record.owner)
+                    .map_err(PersistenceError::new)?;
+                validate_principal_for_digest("approver", approver)
+                    .map_err(PersistenceError::new)?;
                 compute_approval_digest(
                     id,
                     &record.digest,
@@ -297,6 +301,9 @@ pub fn validate_state(state: &ChangesetState, version: u32) -> Result<(), Persis
                         waiver,
                     )
                 } else {
+                    // Legacy waiver: validate owner before digest computation.
+                    validate_principal_for_digest("owner", &record.owner)
+                        .map_err(PersistenceError::new)?;
                     compute_waiver_digest(
                         id,
                         &record.digest,
@@ -305,6 +312,9 @@ pub fn validate_state(state: &ChangesetState, version: u32) -> Result<(), Persis
                     )
                 }
             } else {
+                // Legacy waiver without waived field: validate owner before digest computation.
+                validate_principal_for_digest("owner", &record.owner)
+                    .map_err(PersistenceError::new)?;
                 compute_waiver_digest(id, &record.digest, &record.owner, approval.approved_at_unix)
             };
 
