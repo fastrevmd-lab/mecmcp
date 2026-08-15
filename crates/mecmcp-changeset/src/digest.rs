@@ -263,3 +263,32 @@ pub fn compute_waiver_digest_v3(
     .expect("waiver digest inputs are primitives and cannot fail to serialize");
     format!("sha256:{}", digest_hex(&canonical))
 }
+
+/// Validates that a principal identifier does not contain the digest separator.
+///
+/// `compute_approval_digest` and the legacy `compute_waiver_digest` join their
+/// fields with a literal `|` separator. If a principal identifier itself contains
+/// `|`, two different pairings produce the same digest:
+///
+/// ```text
+/// owner="a|b", approver="c"   ->  id|plan|a|b|c|timestamp
+/// owner="a",   approver="b|c" ->  id|plan|a|b|c|timestamp
+/// ```
+///
+/// This function rejects such values before they can participate in a digest,
+/// closing the ambiguity at the input. The full fix (#283) is a length-prefixed
+/// or versioned tuple encoding, but that requires a schema bump; this validation
+/// is the interim mitigation and will remain part of the complete fix.
+///
+/// # Errors
+///
+/// Returns an error message if the value contains `|`.
+pub fn validate_principal_for_digest(field_name: &'static str, value: &str) -> Result<(), String> {
+    if value.contains('|') {
+        return Err(format!(
+            "{field_name} cannot contain '|' (the digest separator): value {:?} would make field boundaries ambiguous",
+            value
+        ));
+    }
+    Ok(())
+}

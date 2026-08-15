@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "state": {
+    "operations": {},
+    "change_sets": {
+      "0000000000000000000000000000000000000000000000000000000000000004": {
+        "id": "0000000000000000000000000000000000000000000000000000000000000004",
+        "owner": "bad|owner",
+        "device": "test-device",
+        "expected_candidate_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000004",
+        "actions": [{"set": "test"}],
+        "digest": "sha256:bf2345cc35293d4f0e8d1bd0305a6ae2cb22a0e2c54f29642144fc253ec86ec0",
+        "state": "approved",
+        "approval": {
+          "approved_at_unix": 1700000001,
+          "digest": "sha256:b2561984e433c79179c7090c34bc9167b982497a79649f1758c7be2f7bdbb48e"
+        },
+        "expires_at_unix": 1700086401
+      }
+    }
+  }
+}
