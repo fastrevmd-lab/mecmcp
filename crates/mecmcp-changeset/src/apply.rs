@@ -54,6 +54,46 @@ fn canonicalize_endpoint(endpoint: &str) -> Result<String, CoordinatorError> {
     Ok(canonical)
 }
 
+/// Returns an error when `change_set` was approved by a waiver whose
+/// `expires_at_unix` has passed as of `now`.
+///
+/// Takes `now` rather than reading the clock so each call site can pass the
+/// instant it already observed: the pre-guard and post-guard checks are
+/// deliberately separated in time to detect TOCTOU attacks.
+///
+/// The `gate` parameter distinguishes the pre-guard check (before the device lock)
+/// from the post-guard check (after acquiring it, on a freshly re-read change set)
+/// so the error message identifies which gate fired. This helps operators diagnose
+/// whether the waiver had already lapsed when they started, or lapsed while waiting
+/// for the device lock.
+///
+/// # Errors
+///
+/// Returns a `CoordinatorError` if the waiver has expired.
+fn waiver_expiry_error(
+    change_set: &crate::records::ChangeSetRecord,
+    now: u64,
+    gate: &str,
+) -> Option<CoordinatorError> {
+    if let Some(expires_at) = change_set
+        .approval
+        .as_ref()
+        .and_then(|approval| approval.waived.as_ref())
+        .and_then(|waiver| waiver.expires_at_unix)
+        && now >= expires_at
+    {
+        Some(CoordinatorError::new(
+            "change_set_id",
+            format!(
+                "waiver expired: this change set was approved by a time-boxed waiver that has \
+                 lapsed ({gate}), so it requires a fresh approval or a new waiver"
+            ),
+        ))
+    } else {
+        None
+    }
+}
+
 /// Output from applying a change set.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApplyOutput<S> {
@@ -182,6 +222,15 @@ impl ChangesetCoordinator {
             ));
         }
 
+        // An approval obtained by a waiver is only an approval while the waiver
+        // is valid. Checked here rather than at waive time because expiry is a
+        // property of the moment of use, not of the moment of grant.
+        let now_for_waiver = now_unix()?;
+        if let Some(error) = waiver_expiry_error(&change_set, now_for_waiver, "before device guard")
+        {
+            return Err(error);
+        }
+
         // Validate approval is present and either genuine or waived.
         // Legacy compatibility: records created before the approval-digest feature have
         // `approver: Some(...)` but `approval: None`. Accept both forms.
@@ -246,6 +295,15 @@ impl ChangesetCoordinator {
                 "change_set_id",
                 "change set is no longer the exact unexpired approved plan",
             ));
+        }
+
+        // An approval obtained by a waiver is only an approval while the waiver
+        // is valid. Checked here rather than at waive time because expiry is a
+        // property of the moment of use, not of the moment of grant.
+        if let Some(error) =
+            waiver_expiry_error(&change_set, now_after_guard, "after acquiring device guard")
+        {
+            return Err(error);
         }
 
         // Check expiration after acquiring the guard. If the TTL elapses while waiting
@@ -578,5 +636,76 @@ impl ChangesetCoordinator {
             staged,
             recorded_state: change_set_state_on_disk,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        lifecycle::ChangeSetState,
+        records::{ApprovalRecord, ChangeSetRecord, WaiverKind, WaiverRecord},
+    };
+
+    /// Waiver expiry boundary: a waiver whose `expires_at_unix` equals `now` is expired.
+    /// The check is `now >= expires_at`, consistent with change-set expiry everywhere.
+    /// This test calls the helper directly with fixed values so the boundary case is
+    /// deterministic, unlike the end-to-end test which reads the real clock.
+    #[test]
+    fn waiver_expiry_boundary_is_exact() {
+        let expires_at = 1_700_000_000_u64;
+
+        let waiver = WaiverRecord {
+            kind: WaiverKind::OperatorFile,
+            reason: "boundary test".to_owned(),
+            expires_at_unix: Some(expires_at),
+            ticket: None,
+        };
+
+        let change_set = ChangeSetRecord {
+            id: "test".to_owned(),
+            device: "test".to_owned(),
+            owner: "test".to_owned(),
+            digest: "a".repeat(64),
+            expected_candidate_fingerprint: "b".repeat(64),
+            actions: vec![],
+            state: ChangeSetState::Approved,
+            expires_at_unix: expires_at + 86400,
+            operation_id: None,
+            approver: None,
+            approval: Some(ApprovalRecord {
+                approver: None,
+                approved_at_unix: expires_at - 3600,
+                digest: "c".repeat(64),
+                waived: Some(waiver),
+            }),
+            policy_signature: "test".to_owned(),
+            targets: vec![],
+            preview: None,
+        };
+
+        // One second before expiry: still valid
+        assert!(
+            waiver_expiry_error(&change_set, expires_at - 1, "test").is_none(),
+            "waiver must be valid one second before expiry"
+        );
+
+        // Exactly at expiry: expired
+        let err = waiver_expiry_error(&change_set, expires_at, "test")
+            .expect("waiver must be expired at the exact instant");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("waiver expired"),
+            "error message must name expiry: {message}"
+        );
+
+        // One second after expiry: expired
+        let err = waiver_expiry_error(&change_set, expires_at + 1, "test")
+            .expect("waiver must be expired one second after expiry");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("waiver expired"),
+            "error message must name expiry: {message}"
+        );
     }
 }

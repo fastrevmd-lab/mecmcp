@@ -377,13 +377,15 @@ async fn test_tampering_waived_record_by_inserting_approver_is_rejected() {
     // Write the tampered state back
     write_state(&state_path, &state, 8 * 1024 * 1024).expect("write tampered state");
 
-    // Attempt to reload — must fail with approval digest mismatch
+    // Attempt to reload — must fail. The mutual exclusion check (defect 5 fix)
+    // now rejects this earlier than the digest check, which is the correct
+    // behavior: a record with both approver and waived is malformed.
     let result = read_state(&state_path, 8 * 1024 * 1024);
     assert!(result.is_err());
     let error_message = result.unwrap_err().to_string();
     assert!(
-        error_message.contains("approval digest mismatch"),
-        "Expected approval digest mismatch, got: {error_message}"
+        error_message.contains("both approver and waived"),
+        "Expected 'both approver and waived', got: {error_message}"
     );
 }
 

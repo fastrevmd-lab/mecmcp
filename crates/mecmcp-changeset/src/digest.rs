@@ -1,5 +1,6 @@
 //! Digest computation and validation for change sets and fingerprints.
 
+use crate::records::WaiverRecord;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -191,6 +192,11 @@ pub fn compute_approval_digest(
     format!("sha256:{}", bytes_hex(&hasher.finalize()))
 }
 
+/// **Legacy: verifies version 1 and 2 records only.** New waivers use
+/// [`compute_waiver_digest_v3`], which binds the waiver's kind, expiry and
+/// ticket. This function is retained because it is the only thing that can
+/// verify a record written before mecmcp#275 — do not call it in new code.
+///
 /// Computes a waiver digest for lab-mode approvals without a second principal.
 ///
 /// The waiver digest covers `(change_set_id, plan_digest, owner, approved_at, "lab-mode-waived")`.
@@ -215,4 +221,45 @@ pub fn compute_waiver_digest(
     hasher.update(b"lab-mode-waived");
 
     format!("sha256:{}", bytes_hex(&hasher.finalize()))
+}
+
+/// Computes a waiver digest binding the waiver's kind, expiry and ticket.
+///
+/// # Encoding
+///
+/// Hashes `serde_json::to_vec` of a tuple, the way [`change_set_digest`] does,
+/// rather than the `|`-joined string [`compute_waiver_digest`] uses. A
+/// serialized tuple encodes lengths, so no field value can shift a boundary —
+/// the weakness recorded for approvals in mecmcp#283.
+///
+/// The leading `"mecmcp-waiver-v3"` is domain separation: it makes a waiver
+/// digest structurally incapable of equalling an approval digest, the role the
+/// literal `"lab-mode-waived"` plays in the legacy function.
+///
+/// # Panics
+///
+/// Does not panic. The tuple is composed of owned primitives and `String`s,
+/// which cannot fail to serialize; the `expect` documents that rather than
+/// propagating an error no caller could act on.
+#[must_use]
+pub fn compute_waiver_digest_v3(
+    change_set_id: &str,
+    plan_digest: &str,
+    owner: &str,
+    waived_at_unix: u64,
+    waiver: &WaiverRecord,
+) -> String {
+    let canonical = serde_json::to_vec(&(
+        "mecmcp-waiver-v3",
+        change_set_id,
+        plan_digest,
+        owner,
+        waived_at_unix,
+        &waiver.kind,
+        &waiver.reason,
+        waiver.expires_at_unix,
+        &waiver.ticket,
+    ))
+    .expect("waiver digest inputs are primitives and cannot fail to serialize");
+    format!("sha256:{}", digest_hex(&canonical))
 }

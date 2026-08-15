@@ -2,7 +2,10 @@
 
 use crate::{
     ChangeSetRecord, OperationRecord,
-    digest::{compute_approval_digest, compute_waiver_digest, validate_fingerprint},
+    digest::{
+        compute_approval_digest, compute_waiver_digest, compute_waiver_digest_v3,
+        validate_fingerprint,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, io::Write, path::Path};
@@ -80,15 +83,40 @@ pub fn read_state(path: &Path, max_state_bytes: u64) -> Result<ChangesetState, P
     let on_disk: OnDiskChangesetState = serde_json::from_slice(bytes)
         .map_err(|error| PersistenceError::new(format!("invalid changeset state JSON: {error}")))?;
 
-    if on_disk.version != 1 && on_disk.version != 2 {
+    if on_disk.version != 1 && on_disk.version != 2 && on_disk.version != 3 {
         return Err(PersistenceError::new(format!(
             "unsupported changeset state version {}",
             on_disk.version
         )));
     }
 
-    validate_state(&on_disk.state)?;
-    Ok(on_disk.state)
+    validate_state(&on_disk.state, on_disk.version)?;
+
+    // Defect 1 fix: migrate legacy waiver digests to v3 after successful validation.
+    // This is safe precisely because the legacy digest was just verified — we are
+    // re-signing evidence we have already authenticated. Without this migration, the
+    // next write_state would stamp the file version 3 (waivers_need_v3 triggers on
+    // any waiver), but the digest stays legacy, causing the next read_state to fail
+    // with a mismatch.
+    let mut state = on_disk.state;
+    if on_disk.version < 3 {
+        for record in state.change_sets.values_mut() {
+            if let Some(approval) = record.approval.as_mut()
+                && let Some(waiver) = approval.waived.as_ref()
+            {
+                // Re-compute the digest using v3 over the same inputs
+                approval.digest = crate::digest::compute_waiver_digest_v3(
+                    &record.id,
+                    &record.digest,
+                    &record.owner,
+                    approval.approved_at_unix,
+                    waiver,
+                );
+            }
+        }
+    }
+
+    Ok(state)
 }
 
 /// Validates the in-memory state for consistency.
@@ -96,7 +124,7 @@ pub fn read_state(path: &Path, max_state_bytes: u64) -> Result<ChangesetState, P
 /// # Errors
 ///
 /// Returns an error if the state contains invalid or inconsistent records.
-pub fn validate_state(state: &ChangesetState) -> Result<(), PersistenceError> {
+pub fn validate_state(state: &ChangesetState, version: u32) -> Result<(), PersistenceError> {
     const MAX_OPERATIONS: usize = 1024;
     const MAX_CHANGE_SETS: usize = 1024;
     const MAX_CHANGE_SET_ACTIONS: usize = 64;
@@ -198,6 +226,18 @@ pub fn validate_state(state: &ChangesetState) -> Result<(), PersistenceError> {
                 |error| PersistenceError::new(format!("approval digest invalid: {error}")),
             )?;
 
+            // Defect 5 fix: reject records with both approver and waived set.
+            // These fields are mutually exclusive by construction — waive_approval
+            // sets approver = None. A record with both is malformed and likely an
+            // injection attempt. Rejecting this shape before the digest branch
+            // prevents the migration from corrupting a genuine approval that has
+            // a waived object injected.
+            if approval.approver.is_some() && approval.waived.is_some() {
+                return Err(PersistenceError::new(
+                    "changeset state approval record has both approver and waived fields set (mutually exclusive)",
+                ));
+            }
+
             let expected_approval_digest = if let Some(approver) = &approval.approver {
                 // Genuine two-person approval
                 compute_approval_digest(
@@ -207,8 +247,64 @@ pub fn validate_state(state: &ChangesetState) -> Result<(), PersistenceError> {
                     approver,
                     approval.approved_at_unix,
                 )
+            } else if let Some(waiver) = approval.waived.as_ref() {
+                // Defect 2 fix: reject v1/v2 waivers carrying v3-only metadata.
+                // A genuine legacy waiver could not have carried kind != LabMode,
+                // expires_at_unix, or ticket. Accepting them here lets someone
+                // relabel a lab-mode waiver as operator_file and forge its authority.
+                if version < 3 {
+                    use crate::records::WaiverKind;
+                    if waiver.kind != WaiverKind::LabMode {
+                        return Err(PersistenceError::new(format!(
+                            "changeset state v{version} waiver cannot carry kind {:?} (v3-only metadata)",
+                            waiver.kind
+                        )));
+                    }
+                    if waiver.expires_at_unix.is_some() {
+                        return Err(PersistenceError::new(format!(
+                            "changeset state v{version} waiver cannot carry expires_at_unix (v3-only metadata)"
+                        )));
+                    }
+                    if waiver.ticket.is_some() {
+                        return Err(PersistenceError::new(format!(
+                            "changeset state v{version} waiver cannot carry ticket (v3-only metadata)"
+                        )));
+                    }
+                    // Defect 4 fix: reject v1/v2 waivers with unexpected reason text.
+                    // The legacy digest does NOT cover reason, so it can be edited
+                    // freely. The migration then re-signs with v3, which DOES include
+                    // reason, promoting unauthenticated text into signed evidence.
+                    // waive_approval emits the literal "lab-mode", so require exactly
+                    // that before re-signing. This check protects both validate_state
+                    // and the migration.
+                    if waiver.reason != "lab-mode" {
+                        return Err(PersistenceError::new(format!(
+                            "changeset state v{version} waiver has unexpected reason {:?} (expected \"lab-mode\")",
+                            waiver.reason
+                        )));
+                    }
+                }
+
+                // Version decides the rule outright. Accepting "either digest
+                // verifies" would let a forged legacy digest pass on a v3
+                // record, which defeats the point of binding the kind.
+                if version >= 3 {
+                    compute_waiver_digest_v3(
+                        id,
+                        &record.digest,
+                        &record.owner,
+                        approval.approved_at_unix,
+                        waiver,
+                    )
+                } else {
+                    compute_waiver_digest(
+                        id,
+                        &record.digest,
+                        &record.owner,
+                        approval.approved_at_unix,
+                    )
+                }
             } else {
-                // Waived approval in lab mode
                 compute_waiver_digest(id, &record.digest, &record.owner, approval.approved_at_unix)
             };
 
@@ -272,7 +368,21 @@ pub fn write_state(
         .operations
         .values()
         .any(|op| !op.endpoint.starts_with("https://"));
-    let version = if operations_need_v2 || change_sets_need_v2 || endpoints_need_v2 {
+    // Version 3 is required if any waiver record is present. `WaiverRecord::kind`
+    // always serializes (no `skip_serializing_if`), so every waiver — lab mode
+    // included — writes a `"kind"` key, and the pre-#275 `WaiverRecord` is
+    // `deny_unknown_fields` over `reason` alone. An older binary rejects any
+    // file containing any waiver regardless of version. Deployments with no
+    // waivers are unaffected and keep selecting v1/v2 by the existing rules.
+    let waivers_need_v3 = state.change_sets.values().any(|cs| {
+        cs.approval
+            .as_ref()
+            .and_then(|a| a.waived.as_ref())
+            .is_some()
+    });
+    let version = if waivers_need_v3 {
+        3
+    } else if operations_need_v2 || change_sets_need_v2 || endpoints_need_v2 {
         2
     } else {
         1

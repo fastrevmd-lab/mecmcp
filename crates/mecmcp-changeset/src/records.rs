@@ -474,22 +474,68 @@ pub struct ApprovalRecord {
     /// Tamper-evident digest.
     ///
     /// For genuine approvals: `(change_set_id, plan_digest, owner, approver, approved_at)`.
-    /// For waived approvals: `(change_set_id, plan_digest, owner, approved_at, "lab-mode-waived")`.
+    /// For waived approvals: [`crate::digest::compute_waiver_digest_v3`] over
+    /// `(change_set_id, plan_digest, owner, waived_at, waiver)`, which binds the
+    /// waiver's kind, expiry and ticket. Records written before schema v3 used
+    /// [`crate::digest::compute_waiver_digest`] instead, and are still verified
+    /// with it when the file declares version 1 or 2.
     pub digest: String,
-    /// Waiver record, present only when approval was waived in lab mode.
+    /// Waiver record, present when approval was waived — whether by lab mode or
+    /// by an operator-granted exception. See [`WaiverKind`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waived: Option<WaiverRecord>,
 }
 
-/// Record of a waived approval in lab mode.
+/// How an approval came to be waived.
 ///
-/// This explicitly documents that the approval was waived, making lab-mode
-/// records programmatically distinguishable from genuine two-person approvals.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Bound into the waiver digest, so a record cannot be relabelled after the
+/// fact. Before mecmcp#275 every waiver was implicitly lab-mode, which reported
+/// a bounded exception and a disabled control as the same event.
+///
+/// `#[non_exhaustive]`: the set of ways an exception can be granted is exactly
+/// the kind of list that grows, and this type exists because the previous
+/// version of it was implicitly a set of one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WaiverKind {
+    /// `--lab-mode`: the control is switched off for this process.
+    ///
+    /// The default for a record that does not say, which is what every v1 and
+    /// v2 waiver looks like.
+    #[default]
+    LabMode,
+    /// Granted out of band, in a file the service process cannot write.
+    OperatorFile,
+    /// Granted in band, by a second principal calling a tool.
+    OperatorTool,
+}
+
+/// Why an approval was waived, and under what authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WaiverRecord {
+    /// How the waiver was granted. Digest-bound.
+    ///
+    /// Defaults to [`WaiverKind::LabMode`] so a v1/v2 body carrying only
+    /// `reason` still decodes.
+    #[serde(default)]
+    pub kind: WaiverKind,
     /// Reason for waiving approval.
     pub reason: String,
+    /// When this waiver stops being valid. Digest-bound.
+    ///
+    /// `None` means it does not expire, which is the only thing lab mode can
+    /// mean. Bound into the digest because an expiry that can be edited
+    /// afterwards is not a time box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<u64>,
+    /// External change-control reference. Digest-bound.
+    ///
+    /// Bound because its only purpose is pointing an auditor at the record that
+    /// authorised this, and a rewritable pointer misleads that reader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
 }
 
 /// Error type for record validation failures.
@@ -655,3 +701,38 @@ pub fn validate_change_set_actions<A: Serialize>(
 
 /// Re-export digest functions for use in tests and validation.
 pub use crate::digest::{change_set_digest, change_set_digest_with_targets, preview_digest};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waiver_kind_serializes_to_stable_snake_case_names() {
+        // These strings are on disk in every persisted waiver. Renaming a variant
+        // must not silently change them, so they are asserted explicitly rather
+        // than derived.
+        for (kind, expected) in [
+            (WaiverKind::LabMode, "\"lab_mode\""),
+            (WaiverKind::OperatorFile, "\"operator_file\""),
+            (WaiverKind::OperatorTool, "\"operator_tool\""),
+        ] {
+            let encoded = serde_json::to_string(&kind).expect("encode kind");
+            assert_eq!(encoded, expected, "on-disk name for {kind:?} changed");
+            let decoded: WaiverKind = serde_json::from_str(&encoded).expect("decode kind");
+            assert_eq!(decoded, kind);
+        }
+    }
+
+    #[test]
+    fn a_legacy_waiver_body_decodes_as_lab_mode() {
+        // v1 and v2 files carry `{"reason": "..."}` and nothing else. They must
+        // load, and they must mean lab mode — that is all a waiver could be before
+        // this change.
+        let record: WaiverRecord =
+            serde_json::from_str(r#"{"reason":"lab-mode"}"#).expect("legacy waiver body");
+        assert_eq!(record.kind, WaiverKind::LabMode);
+        assert_eq!(record.reason, "lab-mode");
+        assert_eq!(record.expires_at_unix, None);
+        assert_eq!(record.ticket, None);
+    }
+}

@@ -98,9 +98,9 @@ fn test_version_rejection() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state_path = temp_dir.path().join("state.json");
 
-    // Write a state file with version 3 (unsupported)
+    // Write a state file with version 4 (unsupported)
     let invalid_version = serde_json::json!({
-        "version": 3,
+        "version": 4,
         "state": {
             "operations": {},
             "change_sets": {}
@@ -123,7 +123,7 @@ fn test_version_rejection() {
     assert!(result.is_err());
     let error_message = result.unwrap_err().to_string();
     assert!(
-        error_message.contains("unsupported changeset state version 3"),
+        error_message.contains("unsupported changeset state version 4"),
         "Expected version error, got: {error_message}"
     );
 }
@@ -310,7 +310,7 @@ fn test_state_validation() {
     let state = read_state(&fixture_path, 8 * 1024 * 1024).unwrap();
 
     // validate_state should pass for the production fixture
-    validate_state(&state).expect("production fixture must pass validation");
+    validate_state(&state, 2).expect("production fixture must pass validation");
 }
 
 #[test]

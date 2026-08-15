@@ -35,6 +35,45 @@ apply) and the modern crate hygiene. Neither benefits from the other.
 
 ## Status
 
+**0.10.0 — operator waivers are a kind, bounded, and expire (#275).**
+Every waiver was a lab-mode waiver by construction — the digest bound the literal
+string `"lab-mode-waived"`, so *a bounded, ticketed exception granted under a
+control that is still on* and *someone switching the control off entirely*
+were recorded identically. `reason` was free text that nothing verified and
+nothing bound.
+
+The fix: `WaiverKind` (`LabMode` / `OperatorFile` / `OperatorTool`,
+`#[non_exhaustive]`); `expires_at_unix` and `ticket`, both digest-bound;
+`compute_waiver_digest_v3`, which hashes a serialized tuple with a
+domain-separation marker instead of a `|`-joined string, so no field value can
+shift a boundary; schema v3; a new `waive_approval_operator`; and expiry
+enforced at apply, at both the pre-guard and post-guard gates.
+
+**Breaking:** `WaiverRecord` struct-literal construction now needs `kind` (plus
+the two new `Option` fields `expires_at_unix` and `ticket`), and `validate_state`
+takes a version argument. Consumers that only call `waive_approval` need no change.
+Checked across the consumer repos: none constructs a `WaiverRecord`, references
+`WaiverKind`, or calls `validate_state`, so upgrading is a dependency bump with
+no code changes. Bump **both** strings on each entry — a `version = "0.9.x"`
+requirement does not accept `0.10.0`, so changing only `tag = "v0.9.1"` leaves
+the dependency unresolvable.
+
+**No data migration:** a live survey of LXC 950, 960, 601, 606, and 600 found 28
+change sets and **zero** waiver records, so changing the waiver digest invalidates
+nothing that exists. The neighbouring approval digest was deliberately left alone
+for that reason and is tracked as #283. Any state file containing a waiver is now
+written as version 3; files with no waivers still select v1/v2 exactly as before.
+
+**0.9.1 — test consumers can serve a plan on an ephemeral loopback port (#280).**
+0.9.0 sealed the `Router` inside `ServePlan`, so `serve_router` became the only
+way to serve one. Four consumer migrations worked around that by cloning the
+listener token and driving `serve_router` in a background task, then racing their
+client against the bind to discover the port from the OS. The harness extracts
+that pattern: `mecmcp_transport::test_harness::serve_on_loopback` takes a
+`ServePlan` and returns the bound `SocketAddr`, so the client can dial it
+immediately. Loopback-only, as the control on inadmissible listeners is the
+signature `serve_router` moved to the right of.
+
 **0.9.0 also warns when a revoke has not reached the server (#266).**
 `token revoke` removed the entry, printed `revoked '<name>'` and exited 0 —
 while a running server kept its store in memory and went on accepting the
