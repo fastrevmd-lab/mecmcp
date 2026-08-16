@@ -1,7 +1,14 @@
-//! End-to-end provenance test: `_meta.mecmcp/provenance` → audit attribution.
+//! Unit tests for `Attribution::from_caller` provenance population.
 //!
-//! Verifies that model_id and session_id flow from the initialize request's
-//! `_meta` block all the way through to the audit event's AgentIdentity.
+//! These tests hand-construct `CallerCtx` with provenance fields already set,
+//! so they verify only that `Attribution::from_caller` copies those fields into
+//! `AgentIdentity`. They do NOT exercise:
+//! - Parsing `_meta.mecmcp/provenance` from initialize params
+//! - Storing provenance in SessionTracker
+//! - The hand-off in `auth.rs` that extracts provenance from the session
+//!
+//! For the complete chain, see `bearer_boundary::provenance_from_meta_reaches_audit_attribution`,
+//! which drives the real parse → session store → hand-off → attribution path.
 
 use mecmcp_audit::testutil::run_with_capture;
 use mecmcp_auth::{ActorType, CallerCtx, NoGrant, ScopeSet};
@@ -79,7 +86,9 @@ fn missing_provenance_fields_work() {
         "model_id should be empty in audit event:\n{captured}"
     );
     assert!(
-        captured.contains("session_id=,") || captured.contains("session_id= ") || captured.contains("session_id=\n"),
+        captured.contains("session_id=,")
+            || captured.contains("session_id= ")
+            || captured.contains("session_id=\n"),
         "session_id should be empty in audit event:\n{captured}"
     );
 }
