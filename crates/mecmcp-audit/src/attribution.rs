@@ -251,12 +251,13 @@ impl Attribution {
         };
 
         // When the token declares a provider, populate an AgentIdentity with
-        // server-verified fields. The client_name is populated from CallerCtx
-        // if available (captured from the MCP session during bearer preflight).
+        // server-verified fields. Client-asserted provenance (client_name, model_id,
+        // session_id) is populated from CallerCtx if available (captured from the
+        // MCP session during bearer preflight).
         let agent = match (&ctx.provider, ctx.provider_tier) {
             (Some(provider), Some(tier)) => Some(AgentIdentity {
-                model_id: String::new(),
-                session_id: String::new(),
+                model_id: ctx.model_id.map(String::from).unwrap_or_default(),
+                session_id: ctx.session_id.clone().unwrap_or_default(),
                 client_name: ctx.client_name.map(String::from),
                 provider: provider.clone(),
                 provider_tier: match tier {
@@ -265,14 +266,21 @@ impl Attribution {
                 },
                 skills_used: Vec::new(),
             }),
-            _ => ctx.client_name.map(|name| AgentIdentity {
-                model_id: String::new(),
-                session_id: String::new(),
-                client_name: Some(name.to_string()),
-                provider: default_provider(),
-                provider_tier: Tier::default(),
-                skills_used: Vec::new(),
-            }),
+            _ => {
+                // Create an AgentIdentity if any client-asserted field is present.
+                if ctx.client_name.is_some() || ctx.model_id.is_some() || ctx.session_id.is_some() {
+                    Some(AgentIdentity {
+                        model_id: ctx.model_id.map(String::from).unwrap_or_default(),
+                        session_id: ctx.session_id.clone().unwrap_or_default(),
+                        client_name: ctx.client_name.map(String::from),
+                        provider: default_provider(),
+                        provider_tier: Tier::default(),
+                        skills_used: Vec::new(),
+                    })
+                } else {
+                    None
+                }
+            }
         };
 
         // The token entry is the server's own record, so anything it declared is
@@ -373,6 +381,8 @@ mod tests {
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Unknown,
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         }
     }
@@ -639,6 +649,8 @@ mod tests {
             on_behalf_of: Some("fastrevmd@gmail.com".into()),
             actor_type: mecmcp_auth::ActorType::Agent,
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         };
         let a = Attribution::from_caller(&ctx);
@@ -694,6 +706,8 @@ mod tests {
             on_behalf_of: Some("alice@example.com".into()),
             actor_type: mecmcp_auth::ActorType::Human,
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         };
         let a = Attribution::from_caller(&ctx);
@@ -722,6 +736,8 @@ mod tests {
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Unknown, // defaulted, not explicit
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         };
         let a = Attribution::from_caller(&c);
@@ -748,6 +764,8 @@ mod tests {
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Agent, // explicit
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         };
         let a = Attribution::from_caller(&c);
@@ -776,6 +794,8 @@ mod tests {
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Agent,
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         };
         let a = Attribution::from_caller(&c);
@@ -806,6 +826,8 @@ mod tests {
             on_behalf_of: Some("alice@example.com".into()),
             actor_type: mecmcp_auth::ActorType::Agent,
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         };
         let a = Attribution::from_caller(&c);

@@ -259,6 +259,8 @@ mod tests {
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Unknown,
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         }
     }
@@ -480,6 +482,8 @@ mod tests {
             on_behalf_of: Some("fastrevmd@gmail.com".into()),
             actor_type: mecmcp_auth::ActorType::Agent,
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         };
         let out = run_with_capture(|| {

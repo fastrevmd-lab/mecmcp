@@ -134,6 +134,16 @@ pub struct CallerCtx<G: Grant = NoGrant> {
     /// `None` for the very first request (initialize itself, before the session
     /// has a captured name) or when the client did not provide `clientInfo`.
     pub client_name: Option<&'static str>,
+    /// Client-asserted model ID from `_meta.mecmcp/provenance` in `initialize`.
+    ///
+    /// Interned, low-cardinality (a handful of model names). ALWAYS client-asserted.
+    /// Populated by bearer preflight when the session provided provenance.
+    pub model_id: Option<&'static str>,
+    /// Client-asserted session ID from `_meta.mecmcp/provenance` in `initialize`.
+    ///
+    /// High-cardinality (one per session), not interned. ALWAYS client-asserted.
+    /// Populated by bearer preflight when the session provided provenance.
+    pub session_id: Option<String>,
     /// Correlation ID shared by every audit event for this one request.
     ///
     /// One authenticated `tools/call` emits two audit events — the transport
@@ -162,6 +172,8 @@ impl<G: Grant> From<&TokenEntry<G>> for CallerCtx<G> {
             on_behalf_of: entry.on_behalf_of.clone(),
             actor_type: entry.effective_actor_type(),
             client_name: None,
+            model_id: None,
+            session_id: None,
             // Minted here rather than at the audit layer: authentication runs
             // once per request, so this is the point at which "one request"
             // is a fact rather than an assumption (mecmcp#269).
@@ -285,6 +297,8 @@ mod tests {
             on_behalf_of: None,
             actor_type: crate::ActorType::Human,
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         };
         let visible =
@@ -313,6 +327,8 @@ mod tests {
             on_behalf_of: None,
             actor_type: crate::ActorType::Human,
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         };
         let visible = filter_device_names(Some(&ctx), vec!["edge-fw".to_owned()]);
@@ -333,6 +349,8 @@ mod tests {
             on_behalf_of: None,
             actor_type: crate::ActorType::Human,
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         };
         let names = vec!["edge-fw".to_owned(), "core-fw".to_owned()];

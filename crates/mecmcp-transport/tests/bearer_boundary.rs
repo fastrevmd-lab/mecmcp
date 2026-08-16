@@ -45,6 +45,8 @@ fn caller() -> CallerCtx<TestGrant> {
         on_behalf_of: None,
         actor_type: ActorType::Human,
         client_name: None,
+        model_id: None,
+        session_id: None,
         request_id: uuid::Uuid::new_v4(),
     }
 }
@@ -1408,5 +1410,160 @@ fn preflight_pass_is_still_audited_as_allowed() {
     assert!(
         !captured.contains("result=unsettled"),
         "the outcome must be settled before the scope drops, got: {captured}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// mecmcp#267: client-asserted provenance (model_id, session_id) must reach
+// audit attribution.
+//
+// This is the REAL end-to-end test. It drives the actual parse → session store →
+// bearer preflight hand-off → attribution chain. Tests in `provenance_e2e.rs`
+// hand-construct `CallerCtx`, so they cannot observe the parse, session store, or
+// the hand-off in `auth.rs` — that gap shipped identical defects twice.
+// ---------------------------------------------------------------------------
+
+/// Provenance from `_meta.mecmcp/provenance` in initialize reaches the audit event.
+///
+/// This test exercises the complete chain:
+/// 1. Parse `_meta` from initialize params (ClientInfo::from_initialize_params)
+/// 2. Store in SessionTracker (set_client_info)
+/// 3. Extract in bearer preflight (auth.rs extracts model_id/session_id from tracker)
+/// 4. Populate CallerCtx
+/// 5. Attribution::from_caller populates AgentIdentity
+/// 6. Audit event contains both fields
+///
+/// If the hand-off at step 3 is severed (auth.rs never assigns to caller.model_id
+/// or caller.session_id), this test MUST FAIL. That is the acceptance criterion.
+#[test]
+fn provenance_from_meta_reaches_audit_attribution() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let tracker = Arc::new(SessionTracker::new(&LimitsConfig::default()));
+    let session_id: Arc<str> = Arc::from("test-session");
+    assert!(
+        tracker.try_register(session_id.clone(), std::time::Instant::now()),
+        "session must register"
+    );
+
+    // Parse provenance from initialize params with _meta block
+    let info = ClientInfo::from_initialize_params(&json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": {"name": "claude-code", "version": "1.0"},
+        "_meta": {
+            "mecmcp/provenance": {
+                "model_id": "claude-opus-5",
+                "session_id": "01JXYZ123456789"
+            }
+        }
+    }))
+    .expect("clientInfo with provenance parses");
+
+    // Verify parse succeeded before testing hand-off
+    assert_eq!(info.name(), "claude-code");
+    assert_eq!(info.model_id(), Some("claude-opus-5"));
+    assert_eq!(info.session_id(), Some("01JXYZ123456789"));
+
+    tracker.set_client_info(&session_id, info);
+
+    // Verify session store succeeded
+    assert_eq!(tracker.client_name(&session_id), Some("claude-code"));
+    assert_eq!(tracker.model_id(&session_id), Some("claude-opus-5"));
+    assert_eq!(
+        tracker.session_id(&session_id),
+        Some("01JXYZ123456789".to_owned())
+    );
+
+    let app = app_with_tracker(Some(tracker));
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        runtime.block_on(async {
+            let response = app
+                .oneshot(tools_call(Some("test-session")))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    });
+
+    // All three provenance fields must appear in the audit event
+    assert!(
+        captured.contains("client_name=claude-code"),
+        "client_name missing from audit event (hand-off at auth.rs:632 broken): {captured}"
+    );
+    assert!(
+        captured.contains("model_id=claude-opus-5"),
+        "model_id missing from audit event (hand-off at auth.rs:635 broken): {captured}"
+    );
+    assert!(
+        captured.contains("session_id=01JXYZ123456789"),
+        "session_id missing from audit event (hand-off at auth.rs:638 broken): {captured}"
+    );
+}
+
+/// Stateless requests without `Mcp-Session-Id` have empty provenance.
+///
+/// Clients declaring MCP `2026-07-28` are routed statelessly (no session header),
+/// so the provenance capture block in `auth.rs:626` never runs. This is a known
+/// limitation documented at that call site. All three fields render empty, and the
+/// request does not error.
+///
+/// If this test fails after implementing stateless capture, the limitation is fixed.
+#[test]
+fn stateless_request_without_session_header_has_empty_provenance() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let tracker = Arc::new(SessionTracker::new(&LimitsConfig::default()));
+    let session_id: Arc<str> = Arc::from("known-session");
+    assert!(
+        tracker.try_register(session_id.clone(), std::time::Instant::now()),
+        "session must register"
+    );
+
+    let info = ClientInfo::from_initialize_params(&json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": {"name": "stateless-client", "version": "1.0"},
+        "_meta": {
+            "mecmcp/provenance": {
+                "model_id": "should-not-appear",
+                "session_id": "should-not-appear"
+            }
+        }
+    }))
+    .expect("clientInfo parses");
+    tracker.set_client_info(&session_id, info);
+
+    let app = app_with_tracker(Some(tracker));
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        runtime.block_on(async {
+            // Request with NO Mcp-Session-Id header (stateless path)
+            let response = app.oneshot(tools_call(None)).await.expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    });
+
+    // All provenance fields must be empty (limitation)
+    assert!(
+        !captured.contains("should-not-appear"),
+        "stateless request must not carry session provenance: {captured}"
+    );
+    assert!(
+        captured.contains("client_name=") && !captured.contains("client_name=stateless-client"),
+        "client_name must be empty without session header: {captured}"
+    );
+    assert!(
+        captured.contains("model_id=") && !captured.contains("model_id=should"),
+        "model_id must be empty without session header: {captured}"
+    );
+    assert!(
+        captured.contains("session_id=") && !captured.contains("session_id=should"),
+        "session_id must be empty without session header: {captured}"
     );
 }

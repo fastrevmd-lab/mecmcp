@@ -58,6 +58,8 @@ fn emit_transport_audit(tool: &'static str, client_name: Option<&'static str>) {
         on_behalf_of: None,
         actor_type: ActorType::Human,
         client_name,
+        model_id: None,
+        session_id: None,
         request_id: uuid::Uuid::new_v4(),
     };
 

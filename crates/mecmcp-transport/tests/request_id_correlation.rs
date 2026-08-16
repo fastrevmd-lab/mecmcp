@@ -50,6 +50,8 @@ fn caller(client_name: Option<&'static str>) -> CallerCtx<NoGrant> {
         on_behalf_of: None,
         actor_type: ActorType::Agent,
         client_name,
+        model_id: None,
+        session_id: None,
         request_id: uuid::Uuid::new_v4(),
     }
 }
@@ -161,6 +163,8 @@ fn authenticated_caller() -> CallerCtx<TestGrant> {
         on_behalf_of: None,
         actor_type: ActorType::Agent,
         client_name: None,
+        model_id: None,
+        session_id: None,
         request_id: uuid::Uuid::new_v4(),
     }
 }
