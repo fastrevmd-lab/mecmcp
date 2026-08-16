@@ -639,6 +639,7 @@ refused at startup by 0.3.8.
 | [`PLAN.md`](PLAN.md) | Program-level extraction plan: crate map, phase sequencing, decisions, exit criteria (historical — the plan is delivered) |
 | [`ROADMAP.md`](ROADMAP.md) | What "enterprise grade" means at 150 engineers and 4,000 multi-vendor firewalls |
 | [`docs/PACKAGING.md`](docs/PACKAGING.md) | How a mechub MCP server is delivered and installed — container base, LXC, README requirements |
+| [`docs/AUDIT-FORWARDING-STANDARD.md`](docs/AUDIT-FORWARDING-STANDARD.md) | **Standard.** How every server ships its audit trail off the host: JSON emission rules (normative) and the hash-chained ClickHouse sink (#292) |
 | [`docs/superpowers/plans/`](docs/superpowers/plans/) | Executable per-phase implementation plans |
 
 ## The crate family
@@ -681,6 +682,24 @@ Vendor servers keep their protocol adapters, XML parsers, and vendor workflows.
 For `mecmcp-http` specifically, that means endpoint catalogs, header names, payload
 schemas, terminal job states, and retry policy stay in the product repository —
 the shared crate owns only the transport posture.
+
+### The audit trail leaves the host
+
+An audit record that only exists on the machine that produced it is not an audit
+trail. Every server emits JSON to a file and forwards it to the security event
+store.
+
+Transport is a **direct, hash-chained write into `ssdf.audit`**, per SSDF's
+merged evidence contract — not syslog. Every other link in this chain is
+tamper-evident by construction: plan digests bind approvals, approvals name a
+distinct principal, `token_verified_fields` separates vouched-for provenance from
+asserted. An unchained final hop would discard that guarantee at the point an
+auditor relies on it.
+
+Emission rules are normative today; the sink is tracked in
+[#292](https://github.com/fastrevmd-lab/mecmcp/issues/292). The standard —
+including why the cheaper syslog path was rejected — is in
+[`docs/AUDIT-FORWARDING-STANDARD.md`](docs/AUDIT-FORWARDING-STANDARD.md).
 
 ## License
 
