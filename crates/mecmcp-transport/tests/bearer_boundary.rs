@@ -1503,3 +1503,67 @@ fn provenance_from_meta_reaches_audit_attribution() {
         "session_id missing from audit event (hand-off at auth.rs:638 broken): {captured}"
     );
 }
+
+/// Stateless requests without `Mcp-Session-Id` have empty provenance.
+///
+/// Clients declaring MCP `2026-07-28` are routed statelessly (no session header),
+/// so the provenance capture block in `auth.rs:626` never runs. This is a known
+/// limitation documented at that call site. All three fields render empty, and the
+/// request does not error.
+///
+/// If this test fails after implementing stateless capture, the limitation is fixed.
+#[test]
+fn stateless_request_without_session_header_has_empty_provenance() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let tracker = Arc::new(SessionTracker::new(&LimitsConfig::default()));
+    let session_id: Arc<str> = Arc::from("known-session");
+    assert!(
+        tracker.try_register(session_id.clone(), std::time::Instant::now()),
+        "session must register"
+    );
+
+    let info = ClientInfo::from_initialize_params(&json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": {"name": "stateless-client", "version": "1.0"},
+        "_meta": {
+            "mecmcp/provenance": {
+                "model_id": "should-not-appear",
+                "session_id": "should-not-appear"
+            }
+        }
+    }))
+    .expect("clientInfo parses");
+    tracker.set_client_info(&session_id, info);
+
+    let app = app_with_tracker(Some(tracker));
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        runtime.block_on(async {
+            // Request with NO Mcp-Session-Id header (stateless path)
+            let response = app.oneshot(tools_call(None)).await.expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    });
+
+    // All provenance fields must be empty (limitation)
+    assert!(
+        !captured.contains("should-not-appear"),
+        "stateless request must not carry session provenance: {captured}"
+    );
+    assert!(
+        captured.contains("client_name=") && !captured.contains("client_name=stateless-client"),
+        "client_name must be empty without session header: {captured}"
+    );
+    assert!(
+        captured.contains("model_id=") && !captured.contains("model_id=should"),
+        "model_id must be empty without session header: {captured}"
+    );
+    assert!(
+        captured.contains("session_id=") && !captured.contains("session_id=should"),
+        "session_id must be empty without session header: {captured}"
+    );
+}

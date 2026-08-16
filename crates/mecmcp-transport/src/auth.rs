@@ -620,9 +620,16 @@ pub async fn bearer_preflight_middleware<G: Grant>(
         .clone();
 
     // Populate client provenance from session (mecmcp#253, mecmcp#267).
-    // The Mcp-Session-Id header identifies the session; if present and provenance
-    // was captured during initialize, attach it to CallerCtx so handlers can
-    // populate it in their audit events without re-implementing session lookup.
+    //
+    // This path depends on the `Mcp-Session-Id` header. Clients declaring MCP
+    // `2026-07-28` are routed statelessly (config.rs:194, server.rs:300,
+    // concurrency.rs:412) with no session header, so this block never runs for
+    // them and `client_name`, `model_id`, and `session_id` all render empty in
+    // audit events. The deployed fleet is unaffected (claude-code sends sessions).
+    //
+    // Fixing this requires deciding whether `_meta` travels per-request instead of
+    // only at `initialize`. See issue #288 — left open because PAN-OS and Junos
+    // both consume mecmcp-audit, so the wire format should be settled once.
     if let Some(tracker) = &state.session_tracker
         && let Some(session_id_value) = parts.headers.get("Mcp-Session-Id")
         && let Ok(session_id_str) = session_id_value.to_str()
