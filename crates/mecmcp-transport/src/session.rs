@@ -293,6 +293,31 @@ impl SessionTracker {
             .and_then(|m| m.client_info.as_ref().map(ClientInfo::name))
     }
 
+    /// Retrieve the model ID for a session, if available.
+    ///
+    /// Returns `None` if the session doesn't exist, never provided `clientInfo`,
+    /// or didn't include provenance with a model_id.
+    #[must_use]
+    pub fn model_id(&self, id: &SessionId) -> Option<&'static str> {
+        self.activity
+            .get(id)
+            .and_then(|m| m.client_info.as_ref().and_then(ClientInfo::model_id))
+    }
+
+    /// Retrieve the session ID for a session, if available.
+    ///
+    /// Returns `None` if the session doesn't exist, never provided `clientInfo`,
+    /// or didn't include provenance with a session_id.
+    #[must_use]
+    pub fn session_id(&self, id: &SessionId) -> Option<String> {
+        self.activity.get(id).and_then(|m| {
+            m.client_info
+                .as_ref()
+                .and_then(ClientInfo::session_id)
+                .map(String::from)
+        })
+    }
+
     /// Drop a session from tracking and decrement the gauge.
     pub fn unregister(&self, id: &SessionId) {
         let _ = self.unregister_inner(id);

@@ -38,6 +38,8 @@ fn both_transports_emit_the_same_tool_and_action() {
             on_behalf_of: None,
             actor_type: ActorType::Human,
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         };
         let mut authenticated = audit_scope(

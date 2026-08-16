@@ -19,6 +19,8 @@ fn emit_correlated_events(client_name: Option<&'static str>) {
         on_behalf_of: None,
         actor_type: ActorType::Agent,
         client_name,
+        model_id: None,
+        session_id: None,
         request_id: uuid::Uuid::new_v4(),
     };
 
@@ -141,6 +143,8 @@ fn client_name_round_trips_from_caller_ctx_to_audit_event() {
         on_behalf_of: None,
         actor_type: ActorType::Agent,
         client_name: Some("claude-code"),
+        model_id: None,
+        session_id: None,
         request_id: uuid::Uuid::new_v4(),
     };
 

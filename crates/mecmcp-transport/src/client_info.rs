@@ -15,6 +15,14 @@ use std::sync::LazyLock;
 /// and add unbounded cardinality to audit output.
 const MAX_INTERNED_CLIENT_NAMES: usize = 64;
 
+/// Maximum distinct model IDs ever interned.
+///
+/// Model IDs arrive in `_meta.mecmcp/provenance.model_id` within the initialize
+/// request. They are low cardinality (a handful of model names like "claude-opus-5"),
+/// so interning them prevents duplicate allocations. The cap prevents unbounded
+/// growth from untrusted input.
+const MAX_INTERNED_MODEL_IDS: usize = 64;
+
 /// Maximum length for a client name or version string.
 ///
 /// Longer strings are rejected and replaced with a placeholder. This prevents
@@ -24,8 +32,33 @@ const MAX_CLIENT_INFO_LEN: usize = 128;
 /// Placeholder recorded when a client name is implausible or the intern table is full.
 const UNKNOWN_CLIENT: &str = "unknown";
 
+/// Placeholder recorded when a model ID is implausible or the intern table is full.
+const UNKNOWN_MODEL: &str = "unknown";
+
+/// Maximum length for a session ID.
+///
+/// Session IDs are high cardinality (one per session), so they are NOT interned.
+/// This cap prevents memory exhaustion from malicious clients.
+const MAX_SESSION_ID_LEN: usize = 128;
+
 static INTERNED_CLIENT_NAMES: LazyLock<DashMap<&'static str, ()>> =
     LazyLock::new(|| DashMap::with_capacity(MAX_INTERNED_CLIENT_NAMES));
+
+static INTERNED_MODEL_IDS: LazyLock<DashMap<&'static str, ()>> =
+    LazyLock::new(|| DashMap::with_capacity(MAX_INTERNED_MODEL_IDS));
+
+/// Client-asserted provenance from the MCP `_meta.mecmcp/provenance` block.
+///
+/// This is **entirely client-asserted** and must never be used for authorization.
+/// The model_id is interned (low cardinality), while session_id is bounded but
+/// not interned (high cardinality — one per session).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientProvenance {
+    /// Interned model ID (e.g., "claude-opus-5"), bounded and validated.
+    model_id: &'static str,
+    /// Session ID, bounded but not interned (high cardinality).
+    session_id: Option<String>,
+}
 
 /// Client identity from the MCP `initialize` request.
 ///
@@ -44,27 +77,40 @@ static INTERNED_CLIENT_NAMES: LazyLock<DashMap<&'static str, ()>> =
 /// name arrives in a request body. `intern_tool_name` is bounded the same way
 /// (256 names, 128 bytes, falling back to a placeholder) — an earlier revision of
 /// this comment described it as an unbounded `Box::leak`, which is no longer true.
+///
+/// As of #267, this also parses and stores client-asserted provenance (model_id
+/// and session_id) from the `_meta` extension block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientInfo {
     /// Interned client name, bounded and validated.
     name: &'static str,
     /// Client version, bounded but not interned (high cardinality).
     version: Option<String>,
+    /// Client-asserted provenance (model_id, session_id), if present.
+    provenance: Option<ClientProvenance>,
 }
 
 impl ClientInfo {
     /// Parse client info from an MCP `initialize` params object.
     ///
-    /// Expects a JSON object with optional `clientInfo` field:
+    /// Expects a JSON object with optional `clientInfo` field and optional
+    /// `_meta.mecmcp/provenance` extension:
     /// ```json
     /// {
     ///   "protocolVersion": "2025-03-26",
-    ///   "clientInfo": { "name": "claude-code", "version": "1.0" }
+    ///   "clientInfo": { "name": "claude-code", "version": "1.0" },
+    ///   "_meta": {
+    ///     "mecmcp/provenance": {
+    ///       "model_id": "claude-opus-5",
+    ///       "session_id": "01J..."
+    ///     }
+    ///   }
     /// }
     /// ```
     ///
     /// Missing or malformed `clientInfo` produces `None`. Names and versions are
-    /// bounded and sanitized; implausible values become placeholders.
+    /// bounded and sanitized; implausible values become placeholders. The `_meta`
+    /// block is optional; absent or malformed provenance is silently ignored.
     ///
     /// # Trust boundary
     ///
@@ -76,9 +122,18 @@ impl ClientInfo {
         let name = client_info.get("name")?.as_str()?;
         let version = client_info.get("version").and_then(|v| v.as_str());
 
+        // Parse optional provenance from _meta.mecmcp/provenance.
+        // Absent or malformed provenance is not an error — clients that don't
+        // know about this extension keep working unchanged.
+        let provenance = params
+            .get("_meta")
+            .and_then(|meta| meta.get("mecmcp/provenance"))
+            .and_then(parse_provenance);
+
         Some(Self {
             name: intern_client_name(name),
             version: version.and_then(bound_version),
+            provenance,
         })
     }
 
@@ -93,6 +148,42 @@ impl ClientInfo {
     pub fn version(&self) -> Option<&str> {
         self.version.as_deref()
     }
+
+    /// Return the interned model ID, if provenance was provided.
+    #[must_use]
+    pub fn model_id(&self) -> Option<&'static str> {
+        self.provenance.as_ref().map(|p| p.model_id)
+    }
+
+    /// Return the session ID, if provenance was provided and plausible.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.provenance
+            .as_ref()
+            .and_then(|p| p.session_id.as_deref())
+    }
+}
+
+/// Parse provenance from the `mecmcp/provenance` object within `_meta`.
+///
+/// Returns `None` if required fields are missing or implausible. Partial
+/// provenance (e.g., only model_id present) is accepted.
+fn parse_provenance(prov: &serde_json::Value) -> Option<ClientProvenance> {
+    let model_id_str = prov.get("model_id").and_then(|v| v.as_str());
+    let session_id_str = prov.get("session_id").and_then(|v| v.as_str());
+
+    // At least one field must be present and plausible.
+    if model_id_str.is_none() && session_id_str.is_none() {
+        return None;
+    }
+
+    let model_id = model_id_str.map_or(UNKNOWN_MODEL, intern_model_id);
+    let session_id = session_id_str.and_then(bound_session_id);
+
+    Some(ClientProvenance {
+        model_id,
+        session_id,
+    })
 }
 
 /// Intern a client name into a bounded set, returning a `&'static str`.
@@ -102,7 +193,16 @@ impl ClientInfo {
 /// `UNKNOWN_CLIENT`. This prevents unbounded memory growth and metrics
 /// cardinality from attacker-controlled input.
 fn intern_client_name(name: &str) -> &'static str {
-    intern_into(&INTERNED_CLIENT_NAMES, name)
+    intern_into(&INTERNED_CLIENT_NAMES, name, UNKNOWN_CLIENT)
+}
+
+/// Intern a model ID into a bounded set, returning a `&'static str`.
+///
+/// Model IDs are low cardinality (a handful of model names). Interning them
+/// prevents duplicate allocations. Implausible values or overflow become
+/// `UNKNOWN_MODEL`.
+fn intern_model_id(model_id: &str) -> &'static str {
+    intern_into(&INTERNED_MODEL_IDS, model_id, UNKNOWN_MODEL)
 }
 
 /// Intern into a caller-supplied table.
@@ -113,17 +213,25 @@ fn intern_client_name(name: &str) -> &'static str {
 /// concurrently, and any test asserting a specific name back would then get
 /// `unknown` depending on scheduling. That reproduced as roughly one failure in
 /// six runs, passed locally often enough to look fine, and failed in CI.
-fn intern_into(table: &DashMap<&'static str, ()>, name: &str) -> &'static str {
+///
+/// The table capacity is not passed — the table itself carries its own limit.
+/// The caller specifies the placeholder to use on rejection.
+fn intern_into(
+    table: &DashMap<&'static str, ()>,
+    name: &str,
+    placeholder: &'static str,
+) -> &'static str {
     if name.is_empty() || name.len() > MAX_CLIENT_INFO_LEN {
-        return UNKNOWN_CLIENT;
+        return placeholder;
     }
     // Allow alphanumerics, hyphens, underscores, dots, and forward slashes
-    // (covers "claude-code", "mcp-client/1.0", "my.client" patterns)
+    // (covers "claude-code", "mcp-client/1.0", "my.client" patterns, and model
+    // IDs like "claude-opus-5")
     if !name
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'/')
     {
-        return UNKNOWN_CLIENT;
+        return placeholder;
     }
 
     // Fast path: already interned
@@ -132,8 +240,10 @@ fn intern_into(table: &DashMap<&'static str, ()>, name: &str) -> &'static str {
     }
 
     // Slow path: try to intern
+    // The table's initial capacity is its limit, not a performance hint. Both
+    // tables (client names and model IDs) use 64.
     if table.len() >= MAX_INTERNED_CLIENT_NAMES {
-        return UNKNOWN_CLIENT;
+        return placeholder;
     }
 
     let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
@@ -157,6 +267,25 @@ fn bound_version(version: &str) -> Option<String> {
         return None;
     }
     Some(version.to_owned())
+}
+
+/// Bound and validate a session ID.
+///
+/// Session IDs are high cardinality (one per session), so they are NOT interned.
+/// They are length-bounded and charset-restricted. Returns `None` for implausible
+/// values.
+fn bound_session_id(session_id: &str) -> Option<String> {
+    if session_id.is_empty() || session_id.len() > MAX_SESSION_ID_LEN {
+        return None;
+    }
+    // Allow alphanumerics, hyphens, and underscores (covers ULIDs like "01J...")
+    if !session_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    Some(session_id.to_owned())
 }
 
 #[cfg(test)]
@@ -281,7 +410,7 @@ mod tests {
         for i in 0..MAX_INTERNED_CLIENT_NAMES {
             let name = format!("client-{i}");
             assert_ne!(
-                intern_into(&table, &name),
+                intern_into(&table, &name, UNKNOWN_CLIENT),
                 UNKNOWN_CLIENT,
                 "names below the cap must intern"
             );
@@ -289,11 +418,14 @@ mod tests {
         assert_eq!(table.len(), MAX_INTERNED_CLIENT_NAMES);
 
         // The next distinct name is refused rather than growing the table.
-        assert_eq!(intern_into(&table, "overflow-client"), UNKNOWN_CLIENT);
+        assert_eq!(
+            intern_into(&table, "overflow-client", UNKNOWN_CLIENT),
+            UNKNOWN_CLIENT
+        );
         assert_eq!(table.len(), MAX_INTERNED_CLIENT_NAMES);
 
         // An already-interned name still resolves, cap or no cap.
-        assert_eq!(intern_into(&table, "client-0"), "client-0");
+        assert_eq!(intern_into(&table, "client-0", UNKNOWN_CLIENT), "client-0");
     }
 
     #[test]
@@ -341,6 +473,168 @@ mod tests {
                 UNKNOWN_CLIENT,
                 "invalid characters must be rejected, got: {}",
                 bad
+            );
+        }
+    }
+
+    #[test]
+    fn parse_provenance_with_both_fields() {
+        let params = json!({
+            "protocolVersion": "2025-03-26",
+            "clientInfo": { "name": "claude-code", "version": "1.0" },
+            "_meta": {
+                "mecmcp/provenance": {
+                    "model_id": "claude-opus-5",
+                    "session_id": "01J5KZ8X9Y7W6V5U4T3S2R1Q0P"
+                }
+            }
+        });
+        let info = ClientInfo::from_initialize_params(&params).expect("valid clientInfo");
+        assert_eq!(info.name(), "claude-code");
+        assert_eq!(info.model_id(), Some("claude-opus-5"));
+        assert_eq!(info.session_id(), Some("01J5KZ8X9Y7W6V5U4T3S2R1Q0P"));
+    }
+
+    #[test]
+    fn parse_provenance_with_only_model_id() {
+        let params = json!({
+            "protocolVersion": "2025-03-26",
+            "clientInfo": { "name": "test" },
+            "_meta": {
+                "mecmcp/provenance": {
+                    "model_id": "claude-sonnet-4"
+                }
+            }
+        });
+        let info = ClientInfo::from_initialize_params(&params).expect("valid clientInfo");
+        assert_eq!(info.model_id(), Some("claude-sonnet-4"));
+        assert_eq!(info.session_id(), None);
+    }
+
+    #[test]
+    fn parse_provenance_with_only_session_id() {
+        let params = json!({
+            "protocolVersion": "2025-03-26",
+            "clientInfo": { "name": "test" },
+            "_meta": {
+                "mecmcp/provenance": {
+                    "session_id": "01JXYZ123456"
+                }
+            }
+        });
+        let info = ClientInfo::from_initialize_params(&params).expect("valid clientInfo");
+        assert_eq!(info.model_id(), Some(UNKNOWN_MODEL));
+        assert_eq!(info.session_id(), Some("01JXYZ123456"));
+    }
+
+    #[test]
+    fn missing_meta_block_works() {
+        let params = json!({
+            "protocolVersion": "2025-03-26",
+            "clientInfo": { "name": "test" }
+        });
+        let info = ClientInfo::from_initialize_params(&params).expect("valid clientInfo");
+        assert_eq!(info.name(), "test");
+        assert_eq!(info.model_id(), None);
+        assert_eq!(info.session_id(), None);
+    }
+
+    #[test]
+    fn malformed_provenance_is_ignored() {
+        let params = json!({
+            "protocolVersion": "2025-03-26",
+            "clientInfo": { "name": "test" },
+            "_meta": {
+                "mecmcp/provenance": "not-an-object"
+            }
+        });
+        let info = ClientInfo::from_initialize_params(&params).expect("valid clientInfo");
+        assert_eq!(info.name(), "test");
+        assert_eq!(info.model_id(), None);
+        assert_eq!(info.session_id(), None);
+    }
+
+    #[test]
+    fn empty_provenance_object_is_ignored() {
+        let params = json!({
+            "protocolVersion": "2025-03-26",
+            "clientInfo": { "name": "test" },
+            "_meta": {
+                "mecmcp/provenance": {}
+            }
+        });
+        let info = ClientInfo::from_initialize_params(&params).expect("valid clientInfo");
+        assert_eq!(info.name(), "test");
+        assert_eq!(info.model_id(), None);
+        assert_eq!(info.session_id(), None);
+    }
+
+    #[test]
+    fn oversized_session_id_is_dropped() {
+        let long_session_id = "01J".to_owned() + &"X".repeat(MAX_SESSION_ID_LEN);
+        let params = json!({
+            "protocolVersion": "2025-03-26",
+            "clientInfo": { "name": "test" },
+            "_meta": {
+                "mecmcp/provenance": {
+                    "model_id": "claude-opus-5",
+                    "session_id": long_session_id
+                }
+            }
+        });
+        let info = ClientInfo::from_initialize_params(&params).expect("valid clientInfo");
+        assert_eq!(info.model_id(), Some("claude-opus-5"));
+        assert_eq!(info.session_id(), None);
+    }
+
+    #[test]
+    fn invalid_characters_in_session_id_are_dropped() {
+        let params = json!({
+            "protocolVersion": "2025-03-26",
+            "clientInfo": { "name": "test" },
+            "_meta": {
+                "mecmcp/provenance": {
+                    "session_id": "01J<script>"
+                }
+            }
+        });
+        let info = ClientInfo::from_initialize_params(&params).expect("valid clientInfo");
+        assert_eq!(info.session_id(), None);
+    }
+
+    #[test]
+    fn model_id_is_interned() {
+        let params1 = json!({
+            "clientInfo": { "name": "test" },
+            "_meta": { "mecmcp/provenance": { "model_id": "claude-opus-5" } }
+        });
+        let params2 = json!({
+            "clientInfo": { "name": "test" },
+            "_meta": { "mecmcp/provenance": { "model_id": "claude-opus-5" } }
+        });
+        let info1 = ClientInfo::from_initialize_params(&params1).expect("valid");
+        let info2 = ClientInfo::from_initialize_params(&params2).expect("valid");
+        let model1 = info1.model_id().expect("model_id present");
+        let model2 = info2.model_id().expect("model_id present");
+        assert!(std::ptr::eq(model1, model2), "model_id must be interned");
+    }
+
+    #[test]
+    /// Session IDs are high cardinality (one per session), so they must NOT be
+    /// interned. This test proves that many distinct session IDs do not degrade
+    /// to a placeholder or exhaust a fixed-size table.
+    fn session_id_is_not_interned() {
+        for i in 0..100 {
+            let session_id = format!("01J{i:0>24}");
+            let params = json!({
+                "clientInfo": { "name": "test" },
+                "_meta": { "mecmcp/provenance": { "session_id": session_id } }
+            });
+            let info = ClientInfo::from_initialize_params(&params).expect("valid");
+            assert_eq!(
+                info.session_id(),
+                Some(session_id.as_str()),
+                "session {i} must not degrade to placeholder"
             );
         }
     }

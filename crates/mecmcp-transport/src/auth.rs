@@ -619,23 +619,25 @@ pub async fn bearer_preflight_middleware<G: Grant>(
         .expect("preflight layer must run after authentication layer")
         .clone();
 
-    // Populate client name from session (mecmcp#253).
-    // The Mcp-Session-Id header identifies the session; if present and a client
-    // name was captured during initialize, attach it to CallerCtx so handlers can
+    // Populate client provenance from session (mecmcp#253, mecmcp#267).
+    // The Mcp-Session-Id header identifies the session; if present and provenance
+    // was captured during initialize, attach it to CallerCtx so handlers can
     // populate it in their audit events without re-implementing session lookup.
-    let captured_client_name = if let Some(tracker) = &state.session_tracker
+    if let Some(tracker) = &state.session_tracker
         && let Some(session_id_value) = parts.headers.get("Mcp-Session-Id")
         && let Ok(session_id_str) = session_id_value.to_str()
     {
         let session_id: rmcp::transport::common::server_side_http::SessionId =
             session_id_str.into();
-        tracker.client_name(&session_id)
-    } else {
-        None
-    };
-
-    if let Some(client_name) = captured_client_name {
-        caller.client_name = Some(client_name);
+        if let Some(client_name) = tracker.client_name(&session_id) {
+            caller.client_name = Some(client_name);
+        }
+        if let Some(model_id) = tracker.model_id(&session_id) {
+            caller.model_id = Some(model_id);
+        }
+        if let Some(sess_id) = tracker.session_id(&session_id) {
+            caller.session_id = Some(sess_id);
+        }
     }
 
     // Emit transport-level audit event for tools/call requests (mecmcp#32).
@@ -657,15 +659,6 @@ pub async fn bearer_preflight_middleware<G: Grant>(
     let mut scope = extract_tool_name(&body_bytes).map(|tool| {
         let mut scope = AuditScope::from_caller(&caller, tool, "transport", Vec::new());
         scope.meta("layer", "preflight");
-
-        // Propagate captured client name from the session (mecmcp#53).
-        // Now that CallerCtx carries the client name (mecmcp#253), the transport
-        // audit event already has it via from_caller. This explicit attachment
-        // remains for backward compatibility with the pre-#253 event shape.
-        if let Some(client_name) = captured_client_name {
-            scope.attach_client_name(client_name);
-        }
-
         scope
     });
 
@@ -1161,6 +1154,8 @@ mod tests {
             on_behalf_of: None,
             actor_type: ActorType::Human,
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         };
 
@@ -1214,6 +1209,8 @@ mod tests {
             on_behalf_of: None,
             actor_type: ActorType::Human,
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         };
 
@@ -1258,6 +1255,8 @@ mod tests {
             on_behalf_of: Some("user@example.com".to_owned()),
             actor_type: ActorType::Agent,
             client_name: None,
+            model_id: None,
+            session_id: None,
             request_id: uuid::Uuid::new_v4(),
         };
         let mut attr = Attribution::from_caller(&caller);
