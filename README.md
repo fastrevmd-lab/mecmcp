@@ -639,6 +639,7 @@ refused at startup by 0.3.8.
 | [`PLAN.md`](PLAN.md) | Program-level extraction plan: crate map, phase sequencing, decisions, exit criteria (historical — the plan is delivered) |
 | [`ROADMAP.md`](ROADMAP.md) | What "enterprise grade" means at 150 engineers and 4,000 multi-vendor firewalls |
 | [`docs/PACKAGING.md`](docs/PACKAGING.md) | How a mechub MCP server is delivered and installed — container base, LXC, README requirements |
+| [`docs/AUDIT-FORWARDING-STANDARD.md`](docs/AUDIT-FORWARDING-STANDARD.md) | **Standard.** How every server ships its audit trail off the host: JSON to file, rsyslog over TCP to port 519, ECS mapping at the collector |
 | [`docs/superpowers/plans/`](docs/superpowers/plans/) | Executable per-phase implementation plans |
 
 ## The crate family
@@ -681,6 +682,23 @@ Vendor servers keep their protocol adapters, XML parsers, and vendor workflows.
 For `mecmcp-http` specifically, that means endpoint catalogs, header names, payload
 schemas, terminal job states, and retry policy stay in the product repository —
 the shared crate owns only the transport posture.
+
+### The audit trail leaves the host, over TCP
+
+An audit record that only exists on the machine that produced it is not an audit
+trail. Every server in the family therefore emits JSON to a file and forwards it
+to the security event store — **TCP, not UDP**.
+
+That differs deliberately from the rest of the fleet. Device telemetry is
+high-volume and individually disposable, so UDP is the right trade. An audit
+trail is low-volume and every record is load bearing: UDP drops silently, and a
+missing record is indistinguishable from an action that never happened.
+
+The full standard — flags, forwarder config, port assignment, ECS field mapping,
+and the rule that server-verified and client-asserted provenance must stay
+visibly separate — is in
+[`docs/AUDIT-FORWARDING-STANDARD.md`](docs/AUDIT-FORWARDING-STANDARD.md).
+Consumers ship that configuration rather than inventing their own.
 
 ## License
 

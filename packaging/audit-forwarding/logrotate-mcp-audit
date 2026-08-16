@@ -1,0 +1,24 @@
+# mecmcp audit log rotation. Reference template.
+# See docs/AUDIT-FORWARDING-STANDARD.md.
+#
+# Substitute before install:
+#   @AUDIT_LOG@  audit file, e.g. /var/lib/jmcp/audit.jsonl
+#
+# Without this the audit file grows without bound. The forwarder tails it, so
+# the file is never truncated by the server itself.
+
+@AUDIT_LOG@ {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+
+    # copytruncate is required, not stylistic. rsyslog's imfile follows an
+    # inode; a rename-based rotation leaves it tailing the rotated file
+    # forever, and forwarding silently stops while the local file keeps
+    # growing -- the failure looks like a collector problem, not a rotation
+    # one.
+    copytruncate
+}
