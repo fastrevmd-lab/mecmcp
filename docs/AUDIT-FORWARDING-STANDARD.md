@@ -1,195 +1,103 @@
-# Audit forwarding standard — ECS over TCP syslog
+# Audit forwarding standard
 
-**Status: standard.** Every server in the mecmcp family forwards its audit trail
-off the host this way. Consumers are expected to ship the configuration, not
-invent their own.
+**Status:** emission rules are **normative now**. Transport is **specified but
+not yet implemented** — see [#292](https://github.com/fastrevmd-lab/mecmcp/issues/292).
 
 ## Why this exists
 
 An audit record that only exists on the machine that produced it is not an audit
 trail. It is a log file on a box whose operator is the party the record is about.
 
-The mecmcp family already emits good records — server-verified `actor_type`,
-`provider`, `on_behalf_of`, plus the client-asserted fields it deliberately keeps
-distinct (see `mecmcp-audit`'s `token_verified_fields`). The gap was transport:
-those records terminated on the MCP host.
+The family already emits good records — server-verified `actor_type`, `provider`
+and `on_behalf_of`, kept deliberately distinct from client-asserted fields via
+`token_verified_fields`. The gap is transport: those records terminate on the MCP
+host.
 
-This standard closes that gap and fixes the field format so a collector can parse
-every server the same way.
+## Part 1 — Emission (normative)
 
-## The rule
+Every server, regardless of how the records are later shipped:
 
-1. **Emit JSON, always.** `--audit-format json`. The `text` format is for humans
-   reading a terminal; it is not a parse target and must not be forwarded.
-2. **Write to a file.** `--audit-log-file <state-dir>/audit.jsonl`. journald-only
-   is not sufficient — see "Why not journald" below.
-3. **Forward over TCP**, not UDP, with a disk-assisted queue.
-4. **Map to ECS** at the collector, not on the MCP host. The host's job is to
-   deliver bytes reliably; schema is the collector's concern.
+1. **`--audit-format json`.** Always. The `text` format is for reading in a
+   terminal; it is not a parse target and must never be forwarded. Five of the
+   fifteen deployed servers were emitting `text`.
+2. **`--audit-log-file <state-dir>/audit.jsonl`.** journald-only is not
+   sufficient — the file is the operator-facing artifact and the natural spool
+   source. Eleven of fifteen were journald-only.
+3. **Rotate it.** The file grows without bound; the server never truncates it.
 
-## Why TCP, when everything else is UDP
+These rules are transport-independent and hold under any of the options below.
 
-Device telemetry — flow logs, screen events — is high-volume and individually
-disposable. UDP is the right trade there, and the rest of the fleet uses it.
+## Part 2 — Transport
 
-An audit trail is the opposite. It is low-volume, and every record is load
-bearing. UDP fails silently: a dropped datagram is indistinguishable from an
-action that never happened, and the failure appears nowhere — not on the sender,
-not on the collector. For a record whose purpose is to answer "who did this",
-silent loss is the one failure mode that cannot be tolerated.
+**Decision: direct ClickHouse sink, hash-chained.** SSDF is the schema steward;
+the contract is theirs:
 
-TCP with `action.resumeRetryCount=-1` and a disk-assisted queue means a collector
-restart, a network blip, or a reboot buffers rather than discards.
+- [`audit-evidence-contract-v1.md`](https://github.com/fastrevmd-lab/SSDF/blob/main/docs/audit-evidence-contract-v1.md)
+- [`audit-evidence-ingestion.md`](https://github.com/fastrevmd-lab/SSDF/blob/main/docs/audit-evidence-ingestion.md)
 
-**Volume makes this cheap.** These servers emit two records per tool call. Even a
-busy operational server produces a trickle, so the ordering and retransmit cost
-that rules TCP out for flow logs is irrelevant here.
+Records are written by `mecmcp-audit` directly into `ssdf.audit` over the
+ClickHouse HTTP interface, carrying `prev_hash`/`row_hash` so that deletion or
+modification of a row is detectable.
 
-## Why not journald
+Implementation, open questions and design requirements are tracked in
+[#292](https://github.com/fastrevmd-lab/mecmcp/issues/292). Two are unresolved
+and block coding: the contract's dedup guard requires `SELECT` that its own write
+identity is specified not to have, and it is not yet agreed whether the per-call
+audit stream ships alongside the change-lifecycle evidence records.
 
-`systemd-journal-upload` exists and would avoid a second daemon. It is not used
-because:
+### Why not syslog to the existing collector
 
-- It ships the *whole* journal, not the audit stream. Filtering happens at the
-  receiver, so unrelated unit noise crosses the wire.
-- The receiver must speak the journal export format. The collector here is
-  Vector, whose `socket` source speaks syslog — adding a journal receiver is a
-  larger change than adding a file tail.
-- The audit file is the artifact operators already inspect. Forwarding the same
-  file keeps what is shipped identical to what is read locally.
+A syslog path — `rsyslog` `imfile` tailing the JSON file, forwarding over TCP to
+a new Vector source — was designed, staged and rejected. It is worth recording
+why, because it is the obvious answer and it is cheaper:
 
-## Configuration
+**For it.** No code change in `mecmcp-audit`. Reuses the collector already
+ingesting five device sources. `rsyslog`'s disk-assisted queue gives durability
+for free — a collector restart or reboot buffers rather than discards.
 
-### On the MCP server
+**Against it, decisively.** The records are unchained. Anyone with write access
+to the collector or the events table can edit history undetectably. Every other
+link in this chain is tamper-evident by construction: plan digests bind
+approvals, approvals name a distinct principal, `token_verified_fields`
+separates vouched-for provenance from asserted. Shipping the trail over an
+unchained final hop discards that guarantee at exactly the point an auditor
+relies on it.
 
-Both flags, in the unit or its drop-in:
+It also lands in `ssdf.events` — the device-telemetry table — rather than
+`ssdf.audit`, where SSDF's own MCP servers already write their tool-call trail.
+Two tables for one question is a reporting trap.
 
-```
---audit-format json \
---audit-log-file /var/lib/<service>/audit.jsonl
-```
-
-### Forwarder
-
-Ready-to-substitute templates live in
-[`packaging/audit-forwarding/`](../packaging/audit-forwarding/) —
-`50-mcp-audit.conf` and `logrotate-mcp-audit`, with `@SERVICE@`, `@AUDIT_LOG@`
-and `@COLLECTOR@` placeholders. Consumers should install those rather than
-retype the config.
-
-`rsyslog` with `imfile`, installed on the MCP host:
-
-```rsyslog
-# /etc/rsyslog.d/50-mcp-audit.conf
-module(load="imfile")
-
-input(type="imfile"
-      File="/var/lib/<service>/audit.jsonl"
-      Tag="mcp-audit"
-      Severity="info"
-      Facility="local5"
-      ruleset="mcp_audit_fwd")
-
-ruleset(name="mcp_audit_fwd") {
-    action(type="omfwd"
-           Target="<collector>" Port="519" Protocol="tcp"
-           action.resumeRetryCount="-1"
-           queue.type="LinkedList"
-           queue.filename="mcp_audit_fwd"
-           queue.saveOnShutdown="on"
-           queue.maxDiskSpace="256m")
-}
-```
-
-`queue.saveOnShutdown="on"` is the half that survives a reboot; without it the
-in-memory queue is lost exactly when you most need it.
-
-### Rotation
-
-The audit file grows without bound. Ship logrotate alongside the forwarder:
-
-```
-/var/lib/<service>/audit.jsonl {
-    daily
-    rotate 14
-    compress
-    missingok
-    notifempty
-    copytruncate
-}
-```
-
-`copytruncate` matters: `imfile` follows an inode, and a rename-based rotation
-makes it silently follow the rotated file forever.
-
-## Port assignment
-
-| Port | Source |
-|---|---|
-| 514 | SRX flow (`security log`) |
-| 515 | PAN-OS |
-| 516 | UniFi |
-| 517 | Proxmox host syslog |
-| 518 | Junos system syslog (`system syslog host`) |
-| **519** | **mecmcp audit (TCP)** |
-
-519 is TCP. 514–518 remain UDP.
+**What carries over.** If the direct sink ever needs a local spool, `rsyslog`'s
+queue semantics are the reference: unlimited retry, disk-assisted, and
+`saveOnShutdown` so a reboot does not discard the backlog. Durability was the one
+thing the syslog design got right for free, and the direct sink has to build it
+deliberately.
 
 ## Field mapping
 
-The record is a `tracing` JSON envelope: `timestamp`, `level`, `target`, and the
-audit fields under `fields`. The collector maps it into the shared events schema:
+Owned by the SSDF contract, not restated here. Two rules are called out because
+getting them wrong produces a record that looks stronger than it is:
 
-| Column | Source |
-|---|---|
-| `timestamp` | envelope `timestamp` |
-| `event_provider` | `"mecmcp"` |
-| `observer_hostname` | MCP host name (`prod-junosmcp`, …) — **not** the managed device |
-| `user_name` | `fields.caller` (token name) |
-| `event_action` | `fields.action` (`read`, `approve`, `apply`, `transport`, …) |
-| `event_outcome` | `fields.result` |
-| `event_category` | `"configuration"` when `fields.change_ref` or a change-set tool; else `"process"` |
-| `ext` | `actor_type`, `provider`, `provider_tier`, `on_behalf_of`, `client_name`, `model_id`, `session_id`, `tool`, `devices`, `device_count`, `change_ref`, `request_id`, `token_verified_fields` |
-| `raw` | the original line |
-
-### Keep the trust boundary visible
-
-`ext.token_verified_fields` lists which provenance fields the **token** vouched
-for. Everything else in that group is client-asserted and must not be treated as
-authenticated — `client_name`, `model_id` and `session_id` are supplied by the
-caller and nothing checks them.
-
-Do not flatten the two groups into one. An auditor who cannot tell a
-server-verified `actor_type` from a self-declared `model_id` has a record that
-looks stronger than it is.
-
-### `observer_hostname` is the MCP host
-
-The managed device appears in `ext.devices`. Setting `observer_hostname` to the
-device would collide with the device's own syslog stream, which arrives on a
-different port with a different schema and a different meaning.
+- **The observer is the MCP host**, never the managed device. The device is a
+  target field. Conflating them collides with that device's own syslog stream,
+  which arrives by a different path with different semantics.
+- **`token_verified_fields` must survive into the record.** It names which
+  provenance fields the *token* vouched for. Everything else in that group —
+  `client_name`, `model_id`, `session_id` — is client-asserted and authenticated
+  by nothing. An auditor who cannot tell them apart has been misled.
 
 ## Correlation
 
-`ext.request_id` is the join key. It appears on both audit records for a call —
-the transport preflight event and the handler event — and, for Junos, in the
-device's commit comment as `request.id=`. That is what links an MCP action to the
-change it made on the device.
-
-## What consumers must do
-
-1. Set both audit flags in the shipped unit.
-2. Ship `50-mcp-audit.conf` and the logrotate snippet in the package.
-3. Depend on `rsyslog`.
-4. Document it in the repo README, pointing here for the rationale.
+`request_id` is the join key. It appears on both audit records for a call — the
+transport preflight event and the handler event — and, for Junos, in the device's
+commit comment as `request.id=`. That is what links an MCP action to the change
+it made on the device.
 
 ## Known gaps
 
-- **No native sink.** `mecmcp-audit` has no syslog output; forwarding is external
-  by necessity. A native TCP sink would remove the second daemon and is worth
-  considering once this is proven in the field.
-- **No transport authentication.** Plain TCP on a trusted subnet. TLS with a
-  client certificate is the obvious hardening step and is deliberately deferred
-  rather than forgotten.
-- **The collector is a single destination.** No fan-out, no local spool beyond
-  the rsyslog queue.
+- **No native sink yet.** That is #292.
+- **The device-side record omits the approver.** A two-person apply commits
+  naming only the applier — see
+  [rustjunosmcp#307](https://github.com/fastrevmd-lab/rustjunosmcp/issues/307).
+- **Retention and journald sealing** are tracked in
+  [rustjunosmcp#299](https://github.com/fastrevmd-lab/rustjunosmcp/issues/299).
