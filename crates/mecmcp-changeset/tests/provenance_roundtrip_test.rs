@@ -65,6 +65,8 @@ fn roundtrip_request_id_composition_and_parsing() {
         change_ref: None,
         request_id: known_request_id,
         token_verified_fields: TokenVerifiedFields::none(),
+        approver: None,
+        change_set_id: None,
     };
 
     // 2. Compose a commit comment through the REAL hook path
@@ -146,6 +148,8 @@ fn roundtrip_provenance_only_no_operator_comment() {
         change_ref: None,
         request_id: known_request_id,
         token_verified_fields: TokenVerifiedFields::none(),
+        approver: None,
+        change_set_id: None,
     };
 
     // Compose with no operator comment
@@ -247,6 +251,8 @@ fn multiple_commits_in_log() {
         change_ref: None,
         request_id: request_id_1,
         token_verified_fields: TokenVerifiedFields::none(),
+        approver: None,
+        change_set_id: None,
     };
 
     let attribution_2 = Attribution {
@@ -264,6 +270,8 @@ fn multiple_commits_in_log() {
         change_ref: None,
         request_id: request_id_2,
         token_verified_fields: TokenVerifiedFields::none(),
+        approver: None,
+        change_set_id: None,
     };
 
     let mut sink_1 = RecordingSink::new();

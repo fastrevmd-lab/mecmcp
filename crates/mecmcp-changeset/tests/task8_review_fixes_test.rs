@@ -224,6 +224,8 @@ fn mock_attribution() -> Attribution {
         change_ref: Some("CHG0012345".into()),
         request_id: Uuid::new_v4(),
         token_verified_fields: mecmcp_audit::TokenVerifiedFields::none(),
+        approver: None,
+        change_set_id: None,
     }
 }
 
