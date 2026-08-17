@@ -1217,6 +1217,172 @@ fn tools_call(session: Option<&str>) -> Request<Body> {
         .expect("request")
 }
 
+/// A `tools/call` carrying per-request provenance in `params._meta`.
+///
+/// This is the shape a client declaring MCP `2026-07-28` actually sends — both
+/// keys were observed on the wire against LXC 611 (#288). `clientInfo` travels
+/// under the spec's `io.modelcontextprotocol/clientInfo` key per request, not
+/// under the bare `clientInfo` that only `initialize` uses.
+fn tools_call_with_meta(session: Option<&str>, meta: serde_json::Value) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header(header::AUTHORIZATION, "Bearer secret");
+    if let Some(id) = session {
+        builder = builder.header("Mcp-Session-Id", id);
+    }
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "read",
+            "arguments": {"device": "tenant-a"},
+            "_meta": meta,
+        }
+    });
+    builder.body(Body::from(body.to_string())).expect("request")
+}
+
+/// The per-request `_meta` block a 2026-07-28 client sends.
+fn wire_meta(client: &str, model: &str, session: &str) -> serde_json::Value {
+    json!({
+        "mecmcp/provenance": {"model_id": model, "session_id": session},
+        "io.modelcontextprotocol/clientInfo": {"name": client, "version": "1.0"},
+    })
+}
+
+/// The #288 fix: a stateless call's own `_meta` populates all three fields.
+///
+/// Fails before the fix because capture is gated on the `Mcp-Session-Id` header,
+/// which a stateless client never sends — so a fully successful call audits with
+/// empty provenance even though it carried every field.
+#[test]
+fn stateless_request_captures_provenance_from_request_meta() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let app = app_with_tracker(Some(Arc::new(
+        SessionTracker::new(&LimitsConfig::default()),
+    )));
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        runtime.block_on(async {
+            let request =
+                tools_call_with_meta(None, wire_meta("claude-code", "claude-opus-5", "sess-288"));
+            let response = app.oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    });
+
+    assert!(
+        captured.contains("client_name=claude-code"),
+        "client_name must come from per-request _meta on the stateless path: {captured}"
+    );
+    assert!(
+        captured.contains("model_id=claude-opus-5"),
+        "model_id must come from per-request _meta on the stateless path: {captured}"
+    );
+    assert!(
+        captured.contains("session_id=sess-288"),
+        "session_id must come from per-request _meta on the stateless path: {captured}"
+    );
+}
+
+/// Session values win when both sources are present.
+///
+/// The fallback is strictly additive: the deployed fleet is all on the session
+/// path, and its audit output must not change. A request whose `_meta` disagrees
+/// with its session must therefore audit as the session says.
+#[test]
+fn session_provenance_wins_over_request_meta() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let tracker = Arc::new(SessionTracker::new(&LimitsConfig::default()));
+    let session_id: Arc<str> = Arc::from("live-session");
+    assert!(
+        tracker.try_register(session_id.clone(), std::time::Instant::now()),
+        "session must register"
+    );
+    let info = ClientInfo::from_initialize_params(&json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": {"name": "session-client", "version": "1.0"},
+        "_meta": {
+            "mecmcp/provenance": {
+                "model_id": "session-model",
+                "session_id": "session-sess"
+            }
+        }
+    }))
+    .expect("clientInfo parses");
+    tracker.set_client_info(&session_id, info);
+
+    let app = app_with_tracker(Some(tracker));
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        runtime.block_on(async {
+            let request = tools_call_with_meta(
+                Some("live-session"),
+                wire_meta("body-client", "body-model", "body-sess"),
+            );
+            let response = app.oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    });
+
+    assert!(
+        captured.contains("client_name=session-client"),
+        "session client_name must win over the request body: {captured}"
+    );
+    assert!(
+        captured.contains("model_id=session-model"),
+        "session model_id must win over the request body: {captured}"
+    );
+    assert!(
+        captured.contains("session_id=session-sess"),
+        "session session_id must win over the request body: {captured}"
+    );
+    assert!(
+        !captured.contains("body-"),
+        "no request-body provenance may survive when a session supplied it: {captured}"
+    );
+}
+
+/// Provenance is client-asserted wherever it came from, so the fallback must not
+/// mark any of it server-verified.
+#[test]
+fn request_meta_provenance_is_never_server_verified() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let app = app_with_tracker(Some(Arc::new(
+        SessionTracker::new(&LimitsConfig::default()),
+    )));
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        runtime.block_on(async {
+            let request =
+                tools_call_with_meta(None, wire_meta("claude-code", "claude-opus-5", "sess-288"));
+            let response = app.oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    });
+
+    assert!(
+        !captured.contains("client_name_verified"),
+        "client_name from a request body must never be marked verified: {captured}"
+    );
+    assert!(
+        !captured.contains("model_id_verified"),
+        "model_id from a request body must never be marked verified: {captured}"
+    );
+}
+
 fn tracker_with_client(session: &str, client: &str) -> (Arc<SessionTracker>, Arc<str>) {
     let tracker = Arc::new(SessionTracker::new(&LimitsConfig::default()));
     let session_id: Arc<str> = Arc::from(session);
@@ -1504,14 +1670,13 @@ fn provenance_from_meta_reaches_audit_attribution() {
     );
 }
 
-/// Stateless requests without `Mcp-Session-Id` have empty provenance.
+/// A stateless request carrying no `_meta` still has empty provenance, and in
+/// particular never inherits another session's.
 ///
-/// Clients declaring MCP `2026-07-28` are routed statelessly (no session header),
-/// so the provenance capture block in `auth.rs:626` never runs. This is a known
-/// limitation documented at that call site. All three fields render empty, and the
-/// request does not error.
-///
-/// If this test fails after implementing stateless capture, the limitation is fixed.
+/// This is a session-isolation property, not the #288 limitation: the request
+/// body here carries nothing to capture, so there is no source for the fields
+/// other than the unrelated session registered below — which must not be used.
+/// It held before stateless capture existed and must go on holding after.
 #[test]
 fn stateless_request_without_session_header_has_empty_provenance() {
     let runtime = tokio::runtime::Builder::new_current_thread()

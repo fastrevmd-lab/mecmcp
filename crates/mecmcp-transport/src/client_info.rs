@@ -164,6 +164,67 @@ impl ClientInfo {
     }
 }
 
+/// Client-asserted provenance read from a single request's `_meta` (#288).
+///
+/// The session path captures this once, at `initialize`, and keys it by
+/// `Mcp-Session-Id`. A client declaring MCP `2026-07-28` is routed statelessly
+/// and never sends that header, so nothing was captured for it at all — a fully
+/// successful call audited with all three fields empty even though it carried
+/// every one of them on the request.
+///
+/// Nothing here is a new wire format. These are the keys such a client already
+/// sends, observed on the wire against LXC 611. The only difference from
+/// [`ClientInfo::from_initialize_params`] is where the client name lives:
+/// per-request, the spec carries it under `io.modelcontextprotocol/clientInfo`,
+/// while `initialize` uses a bare `clientInfo` sibling of `_meta`.
+///
+/// Bounding and interning are the same functions the session path uses, so the
+/// caps on untrusted strings apply identically. Like everything else on this
+/// type, the contents are **client-asserted** and must never be used for
+/// authorization or marked server-verified.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RequestProvenance {
+    /// Interned client name from `io.modelcontextprotocol/clientInfo`.
+    pub client_name: Option<&'static str>,
+    /// Interned model ID from `mecmcp/provenance`.
+    pub model_id: Option<&'static str>,
+    /// Bounded session ID from `mecmcp/provenance`.
+    pub session_id: Option<String>,
+}
+
+impl RequestProvenance {
+    /// Parse provenance out of a request's `params._meta` object.
+    ///
+    /// Returns `None` when the block carries none of the three fields, so a
+    /// client that knows nothing about either extension is unaffected. A
+    /// malformed or partial block is not an error: whatever parses is kept and
+    /// the rest stays absent, matching how the initialize path already treats
+    /// partial provenance.
+    #[must_use]
+    pub fn from_request_meta(meta: &serde_json::Value) -> Option<Self> {
+        let provenance = meta.get("mecmcp/provenance").and_then(parse_provenance);
+
+        let client_name = meta
+            .get("io.modelcontextprotocol/clientInfo")
+            .and_then(|info| info.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .map(intern_client_name);
+
+        let parsed = Self {
+            client_name,
+            model_id: provenance.as_ref().map(|p| p.model_id),
+            session_id: provenance.and_then(|p| p.session_id),
+        };
+
+        if parsed.client_name.is_none() && parsed.model_id.is_none() && parsed.session_id.is_none()
+        {
+            return None;
+        }
+
+        Some(parsed)
+    }
+}
+
 /// Parse provenance from the `mecmcp/provenance` object within `_meta`.
 ///
 /// Returns `None` if required fields are missing or implausible. Partial
