@@ -307,9 +307,28 @@ fn intern_into(
         return placeholder;
     }
 
+    // Decide and insert under one shard lock. Checking `get` and then calling
+    // `insert` is two steps, and two threads interning the same name could both
+    // miss the fast path above, both leak a distinct `&'static str`, and both
+    // insert — the second overwriting the key. The first caller was left holding
+    // a pointer the table no longer contained, so the same name yielded
+    // different pointers depending on scheduling. That defeats interning twice:
+    // the allocation is not shared, and anything counting distinct pointers sees
+    // cardinality that is not there.
+    //
+    // The name is leaked before the entry is taken because the key type is
+    // `&'static str`. On the losing side of a race that allocation is dropped on
+    // the floor rather than freed, which is bounded and rare: it costs one
+    // string only when two threads intern the same novel name simultaneously,
+    // and the table admits at most 64 names in the first place.
     let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
-    table.insert(leaked, ());
-    leaked
+    match table.entry(leaked) {
+        dashmap::mapref::entry::Entry::Occupied(existing) => existing.key(),
+        dashmap::mapref::entry::Entry::Vacant(slot) => {
+            slot.insert(());
+            leaked
+        }
+    }
 }
 
 /// Bound and validate a version string.
@@ -661,6 +680,56 @@ mod tests {
         });
         let info = ClientInfo::from_initialize_params(&params).expect("valid clientInfo");
         assert_eq!(info.session_id(), None);
+    }
+
+    /// Concurrent interning of one name must yield one pointer.
+    ///
+    /// `intern_into` used to check `get` and then `insert` as two steps. Two
+    /// threads interning the same name could both miss the fast path, both leak
+    /// a distinct `&'static str`, and both insert — the second overwriting the
+    /// key. The first caller then held a pointer the table no longer contained,
+    /// so a later reader got a different pointer for the same name.
+    ///
+    /// That defeats the point of interning twice over: the allocation is not
+    /// shared, and an audit consumer counting distinct pointers sees phantom
+    /// cardinality. It also made `model_id_is_interned` flake, because several
+    /// tests in this module intern "claude-opus-5" concurrently — reproduced at
+    /// 4 failures in 60 runs before the fix.
+    #[test]
+    fn concurrent_interning_of_one_name_yields_one_pointer() {
+        use std::sync::{Arc, Barrier};
+
+        // A name unique to this test, so the fast path cannot mask the race by
+        // finding an entry an earlier test already interned.
+        let name = "race-probe-model.v1";
+        let threads = 16;
+        let barrier = Arc::new(Barrier::new(threads));
+
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // Release every thread into the slow path together.
+                    barrier.wait();
+                    intern_model_id(name)
+                })
+            })
+            .collect();
+
+        let pointers: Vec<&'static str> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .collect();
+
+        let first = pointers[0];
+        assert!(
+            pointers.iter().all(|pointer| std::ptr::eq(*pointer, first)),
+            "every concurrent intern of one name must return the same pointer"
+        );
+        assert!(
+            std::ptr::eq(intern_model_id(name), first),
+            "a later intern must return the pointer the table actually holds"
+        );
     }
 
     #[test]
