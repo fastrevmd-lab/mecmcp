@@ -35,7 +35,7 @@ fn is_pending(state: ChangeSetState) -> bool {
 /// same principal and device. A crash would then leave the live operation paired
 /// with an expired or absent change set, instead of the `Failed` state that
 /// restart recovery assigns to anything caught mid-apply.
-fn is_expirable(state: ChangeSetState) -> bool {
+pub(crate) fn is_expirable(state: ChangeSetState) -> bool {
     matches!(state, ChangeSetState::Planned | ChangeSetState::Approved)
 }
 
@@ -507,7 +507,12 @@ impl ChangesetCoordinator {
         // the persist below fails.
         let mut retired: Vec<(String, ChangeSetState)> = Vec::new();
         for (id, existing) in &mut state.change_sets {
-            if is_expirable(existing.state) && existing.expires_at_unix <= now {
+            // Two deadlines can retire a record: its own approval TTL, and the
+            // expiry of the waiver that approved it (#284). The second is
+            // checked through the same predicate the apply gate uses.
+            if is_expirable(existing.state)
+                && (existing.expires_at_unix <= now || crate::apply::waiver_lapsed(existing, now))
+            {
                 retired.push((id.clone(), existing.state));
                 existing.state = ChangeSetState::Expired;
             }

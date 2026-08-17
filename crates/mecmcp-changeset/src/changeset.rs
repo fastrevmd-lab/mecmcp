@@ -466,6 +466,38 @@ impl ChangesetCoordinator {
         Ok(record.into())
     }
 
+    /// Retire `record` in place if either of its deadlines has passed.
+    ///
+    /// Two deadlines apply. A `Planned` record is retired by its own approval
+    /// TTL, which is the long-standing rule and is left exactly as it was. A
+    /// record approved by a time-boxed waiver is retired once that waiver has
+    /// lapsed (#284) — before, `apply` refused such a record while every read
+    /// path went on reporting it `Approved`, so the state the operator was shown
+    /// contradicted the one the state machine enforced.
+    ///
+    /// The waiver check is deliberately not folded into the first condition.
+    /// Widening the approval-TTL rule from `Planned` to every expirable state
+    /// would retire `Approved` records on read for a reason unrelated to this
+    /// defect, which is a larger behaviour change than the one being fixed.
+    async fn retire_if_deadline_passed(
+        &self,
+        record: &mut ChangeSetRecord,
+    ) -> Result<(), CoordinatorError> {
+        let now = now_unix()?;
+
+        let approval_ttl_passed =
+            record.state == ChangeSetState::Planned && now >= record.expires_at_unix;
+        let waiver_lapsed = crate::coordinator::is_expirable(record.state)
+            && crate::apply::waiver_lapsed(record, now);
+
+        if approval_ttl_passed || waiver_lapsed {
+            record.state = ChangeSetState::Expired;
+            self.update_change_set(record.clone()).await?;
+        }
+
+        Ok(())
+    }
+
     /// Retrieves the status of a change set, auto-expiring if needed.
     ///
     /// If the change set is in `Planned` state and the current time is past
@@ -484,13 +516,7 @@ impl ChangesetCoordinator {
     ) -> Result<ChangeSetOutput, CoordinatorError> {
         let mut record = self.change_set(&change_set_id, &device).await?;
 
-        if record.state == ChangeSetState::Planned {
-            let now = now_unix()?;
-            if now >= record.expires_at_unix {
-                record.state = ChangeSetState::Expired;
-                self.update_change_set(record.clone()).await?;
-            }
-        }
+        self.retire_if_deadline_passed(&mut record).await?;
 
         Ok(record.into())
     }
@@ -522,13 +548,7 @@ impl ChangesetCoordinator {
     ) -> Result<ChangeSetOutput, CoordinatorError> {
         let mut record = self.change_set(&change_set_id, &device).await?;
 
-        if record.state == ChangeSetState::Planned {
-            let now = now_unix()?;
-            if now >= record.expires_at_unix {
-                record.state = ChangeSetState::Expired;
-                self.update_change_set(record.clone()).await?;
-            }
-        }
+        self.retire_if_deadline_passed(&mut record).await?;
 
         let mut output: ChangeSetOutput = record.clone().into();
         output.actions = Some(record.actions);
