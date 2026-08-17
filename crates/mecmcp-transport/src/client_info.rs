@@ -164,6 +164,67 @@ impl ClientInfo {
     }
 }
 
+/// Client-asserted provenance read from a single request's `_meta` (#288).
+///
+/// The session path captures this once, at `initialize`, and keys it by
+/// `Mcp-Session-Id`. A client declaring MCP `2026-07-28` is routed statelessly
+/// and never sends that header, so nothing was captured for it at all — a fully
+/// successful call audited with all three fields empty even though it carried
+/// every one of them on the request.
+///
+/// Nothing here is a new wire format. These are the keys such a client already
+/// sends, observed on the wire against LXC 611. The only difference from
+/// [`ClientInfo::from_initialize_params`] is where the client name lives:
+/// per-request, the spec carries it under `io.modelcontextprotocol/clientInfo`,
+/// while `initialize` uses a bare `clientInfo` sibling of `_meta`.
+///
+/// Bounding and interning are the same functions the session path uses, so the
+/// caps on untrusted strings apply identically. Like everything else on this
+/// type, the contents are **client-asserted** and must never be used for
+/// authorization or marked server-verified.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RequestProvenance {
+    /// Interned client name from `io.modelcontextprotocol/clientInfo`.
+    pub client_name: Option<&'static str>,
+    /// Interned model ID from `mecmcp/provenance`.
+    pub model_id: Option<&'static str>,
+    /// Bounded session ID from `mecmcp/provenance`.
+    pub session_id: Option<String>,
+}
+
+impl RequestProvenance {
+    /// Parse provenance out of a request's `params._meta` object.
+    ///
+    /// Returns `None` when the block carries none of the three fields, so a
+    /// client that knows nothing about either extension is unaffected. A
+    /// malformed or partial block is not an error: whatever parses is kept and
+    /// the rest stays absent, matching how the initialize path already treats
+    /// partial provenance.
+    #[must_use]
+    pub fn from_request_meta(meta: &serde_json::Value) -> Option<Self> {
+        let provenance = meta.get("mecmcp/provenance").and_then(parse_provenance);
+
+        let client_name = meta
+            .get("io.modelcontextprotocol/clientInfo")
+            .and_then(|info| info.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .map(intern_client_name);
+
+        let parsed = Self {
+            client_name,
+            model_id: provenance.as_ref().map(|p| p.model_id),
+            session_id: provenance.and_then(|p| p.session_id),
+        };
+
+        if parsed.client_name.is_none() && parsed.model_id.is_none() && parsed.session_id.is_none()
+        {
+            return None;
+        }
+
+        Some(parsed)
+    }
+}
+
 /// Parse provenance from the `mecmcp/provenance` object within `_meta`.
 ///
 /// Returns `None` if required fields are missing or implausible. Partial
@@ -246,9 +307,28 @@ fn intern_into(
         return placeholder;
     }
 
+    // Decide and insert under one shard lock. Checking `get` and then calling
+    // `insert` is two steps, and two threads interning the same name could both
+    // miss the fast path above, both leak a distinct `&'static str`, and both
+    // insert — the second overwriting the key. The first caller was left holding
+    // a pointer the table no longer contained, so the same name yielded
+    // different pointers depending on scheduling. That defeats interning twice:
+    // the allocation is not shared, and anything counting distinct pointers sees
+    // cardinality that is not there.
+    //
+    // The name is leaked before the entry is taken because the key type is
+    // `&'static str`. On the losing side of a race that allocation is dropped on
+    // the floor rather than freed, which is bounded and rare: it costs one
+    // string only when two threads intern the same novel name simultaneously,
+    // and the table admits at most 64 names in the first place.
     let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
-    table.insert(leaked, ());
-    leaked
+    match table.entry(leaked) {
+        dashmap::mapref::entry::Entry::Occupied(existing) => existing.key(),
+        dashmap::mapref::entry::Entry::Vacant(slot) => {
+            slot.insert(());
+            leaked
+        }
+    }
 }
 
 /// Bound and validate a version string.
@@ -600,6 +680,56 @@ mod tests {
         });
         let info = ClientInfo::from_initialize_params(&params).expect("valid clientInfo");
         assert_eq!(info.session_id(), None);
+    }
+
+    /// Concurrent interning of one name must yield one pointer.
+    ///
+    /// `intern_into` used to check `get` and then `insert` as two steps. Two
+    /// threads interning the same name could both miss the fast path, both leak
+    /// a distinct `&'static str`, and both insert — the second overwriting the
+    /// key. The first caller then held a pointer the table no longer contained,
+    /// so a later reader got a different pointer for the same name.
+    ///
+    /// That defeats the point of interning twice over: the allocation is not
+    /// shared, and an audit consumer counting distinct pointers sees phantom
+    /// cardinality. It also made `model_id_is_interned` flake, because several
+    /// tests in this module intern "claude-opus-5" concurrently — reproduced at
+    /// 4 failures in 60 runs before the fix.
+    #[test]
+    fn concurrent_interning_of_one_name_yields_one_pointer() {
+        use std::sync::{Arc, Barrier};
+
+        // A name unique to this test, so the fast path cannot mask the race by
+        // finding an entry an earlier test already interned.
+        let name = "race-probe-model.v1";
+        let threads = 16;
+        let barrier = Arc::new(Barrier::new(threads));
+
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // Release every thread into the slow path together.
+                    barrier.wait();
+                    intern_model_id(name)
+                })
+            })
+            .collect();
+
+        let pointers: Vec<&'static str> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .collect();
+
+        let first = pointers[0];
+        assert!(
+            pointers.iter().all(|pointer| std::ptr::eq(*pointer, first)),
+            "every concurrent intern of one name must return the same pointer"
+        );
+        assert!(
+            std::ptr::eq(intern_model_id(name), first),
+            "a later intern must return the pointer the table actually holds"
+        );
     }
 
     #[test]

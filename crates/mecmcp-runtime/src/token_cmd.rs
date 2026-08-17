@@ -392,6 +392,109 @@ where
             signal_reload(server_pid)?;
             Ok(())
         }
+        TokenAction::SetProvenance {
+            tokens_file,
+            name,
+            provider,
+            provider_tier,
+            on_behalf_of,
+            actor_type,
+            yes,
+            server_pid,
+        } => {
+            // The same reconciliation `add` performs, from the one place that
+            // owns it. Restating the derive rule here is how two paths end up
+            // disagreeing about what a token means.
+            let provenance = parse_provenance(provider, provider_tier, on_behalf_of, actor_type)?;
+
+            // Cloned out of the store for the same reason as the SetScopes arm:
+            // `store()` returns a guard, and holding a borrow across the write
+            // would not compile.
+            let store_file = TokenStoreFile::<G>::load(&tokens_file)?;
+            let before = {
+                let store = store_file.store();
+                store
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .ok_or_else(|| {
+                        TokenCommandError::InvalidArgument(format!("token '{name}' does not exist"))
+                    })?
+                    .clone()
+            };
+
+            // Replacement semantics make an omitted flag destructive, and the
+            // fields exist to attribute actions to a principal — losing one
+            // silently is not discovered until an auditor reads an event months
+            // later. So the clears are named, and confirmed.
+            let mut cleared: Vec<&str> = Vec::new();
+            if before.provider.is_some() && provenance.provider.is_none() {
+                cleared.push("provider");
+            }
+            if before.provider_tier.is_some() && provenance.provider_tier.is_none() {
+                cleared.push("provider_tier");
+            }
+            if before.on_behalf_of.is_some() && provenance.on_behalf_of.is_none() {
+                cleared.push("on_behalf_of");
+            }
+            if before.actor_type != mecmcp_auth::ActorType::Unknown
+                && provenance.actor_type.is_none()
+            {
+                cleared.push("actor_type");
+            }
+
+            println!("token: {name}");
+            println!(
+                "  provider:      {:?} -> {:?}",
+                before.provider, provenance.provider
+            );
+            println!(
+                "  provider_tier: {:?} -> {:?}",
+                before.provider_tier, provenance.provider_tier
+            );
+            println!(
+                "  on_behalf_of:  {:?} -> {:?}",
+                before.on_behalf_of, provenance.on_behalf_of
+            );
+            println!(
+                "  actor_type:    {:?} -> {:?}",
+                before.actor_type,
+                provenance.actor_type.unwrap_or_default()
+            );
+
+            if !cleared.is_empty() && !yes {
+                return Err(TokenCommandError::InvalidArgument(format!(
+                    "this clears {} — every field is replaced on each call, so an omitted \
+                     flag drops the value it names; restate it, or re-run with --yes",
+                    cleared.join(", ")
+                )));
+            }
+
+            TokenStoreFile::<G>::set_provenance(
+                &tokens_file,
+                &name,
+                provenance.provider,
+                provenance.provider_tier,
+                provenance.on_behalf_of,
+                provenance.actor_type,
+            )?;
+
+            // Provenance decides how every subsequent action by this token is
+            // attributed, so a change to it is an audit event in its own right —
+            // recorded here because the change is made by a CLI rather than
+            // through the served API.
+            tracing::info!(
+                target: "audit",
+                tool = "token_set_provenance",
+                action = "set_provenance",
+                result = "ok",
+                metadata = format!("token={name} cleared={}", cleared.join("|")),
+                "token provenance changed",
+            );
+
+            signal_reload(server_pid)?;
+            Ok(())
+        }
         TokenAction::List { tokens_file } => list::<G>(&tokens_file),
         TokenAction::Revoke {
             tokens_file,

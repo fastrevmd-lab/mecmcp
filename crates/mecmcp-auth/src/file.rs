@@ -531,6 +531,84 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
         Ok(())
     }
 
+    /// Replace an existing token's provenance without touching its secret.
+    ///
+    /// The mirror of [`set_scopes`](Self::set_scopes), and it exists for the
+    /// same reason that one does: every alternative mints a new secret and so
+    /// forces every registered client to be reconfigured, while hand-editing
+    /// `tokens.json` keeps the secret but skips the validation performed here
+    /// (#289). Two rules in particular are easy to get wrong by hand — a
+    /// present-but-empty field, and a `provider` alongside `actor_type: human` —
+    /// and both are discovered at next start, on a credential file, which is the
+    /// worst place to find out.
+    ///
+    /// All four fields are replaced, not merged: `None` clears. Deciding whether
+    /// a clear was intended is the caller's job, because only the CLI layer can
+    /// distinguish an omitted flag from a deliberate one.
+    ///
+    /// Unlike `set_scopes`, this does not re-check device and tool references.
+    /// The scopes are copied through untouched, so re-validating them could only
+    /// fail for a reason unrelated to this change — a device that has since left
+    /// the inventory would make an existing token permanently untaggable, and
+    /// tagging the existing fleet is the entire purpose of this call. Entry
+    /// validation still runs via [`TokenStore::try_new`], which is what enforces
+    /// the provenance rules themselves.
+    ///
+    /// # Errors
+    /// Returns [`FileError`] on I/O or validation failure, or if `name` does not
+    /// exist in the store.
+    pub fn set_provenance(
+        path: &Path,
+        name: &str,
+        provider: Option<String>,
+        provider_tier: Option<crate::Tier>,
+        on_behalf_of: Option<String>,
+        actor_type: Option<crate::ActorType>,
+    ) -> Result<(), FileError> {
+        let (current, version) = Self::read_store(path)?;
+
+        if !current.entries().iter().any(|entry| entry.name == name) {
+            return Err(FileError::Store {
+                path: path.to_path_buf(),
+                source: StoreError::Entry(crate::entry::EntryError::Invalid(format!(
+                    "token '{name}' does not exist"
+                ))),
+            });
+        }
+
+        let entries: Vec<TokenEntry<G>> = current
+            .entries()
+            .iter()
+            .map(|entry| {
+                if entry.name == name {
+                    TokenEntry {
+                        name: entry.name.clone(),
+                        digest: entry.digest.clone(),
+                        devices: entry.devices.clone(),
+                        tools: entry.tools.clone(),
+                        created_at: entry.created_at,
+                        expires_at: entry.expires_at,
+                        grant: entry.grant.clone(),
+                        provider: provider.clone(),
+                        provider_tier,
+                        on_behalf_of: on_behalf_of.clone(),
+                        actor_type: actor_type.unwrap_or_default(),
+                    }
+                } else {
+                    entry.clone()
+                }
+            })
+            .collect();
+
+        let updated = TokenStore::try_new(entries).map_err(|source| FileError::Store {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        write_atomic(path, updated.entries(), version)?;
+        Ok(())
+    }
+
     /// Idempotently revoke one named token.
     ///
     /// # Errors

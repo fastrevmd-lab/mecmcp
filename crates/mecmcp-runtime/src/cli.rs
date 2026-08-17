@@ -441,6 +441,46 @@ pub enum TokenAction {
         #[arg(long)]
         server_pid: Option<i32>,
     },
+    /// Replace an existing token's provenance without touching its secret.
+    ///
+    /// A sibling of `set-scopes` rather than four more flags on it: that
+    /// command's name would stop being true, and the two changes confirm
+    /// different things. `set-scopes` confirms a widening, which is a privilege
+    /// escalation; this confirms a clear, which destroys attribution.
+    ///
+    /// All four fields are replaced on every call, so an omitted flag clears the
+    /// field it names. Because that is destructive, a call that would clear a
+    /// field currently holding a value is refused unless `--yes` is passed.
+    /// Setting or changing a value is never prompted.
+    SetProvenance {
+        /// Absolute token-store path.
+        #[arg(long)]
+        tokens_file: PathBuf,
+        /// Token audit name.
+        #[arg(long)]
+        name: String,
+        /// Provider name (e.g., "anthropic", "ollama"). Omit to clear.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Provider tier: "public" or "private". Omit to clear.
+        #[arg(long)]
+        provider_tier: Option<String>,
+        /// The human on whose behalf this credential acts. Omit to clear.
+        #[arg(long)]
+        on_behalf_of: Option<String>,
+        /// Actor type: "human", "agent", or "unknown". Omit to clear.
+        ///
+        /// Derived as "agent" when a provider is given and this is omitted:
+        /// nothing else has an LLM provider.
+        #[arg(long)]
+        actor_type: Option<String>,
+        /// Apply a change that clears a populated field without confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Send SIGHUP to this pid after writing.
+        #[arg(long)]
+        server_pid: Option<i32>,
+    },
     /// List token names + scopes (never the hash or secret).
     List {
         /// Absolute token-store path.

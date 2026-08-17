@@ -621,15 +621,8 @@ pub async fn bearer_preflight_middleware<G: Grant>(
 
     // Populate client provenance from session (mecmcp#253, mecmcp#267).
     //
-    // This path depends on the `Mcp-Session-Id` header. Clients declaring MCP
-    // `2026-07-28` are routed statelessly (config.rs:194, server.rs:300,
-    // concurrency.rs:412) with no session header, so this block never runs for
-    // them and `client_name`, `model_id`, and `session_id` all render empty in
-    // audit events. The deployed fleet is unaffected (claude-code sends sessions).
-    //
-    // Fixing this requires deciding whether `_meta` travels per-request instead of
-    // only at `initialize`. See issue #288 — left open because PAN-OS and Junos
-    // both consume mecmcp-audit, so the wire format should be settled once.
+    // This path depends on the `Mcp-Session-Id` header, captured once at
+    // `initialize` and keyed by session.
     if let Some(tracker) = &state.session_tracker
         && let Some(session_id_value) = parts.headers.get("Mcp-Session-Id")
         && let Ok(session_id_str) = session_id_value.to_str()
@@ -644,6 +637,34 @@ pub async fn bearer_preflight_middleware<G: Grant>(
         }
         if let Some(sess_id) = tracker.session_id(&session_id) {
             caller.session_id = Some(sess_id);
+        }
+    }
+
+    // Fall back to the request's own `_meta` for anything the session did not
+    // supply (mecmcp#288).
+    //
+    // Clients declaring MCP `2026-07-28` are routed statelessly (config.rs,
+    // server.rs, concurrency.rs) and never send a session header, so the block
+    // above cannot run for them. They do carry the same provenance per request,
+    // which the body already buffered here makes available at no extra cost —
+    // `extract_tool_name` parses these same bytes a few lines down.
+    //
+    // Per-field fallback rather than replacement: a session value, where one
+    // exists, is what the deployed fleet audits today and must keep auditing.
+    // This only fills gaps. Nothing here is server-verified — it is
+    // client-asserted wherever it arrived from, exactly as the session path's
+    // values are.
+    if (caller.client_name.is_none() || caller.model_id.is_none() || caller.session_id.is_none())
+        && let Some(provenance) = request_meta_provenance(&body_bytes)
+    {
+        if caller.client_name.is_none() {
+            caller.client_name = provenance.client_name;
+        }
+        if caller.model_id.is_none() {
+            caller.model_id = provenance.model_id;
+        }
+        if caller.session_id.is_none() {
+            caller.session_id = provenance.session_id;
         }
     }
 
@@ -760,6 +781,32 @@ fn intern_tool_into(names_table: &Mutex<HashSet<&'static str>>, name: &str) -> &
     let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
     names.insert(leaked);
     leaked
+}
+
+/// Extract client-asserted provenance from a request's `params._meta` (#288).
+///
+/// Returns the first `_meta` block carrying any of the three fields, or `None`
+/// for other shapes and malformed JSON. Batches are walked the same way
+/// [`extract_tool_name`] walks them, and for the same reason: one audit event is
+/// emitted per batch, so the provenance recorded must be the one belonging to
+/// the call that event describes.
+///
+/// Parsing is deliberately total — a body that is not JSON, or carries no
+/// `_meta`, yields `None` rather than an error. This runs on every request,
+/// including ones that are about to be refused, and must never be able to turn
+/// a well-formed call into a failure.
+fn request_meta_provenance(body: &[u8]) -> Option<crate::client_info::RequestProvenance> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+
+    let requests = match &value {
+        Value::Array(requests) => requests.as_slice(),
+        single => std::slice::from_ref(single),
+    };
+
+    requests
+        .iter()
+        .filter_map(|request| request.get("params").and_then(|params| params.get("_meta")))
+        .find_map(crate::client_info::RequestProvenance::from_request_meta)
 }
 
 /// Extract the tool name from a `tools/call` JSON-RPC request.
