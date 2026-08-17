@@ -54,6 +54,25 @@ fn canonicalize_endpoint(endpoint: &str) -> Result<String, CoordinatorError> {
     Ok(canonical)
 }
 
+/// Whether `change_set` was approved by a waiver that has lapsed as of `now`.
+///
+/// Shared by the apply gates and by the retirement sweeps in `coordinator` and
+/// `changeset` so the two cannot disagree. They did disagree before #284: apply
+/// refused a lapsed record while every read path went on reporting it
+/// `Approved`, and a sweep written separately could reintroduce that in the
+/// narrower form of an off-by-one on the boundary second.
+///
+/// A waiver with no `expires_at_unix` never lapses — that absence is the only
+/// thing lab mode can mean.
+pub(crate) fn waiver_lapsed(change_set: &crate::records::ChangeSetRecord, now: u64) -> bool {
+    change_set
+        .approval
+        .as_ref()
+        .and_then(|approval| approval.waived.as_ref())
+        .and_then(|waiver| waiver.expires_at_unix)
+        .is_some_and(|expires_at| now >= expires_at)
+}
+
 /// Returns an error when `change_set` was approved by a waiver whose
 /// `expires_at_unix` has passed as of `now`.
 ///
@@ -75,13 +94,7 @@ fn waiver_expiry_error(
     now: u64,
     gate: &str,
 ) -> Option<CoordinatorError> {
-    if let Some(expires_at) = change_set
-        .approval
-        .as_ref()
-        .and_then(|approval| approval.waived.as_ref())
-        .and_then(|waiver| waiver.expires_at_unix)
-        && now >= expires_at
-    {
+    if waiver_lapsed(change_set, now) {
         Some(CoordinatorError::new(
             "change_set_id",
             format!(
