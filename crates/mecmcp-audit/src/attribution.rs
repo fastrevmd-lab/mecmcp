@@ -171,6 +171,32 @@ pub struct Attribution {
     /// it was — that is the whole point of mecmcp#52 — so the fact is carried
     /// explicitly from the one place that knows it.
     pub token_verified_fields: TokenVerifiedFields,
+    /// The second principal who approved, when applied under two-person control.
+    ///
+    /// Distinct from `change_ref`, which is an external change-control reference
+    /// such as a ticket id. "Who else signed this off" and "which ticket
+    /// authorised this" are different questions, and collapsing them would make
+    /// the two-person evidence unreadable wherever a ticket was also supplied.
+    ///
+    /// Never populated by [`from_caller`](Self::from_caller): a token cannot
+    /// vouch for who approved a change set. Only a call site holding the
+    /// change-set record can set this, via
+    /// [`with_change_set`](Self::with_change_set).
+    ///
+    /// `None` on a single-operator or waived apply, and that absence must
+    /// survive — inventing a value here would put a name on a device's commit
+    /// log that approved nothing (rustjunosmcp#307).
+    pub approver: Option<String>,
+    /// The change set this action belongs to.
+    ///
+    /// Carried so the durable record on the device can name it. `request_id`
+    /// already correlates a commit to its audit event, but only for someone
+    /// holding both artifacts and knowing to join them; the change-set id is
+    /// what the server's own store is keyed by.
+    ///
+    /// Never populated by [`from_caller`](Self::from_caller) — a caller context
+    /// does not identify a change set.
+    pub change_set_id: Option<String>,
 }
 
 /// Which provenance fields the server read from the token entry.
@@ -312,6 +338,10 @@ impl Attribution {
             // Minting per call is what made that correlation impossible.
             request_id: ctx.request_id,
             token_verified_fields,
+            // A token cannot vouch for who approved a change set, nor identify
+            // one. Only a call site holding the record may set these.
+            approver: None,
+            change_set_id: None,
         }
     }
 
@@ -331,6 +361,9 @@ impl Attribution {
             change_ref: None,
             request_id: Uuid::new_v4(),
             token_verified_fields: TokenVerifiedFields::none(),
+            // Never derived from a caller: only a change-set record knows these.
+            approver: None,
+            change_set_id: None,
         }
     }
 
@@ -361,6 +394,17 @@ impl Attribution {
                 skills_used: Vec::new(),
             });
         }
+    }
+
+    /// Record the change set being applied, and the approver if there was one.
+    ///
+    /// The seam for a call site that holds the change-set record — the only
+    /// place that knows either value. `approver` is `None` for a waived or
+    /// single-operator apply, and is stored as `None`: an absent approver is a
+    /// fact about the change, not a gap to fill.
+    pub fn with_change_set(&mut self, change_set_id: &str, approver: Option<&str>) {
+        self.change_set_id = Some(change_set_id.to_owned());
+        self.approver = approver.map(str::to_owned);
     }
 }
 
