@@ -293,6 +293,20 @@ impl SessionTracker {
             .and_then(|m| m.client_info.as_ref().map(ClientInfo::name))
     }
 
+    /// Retrieve the client version for a session, if available.
+    ///
+    /// A stateful client sends `clientInfo` once, at `initialize`, so later
+    /// requests carry no version of their own. Without this the audit line for
+    /// every call after the handshake would show an empty version.
+    #[must_use]
+    pub fn client_version(&self, id: &SessionId) -> Option<String> {
+        self.activity.get(id).and_then(|m| {
+            m.client_info
+                .as_ref()
+                .and_then(|info| info.version().map(str::to_owned))
+        })
+    }
+
     /// Retrieve the model ID for a session, if available.
     ///
     /// Returns `None` if the session doesn't exist, never provided `clientInfo`,
