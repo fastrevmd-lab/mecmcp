@@ -15,9 +15,25 @@ pub struct AuditScope {
     started: Instant,
     outcome: AuditOutcome,
     metadata: Vec<(&'static str, AuditValue)>,
+    /// Client-asserted version string, if the client sent one.
+    client_version: Option<String>,
+    /// Client-asserted per-call identifier, if the client sent one.
+    client_call_id: Option<String>,
 }
 
 impl AuditScope {
+    /// Record client-asserted call context alongside the rest of the event.
+    ///
+    /// Both values come from the request's `_meta` and are **client-asserted**,
+    /// exactly like `client_name` — never usable for authorization. The call id
+    /// is the useful half: `request_id` correlates this server's transport and
+    /// handler events with each other, and nothing beyond them, whereas this
+    /// ties the record to the exact tool call in the client's own transcript.
+    pub fn set_client_extras(&mut self, version: Option<String>, call_id: Option<String>) {
+        self.client_version = version;
+        self.client_call_id = call_id;
+    }
+
     /// Build for a call with an explicit `Attribution`.
     ///
     /// This is the primary constructor when the caller has built an
@@ -36,6 +52,8 @@ impl AuditScope {
             started: Instant::now(),
             outcome: AuditOutcome::Unsettled,
             metadata: Vec::new(),
+            client_version: None,
+            client_call_id: None,
         }
     }
 
@@ -222,6 +240,8 @@ impl Drop for AuditScope {
             model_id = %model_id,
             session_id = %session_id,
             client_name = %client_name,
+            client_version = %self.client_version.as_deref().unwrap_or(""),
+            client_call_id = %self.client_call_id.as_deref().unwrap_or(""),
             on_behalf_of = %on_behalf_of,
             change_ref = %change_ref,
             tool = %self.tool,
@@ -435,6 +455,49 @@ mod tests {
         assert!(out.contains("client_name=mcp-client/1.0"));
         assert!(out.contains("on_behalf_of=alice"));
         assert!(out.contains("change_ref=CHG0012345"));
+    }
+
+    /// Client version and per-call id reach the audit line.
+    ///
+    /// Both are client-asserted, like `client_name`. The call id is what ties a
+    /// server-side record to the exact tool call in the client's own transcript;
+    /// `request_id` only correlates this server's two events with each other.
+    #[test]
+    fn client_extras_reach_the_audit_line() {
+        let out = run_with_capture(|| {
+            let mut a = AuditScope::from_caller(&ctx("writer"), "commit_config", "commit", vec![]);
+            a.set_client_extras(
+                Some("2.1.234".into()),
+                Some("toolu_011on2R3XWgvKmG2WRChDa5P".into()),
+            );
+            a.succeed();
+        });
+        assert!(
+            out.contains("client_version=2.1.234"),
+            "client version must be emitted: {out}"
+        );
+        assert!(
+            out.contains("client_call_id=toolu_011on2R3XWgvKmG2WRChDa5P"),
+            "per-call id must be emitted: {out}"
+        );
+    }
+
+    /// A client that sends neither must not gain empty-looking claims that read
+    /// as though something was asserted.
+    #[test]
+    fn client_extras_are_empty_when_the_client_sends_none() {
+        let out = run_with_capture(|| {
+            let mut a = AuditScope::from_caller(&ctx("writer"), "commit_config", "commit", vec![]);
+            a.succeed();
+        });
+        assert!(
+            out.contains("client_version="),
+            "the field is always present: {out}"
+        );
+        assert!(
+            !out.contains("client_version=2."),
+            "nothing may be invented: {out}"
+        );
     }
 
     #[test]

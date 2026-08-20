@@ -182,7 +182,13 @@ impl ClientInfo {
 /// caps on untrusted strings apply identically. Like everything else on this
 /// type, the contents are **client-asserted** and must never be used for
 /// authorization or marked server-verified.
+///
+/// `#[non_exhaustive]`: this grew two fields in one release, and the shape is
+/// driven by what clients put on the wire rather than by anything stable here.
+/// Downstream builds it through [`from_request_meta`](Self::from_request_meta),
+/// never as a literal.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct RequestProvenance {
     /// Interned client name from `io.modelcontextprotocol/clientInfo`.
     pub client_name: Option<&'static str>,
@@ -190,6 +196,20 @@ pub struct RequestProvenance {
     pub model_id: Option<&'static str>,
     /// Bounded session ID from `mecmcp/provenance`.
     pub session_id: Option<String>,
+    /// Bounded client version from `io.modelcontextprotocol/clientInfo`.
+    ///
+    /// "claude-code" and "claude-code 2.1.234" are different things to an
+    /// auditor reading the trail months later, and the client already sends it.
+    pub client_version: Option<String>,
+    /// Bounded per-call identifier asserted by the client.
+    ///
+    /// Read from `claudecode/toolUseId`, the one client extension seen in the
+    /// wild that carries a stable id for a single tool call. The field name is
+    /// deliberately vendor-neutral: mecmcp's own `request_id` correlates two
+    /// server-side events with each other, and nothing outside this process,
+    /// whereas this ties the record to the exact call in the client's own
+    /// transcript.
+    pub client_call_id: Option<String>,
 }
 
 impl RequestProvenance {
@@ -204,24 +224,85 @@ impl RequestProvenance {
     pub fn from_request_meta(meta: &serde_json::Value) -> Option<Self> {
         let provenance = meta.get("mecmcp/provenance").and_then(parse_provenance);
 
-        let client_name = meta
-            .get("io.modelcontextprotocol/clientInfo")
+        let client_info = meta.get("io.modelcontextprotocol/clientInfo");
+        let client_name = client_info
             .and_then(|info| info.get("name"))
             .and_then(serde_json::Value::as_str)
             .map(intern_client_name);
+        let client_version = client_info
+            .and_then(|info| info.get("version"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(bound_version);
+
+        // Bounded like a session ID rather than a version: the ids seen in the
+        // wild (`toolu_011on2R3XWgvKmG2WRChDa5P`) carry underscores, which the
+        // version charset rejects. This is an untrusted string arriving in a
+        // request body, so the cap and charset are the point.
+        let client_call_id = meta
+            .get("claudecode/toolUseId")
+            .and_then(serde_json::Value::as_str)
+            .and_then(bound_session_id);
 
         let parsed = Self {
             client_name,
             model_id: provenance.as_ref().map(|p| p.model_id),
             session_id: provenance.and_then(|p| p.session_id),
+            client_version,
+            client_call_id,
         };
 
-        if parsed.client_name.is_none() && parsed.model_id.is_none() && parsed.session_id.is_none()
+        if parsed.client_name.is_none()
+            && parsed.model_id.is_none()
+            && parsed.session_id.is_none()
+            && parsed.client_version.is_none()
+            && parsed.client_call_id.is_none()
         {
             return None;
         }
 
         Some(parsed)
+    }
+}
+
+impl RequestProvenance {
+    /// Fold another element's client-level facts into these.
+    ///
+    /// A batch may name the client on one element, carry `mecmcp/provenance` on
+    /// another and call the tool on a third; all of them describe the same
+    /// client. First value wins per field, so a single-element body is
+    /// unchanged.
+    ///
+    /// `UNKNOWN_MODEL` counts as absent. `parse_provenance` substitutes it when
+    /// a block carries a session ID and no model, and treating that placeholder
+    /// as a real value would let it mask a genuine `model_id` on a later
+    /// element — an audit line reading `model_id=unknown` when the client did
+    /// in fact say which model it was.
+    ///
+    /// `client_call_id` is not merged: it identifies one call, not the client.
+    #[must_use]
+    pub fn merge(mut self, other: Self) -> Self {
+        if self.client_name.is_none() {
+            self.client_name = other.client_name;
+        }
+        if self.model_id.is_none_or(|model| model == UNKNOWN_MODEL) {
+            self.model_id = other.model_id.or(self.model_id);
+        }
+        if self.session_id.is_none() {
+            self.session_id = other.session_id;
+        }
+        if self.client_version.is_none() {
+            self.client_version = other.client_version;
+        }
+        self
+    }
+
+    /// Whether this carries nothing about the client.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.client_name.is_none()
+            && self.model_id.is_none()
+            && self.session_id.is_none()
+            && self.client_version.is_none()
     }
 }
 
@@ -382,6 +463,54 @@ mod tests {
         let info = ClientInfo::from_initialize_params(&params).expect("valid clientInfo");
         assert_eq!(info.name(), "claude-code");
         assert_eq!(info.version(), Some("1.0.0"));
+    }
+
+    /// The exact `_meta` Claude Code 2.1.234 sends at protocol 2026-07-28,
+    /// captured off the wire on a test rig (rustjunosmcp#267).
+    ///
+    /// It carries no `mecmcp/provenance`, so `model_id` and `session_id` stay
+    /// absent and no server change can fill them. What it *does* carry, and
+    /// what we were throwing away, is the client version and a per-call id that
+    /// ties this record to the exact tool call in the client's transcript.
+    #[test]
+    fn request_meta_captures_the_client_version_and_call_id() {
+        let meta = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "claude-code",
+                "title": "Claude Code",
+                "version": "2.1.234",
+                "description": "Anthropic's agentic coding tool",
+                "websiteUrl": "https://claude.com/claude-code"
+            },
+            "io.modelcontextprotocol/clientCapabilities": {"roots": {"listChanged": true}},
+            "claudecode/toolUseId": "toolu_011on2R3XWgvKmG2WRChDa5P",
+            "progressToken": 2
+        });
+
+        let parsed = RequestProvenance::from_request_meta(&meta).expect("provenance");
+
+        assert_eq!(parsed.client_name, Some("claude-code"));
+        assert_eq!(parsed.client_version.as_deref(), Some("2.1.234"));
+        assert_eq!(
+            parsed.client_call_id.as_deref(),
+            Some("toolu_011on2R3XWgvKmG2WRChDa5P")
+        );
+        assert_eq!(
+            parsed.model_id, None,
+            "this client sends no mecmcp/provenance, so model_id must stay absent"
+        );
+        assert_eq!(parsed.session_id, None);
+    }
+
+    /// A client that sends only the call id still produces a record: the block
+    /// is partial by nature and whatever parses is kept.
+    #[test]
+    fn a_call_id_alone_is_enough_to_produce_provenance() {
+        let meta = serde_json::json!({"claudecode/toolUseId": "toolu_abc"});
+        let parsed = RequestProvenance::from_request_meta(&meta).expect("provenance");
+        assert_eq!(parsed.client_call_id.as_deref(), Some("toolu_abc"));
+        assert_eq!(parsed.client_name, None);
     }
 
     #[test]

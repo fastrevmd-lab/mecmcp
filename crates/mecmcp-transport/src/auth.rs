@@ -619,6 +619,10 @@ pub async fn bearer_preflight_middleware<G: Grant>(
         .expect("preflight layer must run after authentication layer")
         .clone();
 
+    // A stateful client sends `clientInfo` once, at `initialize`; the version
+    // lives on the session from then on, and the request bodies carry none.
+    let mut session_client_version: Option<String> = None;
+
     // Populate client provenance from session (mecmcp#253, mecmcp#267).
     //
     // This path depends on the `Mcp-Session-Id` header, captured once at
@@ -638,6 +642,7 @@ pub async fn bearer_preflight_middleware<G: Grant>(
         if let Some(sess_id) = tracker.session_id(&session_id) {
             caller.session_id = Some(sess_id);
         }
+        session_client_version = tracker.client_version(&session_id);
     }
 
     // Fall back to the request's own `_meta` for anything the session did not
@@ -654,9 +659,27 @@ pub async fn bearer_preflight_middleware<G: Grant>(
     // This only fills gaps. Nothing here is server-verified — it is
     // client-asserted wherever it arrived from, exactly as the session path's
     // values are.
-    if (caller.client_name.is_none() || caller.model_id.is_none() || caller.session_id.is_none())
-        && let Some(provenance) = request_meta_provenance(&body_bytes)
-    {
+    // Parsed unconditionally now: the per-call id has no session-path
+    // equivalent to fall back on, so gating this on a gap in `caller` would drop
+    // it on every request that already knew its client.
+    // One parse serves all three questions — who the client is, which tool is
+    // audited, and that call's own metadata — because the body can be as large
+    // as the configured limit (10 MiB by default) and this runs on every
+    // authenticated call.
+    //
+    // Scoped so the parsed `Value` is dropped right here. Everything taken out
+    // of it is small and owned; holding the whole tree across `run_preflight`
+    // and `next.run(...).await` would keep a second copy of every in-flight
+    // body alive, and with the default 64-request concurrency that is hundreds
+    // of megabytes of duplicate data.
+    let (request_provenance, audited_tool, audited_extras) = {
+        let parsed: Option<Value> = serde_json::from_slice(&body_bytes).ok();
+        let identity = parsed.as_ref().and_then(identity_provenance);
+        let tool = parsed.as_ref().and_then(tool_name);
+        let extras = parsed.as_ref().and_then(audited_call_provenance);
+        (identity, tool, extras)
+    };
+    if let Some(provenance) = request_provenance.as_ref() {
         if caller.client_name.is_none() {
             caller.client_name = provenance.client_name;
         }
@@ -664,7 +687,7 @@ pub async fn bearer_preflight_middleware<G: Grant>(
             caller.model_id = provenance.model_id;
         }
         if caller.session_id.is_none() {
-            caller.session_id = provenance.session_id;
+            caller.session_id = provenance.session_id.clone();
         }
     }
 
@@ -684,8 +707,38 @@ pub async fn bearer_preflight_middleware<G: Grant>(
     // the *only* record of the call — the handler never runs, so nothing
     // downstream can correct an optimistic outcome, and a `succeed()` here
     // would assert that a request answered with 403 was allowed.
-    let mut scope = extract_tool_name(&body_bytes).map(|tool| {
+    let mut scope = audited_tool.map(|tool| {
         let mut scope = AuditScope::from_caller(&caller, tool, "transport", Vec::new());
+        // These live on the scope rather than on `CallerCtx` deliberately.
+        // `CallerCtx` is constructed field-by-field by every consuming server,
+        // so adding to it is a breaking change across all of them; `AuditScope`
+        // is constructor-only, so this reaches the audit trail without one.
+        // The version prefers the session, which is where a stateful client's
+        // `clientInfo` lives after `initialize`; the request body is the
+        // stateless path's only source. The call id comes from the audited
+        // element alone — see `audited_call_provenance`.
+        scope.set_client_extras(
+            // The version describes the client, not the call, so any element
+            // of a batch that names it is authoritative for all of them:
+            // session first, then the audited call, then whichever element
+            // carried the identity. The call id is the opposite — it belongs to
+            // one call, so it comes from the audited element or not at all.
+            session_client_version
+                .clone()
+                .or_else(|| {
+                    audited_extras
+                        .as_ref()
+                        .and_then(|p| p.client_version.clone())
+                })
+                .or_else(|| {
+                    request_provenance
+                        .as_ref()
+                        .and_then(|p| p.client_version.clone())
+                }),
+            audited_extras
+                .as_ref()
+                .and_then(|p| p.client_call_id.clone()),
+        );
         scope.meta("layer", "preflight");
         scope
     });
@@ -795,18 +848,68 @@ fn intern_tool_into(names_table: &Mutex<HashSet<&'static str>>, name: &str) -> &
 /// `_meta`, yields `None` rather than an error. This runs on every request,
 /// including ones that are about to be refused, and must never be able to turn
 /// a well-formed call into a failure.
-fn request_meta_provenance(body: &[u8]) -> Option<crate::client_info::RequestProvenance> {
-    let value: Value = serde_json::from_slice(body).ok()?;
-
-    let requests = match &value {
+/// The elements of a request body, whether it is one call or a batch.
+fn elements(value: &Value) -> &[Value] {
+    match value {
         Value::Array(requests) => requests.as_slice(),
         single => std::slice::from_ref(single),
-    };
+    }
+}
 
-    requests
+/// Identity, from an already-parsed body.
+fn identity_provenance(value: &Value) -> Option<crate::client_info::RequestProvenance> {
+    // Client-level facts, merged across the batch rather than taken from one
+    // element. A batch may name the client on one element, carry
+    // `mecmcp/provenance` on another, and call the tool on a third; every one of
+    // those describes the same client, so stopping at the first element that
+    // says anything would discard what the others say. The first value wins per
+    // field, so a single-element body behaves exactly as before.
+    //
+    // `client_call_id` is deliberately not merged here — it identifies one call,
+    // not the client, and is read from the audited element by
+    // `audited_call_provenance`.
+    let merged = elements(value)
         .iter()
         .filter_map(|request| request.get("params").and_then(|params| params.get("_meta")))
-        .find_map(crate::client_info::RequestProvenance::from_request_meta)
+        .filter_map(crate::client_info::RequestProvenance::from_request_meta)
+        .fold(
+            crate::client_info::RequestProvenance::default(),
+            crate::client_info::RequestProvenance::merge,
+        );
+
+    if merged.is_empty() {
+        return None;
+    }
+
+    Some(merged)
+}
+
+/// Provenance from the element the audit event is actually about.
+///
+/// [`extract_tool_name`] audits the first `tools/call` in a batch, while
+/// [`request_meta_provenance`] takes the first element carrying *any* metadata.
+/// In a batch those need not be the same element, and attributing one call's id
+/// to another call's audit record is worse than recording none — so the per-call
+/// id is read from the audited element only, and falls back to nothing.
+fn audited_call_provenance(value: &Value) -> Option<crate::client_info::RequestProvenance> {
+    let requests = elements(value);
+
+    // The same predicate `extract_tool_name` uses, including the string `name`:
+    // it skips a malformed `tools/call` and audits the next one, so matching on
+    // the method alone would pair this metadata with a different tool's record.
+    let audited = requests.iter().find(|request| {
+        request.get("method").and_then(Value::as_str) == Some("tools/call")
+            && request
+                .get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(Value::as_str)
+                .is_some()
+    })?;
+
+    audited
+        .get("params")
+        .and_then(|params| params.get("_meta"))
+        .and_then(crate::client_info::RequestProvenance::from_request_meta)
 }
 
 /// Extract the tool name from a `tools/call` JSON-RPC request.
@@ -819,14 +922,10 @@ fn request_meta_provenance(body: &[u8]) -> Option<crate::client_info::RequestPro
 /// reaches dispatch must produce an audit event, and this is the seam where that
 /// guarantee is enforced. The transport emits an event here; the handler
 /// enriches it with action, targets, and outcome.
-fn extract_tool_name(body: &[u8]) -> Option<&'static str> {
-    let value: Value = serde_json::from_slice(body).ok()?;
-
+/// The audited tool, from an already-parsed body.
+fn tool_name(value: &Value) -> Option<&'static str> {
     // Handle both single requests and batched requests.
-    let requests = match &value {
-        Value::Array(requests) => requests.as_slice(),
-        single => std::slice::from_ref(single),
-    };
+    let requests = elements(value);
 
     // One event for the first tools/call in a batch. Batches are uncommon and
     // typically call the same or closely related tools, so this gives coverage
@@ -1096,6 +1195,215 @@ fn validate_realm(realm: String) -> Result<String, BearerAuthError> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    /// A session-id-only element parses `model_id` as the "unknown" placeholder.
+    /// That must not mask a real model named by a later element.
+    #[test]
+    fn an_unknown_model_placeholder_does_not_mask_a_later_real_one() {
+        let body = serde_json::json!([
+            {
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "a", "_meta": {"mecmcp/provenance":
+                    {"session_id": "01JABCDEF"}}}
+            },
+            {
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "b", "_meta": {"mecmcp/provenance":
+                    {"model_id": "claude-opus-5"}}}
+            }
+        ])
+        .to_string();
+
+        let identity = request_meta_provenance(body.as_bytes()).expect("identity");
+        assert_eq!(
+            identity.model_id,
+            Some("claude-opus-5"),
+            "the placeholder from the first element must not win over a real model"
+        );
+        assert_eq!(identity.session_id.as_deref(), Some("01JABCDEF"));
+    }
+
+    /// Client-level facts are merged across a batch: one element may carry
+    /// `mecmcp/provenance` and another the `clientInfo` that names the version.
+    #[test]
+    fn a_batch_merges_client_facts_across_elements() {
+        let body = serde_json::json!([
+            {
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "a", "_meta": {"mecmcp/provenance":
+                    {"model_id": "claude-opus-5"}}}
+            },
+            {
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "b", "_meta": {"io.modelcontextprotocol/clientInfo":
+                    {"name": "claude-code", "version": "2.1.234"}}}
+            }
+        ])
+        .to_string();
+
+        let identity = request_meta_provenance(body.as_bytes()).expect("identity");
+        assert_eq!(
+            identity.model_id,
+            Some("claude-opus-5"),
+            "from the first element"
+        );
+        assert_eq!(
+            identity.client_version.as_deref(),
+            Some("2.1.234"),
+            "a version on a later element must not be lost to the earlier one"
+        );
+        assert_eq!(identity.client_name, Some("claude-code"));
+    }
+
+    /// A batch may name the client on one element and call the tool on another.
+    /// The version describes the client, so it applies either way; the call id
+    /// still belongs only to the audited element.
+    #[test]
+    fn a_batch_version_is_taken_from_whichever_element_names_the_client() {
+        let body = serde_json::json!([
+            {
+                "jsonrpc": "2.0", "id": 1, "method": "resources/list",
+                "params": {"_meta": {"io.modelcontextprotocol/clientInfo":
+                    {"name": "claude-code", "version": "2.1.234"}}}
+            },
+            {
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "list_devices",
+                    "_meta": {"claudecode/toolUseId": "toolu_audited"}}
+            }
+        ])
+        .to_string();
+
+        let identity = request_meta_provenance(body.as_bytes()).expect("identity");
+        assert_eq!(identity.client_version.as_deref(), Some("2.1.234"));
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let audited = super::audited_call_provenance(&parsed).expect("audited");
+        assert_eq!(audited.client_call_id.as_deref(), Some("toolu_audited"));
+        assert_eq!(
+            audited.client_version, None,
+            "the audited element names no version; the identity element supplies it"
+        );
+    }
+
+    /// Parse then ask, which is what the request path now does once per body.
+    fn extract_tool_name(body: &[u8]) -> Option<&'static str> {
+        super::tool_name(&serde_json::from_slice::<serde_json::Value>(body).ok()?)
+    }
+
+    fn request_meta_provenance(body: &[u8]) -> Option<crate::client_info::RequestProvenance> {
+        super::identity_provenance(&serde_json::from_slice::<serde_json::Value>(body).ok()?)
+    }
+
+    /// `extract_tool_name` skips a `tools/call` with no string `name` and audits
+    /// the next one; the metadata must follow it to the same element.
+    #[test]
+    fn a_malformed_call_does_not_capture_the_next_calls_metadata() {
+        let body = serde_json::json!([
+            {
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"_meta": {"claudecode/toolUseId": "toolu_malformed_element"}}
+            },
+            {
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {
+                    "name": "list_devices",
+                    "_meta": {"claudecode/toolUseId": "toolu_audited_element"}
+                }
+            }
+        ])
+        .to_string();
+
+        assert_eq!(
+            extract_tool_name(body.as_bytes()),
+            Some("list_devices"),
+            "the malformed element is skipped, so the audited tool is the second"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let audited = super::audited_call_provenance(&parsed).expect("provenance");
+        assert_eq!(
+            audited.client_call_id.as_deref(),
+            Some("toolu_audited_element"),
+            "metadata must come from the element that was audited"
+        );
+    }
+
+    /// An extras-only element must not end the search for who the client is.
+    #[test]
+    fn identity_is_found_past_an_extras_only_element() {
+        let body = serde_json::json!([
+            {
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "a", "_meta": {"claudecode/toolUseId": "toolu_extras_only"}}
+            },
+            {
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {
+                    "name": "b",
+                    "_meta": {"io.modelcontextprotocol/clientInfo": {"name": "claude-code"}}
+                }
+            }
+        ])
+        .to_string();
+
+        let identity = request_meta_provenance(body.as_bytes()).expect("identity");
+        assert_eq!(
+            identity.client_name,
+            Some("claude-code"),
+            "the search must continue past an element carrying only extras"
+        );
+    }
+
+    /// A batch must not borrow another call's identifier.
+    ///
+    /// `extract_tool_name` audits the first `tools/call`; taking the first
+    /// element with *any* `_meta` would attribute an unrelated element's id to
+    /// that record. Recording nothing is better than recording someone else's.
+    #[test]
+    fn a_batch_takes_the_call_id_from_the_audited_element() {
+        let body = serde_json::json!([
+            {
+                "jsonrpc": "2.0", "id": 1, "method": "resources/list",
+                "params": {"_meta": {"claudecode/toolUseId": "toolu_not_the_audited_one"}}
+            },
+            {
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {
+                    "name": "list_devices",
+                    "_meta": {"claudecode/toolUseId": "toolu_the_audited_one"}
+                }
+            }
+        ])
+        .to_string();
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let audited = super::audited_call_provenance(&parsed).expect("provenance");
+        assert_eq!(
+            audited.client_call_id.as_deref(),
+            Some("toolu_the_audited_one"),
+            "the id must come from the tools/call being audited"
+        );
+    }
+
+    /// The audited call carrying no metadata means no id — not the id of some
+    /// other element that happened to have one.
+    #[test]
+    fn a_batch_records_no_call_id_when_the_audited_element_has_none() {
+        let body = serde_json::json!([
+            {
+                "jsonrpc": "2.0", "id": 1, "method": "resources/list",
+                "params": {"_meta": {"claudecode/toolUseId": "toolu_someone_else"}}
+            },
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_devices"}}
+        ])
+        .to_string();
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert!(
+            super::audited_call_provenance(&parsed).is_none(),
+            "an unrelated element's id must not be attributed to this call"
+        );
+    }
+
     use super::*;
     use mecmcp_audit::testutil::run_with_capture;
 
