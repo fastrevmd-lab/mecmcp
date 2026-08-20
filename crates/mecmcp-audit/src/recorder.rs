@@ -42,6 +42,34 @@ const SSDF_CHAIN_START: &str = "";
 /// rejection would otherwise accumulate for the life of the process.
 const MAX_TRACKED_CHANGES: usize = 1024;
 
+/// Classify what [`SsdfSink::spool`](crate::SsdfSink::spool) reported.
+///
+/// The sink writes and fsyncs the segment, *then* marks it pending in a
+/// separate, independently configured ledger file. Only the first of those two
+/// establishes durability, so a ledger failure must not be reported as a spool
+/// failure: the record is already on disk, and `attempt_delivery` reads the
+/// outbox rather than the ledger, so it will still be delivered. Treating it as
+/// a refusal would fail an operation closed over a record that was safely
+/// written, and requeue an already-durable segment for a duplicate append.
+///
+/// The ledger degradation is not silently dropped — it is logged at `warn`,
+/// because delivery bookkeeping being unwritable is a real problem, just not
+/// one that should stop a device operation.
+pub fn spool_outcome(result: Result<(), crate::SsdfSinkError>) -> Result<(), SpoolError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(crate::SsdfSinkError::Ledger(error)) => {
+            tracing::warn!(
+                %error,
+                "evidence segment is durable in the outbox but the delivery ledger \
+                 could not be updated; delivery is unaffected, bookkeeping is degraded"
+            );
+            Ok(())
+        }
+        Err(error) => Err(SpoolError::new(error.to_string())),
+    }
+}
+
 /// The head a new run must continue from.
 ///
 /// `local_newest` is what this writer last **produced**, which only
@@ -155,6 +183,13 @@ pub struct EvidenceRecorder {
     /// and a crash during the device call it precedes loses the very record
     /// that was supposed to prove the attempt happened.
     spool: Option<Spool>,
+    /// Held across a whole flush, so segments reach the spool in the order
+    /// they were produced.
+    ///
+    /// Separate from `state` on purpose: appends must not block behind another
+    /// thread's fsync, only flushes must queue behind each other. Taking
+    /// `state` for the duration would serialise recording as well, for no gain.
+    flushing: Mutex<()>,
 }
 
 struct RecorderState {
@@ -218,6 +253,7 @@ impl EvidenceRecorder {
             }),
             config,
             spool: None,
+            flushing: Mutex::new(()),
         }
     }
 
@@ -250,10 +286,7 @@ impl EvidenceRecorder {
     /// all — which is the case where proceeding would leave no trace.
     #[must_use]
     pub fn spooling_to(self, sink: std::sync::Arc<crate::SsdfSink>) -> Self {
-        self.with_spool(move |segment| {
-            sink.spool(segment)
-                .map_err(|error| SpoolError::new(error.to_string()))
-        })
+        self.with_spool(move |segment| spool_outcome(sink.spool(segment)))
     }
 
     /// A change was proposed.
@@ -330,7 +363,15 @@ impl EvidenceRecorder {
     /// Without this, the trail jumps from proposal straight to apply intent, and
     /// a legitimate exception is indistinguishable from a bypassed gate — which
     /// is the normal case on a lab-mode server, not an edge case.
-    pub fn approval_waived(&self, request_id: &str, changeset_id: &str, kind: &str, reason: &str) {
+    pub fn approval_waived(
+        &self,
+        request_id: &str,
+        changeset_id: &str,
+        kind: &str,
+        reason: &str,
+        expires_at_unix: Option<u64>,
+        ticket: Option<&str>,
+    ) {
         let context = self.context_for(changeset_id);
         self.append(EvidenceRecord::Approval(ApprovalRecord {
             request_id: request_id.to_owned(),
@@ -345,7 +386,16 @@ impl EvidenceRecorder {
             prev_hash: String::new(),
             approver: String::new(),
             decision: "approved".to_owned(),
-            metadata: Some(serde_json::json!({ "waived": kind, "reason": reason })),
+            metadata: Some(serde_json::json!({
+                "waived": kind,
+                "reason": reason,
+                // What separates a bounded, ticketed exception from an
+                // open-ended one. Omitted rather than nulled when absent, so a
+                // waiver that genuinely has no time box does not read as one
+                // whose time box went missing.
+                "expires_at_unix": expires_at_unix,
+                "ticket": ticket,
+            })),
         }));
     }
 
@@ -394,6 +444,18 @@ impl EvidenceRecorder {
     }
 
     /// The device answered.
+    ///
+    /// Persisted before it returns, like [`apply_intent`](Self::apply_intent)
+    /// and for the same reason turned around: this is the terminal record of a
+    /// change, and the case it exists for — the device acted, local state did
+    /// not follow — is exactly the case where nothing later comes along to
+    /// flush it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the record could not be made durable. Unlike
+    /// `apply_intent` the caller cannot fail closed on this: the device has
+    /// already acted, and refusing afterwards would not un-act it. Report it.
     pub fn result_receipt(
         &self,
         request_id: &str,
@@ -401,7 +463,7 @@ impl EvidenceRecorder {
         device_id: &str,
         succeeded: bool,
         error: &str,
-    ) {
+    ) -> Result<(), SpoolError> {
         let context = self.context_for(changeset_id);
         self.append(EvidenceRecord::ResultReceipt(ResultReceipt {
             request_id: request_id.to_owned(),
@@ -422,6 +484,7 @@ impl EvidenceRecorder {
         // this a long-lived server accumulates every device, principal and
         // digest it has ever seen.
         self.forget(changeset_id);
+        self.flush_after_append()
     }
 
     /// Take every segment closed so far, leaving the open one alone.
@@ -454,6 +517,17 @@ impl EvidenceRecorder {
         let Some(spool) = self.spool.as_ref() else {
             return Ok(());
         };
+        // Claim and persist under one lock. The recorder is shared across
+        // devices while the coordinator's guards are per device, so two commits
+        // really do arrive here at once; releasing before the spool let a later
+        // segment overtake an earlier one, leaving the durable chain missing a
+        // link while the later commit went on to touch its device. It also broke
+        // `produced_head`, which reads the outbox on the premise that append
+        // order is production order.
+        let _flushing = self
+            .flushing
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let claimed = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             let mut pending = std::mem::take(&mut state.closed);

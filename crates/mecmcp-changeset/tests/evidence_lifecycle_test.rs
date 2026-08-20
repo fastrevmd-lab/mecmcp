@@ -583,3 +583,81 @@ mod receipts {
         );
     }
 }
+
+/// An operator waiver's time box and ticket must reach the trail.
+///
+/// These are the fields that make a bounded, ticketed exception distinguishable
+/// from an open-ended one. Emitting only the kind and reason loses exactly what
+/// an auditor needs to follow the exception back to what authorised it and to
+/// see when it lapses.
+#[tokio::test]
+async fn an_operator_waiver_records_its_time_box_and_ticket() {
+    use mecmcp_changeset::WaiverKind;
+
+    let recorder = Arc::new(EvidenceRecorder::new(RecorderConfig {
+        server_id: "mecmcp-test".to_string(),
+        run_id: "run-001".to_string(),
+        resume_from: None,
+        records_per_segment: 64,
+    }));
+    let coordinator = ChangesetCoordinator::load(
+        None,
+        OperationLimits::default(),
+        Duration::from_secs(900),
+        false,
+    )
+    .unwrap()
+    .with_evidence(Arc::clone(&recorder));
+
+    let output = coordinator
+        .create_change_set(
+            "vsrx-ci".to_string(),
+            vec![serde_json::json!({"op": "set"})],
+            "agent:planner".to_string(),
+            fingerprint(),
+            "sig".to_string(),
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .waive_approval_operator(
+            output.change_set_id.clone(),
+            "vsrx-ci".to_string(),
+            "agent:planner".to_string(),
+            output.digest.clone(),
+            WaiverKind::OperatorTool,
+            "incident bridge".to_string(),
+            Some(4_102_444_800),
+            Some("CHG-1234".to_string()),
+        )
+        .await
+        .unwrap();
+
+    let closed = recorder.close_current().expect("records were written");
+    let EvidenceRecord::Approval(approval) = &closed.records()[1] else {
+        panic!(
+            "the waiver must follow the proposal: {:?}",
+            closed.records()
+        );
+    };
+    let metadata = approval.metadata.as_ref().expect("waiver metadata");
+    assert_eq!(
+        metadata.get("waived"),
+        Some(&serde_json::json!("operator_tool"))
+    );
+    assert_eq!(
+        metadata.get("reason"),
+        Some(&serde_json::json!("incident bridge"))
+    );
+    assert_eq!(
+        metadata.get("ticket"),
+        Some(&serde_json::json!("CHG-1234")),
+        "the change-control reference is how the exception is traced back"
+    );
+    assert_eq!(
+        metadata.get("expires_at_unix"),
+        Some(&serde_json::json!(4_102_444_800u64)),
+        "an exception with no visible time box reads as an open-ended one"
+    );
+}

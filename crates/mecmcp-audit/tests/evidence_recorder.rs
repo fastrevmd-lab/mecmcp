@@ -39,7 +39,9 @@ fn the_four_lifecycle_points_each_append_one_record() {
     recorder
         .apply_intent("req-apply", "cs-1", "vsrx-ci", "agent:test")
         .unwrap();
-    recorder.result_receipt("req-1", "cs-1", "vsrx-ci", true, "");
+    recorder
+        .result_receipt("req-1", "cs-1", "vsrx-ci", true, "")
+        .unwrap();
 
     let closed = recorder.close_current().unwrap();
     let kinds: Vec<&str> = closed
@@ -159,7 +161,9 @@ fn later_records_carry_the_change_they_describe() {
         "sha256:plan",
     );
     recorder.approval("req-approve", "cs-1", "user:alice", "approved");
-    recorder.result_receipt("req-apply", "cs-1", "vsrx-ci", true, "");
+    recorder
+        .result_receipt("req-apply", "cs-1", "vsrx-ci", true, "")
+        .unwrap();
 
     let closed = recorder.close_current().unwrap();
 
@@ -265,7 +269,9 @@ fn a_restarted_run_continues_the_tier_chain() {
 fn a_finished_change_stops_being_tracked() {
     let recorder = recorder_of(64);
     recorder.proposal("req-1", "cs-1", "vsrx-ci", "agent:planner", "sha256:plan");
-    recorder.result_receipt("req-2", "cs-1", "vsrx-ci", true, "");
+    recorder
+        .result_receipt("req-2", "cs-1", "vsrx-ci", true, "")
+        .unwrap();
 
     // A later record for the same changeset finds nothing, which is correct:
     // the change is over, and inventing context for it would be worse than

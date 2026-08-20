@@ -116,3 +116,126 @@ fn the_produced_head_comes_from_the_outbox_in_production_order() {
         "the head must be the last segment produced, not the first or the lowest"
     );
 }
+
+/// Segments must reach the outbox in production order, even when two devices
+/// flush the same recorder at once.
+///
+/// The recorder is shared across devices while the coordinator's guards are
+/// per device, so two commits genuinely run here in parallel. If the flush
+/// releases its lock before spooling, a later segment can overtake an earlier
+/// one: the durable chain then has N+1 without N, the later commit proceeds
+/// having "persisted" its intent, and `produced_head` reads the wrong tip
+/// because outbox order no longer means production order.
+#[test]
+fn concurrent_flushes_reach_the_outbox_in_order() {
+    use std::sync::Mutex;
+
+    let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let recording = Arc::clone(&seen);
+    let recorder = Arc::new(
+        EvidenceRecorder::new(RecorderConfig {
+            server_id: "srv-a".to_string(),
+            run_id: "run-1".to_string(),
+            resume_from: None,
+            records_per_segment: 1,
+        })
+        .with_spool(move |segment| {
+            // Hold the first segment long enough that an unserialised second
+            // one would sail past it.
+            if segment.segment_seq == 0 {
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            recording.lock().unwrap().push(segment.segment_seq);
+            Ok(())
+        }),
+    );
+
+    let first = Arc::clone(&recorder);
+    let one = std::thread::spawn(move || {
+        first
+            .apply_intent("req-1", "cs-1", "dev-1", "alice")
+            .unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(30));
+    let second = Arc::clone(&recorder);
+    let two = std::thread::spawn(move || {
+        second
+            .apply_intent("req-2", "cs-2", "dev-2", "bob")
+            .unwrap();
+    });
+    one.join().unwrap();
+    two.join().unwrap();
+
+    let order = seen.lock().unwrap().clone();
+    assert_eq!(
+        order,
+        vec![0, 1],
+        "a later segment overtook an earlier one, so the durable chain has a \
+         gap and outbox order no longer means production order"
+    );
+}
+
+/// A receipt must be durable too, not merely appended in memory.
+///
+/// Moving the receipt ahead of the local state write only helps if the record
+/// survives the process. `result_receipt` is the terminal record for a change,
+/// and the case it exists for — the device acted, local state did not follow —
+/// is exactly the case where nothing later comes along to flush it.
+#[test]
+fn a_receipt_is_persisted_not_just_appended() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = sink_config(dir.path());
+    let outbox = config.outbox_path.clone();
+    let sink = Arc::new(SsdfSink::new(config).unwrap());
+
+    let recorder = EvidenceRecorder::new(RecorderConfig {
+        server_id: "srv-a".to_string(),
+        run_id: "run-1".to_string(),
+        resume_from: None,
+        records_per_segment: 64,
+    })
+    .spooling_to(Arc::clone(&sink));
+
+    recorder.proposal("req-1", "cs-1", "vsrx-ci", "alice", "sha256:diff");
+    recorder
+        .apply_intent("req-2", "cs-1", "vsrx-ci", "alice")
+        .unwrap();
+    recorder
+        .result_receipt("req-3", "cs-1", "vsrx-ci", true, "")
+        .unwrap();
+
+    let spooled = std::fs::read_to_string(&outbox).unwrap();
+    assert!(
+        spooled.contains("result_receipt"),
+        "the outbox still ends at apply intent, which is the gap this ordering \
+         was meant to close: {spooled}"
+    );
+}
+
+/// A ledger failure after the outbox fsync is not a spool failure.
+///
+/// `SsdfSink::spool` writes and fsyncs the segment, *then* marks it pending in
+/// the ledger — two independently configured files. If only the ledger write
+/// fails, the record is already durable and `attempt_delivery` will still find
+/// it, because delivery reads the outbox rather than the ledger. Refusing the
+/// device operation at that point would fail closed on a record that was
+/// safely written, and requeue an already-durable segment for a duplicate
+/// append on the next flush.
+#[test]
+fn a_ledger_failure_after_fsync_is_not_a_spool_failure() {
+    use mecmcp_audit::SsdfSinkError;
+    use mecmcp_audit::recorder::spool_outcome;
+    use mecmcp_audit::sinks::delivery_ledger::LedgerError;
+
+    let ledger_only = SsdfSinkError::Ledger(LedgerError::InvalidEntry("ledger full".to_owned()));
+    assert!(
+        spool_outcome(Err(ledger_only)).is_ok(),
+        "the segment was fsynced before the ledger was touched, so it is durable"
+    );
+
+    let outbox_failed = SsdfSinkError::OutboxIo(std::io::Error::other("disk full"));
+    assert!(
+        spool_outcome(Err(outbox_failed)).is_err(),
+        "an outbox failure means nothing was written and must still fail closed"
+    );
+}

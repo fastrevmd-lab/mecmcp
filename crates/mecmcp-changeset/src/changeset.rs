@@ -363,7 +363,12 @@ impl ChangesetCoordinator {
             expires_at_unix: None,
             ticket: None,
         };
-        let waived_as = (waiver.kind, waiver.reason.clone());
+        let waived_as = (
+            waiver.kind,
+            waiver.reason.clone(),
+            waiver.expires_at_unix,
+            waiver.ticket.clone(),
+        );
         let waiver_digest =
             compute_waiver_digest_v3(&change_set_id, &record.digest, &record.owner, now, &waiver);
 
@@ -388,6 +393,8 @@ impl ChangesetCoordinator {
                 &change_set_id,
                 waived_as.0.as_str(),
                 &waived_as.1,
+                waived_as.2,
+                waived_as.3.as_deref(),
             );
         }
 
@@ -483,7 +490,12 @@ impl ChangesetCoordinator {
             expires_at_unix,
             ticket,
         };
-        let waived_as = (waiver.kind, waiver.reason.clone());
+        let waived_as = (
+            waiver.kind,
+            waiver.reason.clone(),
+            waiver.expires_at_unix,
+            waiver.ticket.clone(),
+        );
         let waiver_digest =
             compute_waiver_digest_v3(&change_set_id, &record.digest, &record.owner, now, &waiver);
 
@@ -508,6 +520,8 @@ impl ChangesetCoordinator {
                 &change_set_id,
                 waived_as.0.as_str(),
                 &waived_as.1,
+                waived_as.2,
+                waived_as.3.as_deref(),
             );
         }
 

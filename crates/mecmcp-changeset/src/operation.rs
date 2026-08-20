@@ -697,7 +697,13 @@ impl ChangesetCoordinator {
                 // The receipt describes what the device did, which local
                 // persistence cannot retract.
                 if let Some(evidence) = self.evidence() {
-                    evidence.result_receipt(
+                    // Unlike the intent, this cannot fail closed: the device has
+                    // already acted, and refusing afterwards would not un-act
+                    // it. The caller still gets its outcome; a trail that could
+                    // not be written is reported here rather than swallowed,
+                    // because an evidence gap that nobody hears about is the
+                    // condition this whole chain exists to make impossible.
+                    if let Err(error) = evidence.result_receipt(
                         &attribution.request_id.to_string(),
                         &receipt_changeset,
                         &receipt_device,
@@ -712,7 +718,14 @@ impl ChangesetCoordinator {
                         } else {
                             details.as_deref().unwrap_or("")
                         },
-                    );
+                    ) {
+                        tracing::error!(
+                            %error,
+                            operation_id,
+                            "the device answered but its result receipt could not be \
+                             persisted; the evidence chain ends at apply intent"
+                        );
+                    }
                 }
 
                 self.update(record).await?;

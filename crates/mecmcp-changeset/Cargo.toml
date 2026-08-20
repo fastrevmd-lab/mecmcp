@@ -20,6 +20,9 @@ tokio-util   = { version = "0.7" }
 tempfile     = { workspace = true }
 mecmcp-secret = { version = "0.13.0", path = "../mecmcp-secret" }
 rustix       = { workspace = true }
+# Reporting only: the one place an evidence write can fail after the device has
+# already acted, where refusing is impossible and silence is unacceptable.
+tracing      = { workspace = true }
 url          = "2"
 
 [dev-dependencies]
