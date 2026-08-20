@@ -9,6 +9,7 @@ pub mod canonical;
 pub mod device_log;
 pub mod evidence;
 mod init;
+pub mod recorder;
 mod redact;
 mod schema;
 mod scope;
