@@ -19,8 +19,8 @@ futures     = "0.3"
 http        = "1"
 http-body   = "1"
 http-body-util = "0.1"
-mecmcp-audit = { version = "0.12.0", path = "../mecmcp-audit" }
-mecmcp-auth = { version = "0.12.0", path = "../mecmcp-auth" }
+mecmcp-audit = { version = "0.13.0", path = "../mecmcp-audit" }
+mecmcp-auth = { version = "0.13.0", path = "../mecmcp-auth" }
 metrics     = { workspace = true }
 # metrics-exporter-prometheus must have default-features = false to avoid
 # pulling in rustls's aws-lc-rs backend via hyper-rustls, which conflicts with
@@ -54,7 +54,7 @@ zeroize     = "1"
 # on the normal dependency above — that ships test scaffolding in production
 # binaries and widens the attack surface for no runtime benefit. Cargo unifies
 # features per build, so `cargo test` gets it and `cargo build` does not.
-mecmcp-audit = { version = "0.12.0", path = "../mecmcp-audit", features = ["test-util"] }
+mecmcp-audit = { version = "0.13.0", path = "../mecmcp-audit", features = ["test-util"] }
 # Test-only: rmcp's `EventStore` is an `#[async_trait]` trait, so the fake store
 # that proves `LimitedSessionManager` forwards `event_store()` needs the macro.
 async-trait = { workspace = true }
