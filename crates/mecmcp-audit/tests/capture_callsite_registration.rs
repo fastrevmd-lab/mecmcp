@@ -13,41 +13,34 @@
 
 #![allow(clippy::unwrap_used)]
 
-use mecmcp_audit::AuditScope;
 use mecmcp_audit::testutil::run_with_capture;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 
-fn emit(tool: &'static str) {
-    let mut scope = AuditScope::stdio(tool, "read", Vec::new());
-    scope.succeed();
-}
-
-/// The case that cost a debugging session: another thread hammering the same
-/// callsites for the duration of the capture.
+/// The harder case: a callsite whose **first** registration happens on another
+/// thread while the capture is already running. A pre-emptive cache rebuild
+/// cannot help here — the callsite does not exist yet when it runs.
 #[test]
-fn concurrent_emission_does_not_empty_the_capture() {
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_for_thread = Arc::clone(&stop);
+fn a_callsite_first_registered_mid_capture_is_still_captured() {
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+
     let noisy = std::thread::spawn(move || {
-        while !stop_for_thread.load(Ordering::Relaxed) {
-            emit("concurrent_noise");
-        }
+        ready_rx.recv().expect("ready");
+        tracing::info!(target: "audit", marker = "from_noisy_thread", "shared callsite");
+        done_tx.send(()).expect("done");
     });
 
     let captured = run_with_capture(|| {
-        for _ in 0..50 {
-            emit("under_capture");
-            std::thread::yield_now();
-        }
+        ready_tx.send(()).expect("ready");
+        done_rx.recv().expect("done");
+        tracing::info!(target: "audit", marker = "from_capturing_thread", "shared callsite");
     });
 
-    stop.store(true, Ordering::Relaxed);
     noisy.join().expect("noisy thread");
 
     assert!(
-        captured.contains("tool=under_capture"),
-        "capture lost its own events while another thread emitted: {:?}",
-        &captured[..captured.len().min(200)]
+        captured.contains("from_capturing_thread"),
+        "the capture skipped its own event, so the callsite was cached as \
+         uninteresting by a thread with no subscriber: {captured:?}"
     );
 }
