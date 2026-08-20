@@ -49,3 +49,14 @@ metrics-exporter-prometheus = { workspace = true }
 
 [features]
 test-util = []
+
+# `testutil` is gated behind `test-util`, and an integration target does not get
+# `cfg(test)` on the library — so without this, `cargo test -p mecmcp-audit`
+# fails to compile this target rather than running it.
+[[test]]
+name = "capture_under_concurrency"
+required-features = ["test-util"]
+
+[[test]]
+name = "capture_callsite_registration"
+required-features = ["test-util"]

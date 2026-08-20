@@ -79,15 +79,85 @@ fn emits_audit_for_tool(captured: &str, tool: &str) -> bool {
     })
 }
 
+/// A subscriber that refuses to let its callsites be cached as uninteresting.
+///
+/// `tracing` caches an `Interest` per callsite **process-wide**, while
+/// [`run_with_capture`] installs its subscriber **thread-locally**. So a second
+/// thread that reaches a callsite with no subscriber of its own can have
+/// `Interest::never` cached for it, and the capturing thread then silently skips
+/// its own events — the capture comes back empty, which reads at the assertion
+/// as "the field was empty" rather than "the capture broke" (mecmcp#305).
+///
+/// Answering `Interest::sometimes()` opts every callsite out of that cache, so
+/// `enabled` is consulted per event against whatever dispatcher the *current*
+/// thread has. That is the only answer that is correct for a thread-local
+/// subscriber.
+///
+/// **This is defence for a case that has not been reproduced.** The cache
+/// rebuild below is what the tests actually need: with `AlwaysAsk` removed and
+/// the rebuild kept, both pass; with the rebuild removed and `AlwaysAsk` kept,
+/// `capture_under_concurrency` fails. A callsite whose *first* registration
+/// happens on a subscriber-less thread mid-capture is the window the rebuild
+/// cannot close — `capture_callsite_registration` drives exactly that and
+/// passes either way, so the window is argued from `tracing`'s API rather than
+/// demonstrated. Kept because the failure it would cause is silent and reads as
+/// someone else's regression; delete it if it ever gets in the way, and that
+/// test is the guard.
+struct AlwaysAsk<S>(S);
+
+impl<S: tracing::Subscriber> tracing::Subscriber for AlwaysAsk<S> {
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        // Ask the inner subscriber so its own bookkeeping still happens, then
+        // discard its answer: any cacheable verdict is what causes the bug.
+        let _ = self.0.register_callsite(metadata);
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        self.0.enabled(metadata)
+    }
+    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        self.0.new_span(span)
+    }
+    fn record(&self, span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        self.0.record(span, values);
+    }
+    fn record_follows_from(&self, span: &tracing::span::Id, follows: &tracing::span::Id) {
+        self.0.record_follows_from(span, follows);
+    }
+    fn event(&self, event: &tracing::Event<'_>) {
+        self.0.event(event);
+    }
+    fn enter(&self, span: &tracing::span::Id) {
+        self.0.enter(span);
+    }
+    fn exit(&self, span: &tracing::span::Id) {
+        self.0.exit(span);
+    }
+    fn clone_span(&self, id: &tracing::span::Id) -> tracing::span::Id {
+        self.0.clone_span(id)
+    }
+    fn try_close(&self, id: tracing::span::Id) -> bool {
+        self.0.try_close(id)
+    }
+}
+
 /// Run `f` with a temporary subscriber capturing INFO output; return the text.
 pub fn run_with_capture<F: FnOnce()>(f: F) -> String {
     let cap = CapturingWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(cap.clone())
-        .with_ansi(false)
-        .with_target(true)
-        .with_max_level(tracing::Level::INFO)
-        .finish();
+    let subscriber = AlwaysAsk(
+        tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_ansi(false)
+            .with_target(true)
+            .with_max_level(tracing::Level::INFO)
+            .finish(),
+    );
+    // Existing callsites may already hold a cached verdict from before this
+    // subscriber existed; `AlwaysAsk` only governs registrations it sees.
+    tracing::callsite::rebuild_interest_cache();
     tracing::subscriber::with_default(subscriber, f);
     let bytes = cap.0.lock().unwrap().clone();
     String::from_utf8(bytes).unwrap()
