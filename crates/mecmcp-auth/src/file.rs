@@ -380,7 +380,17 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
             source: StoreError::Entry(crate::entry::EntryError::Invalid(error)),
         })?;
 
-        validate_scope_agreement(&updated).map_err(|error| FileError::Store {
+        let minted = updated
+            .entries()
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| FileError::Store {
+                path: path.to_path_buf(),
+                source: StoreError::Entry(crate::entry::EntryError::Invalid(
+                    "minted token missing from store".to_owned(),
+                )),
+            })?;
+        validate_scope_agreement(minted).map_err(|error| FileError::Store {
             path: path.to_path_buf(),
             source: StoreError::Entry(crate::entry::EntryError::Invalid(error)),
         })?;
@@ -532,7 +542,17 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
             source: StoreError::Entry(crate::entry::EntryError::Invalid(error)),
         })?;
 
-        validate_scope_agreement(&updated).map_err(|error| FileError::Store {
+        let changed = updated
+            .entries()
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| FileError::Store {
+                path: path.to_path_buf(),
+                source: StoreError::Entry(crate::entry::EntryError::Invalid(format!(
+                    "token '{name}' missing from store after scope change"
+                ))),
+            })?;
+        validate_scope_agreement(changed).map_err(|error| FileError::Store {
             path: path.to_path_buf(),
             source: StoreError::Entry(crate::entry::EntryError::Invalid(error)),
         })?;
@@ -744,21 +764,25 @@ pub fn write_atomic<G: Grant + serde::Serialize>(
 /// of a scope shape it already has would turn an emergency rotation into an
 /// outage. This runs only where scopes are chosen — `add` and `set_scopes`.
 ///
+/// It takes **one entry**, not the store, for the same reason. A file is
+/// allowed to contain the legacy shape; validating every entry on each mutation
+/// would let one such token block every other token's mint and scope change,
+/// and would make two of them unfixable — narrowing either still trips over the
+/// one left untouched. Only the entry being written is this check's business.
+///
 /// Grants whose subjects are regions *within* a target (PAN-OS XPaths) are a
 /// different axis and are unaffected; see [`Grant::subjects_are_targets`].
-fn validate_scope_agreement<G: Grant>(store: &TokenStore<G>) -> Result<(), String> {
-    for entry in store.entries() {
-        let target_scoped_grant = entry
-            .grant
-            .as_ref()
-            .is_some_and(Grant::subjects_are_targets);
-        if target_scoped_grant && matches!(entry.devices, ScopeSet::Wildcard) {
-            return Err(format!(
-                "token '{}' pairs a wildcard target scope with a grant that names specific \
-                 targets; narrow the scope to the grant's subjects so both layers agree",
-                entry.name
-            ));
-        }
+fn validate_scope_agreement<G: Grant>(entry: &TokenEntry<G>) -> Result<(), String> {
+    let target_scoped_grant = entry
+        .grant
+        .as_ref()
+        .is_some_and(Grant::subjects_are_targets);
+    if target_scoped_grant && matches!(entry.devices, ScopeSet::Wildcard) {
+        return Err(format!(
+            "token '{}' pairs a wildcard target scope with a grant that names specific \
+             targets; narrow the scope to the grant's subjects so both layers agree",
+            entry.name
+        ));
     }
     Ok(())
 }
@@ -2037,6 +2061,94 @@ mod tests {
             result.is_err(),
             "widening back to wildcard reopens the same disagreement the mint refuses"
         );
+    }
+
+    /// The legacy shape is deliberately still allowed to load, rotate and
+    /// revoke, so a file can contain one. Validating the whole store on every
+    /// mutation would make that one entry block every *other* token's mint and
+    /// scope change — and, with two of them, make narrowing either one
+    /// impossible, since the untouched entry keeps failing the check. Only the
+    /// entry being mutated is this call's business.
+    fn store_with_two_legacy_entries(path: &std::path::Path) {
+        let entries: Vec<TokenEntry<TargetScopedGrant>> = ["legacy-a", "legacy-b"]
+            .iter()
+            .map(|name| {
+                let (_secret, digest) = crate::token::TokenSecret::mint().expect("mint");
+                TokenEntry {
+                    name: (*name).to_owned(),
+                    digest,
+                    devices: ScopeSet::Wildcard,
+                    tools: ScopeSet::Wildcard,
+                    created_at: Utc::now(),
+                    expires_at: None,
+                    grant: Some(org_grant()),
+                    provider: None,
+                    provider_tier: None,
+                    on_behalf_of: None,
+                    actor_type: crate::ActorType::Human,
+                }
+            })
+            .collect();
+        write_atomic(path, &entries, DEFAULT_STORE_VERSION).expect("seed legacy store");
+    }
+
+    #[test]
+    fn a_legacy_entry_does_not_block_minting_a_compliant_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        store_with_two_legacy_entries(&path);
+        let known = KnownNames {
+            devices: None,
+            tools: &["get_mist_org"],
+        };
+
+        TokenStoreFile::<TargetScopedGrant>::add_with_options(
+            &path,
+            "compliant",
+            ScopeSet::Allowlist(vec!["org/11111111-2222-3333-4444-555555555555".to_owned()]),
+            ScopeSet::Wildcard,
+            None,
+            Some(org_grant()),
+            None,
+            None,
+            None,
+            None,
+            &known,
+        )
+        .expect("an unrelated legacy entry must not block a compliant mint");
+    }
+
+    #[test]
+    fn legacy_entries_can_be_narrowed_one_at_a_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        store_with_two_legacy_entries(&path);
+        let known = KnownNames {
+            devices: None,
+            tools: &["get_mist_org"],
+        };
+        let narrowed =
+            ScopeSet::Allowlist(vec!["org/11111111-2222-3333-4444-555555555555".to_owned()]);
+
+        TokenStoreFile::<TargetScopedGrant>::set_scopes(
+            &path,
+            "legacy-a",
+            Some(narrowed.clone()),
+            None,
+            None,
+            &known,
+        )
+        .expect("narrowing the first must not be blocked by the second");
+
+        TokenStoreFile::<TargetScopedGrant>::set_scopes(
+            &path,
+            "legacy-b",
+            Some(narrowed),
+            None,
+            None,
+            &known,
+        )
+        .expect("narrowing the second must then succeed too");
     }
 
     #[test]
