@@ -750,14 +750,19 @@ pub async fn bearer_preflight_middleware<G: Grant>(
             .flatten(),
     };
 
+    // The transport's own audit event is not subject to that: it describes one
+    // specific element — the same one `audited_tool` names — so the id
+    // `audited_call_provenance` resolved is the right one for it. Withholding it
+    // there would drop real provenance to solve a problem the extension has.
+    let audited_call_id = audited_extras
+        .as_ref()
+        .and_then(|p| p.client_call_id.clone());
+
     let mut scope = audited_tool.map(|tool| {
         let mut scope = AuditScope::from_caller(&caller, tool, "transport", Vec::new());
         // `AuditScope` is constructor-only, so this reaches the audit trail
         // without the breaking change described above.
-        scope.set_client_extras(
-            client_extras.client_version.clone(),
-            client_extras.client_call_id.clone(),
-        );
+        scope.set_client_extras(client_extras.client_version.clone(), audited_call_id);
         scope.meta("layer", "preflight");
         scope
     });
