@@ -171,6 +171,14 @@ impl ChangesetCoordinator {
 
         self.insert_change_set(record.clone()).await?;
 
+        // A change was proposed. `request_id` is the change-set id: this call
+        // has no MCP request id to hand, and the two later records key on
+        // `changeset_id` anyway, which is what carries context across the
+        // lifecycle (mecmcp#292).
+        if let Some(evidence) = self.evidence() {
+            evidence.proposal(&id, &id, &record.device, &record.owner, &record.digest);
+        }
+
         Ok(record.into())
     }
 
@@ -262,13 +270,19 @@ impl ChangesetCoordinator {
         record.state = ChangeSetState::Approved;
         record.approver = Some(approver.clone());
         record.approval = Some(ApprovalRecord {
-            approver: Some(approver),
+            approver: Some(approver.clone()),
             approved_at_unix: now,
             digest: approval_digest,
             waived: None,
         });
 
         self.update_change_set(record.clone()).await?;
+
+        // A human decided. Recorded after the state write, so the trail cannot
+        // claim an approval the coordinator failed to persist.
+        if let Some(evidence) = self.evidence() {
+            evidence.approval(&change_set_id, &change_set_id, &approver, "approved");
+        }
 
         Ok(record.into())
     }
@@ -349,6 +363,12 @@ impl ChangesetCoordinator {
             expires_at_unix: None,
             ticket: None,
         };
+        let waived_as = (
+            waiver.kind,
+            waiver.reason.clone(),
+            waiver.expires_at_unix,
+            waiver.ticket.clone(),
+        );
         let waiver_digest =
             compute_waiver_digest_v3(&change_set_id, &record.digest, &record.owner, now, &waiver);
 
@@ -362,6 +382,21 @@ impl ChangesetCoordinator {
         });
 
         self.update_change_set(record.clone()).await?;
+
+        // Every prod server in this fleet runs lab mode, so this — not
+        // `approve_change_set` — is the path a real change takes. Emitting
+        // nothing here would leave the trail jumping proposal to apply intent,
+        // which reads exactly like a bypassed approval gate.
+        if let Some(evidence) = self.evidence() {
+            evidence.approval_waived(
+                &change_set_id,
+                &change_set_id,
+                waived_as.0.as_str(),
+                &waived_as.1,
+                waived_as.2,
+                waived_as.3.as_deref(),
+            );
+        }
 
         Ok(record.into())
     }
@@ -455,6 +490,12 @@ impl ChangesetCoordinator {
             expires_at_unix,
             ticket,
         };
+        let waived_as = (
+            waiver.kind,
+            waiver.reason.clone(),
+            waiver.expires_at_unix,
+            waiver.ticket.clone(),
+        );
         let waiver_digest =
             compute_waiver_digest_v3(&change_set_id, &record.digest, &record.owner, now, &waiver);
 
@@ -468,6 +509,21 @@ impl ChangesetCoordinator {
         });
 
         self.update_change_set(record.clone()).await?;
+
+        // Same reasoning as the lab-mode path, and more pointed: an operator
+        // waiver is a bounded, ticketed exception, and the trail is where that
+        // boundedness is visible. The ticket rides in metadata so an auditor can
+        // follow the exception back to what authorised it.
+        if let Some(evidence) = self.evidence() {
+            evidence.approval_waived(
+                &change_set_id,
+                &change_set_id,
+                waived_as.0.as_str(),
+                &waived_as.1,
+                waived_as.2,
+                waived_as.3.as_deref(),
+            );
+        }
 
         Ok(record.into())
     }

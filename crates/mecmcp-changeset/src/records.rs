@@ -511,6 +511,22 @@ pub enum WaiverKind {
     OperatorTool,
 }
 
+impl WaiverKind {
+    /// The wire name, identical to the serde representation.
+    ///
+    /// Evidence metadata and the persisted record must name a waiver the same
+    /// way; two spellings of one kind is how a search for every operator-file
+    /// exception quietly misses half of them.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LabMode => "lab_mode",
+            Self::OperatorFile => "operator_file",
+            Self::OperatorTool => "operator_tool",
+        }
+    }
+}
+
 /// Why an approval was waived, and under what authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

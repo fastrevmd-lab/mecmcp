@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -65,6 +65,33 @@ pub enum LedgerError {
     InvalidEntry(String),
 }
 
+/// Byte offset just past the file's last newline — where a complete record ends.
+///
+/// Scans backwards in bounded chunks rather than reading the file, because the
+/// ledger is append-only and its history has no upper bound while the answer is
+/// always within one line of the end. Returns 0 for a file with no newline at
+/// all, which means the only line present is itself unterminated.
+fn last_newline_end(file: &mut File, length: u64) -> Result<u64, LedgerError> {
+    /// One line is far smaller than this; the chunking is a safety net, not a
+    /// hot path.
+    const CHUNK: u64 = 8192;
+
+    let mut end = length;
+    let mut buffer = Vec::new();
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        let span = usize::try_from(end - start).unwrap_or(usize::MAX);
+        buffer.resize(span, 0);
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer)?;
+        if let Some(offset) = buffer.iter().rposition(|byte| *byte == b'\n') {
+            return Ok(start + offset as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
+}
+
 /// Delivery ledger: tracks delivery status for evidence segments.
 ///
 /// The ledger is an append-only file of JSON lines. Each line is a status
@@ -86,14 +113,48 @@ impl DeliveryLedger {
         let path = std::path::absolute(path)?;
 
         // Open for append, create if absent.
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(&path)?;
 
-        // Load existing entries into the index.
+        // A crash or a full disk partway through `write_entry` leaves a final
+        // line with no terminating newline. That is an interrupted append, not
+        // corruption, and it must not be fatal: the sink treats a ledger failure
+        // as survivable *because* the segment is already safe in the outbox, and
+        // that reasoning collapses if the next start cannot open the ledger to
+        // replay it. Drop the stump and truncate, so the next append does not
+        // weld itself onto a partial record.
+        //
+        // Only the last line gets this benefit. A malformed line anywhere else
+        // cannot be explained by an interrupted append, and rewritten history is
+        // the one thing this subsystem exists to notice.
+        //
+        // This works in bytes, and deliberately so on both counts. Decoding
+        // first would fail with `InvalidData` when the short write split a
+        // multibyte character — identifiers are free-form strings, so it can —
+        // and that error arrives *before* any repair could run, leaving the
+        // ledger unopenable for exactly the case being repaired. Buffering the
+        // whole file to find the newline would also make startup cost grow with
+        // the ledger's entire history, which is append-only and unbounded, when
+        // all that is needed is its tail.
+        let length = file.metadata()?.len();
+        let keep = last_newline_end(&mut file, length)?;
+        if keep < length {
+            tracing::warn!(
+                bytes = length - keep,
+                path = %path.display(),
+                "discarding an unterminated final ledger entry left by an interrupted write"
+            );
+            file.set_len(keep)?;
+            file.sync_all()?;
+        }
+
+        // Load existing entries into the index, streaming: the index holds one
+        // status per segment, but the file holds every transition ever written.
         let mut index = HashMap::new();
+        file.seek(SeekFrom::Start(0))?;
         let reader = BufReader::new(&file);
         for line in reader.lines() {
             let line = line?;

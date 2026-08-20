@@ -603,6 +603,41 @@ impl ChangesetCoordinator {
             ));
         }
 
+        // The device is about to be touched. This is written — and, with a
+        // spool attached, persisted — *before* that happens, so a crash during
+        // the commit still leaves evidence that the attempt was made. A record
+        // written only on the way out cannot describe the case that matters
+        // most (mecmcp#292).
+        //
+        // It also happens before the `Committing` transition below, so a spool
+        // that refuses leaves the record exactly where it was — still
+        // `Validated`, candidate on the device, retryable once the outbox is
+        // writable again. Refusing after the transition would strand it in
+        // `Committing` for a commit that never happened.
+        if let Some(evidence) = self.evidence() {
+            evidence
+                .apply_intent(
+                    &attribution.request_id.to_string(),
+                    record.change_set_id.as_deref().unwrap_or(operation_id),
+                    &record.device,
+                    &attribution.principal.to_string(),
+                )
+                .map_err(|error| {
+                    // Fail closed. Committing anyway would produce the one state
+                    // the chain exists to rule out — a device changed with no
+                    // record that anyone tried — and #292 is explicit that such
+                    // a gap is worse than no audit at all because it is
+                    // invisible.
+                    CoordinatorError::new(
+                        "device",
+                        format!(
+                            "commit refused: the apply-intent evidence record could not be \
+                             persisted ({error}); the operation is still staged"
+                        ),
+                    )
+                })?;
+        }
+
         // Transition to Committing
         record.state = LifecycleState::Committing;
         self.update(record.clone()).await?;
@@ -644,6 +679,55 @@ impl ChangesetCoordinator {
                 if succeeded {
                     record.config_lock_held = false;
                 }
+                let receipt_device = record.device.clone();
+                let receipt_changeset = record
+                    .change_set_id
+                    .clone()
+                    .unwrap_or_else(|| operation_id.to_owned());
+                // The device answered. A failure is recorded as fully as a
+                // success — a trail that only shows what worked cannot answer
+                // the question anyone actually asks it.
+                //
+                // Written *before* the local state update, which can fail on a
+                // full disk or a permission change. Doing it after meant the `?`
+                // below returned first and the chain ended at apply intent for a
+                // commit that had reached the device: evidence of an attempt
+                // with no outcome, at precisely the moment device state and
+                // local state have diverged and someone has to go and look.
+                // The receipt describes what the device did, which local
+                // persistence cannot retract.
+                if let Some(evidence) = self.evidence() {
+                    // Unlike the intent, this cannot fail closed: the device has
+                    // already acted, and refusing afterwards would not un-act
+                    // it. The caller still gets its outcome; a trail that could
+                    // not be written is reported here rather than swallowed,
+                    // because an evidence gap that nobody hears about is the
+                    // condition this whole chain exists to make impossible.
+                    if let Err(error) = evidence.result_receipt(
+                        &attribution.request_id.to_string(),
+                        &receipt_changeset,
+                        &receipt_device,
+                        succeeded,
+                        // Only a failure's details are an error. A successful
+                        // commit's details are warnings or a job note, and
+                        // filing those as errors hands every warning-bearing
+                        // success back to anyone filtering the trail for
+                        // failures.
+                        if succeeded {
+                            ""
+                        } else {
+                            details.as_deref().unwrap_or("")
+                        },
+                    ) {
+                        tracing::error!(
+                            %error,
+                            operation_id,
+                            "the device answered but its result receipt could not be \
+                             persisted; the evidence chain ends at apply intent"
+                        );
+                    }
+                }
+
                 self.update(record).await?;
 
                 Ok(CommitOutcome::Reconciled {
