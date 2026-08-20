@@ -230,6 +230,26 @@ impl EvidenceRecorder {
         self
     }
 
+    /// Spool to an [`SsdfSink`](crate::SsdfSink) — the wiring #292 asks for.
+    ///
+    /// Both halves existed and were tested separately; nothing joined them, so
+    /// a correctly configured deployment still wrote nothing. This is that
+    /// join, offered here rather than hand-rolled per server so the error
+    /// mapping is made once.
+    ///
+    /// Only the *spool* is fail-closed. Delivery is not: `SsdfSink::spool`
+    /// returns once the segment is fsynced to the outbox, and an unreachable
+    /// ClickHouse is dealt with later by `attempt_delivery`. A caller is
+    /// therefore blocked only when the record could not be made durable at
+    /// all — which is the case where proceeding would leave no trace.
+    #[must_use]
+    pub fn spooling_to(self, sink: std::sync::Arc<crate::SsdfSink>) -> Self {
+        self.with_spool(move |segment| {
+            sink.spool(segment)
+                .map_err(|error| SpoolError::new(error.to_string()))
+        })
+    }
+
     /// A change was proposed.
     pub fn proposal(
         &self,
