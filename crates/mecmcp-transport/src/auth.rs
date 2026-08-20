@@ -672,12 +672,13 @@ pub async fn bearer_preflight_middleware<G: Grant>(
     // and `next.run(...).await` would keep a second copy of every in-flight
     // body alive, and with the default 64-request concurrency that is hundreds
     // of megabytes of duplicate data.
-    let (request_provenance, audited_tool, audited_extras) = {
+    let (request_provenance, audited_tool, audited_extras, audited_calls) = {
         let parsed: Option<Value> = serde_json::from_slice(&body_bytes).ok();
         let identity = parsed.as_ref().and_then(identity_provenance);
         let tool = parsed.as_ref().and_then(tool_name);
         let extras = parsed.as_ref().and_then(audited_call_provenance);
-        (identity, tool, extras)
+        let calls = parsed.as_ref().map_or(0, audited_call_count);
+        (identity, tool, extras, calls)
     };
     if let Some(provenance) = request_provenance.as_ref() {
         if caller.client_name.is_none() {
@@ -707,38 +708,61 @@ pub async fn bearer_preflight_middleware<G: Grant>(
     // the *only* record of the call — the handler never runs, so nothing
     // downstream can correct an optimistic outcome, and a `succeed()` here
     // would assert that a request answered with 403 was allowed.
+    // Resolved once, spent twice: on this scope, and in request extensions so a
+    // consuming server's own tool-level audit record can carry them too. It
+    // could not previously — `CallerCtx` is the only thing that reaches a
+    // handler, and it does not carry these (mecmcp#304).
+    //
+    // These are not on `CallerCtx` deliberately. It is constructed
+    // field-by-field by every consuming server, so adding to it is a breaking
+    // change across all of them.
+    //
+    // The version describes the *client*, so any element of a batch that names
+    // it is authoritative for all of them: session first — where a stateful
+    // client's `clientInfo` lives after `initialize` — then the audited call,
+    // then whichever element carried the identity. The call id is the opposite:
+    // it belongs to one call, so it comes from the audited element or not at
+    // all. See `audited_call_provenance`.
+    let client_extras = crate::client_info::ClientExtras {
+        client_version: session_client_version
+            .clone()
+            .or_else(|| {
+                audited_extras
+                    .as_ref()
+                    .and_then(|p| p.client_version.clone())
+            })
+            .or_else(|| {
+                request_provenance
+                    .as_ref()
+                    .and_then(|p| p.client_version.clone())
+            }),
+        // Withheld for a batch. The extension is per HTTP request, but a call id
+        // belongs to one call: a service that dispatches each element would read
+        // the *first* element's id for every one of them and attribute records
+        // to a call that did not make them. The version is unaffected — it
+        // describes the client, so it is true of every element.
+        client_call_id: (audited_calls == 1)
+            .then(|| {
+                audited_extras
+                    .as_ref()
+                    .and_then(|p| p.client_call_id.clone())
+            })
+            .flatten(),
+    };
+
+    // The transport's own audit event is not subject to that: it describes one
+    // specific element — the same one `audited_tool` names — so the id
+    // `audited_call_provenance` resolved is the right one for it. Withholding it
+    // there would drop real provenance to solve a problem the extension has.
+    let audited_call_id = audited_extras
+        .as_ref()
+        .and_then(|p| p.client_call_id.clone());
+
     let mut scope = audited_tool.map(|tool| {
         let mut scope = AuditScope::from_caller(&caller, tool, "transport", Vec::new());
-        // These live on the scope rather than on `CallerCtx` deliberately.
-        // `CallerCtx` is constructed field-by-field by every consuming server,
-        // so adding to it is a breaking change across all of them; `AuditScope`
-        // is constructor-only, so this reaches the audit trail without one.
-        // The version prefers the session, which is where a stateful client's
-        // `clientInfo` lives after `initialize`; the request body is the
-        // stateless path's only source. The call id comes from the audited
-        // element alone — see `audited_call_provenance`.
-        scope.set_client_extras(
-            // The version describes the client, not the call, so any element
-            // of a batch that names it is authoritative for all of them:
-            // session first, then the audited call, then whichever element
-            // carried the identity. The call id is the opposite — it belongs to
-            // one call, so it comes from the audited element or not at all.
-            session_client_version
-                .clone()
-                .or_else(|| {
-                    audited_extras
-                        .as_ref()
-                        .and_then(|p| p.client_version.clone())
-                })
-                .or_else(|| {
-                    request_provenance
-                        .as_ref()
-                        .and_then(|p| p.client_version.clone())
-                }),
-            audited_extras
-                .as_ref()
-                .and_then(|p| p.client_call_id.clone()),
-        );
+        // `AuditScope` is constructor-only, so this reaches the audit trail
+        // without the breaking change described above.
+        scope.set_client_extras(client_extras.client_version.clone(), audited_call_id);
         scope.meta("layer", "preflight");
         scope
     });
@@ -772,6 +796,7 @@ pub async fn bearer_preflight_middleware<G: Grant>(
     // The parts are mutable here, so we can replace the extension.
     let mut request = Request::from_parts(parts, Body::from(body_bytes));
     request.extensions_mut().insert(caller);
+    request.extensions_mut().insert(client_extras);
 
     next.run(request).await
 }
@@ -891,6 +916,25 @@ fn identity_provenance(value: &Value) -> Option<crate::client_info::RequestProve
 /// In a batch those need not be the same element, and attributing one call's id
 /// to another call's audit record is worse than recording none — so the per-call
 /// id is read from the audited element only, and falls back to nothing.
+/// How many elements of this body are calls the audit path would attribute to.
+///
+/// One is the case where a per-call id can be safely handed to a handler; more
+/// than one means the id belongs to a specific element and the extension, which
+/// is per HTTP request, cannot say which.
+fn audited_call_count(value: &Value) -> usize {
+    elements(value)
+        .iter()
+        .filter(|request| {
+            request.get("method").and_then(Value::as_str) == Some("tools/call")
+                && request
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some()
+        })
+        .count()
+}
+
 fn audited_call_provenance(value: &Value) -> Option<crate::client_info::RequestProvenance> {
     let requests = elements(value);
 

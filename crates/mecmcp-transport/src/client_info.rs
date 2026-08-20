@@ -163,6 +163,31 @@ impl ClientInfo {
             .and_then(|p| p.session_id.as_deref())
     }
 }
+/// The client-asserted facts that do not fit on `CallerCtx`.
+///
+/// `CallerCtx` carries `client_name`, `model_id` and `session_id`, and every
+/// consuming server constructs it field-by-field — so growing it is a breaking
+/// change across all of them. These two travel in request extensions instead,
+/// which is additive: a consumer that wants them reads them, and one that does
+/// not is unaffected (mecmcp#304).
+///
+/// Both are **client-asserted and unverifiable**, exactly like the three on
+/// `CallerCtx`. Nothing here is vouched for by the token.
+/// `#[non_exhaustive]`: this exists precisely because growing `CallerCtx` is a
+/// breaking change for every consumer that builds it as a literal. A public
+/// struct with public fields would reproduce that failure the first time a
+/// sixth client-asserted field appears, which is the same reason
+/// `RequestProvenance` carries the attribute.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClientExtras {
+    /// Client version, from `clientInfo.version`. Describes the client, so any
+    /// element of a batch that names it is authoritative for the whole batch.
+    pub client_version: Option<String>,
+    /// Per-call id, from `_meta."claudecode/toolUseId"`. Belongs to one call,
+    /// so it comes from the audited element or not at all.
+    pub client_call_id: Option<String>,
+}
 
 /// Client-asserted provenance read from a single request's `_meta` (#288).
 ///

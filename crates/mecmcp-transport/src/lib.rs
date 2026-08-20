@@ -28,7 +28,7 @@ pub use auth::{
     BearerAuthError, BearerAuthenticator, BearerBoundary, BearerResponseProfile,
     BearerResponseStyle, BoundaryAccounting, apply_bearer_boundary,
 };
-pub use client_info::{ClientInfo, RequestProvenance};
+pub use client_info::{ClientExtras, ClientInfo, RequestProvenance};
 
 // Internal types and functions exported only for testing
 #[doc(hidden)]
