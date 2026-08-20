@@ -256,14 +256,30 @@ fn an_insert_carries_a_dedup_token_for_its_segment() {
 
     let token = dedup_token("junos-950", "run-7", 42);
 
-    assert_eq!(
-        token, "junos-950:run-7:42",
-        "the token must identify exactly one segment: two writers, or two runs \
-         of one writer, must never collide on it"
+    assert!(
+        token.contains("junos-950") && token.contains("run-7") && token.contains("42"),
+        "the token should stay legible for debugging: {token}"
     );
     assert_ne!(
         dedup_token("junos-950", "run-7", 42),
         dedup_token("junos-950", "run-70", 4),
         "a token built by concatenation without separators would collide here"
+    );
+    // The encoding must be injective for *any* identifier, not merely for
+    // well-behaved ones. `RecorderConfig` takes unconstrained strings, so a
+    // separator can appear inside a field, and plain joining is then not
+    // one-to-one. A collision is worse than a crash: ClickHouse acknowledges
+    // the insert and discards the rows as an already-seen block, so a real
+    // segment vanishes with a success reported to the sink.
+    assert_ne!(
+        dedup_token("a:b", "c", 1),
+        dedup_token("a", "b:c", 1),
+        "these differ only in where the field boundary falls, and a token that \
+         cannot tell them apart silently drops one writer's segment"
+    );
+    assert_ne!(
+        dedup_token("a", "b", 12),
+        dedup_token("a", "b:1", 2),
+        "the sequence number is a field like any other"
     );
 }

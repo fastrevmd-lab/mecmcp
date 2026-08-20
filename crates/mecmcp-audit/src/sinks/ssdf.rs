@@ -119,12 +119,24 @@ struct SsdfRow {
 /// retrying is not atomic against a request still in flight. The token closes
 /// that window server-side (ssdf#49, migration 016).
 ///
-/// Colon-separated rather than concatenated, so `("a", "b1", 2)` and
-/// `("a", "b", 12)` cannot produce the same token and silently suppress a real
-/// segment. It identifies exactly one segment of one run of one writer.
+/// **Length-prefixed, because the encoding has to be injective for any
+/// identifier the API accepts.** `RecorderConfig` takes unconstrained strings,
+/// so a separator can appear inside a field, and simply joining on one is then
+/// not one-to-one: `("a:b", "c", 1)` and `("a", "b:c", 1)` both render as
+/// `a:b:c:1`. A collision here is worse than a crash — ClickHouse acknowledges
+/// the insert and drops the rows as an already-seen block, so a real segment
+/// disappears while the sink is told it succeeded. Prefixing each field with
+/// its byte length makes the boundaries unambiguous.
+///
+/// It stays legible on purpose: this ends up in ClickHouse query logs, and a
+/// hash would be injective too but useless when reading them.
 #[must_use]
 pub fn dedup_token(server_id: &str, run_id: &str, segment_seq: u64) -> String {
-    format!("{server_id}:{run_id}:{segment_seq}")
+    format!(
+        "{}:{server_id}:{}:{run_id}:{segment_seq}",
+        server_id.len(),
+        run_id.len(),
+    )
 }
 
 /// The head of the newest segment a writer produced, read from its outbox.
