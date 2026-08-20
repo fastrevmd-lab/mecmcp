@@ -15,7 +15,7 @@ mod authority;
 mod file;
 
 pub use authority::{ConfigAuthority, LocalAuthority};
-pub use file::FileInventory;
+pub use file::{FileInventory, MigrationReport, migrate_to_canonical};
 
 use std::error::Error;
 

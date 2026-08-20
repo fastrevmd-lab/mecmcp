@@ -22,6 +22,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -351,6 +352,126 @@ fn read_inventory_file(path: &Path) -> Result<mecmcp_secret::SecretBytes, Invent
             }
         },
     )
+}
+
+/// SHA-256 of the file at `path`. Returns zeros if the file doesn't exist.
+#[allow(dead_code)]
+/// What a migration did, so a caller can tell a conversion from a no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReport {
+    /// Whether the file was rewritten. `false` means it was already canonical.
+    pub converted: bool,
+    /// Where the pre-migration file was kept, when one was written.
+    pub backup: Option<PathBuf>,
+    /// How many devices the canonical file carries.
+    pub devices: usize,
+}
+
+/// Rewrite an inventory file in the canonical envelope.
+///
+/// #27 taught this crate to *read* three shapes and nothing to emit the
+/// canonical one, so every live file stayed legacy: junos cannot version its
+/// schema without an envelope, and `_blocklist_defaults` keeps sharing the
+/// device namespace (mecmcp#48).
+///
+/// Migration is **explicit** — a separate call, never a side effect of writing
+/// a device. An operator's inventory changing shape because they ran
+/// `add_device` is a surprise, and on a `protected` server it is a surprise
+/// during a change. Shape-preserving writes stay the default; this is the
+/// opt-in.
+///
+/// Idempotent: an already-canonical file is left untouched and reported as
+/// `converted: false`, so "run it and see" is a safe thing for an operator to
+/// do.
+///
+/// The original is kept beside the file as `<name>.pre-canonical`, at the same
+/// mode, which is what makes this reversible without a snapshot. The rewrite
+/// itself goes through the same atomic write the rest of this module uses, so a
+/// crash mid-write cannot leave a half-written inventory. The mode is preserved,
+/// because [`FileInventory::load`] refuses a group- or world-readable file (#173)
+/// and a widened mode would fail at the next restart rather than here.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, is not a shape this crate
+/// understands, or cannot be rewritten. A failed migration leaves the original
+/// in place.
+pub fn migrate_to_canonical<D, P>(path: impl AsRef<Path>) -> Result<MigrationReport, InventoryError>
+where
+    for<'de> D: Deserialize<'de> + serde::Serialize,
+    for<'de> P: Deserialize<'de> + serde::Serialize,
+{
+    let path = path.as_ref();
+    let bytes = read_inventory_file(path)?;
+    let value: serde_json::Value = serde_json::from_slice(bytes.expose())
+        .map_err(|e| InventoryError::ParseError(e.to_string()))?;
+
+    // Parsing first means an unreadable or unrecognised file is refused before
+    // anything is written or moved.
+    let (devices, policy) = parse_inventory::<D, P>(bytes.expose())?;
+
+    if detect_shape(&value)? == InventoryShape::Canonical {
+        return Ok(MigrationReport {
+            converted: false,
+            backup: None,
+            devices: devices.len(),
+        });
+    }
+
+    let canonical = canonical_value(&devices, policy.as_ref())?;
+
+    let backup = path.with_extension("pre-canonical");
+    std::fs::copy(path, &backup).map_err(|e| {
+        InventoryError::ParseError(format!("could not write backup {}: {e}", backup.display()))
+    })?;
+    // `copy` takes the source's permission bits, but say it rather than rely on
+    // it: this file carries the same secrets as the inventory.
+    std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        InventoryError::ParseError(format!("could not secure backup {}: {e}", backup.display()))
+    })?;
+
+    write_atomic(path, &canonical).map_err(|e| {
+        InventoryError::ParseError(format!("could not write {}: {e}", path.display()))
+    })?;
+
+    Ok(MigrationReport {
+        converted: true,
+        backup: Some(backup),
+        devices: devices.len(),
+    })
+}
+
+/// Build the canonical envelope from parsed devices and policy.
+///
+/// The policy slot is omitted when there is none, rather than written as
+/// `null`: a file that says `"policy": null` and one that says nothing are the
+/// same to the reader, and the shorter one does not invite an operator to fill
+/// it in.
+fn canonical_value<D, P>(
+    devices: &HashMap<String, D>,
+    policy: Option<&P>,
+) -> Result<serde_json::Value, InventoryError>
+where
+    D: serde::Serialize,
+    P: serde::Serialize,
+{
+    // BTreeMap so the emitted file is ordered and a re-migration produces byte
+    // -identical output; a HashMap would reorder the devices on every run and
+    // make every migration look like a change in review.
+    let ordered: std::collections::BTreeMap<&String, &D> = devices.iter().collect();
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("version".to_owned(), serde_json::json!(1));
+    if let Some(policy) = policy {
+        envelope.insert(
+            "policy".to_owned(),
+            serde_json::to_value(policy).map_err(|e| InventoryError::ParseError(e.to_string()))?,
+        );
+    }
+    envelope.insert(
+        "devices".to_owned(),
+        serde_json::to_value(ordered).map_err(|e| InventoryError::ParseError(e.to_string()))?,
+    );
+    Ok(serde_json::Value::Object(envelope))
 }
 
 /// SHA-256 of the file at `path`. Returns zeros if the file doesn't exist.
