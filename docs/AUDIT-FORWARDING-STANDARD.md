@@ -93,11 +93,89 @@ transport preflight event and the handler event — and, for Junos, in the devic
 commit comment as `request.id=`. That is what links an MCP action to the change
 it made on the device.
 
+## Part 3 — At rest (normative)
+
+Emission and transport are only worth as much as what the events sit in. Applied
+to every deployed server 2026-08-20 (rustjunosmcp#299).
+
+### Sealing
+
+journald Forward Secure Sealing is enabled on every server, via a drop-in at
+`/etc/systemd/journald.conf.d/10-audit-sealing.conf`:
+
+```ini
+[Journal]
+Storage=persistent
+Seal=yes
+```
+
+plus `journalctl --setup-keys --interval=1month`. Sealing proves integrity only
+from the moment the keys exist, so it is the first thing to enable and the one
+item on this list that cannot be applied retroactively.
+
+**`journalctl --setup-keys` fails on a minimal Debian 13 image** with
+`Failed to generate key pair: Operation not supported`, even though
+`systemctl --version` reports `+GCRYPT`. systemd 257 *dlopens* libgcrypt, and
+the image does not ship it; the real error is one line above, in
+`SYSTEMD_LOG_LEVEL=debug` output — `libgcrypt.so.20 is not installed`.
+`apt-get install libgcrypt20` is the whole fix. Nothing about the message points
+there, so it is recorded here.
+
+The verification key is printed once. It belongs **off** the machine: capture it
+to a root-only file and move it, rather than letting it scroll past in a
+terminal.
+
+### Sinks
+
+`--audit-journald` and `--audit-log-file` are additive, not alternatives. A
+server that needs the standalone JSONL — `mecmcp-verify` and the bench read it
+directly — runs **both**, so the same events get FSS coverage without taking the
+file away. That is the resolution of the "609 sink question": no server has to
+choose.
+
+### Redaction
+
+`--audit-redact <field>=hmac` with `--audit-hmac-key-file`, the key passed **by
+path** so it can never appear in `ps` output or a unit file, mode 0600 and owned
+by the service user. Pseudonymised values are stable
+(`devices=hmac:63206a19…`), so correlation survives export while the inventory
+does not leave the box.
+
+Enabling it is a one-way door: events written before it are cleartext and will
+not correlate with pseudonymised ones written after. Enable it on a server
+before its trail matters, not after.
+
+### Retention
+
+Stated, not inherited, at
+`/etc/systemd/journald.conf.d/20-audit-retention.conf`:
+
+```ini
+[Journal]
+SystemMaxUse=512M
+SystemKeepFree=256M
+MaxRetentionSec=90day
+MaxFileSec=1day
+```
+
+Without these, journald sizes itself to 10% of the filesystem and discards
+silently — how far back the trail reaches becomes a property of disk pressure
+rather than a decision. The tighter of `MaxRetentionSec` and `SystemMaxUse`
+wins, so raising one alone silently keeps less than it claims.
+
+JSONL sinks get the equivalent through logrotate: `daily`, `rotate 14`,
+`compress`, `copytruncate`, `create 0600 <service> <service>`. The mode matters
+— an audit file every account on the box can read is not an audit trail.
+
 ## Known gaps
 
-- **No native sink yet.** That is #292.
+- **No native sink yet.** That is #292. Central forwarding
+  (`systemd-journal-upload`/rsyslog) is deliberately **not** configured: the
+  destination this family wants is the hash-chained SSDF sink, and standing up
+  a second, unchained forwarding path first would be the thing #292 exists to
+  avoid.
 - **The device-side record omits the approver.** A two-person apply commits
   naming only the applier — see
   [rustjunosmcp#307](https://github.com/fastrevmd-lab/rustjunosmcp/issues/307).
-- **Retention and journald sealing** are tracked in
-  [rustjunosmcp#299](https://github.com/fastrevmd-lab/rustjunosmcp/issues/299).
+- **Retention and journald sealing** are done — see Part 3
+  ([rustjunosmcp#299](https://github.com/fastrevmd-lab/rustjunosmcp/issues/299)).
