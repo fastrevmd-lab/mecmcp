@@ -92,8 +92,11 @@ same field with the same rules: `devices` (canonical), `routers` (what
 rustjunosmcp wrote before extraction), and `targets` (for management-plane
 servers, whose scope entries are tenants or sites rather than devices).
 Whichever you write, the file **serializes back as `devices`** — the alias is
-vocabulary, not a schema variant, so a rotate or a scope change never rewrites
-your file into a spelling you did not choose. In code, `TokenEntry::targets()`,
+vocabulary, not a schema variant. Note what that means for lifecycle
+operations: `rotate`, `add`, `revoke` and `set-scopes` rewrite the whole
+document, so the first one to run **canonicalizes your aliases to `devices`**.
+The scopes are identical either way; only the spelling in the file changes, and
+it changes once. In code, `TokenEntry::targets()`,
 `CallerCtx::targets()` and `filter_target_names` are the neutral names for the
 device-named APIs, which remain available and behave identically.
 
