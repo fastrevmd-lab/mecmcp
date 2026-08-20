@@ -18,6 +18,7 @@
 //! serialises its own appends behind a mutex; it cannot detect a second
 //! recorder, and nothing downstream can either.
 
+use crate::ProducedHead;
 use crate::evidence::{
     ApplyIntentRecord, ApprovalRecord, ChainSegment, ClosedSegment, EvidenceRecord, ProposalRecord,
     ResultReceipt, append, close,
@@ -43,17 +44,22 @@ const MAX_TRACKED_CHANGES: usize = 1024;
 
 /// The head a new run must continue from.
 ///
-/// `local_newest` is the head of the highest-numbered segment this writer has
-/// **produced** — delivered or not — read from the outbox and ledger.
-/// `remote` is the newest `row_hash` SSDF holds for this writer.
+/// `local_newest` is what this writer last **produced**, which only
+/// [`SsdfSink::produced_head`](crate::SsdfSink::produced_head) can answer — it
+/// reads the append-only outbox, so it covers delivered and undelivered
+/// segments alike. `remote` is the newest `row_hash` SSDF holds for this
+/// writer.
 ///
 /// Local wins whenever it exists, and "produced" rather than "pending" is the
-/// whole point. An earlier version preferred the newest *unacknowledged*
-/// segment, which forks the chain in a state the sink reaches on its own:
-/// `attempt_delivery` blocks only the failed `(server_id, run_id)`, so a later
-/// run can overtake a stalled one. Then the remote head is a **descendant** of
-/// the pending tail, and resuming from the tail makes the next segment a
-/// sibling of a segment that already landed.
+/// whole point. Preferring the newest *unacknowledged* segment forks the chain
+/// in a state the sink reaches on its own: `attempt_delivery` blocks only the
+/// failed `(server_id, run_id)`, so a later run can overtake a stalled one.
+/// The remote head is then a **descendant** of the pending tail, and resuming
+/// from the tail makes the next segment a sibling of one that already landed.
+///
+/// The argument is a [`ProducedHead`] rather than a `String` so that mistake
+/// cannot be made again: a pending tail and a remote head are both strings, and
+/// an earlier version of this function took whichever the caller had to hand.
 ///
 /// Remote is the fallback only when this writer has produced nothing locally —
 /// a fresh spool after a host rebuild — and `None` from both means a genuinely
@@ -63,8 +69,8 @@ const MAX_TRACKED_CHANGES: usize = 1024;
 /// make even "newest produced" wrong, and nothing here can detect that; see
 /// [`EvidenceRecorder`].
 #[must_use]
-pub fn resume_head(remote: Option<String>, local_newest: Option<String>) -> Option<String> {
-    local_newest.or(remote)
+pub fn resume_head(remote: Option<String>, local_newest: Option<ProducedHead>) -> Option<String> {
+    local_newest.map(Into::into).or(remote)
 }
 
 /// The durable spool refused a segment.
@@ -309,6 +315,38 @@ impl EvidenceRecorder {
             // terminal point.
             self.forget(changeset_id);
         }
+    }
+
+    /// The approval gate was deliberately waived.
+    ///
+    /// Distinct from [`approval`](Self::approval) on purpose. A waiver is not a
+    /// second person's decision, so `approver` stays empty rather than naming
+    /// someone who did not approve — writing the owner there would forge the
+    /// exact fact two-person control exists to establish. `decision` is
+    /// `approved` because the waiver did authorize the apply, and the contract's
+    /// `decision` column admits only `approved`, `rejected` or empty; what makes
+    /// it a waiver rather than an approval lives in `metadata`.
+    ///
+    /// Without this, the trail jumps from proposal straight to apply intent, and
+    /// a legitimate exception is indistinguishable from a bypassed gate — which
+    /// is the normal case on a lab-mode server, not an edge case.
+    pub fn approval_waived(&self, request_id: &str, changeset_id: &str, kind: &str, reason: &str) {
+        let context = self.context_for(changeset_id);
+        self.append(EvidenceRecord::Approval(ApprovalRecord {
+            request_id: request_id.to_owned(),
+            changeset_id: changeset_id.to_owned(),
+            device_id: context.device_id,
+            principal: context.principal,
+            diff_hash: context.diff_hash,
+            timestamp: now(),
+            run_id: String::new(),
+            server_id: String::new(),
+            segment_seq: 0,
+            prev_hash: String::new(),
+            approver: String::new(),
+            decision: "approved".to_owned(),
+            metadata: Some(serde_json::json!({ "waived": kind, "reason": reason })),
+        }));
     }
 
     /// Execution is about to start.

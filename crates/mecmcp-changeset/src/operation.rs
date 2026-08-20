@@ -684,20 +684,38 @@ impl ChangesetCoordinator {
                     .change_set_id
                     .clone()
                     .unwrap_or_else(|| operation_id.to_owned());
-                self.update(record).await?;
-
                 // The device answered. A failure is recorded as fully as a
                 // success — a trail that only shows what worked cannot answer
                 // the question anyone actually asks it.
+                //
+                // Written *before* the local state update, which can fail on a
+                // full disk or a permission change. Doing it after meant the `?`
+                // below returned first and the chain ended at apply intent for a
+                // commit that had reached the device: evidence of an attempt
+                // with no outcome, at precisely the moment device state and
+                // local state have diverged and someone has to go and look.
+                // The receipt describes what the device did, which local
+                // persistence cannot retract.
                 if let Some(evidence) = self.evidence() {
                     evidence.result_receipt(
                         &attribution.request_id.to_string(),
                         &receipt_changeset,
                         &receipt_device,
                         succeeded,
-                        details.as_deref().unwrap_or(""),
+                        // Only a failure's details are an error. A successful
+                        // commit's details are warnings or a job note, and
+                        // filing those as errors hands every warning-bearing
+                        // success back to anyone filtering the trail for
+                        // failures.
+                        if succeeded {
+                            ""
+                        } else {
+                            details.as_deref().unwrap_or("")
+                        },
                     );
                 }
+
+                self.update(record).await?;
 
                 Ok(CommitOutcome::Reconciled {
                     succeeded,

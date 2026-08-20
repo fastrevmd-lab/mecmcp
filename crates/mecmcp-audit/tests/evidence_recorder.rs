@@ -304,28 +304,19 @@ fn a_rejected_change_stops_being_tracked() {
     );
 }
 
-/// The head must be the newest segment this writer **produced**, not the newest
-/// still pending.
+/// With nothing produced locally, the remote head is the only answer.
 ///
-/// Two states, and only one rule survives both:
-///
-/// - crash with unsent segments — the remote head is *behind* the local chain,
-///   so resuming from it would make replay create a sibling;
-/// - a later run overtaking a stalled one — `attempt_delivery` blocks only the
-///   failed `(server_id, run_id)`, so the remote head can be a *descendant* of
-///   the pending tail, and resuming from the tail would rewind into a sibling.
+/// The interesting cases — a crash with unsent segments, and a later run
+/// overtaking a stalled one — are settled by *where the local value comes
+/// from*, which `ProducedHead` now makes unforgeable and
+/// `the_produced_head_comes_from_the_outbox_in_production_order` covers. What
+/// is left here is the fallback.
 #[test]
-fn the_resume_head_is_the_newest_segment_produced() {
+fn a_writer_with_no_local_history_resumes_from_the_remote_head() {
     use mecmcp_audit::recorder::resume_head;
 
     let remote = Some("sha256:delivered".to_string());
-    let local_newest = Some("sha256:newest-produced".to_string());
 
-    assert_eq!(
-        resume_head(remote.clone(), local_newest.clone()),
-        local_newest,
-        "what this writer produced last is the chain tip, delivered or not"
-    );
     assert_eq!(
         resume_head(remote.clone(), None),
         remote,

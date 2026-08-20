@@ -63,3 +63,56 @@ fn an_apply_intent_reaches_the_sink_outbox() {
         "the spooled record must be the one that was written: {spooled}"
     );
 }
+
+/// The resume head must come from the outbox, not from whatever the caller had
+/// to hand.
+///
+/// Renaming the argument does not prevent the fork: any caller can still pass a
+/// pending tail. The head has to be *derived* from the durable record of what
+/// this writer produced, which only the sink holds.
+#[test]
+fn the_produced_head_comes_from_the_outbox_in_production_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = sink_config(dir.path());
+    let sink = Arc::new(SsdfSink::new(config).unwrap());
+
+    let recorder = EvidenceRecorder::new(RecorderConfig {
+        server_id: "srv-a".to_string(),
+        run_id: "run-1".to_string(),
+        resume_from: None,
+        records_per_segment: 1,
+    })
+    .spooling_to(Arc::clone(&sink));
+
+    recorder.proposal("req-1", "cs-1", "vsrx-ci", "alice", "sha256:diff");
+    recorder
+        .apply_intent("req-2", "cs-1", "vsrx-ci", "alice")
+        .unwrap();
+
+    let newest = sink
+        .produced_head("srv-a")
+        .expect("reading the outbox must work")
+        .expect("this writer has produced segments");
+
+    let other = sink
+        .produced_head("srv-b")
+        .expect("reading the outbox works");
+    assert_eq!(
+        other, None,
+        "another writer's chain must not be offered as this one's head"
+    );
+
+    // The last segment this writer appended is the newest it produced; the
+    // outbox is append-only, so file order *is* production order.
+    let spooled = std::fs::read_to_string(dir.path().join("outbox.jsonl")).unwrap();
+    let last = spooled
+        .lines()
+        .rfind(|line| line.contains("\"server_id\":\"srv-a\""))
+        .expect("a segment was spooled");
+    let last: serde_json::Value = serde_json::from_str(last).unwrap();
+    assert_eq!(
+        newest.as_str(),
+        last["head_hash"].as_str().unwrap(),
+        "the head must be the last segment produced, not the first or the lowest"
+    );
+}

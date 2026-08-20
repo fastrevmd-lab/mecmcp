@@ -111,6 +111,29 @@ struct SsdfRow {
     row_hash: String,
 }
 
+/// The head of the newest segment a writer produced, read from its outbox.
+///
+/// A newtype rather than a `String` on purpose. The whole defect it exists to
+/// prevent is a caller passing the wrong hash — the pending tail, or the remote
+/// head — where the produced head belongs, and those are all strings. Only
+/// [`SsdfSink::produced_head`] can make one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProducedHead(String);
+
+impl ProducedHead {
+    /// The hash itself.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<ProducedHead> for String {
+    fn from(head: ProducedHead) -> Self {
+        head.0
+    }
+}
+
 /// SSDF evidence sink.
 ///
 /// Delivers closed evidence segments to ClickHouse via HTTP INSERT, with:
@@ -208,6 +231,36 @@ impl SsdfSink {
             .mark_pending(id)?;
 
         Ok(())
+    }
+
+    /// The head of the newest segment this writer has **produced**.
+    ///
+    /// This is what a restarting recorder must resume from, and it is derived
+    /// here rather than asked of the caller because only the sink holds the
+    /// durable record of what was produced. A caller reaching for the newest
+    /// *pending* segment forks the chain whenever a later run has overtaken a
+    /// stalled one — `attempt_delivery` blocks only the failed
+    /// `(server_id, run_id)`, so that overtaking is reachable — and a caller
+    /// reaching for the remote head forks it whenever anything is still
+    /// undelivered.
+    ///
+    /// The outbox is append-only and never pruned, so file order is production
+    /// order and the last matching line is the newest segment. That holds
+    /// across runs, which run ids alone do not: nothing orders two run ids.
+    ///
+    /// Returns `None` for a writer that has produced nothing here — a fresh
+    /// spool, or a rebuilt host — in which case the remote head is the only
+    /// answer available.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SsdfSinkError`] if the outbox cannot be read or decoded.
+    pub fn produced_head(&self, server_id: &str) -> Result<Option<ProducedHead>, SsdfSinkError> {
+        let segments = self.load_outbox()?;
+        Ok(segments
+            .into_iter()
+            .rfind(|segment| segment.server_id == server_id)
+            .map(|segment| ProducedHead(segment.head_hash)))
     }
 
     /// Attempt delivery of all pending segments in the outbox.

@@ -32,4 +32,6 @@ pub use schema::{AuditOutcome, AuditValue};
 pub use scope::{
     AuditScope, DEFAULT_DURATION_METRIC, duration_metric_name, install_duration_metric_name,
 };
-pub use sinks::{DeliveryLedger, DeliveryStatus, SsdfSink, SsdfSinkConfig, SsdfSinkError};
+pub use sinks::{
+    DeliveryLedger, DeliveryStatus, ProducedHead, SsdfSink, SsdfSinkConfig, SsdfSinkError,
+};
