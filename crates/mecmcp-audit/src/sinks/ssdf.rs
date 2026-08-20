@@ -5,12 +5,21 @@
 //! and delivery status is tracked in a separate ledger. Sink failures are
 //! non-fatal to the serving process (fail-open ship, fail-closed record).
 //!
-//! ## Server-Side Deduplication
+//! ## Deduplication
 //!
-//! Evidence records use server-side INSERT ... SELECT ... WHERE NOT EXISTS guard
-//! with ClickHouse HTTP parameter binding. Parameters are passed via URL query
-//! string in the format `param_X=value` and referenced in SQL as `{X:Type}`.
-//! This prevents SQL injection and enables ClickHouse-native deduplication.
+//! A high-water mark, read before each delivery, **not** an in-statement guard.
+//!
+//! The guard this sink used to send — `INSERT … WHERE NOT EXISTS (SELECT …)` —
+//! could never have executed: ClickHouse runs it as the inserting identity, and
+//! SSDF grants `ssdf_audit` INSERT and nothing else, deliberately, so a stolen
+//! writer credential can append but not enumerate. Every delivery would have
+//! been refused for missing SELECT.
+//!
+//! Instead the sink asks, as the separate `ssdf_audit_verify` identity SSDF
+//! provisions for chain-seeding, what the highest `segment_seq` for this run
+//! already is, and sends only what is above it. Parameters are still bound via
+//! `param_X=value` / `{X:Type}`, so the read is injection-safe. Resolved in
+//! ssdf#47.
 //!
 //! ## Background Delivery
 //!
@@ -50,6 +59,15 @@ pub struct SsdfSinkConfig {
     pub username: String,
     /// ClickHouse password.
     pub password: String,
+    /// Read identity used only for the dedup high-water mark.
+    ///
+    /// `ssdf_audit` is INSERT-only by design, so it cannot perform the read that
+    /// tells the sink what already landed. SSDF provisions `ssdf_audit_verify`
+    /// for exactly this — its migration calls it "startup chain-seeding and
+    /// verify_audit" (ssdf#47).
+    pub verify_username: String,
+    /// Password for [`verify_username`](Self::verify_username).
+    pub verify_password: String,
     /// Path to the durable outbox spool file.
     pub outbox_path: PathBuf,
     /// Path to the delivery ledger.
@@ -304,8 +322,72 @@ impl SsdfSink {
         Ok(segments)
     }
 
-    /// Deliver a single segment to SSDF via HTTP INSERT with server-side dedup guard.
+    /// Deliver a single segment to SSDF via HTTP INSERT.
+    ///
+    /// Dedup happens first, as a separate read under a separate identity — see
+    /// [`high_water_mark`](Self::high_water_mark).
+    /// Highest `segment_seq` SSDF already holds for this run.
+    ///
+    /// Read as the **verify** identity, because the writer has no SELECT. This
+    /// is the same read the sink needs for chain-seeding, so dedup costs nothing
+    /// extra: a segment at or below the mark was already accepted and a retry
+    /// would append a duplicate row to a hash chain.
+    ///
+    /// Returns `None` when SSDF holds nothing for this run, or when the answer
+    /// cannot be read — an unreadable mark must not be treated as "nothing
+    /// landed", so the caller keeps the segment spooled rather than risking a
+    /// duplicate.
+    fn high_water_mark(&self, segment: &ClosedSegment) -> Option<u64> {
+        let query = format!(
+            "SELECT max(JSONExtractUInt(args, 'segment_seq')) FROM {}.audit \
+             WHERE tier = 'evidence' \
+               AND JSONExtractString(args, 'server_id') = {{server_id:String}} \
+               AND JSONExtractString(args, 'run_id') = {{run_id:String}}",
+            self.config.database
+        );
+        let url = format!(
+            "{}/?query={}&param_server_id={}&param_run_id={}",
+            self.config.endpoint,
+            urlencoding::encode(&query),
+            urlencoding::encode(&segment.server_id),
+            urlencoding::encode(&segment.run_id),
+        );
+        let request = HttpRequest {
+            url,
+            method: "POST".to_string(),
+            headers: vec![(
+                "Authorization".to_string(),
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(format!(
+                        "{}:{}",
+                        self.config.verify_username, self.config.verify_password
+                    ))
+                ),
+            )],
+            body: Vec::new(),
+        };
+        let body = self.transport.send(&request).ok()?;
+        let trimmed = body.trim();
+        // ClickHouse renders `max()` over no rows as 0 or an empty cell; both
+        // mean "nothing landed for this run".
+        if trimmed.is_empty() {
+            return None;
+        }
+        trimmed.parse::<u64>().ok().filter(|mark| *mark > 0)
+    }
+
     fn deliver_segment(&self, segment: &ClosedSegment) -> Result<(), SsdfSinkError> {
+        // Dedup, before anything is sent. A retry after a lost acknowledgement
+        // carries the identical rows and identical `row_hash`; appending them
+        // again would put a duplicate into a chain whose whole value is that it
+        // can be verified.
+        if let Some(mark) = self.high_water_mark(segment)
+            && segment.segment_seq <= mark
+        {
+            return Ok(());
+        }
+
         // Convert segment records to SSDF rows.
         let rows: Vec<SsdfRow> = segment
             .records()
@@ -324,33 +406,21 @@ impl SsdfSink {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Build INSERT query with server-side deduplication guard using parameter binding.
-        // ClickHouse HTTP interface supports typed parameters via URL query string:
-        // ?param_X=value references {X:Type} in SQL.
+        // A plain INSERT. It carries no guard clause, and that is not a style
+        // choice: ClickHouse runs a guard's SELECT as the *inserting* identity,
+        // and `ssdf_audit` has no SELECT — SSDF gives it away deliberately so a
+        // stolen writer credential can append but not enumerate. A guarded
+        // insert is refused outright. Dedup happens before this, in
+        // `high_water_mark` (ssdf#47).
         let query = format!(
-            "INSERT INTO {}.audit \
-             SELECT * FROM input('ts DateTime64(3, \\'UTC\\'), principal LowCardinality(String), \
-             tier LowCardinality(String), tool LowCardinality(String), args String, \
-             data_classes Array(LowCardinality(String)), decision LowCardinality(String), \
-             row_count UInt32, error String, prev_hash String, row_hash String') \
-             WHERE NOT EXISTS (\
-               SELECT 1 FROM {}.audit \
-               WHERE tier = 'evidence' \
-                 AND JSONExtractString(args, 'server_id') = {{server_id:String}} \
-                 AND JSONExtractString(args, 'run_id') = {{run_id:String}} \
-                 AND JSONExtractUInt(args, 'segment_seq') = {{segment_seq:UInt64}}\
-             )",
-            self.config.database, self.config.database
+            "INSERT INTO {}.audit FORMAT JSONEachRow",
+            self.config.database
         );
 
-        // Build URL with query and parameters.
         let url = format!(
-            "{}/?query={}&param_server_id={}&param_run_id={}&param_segment_seq={}",
+            "{}/?query={}",
             self.config.endpoint,
-            urlencoding::encode(&query),
-            urlencoding::encode(&segment.server_id),
-            urlencoding::encode(&segment.run_id),
-            segment.segment_seq
+            urlencoding::encode(&query)
         );
 
         // Send HTTP request.
@@ -529,8 +599,11 @@ fn getrandom_u64() -> u64 {
 
 /// HTTP transport abstraction for testing.
 pub trait HttpTransport: Send + Sync {
-    /// Send an HTTP request.
-    fn send(&self, request: &HttpRequest) -> Result<(), SsdfSinkError>;
+    /// Send an HTTP request and return its response body.
+    ///
+    /// The body matters: dedup reads a high-water mark back from ClickHouse, so
+    /// a transport that discards responses cannot support it.
+    fn send(&self, request: &HttpRequest) -> Result<String, SsdfSinkError>;
 }
 
 /// HTTP request.
@@ -553,7 +626,7 @@ pub struct HttpRequest {
 struct StdHttpTransport;
 
 impl HttpTransport for StdHttpTransport {
-    fn send(&self, request: &HttpRequest) -> Result<(), SsdfSinkError> {
+    fn send(&self, request: &HttpRequest) -> Result<String, SsdfSinkError> {
         use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpStream;
         use std::time::Duration;
@@ -698,7 +771,7 @@ impl HttpTransport for StdHttpTransport {
             )));
         }
 
-        Ok(())
+        Ok(String::from_utf8_lossy(&body).into_owned())
     }
 }
 
@@ -741,8 +814,22 @@ mod tests {
         }
     }
 
+    /// Requests that actually insert, as opposed to the high-water read that
+    /// precedes each delivery. Counting raw requests would make every one of
+    /// these tests assert the shape of the dedup protocol by accident.
+    fn inserts(requests: &[HttpRequest]) -> Vec<&HttpRequest> {
+        requests
+            .iter()
+            .filter(|request| {
+                urlencoding::decode(&request.url)
+                    .map(|url| url.contains("INSERT"))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
     impl HttpTransport for MockHttpTransport {
-        fn send(&self, request: &HttpRequest) -> Result<(), SsdfSinkError> {
+        fn send(&self, request: &HttpRequest) -> Result<String, SsdfSinkError> {
             if self.should_fail {
                 return Err(SsdfSinkError::Http("mock transport failure".to_string()));
             }
@@ -750,7 +837,9 @@ mod tests {
                 .lock()
                 .expect("mock transport mutex not poisoned")
                 .push(request.clone());
-            Ok(())
+            // Empty body: for the high-water read this means "SSDF holds nothing
+            // for this run", which is what these tests assume.
+            Ok(String::new())
         }
     }
 
@@ -787,6 +876,8 @@ mod tests {
             database: "ssdf".to_string(),
             username: "ssdf_audit".to_string(),
             password: "test_password".to_string(),
+            verify_username: "ssdf_audit_verify".to_string(),
+            verify_password: "test_verify_password".to_string(),
             outbox_path: dir.path().join("outbox.jsonl"),
             ledger_path: dir.path().join("ledger.jsonl"),
             initial_backoff: Duration::from_millis(100),
@@ -853,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn attempt_delivery_sends_http_request_with_server_side_guard() {
+    fn attempt_delivery_sends_a_plain_insert() {
         let dir = TempDir::new().unwrap();
         let config = make_test_config(&dir);
         let transport = Arc::new(MockHttpTransport::new());
@@ -867,32 +958,20 @@ mod tests {
         let delivered = sink.attempt_delivery().unwrap();
         assert_eq!(delivered, 1);
 
-        // Verify HTTP request was sent with server-side guard.
+        // One insert, preceded by the high-water read that replaces the old
+        // in-statement guard (ssdf#47).
         let requests = transport.requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].method, "POST");
-        assert!(requests[0].url.contains("INSERT"));
-        assert!(requests[0].url.contains("param_server_id"));
-        assert!(requests[0].url.contains("param_run_id"));
-        assert!(requests[0].url.contains("param_segment_seq"));
+        let inserts = inserts(&requests);
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].method, "POST");
 
-        // Decode query param and assert WHERE NOT EXISTS template.
-        let url = &requests[0].url;
-        let query_start = url.find("query=").unwrap() + 6;
-        let query_end = url[query_start..]
-            .find('&')
-            .map(|i| query_start + i)
-            .unwrap_or(url.len());
-        let encoded_query = &url[query_start..query_end];
-        let decoded_query = urlencoding::decode(encoded_query).unwrap();
-        assert!(decoded_query.contains("WHERE NOT EXISTS"));
+        let decoded_query = urlencoding::decode(&inserts[0].url).unwrap();
         assert!(
-            decoded_query.contains("JSONExtractString(args, 'server_id') = {server_id:String}")
+            !decoded_query.contains("NOT EXISTS"),
+            "the writer identity has no SELECT, so a guarded insert is refused \
+             outright: {decoded_query}"
         );
-        assert!(decoded_query.contains("JSONExtractString(args, 'run_id') = {run_id:String}"));
-        assert!(
-            decoded_query.contains("JSONExtractUInt(args, 'segment_seq') = {segment_seq:UInt64}")
-        );
+        assert!(decoded_query.contains("INSERT INTO ssdf.audit"));
 
         // Verify ledger marks it as delivered.
         let id = SegmentId {
@@ -964,9 +1043,9 @@ mod tests {
         let delivered = sink.attempt_delivery().unwrap();
         assert_eq!(delivered, 0);
 
-        // Only one HTTP request was sent.
+        // Only one insert was sent; the replay found the segment delivered.
         let requests = transport.requests();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(inserts(&requests).len(), 1);
     }
 
     #[test]
@@ -995,7 +1074,7 @@ mod tests {
 
         // Verify HTTP request was sent.
         let requests = transport.requests();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(inserts(&requests).len(), 1);
     }
 
     #[test]
@@ -1232,9 +1311,10 @@ mod tests {
 
         // Parse the NDJSON body and verify each row has its own row_hash.
         let requests = transport.requests();
-        assert_eq!(requests.len(), 1);
+        let inserts = inserts(&requests);
+        assert_eq!(inserts.len(), 1);
 
-        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        let body = String::from_utf8(inserts[0].body.clone()).unwrap();
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 2, "should have 2 SSDF rows");
 
