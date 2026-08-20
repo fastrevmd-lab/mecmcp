@@ -31,6 +31,24 @@ pub trait Grant: Clone + std::fmt::Debug + Send + Sync + 'static {
     /// # Errors
     /// Returns [`GrantError::Invalid`] when the grant is malformed.
     fn validate(&self) -> Result<(), GrantError>;
+
+    /// Whether this grant's subjects name *targets* — the same namespace the
+    /// token's `devices`/`targets` scope names.
+    ///
+    /// The distinction decides whether the two scopes can contradict each
+    /// other. Mist's subjects are `org/<uuid>` and `site/<uuid>`, which is
+    /// exactly what `devices` addresses, so a wildcard `devices` beside an
+    /// org-scoped grant leaves the early, fail-closed check inert and the
+    /// handler's grant check as the only live boundary (rustmistmcp#17).
+    /// PAN-OS subjects are XPath regions *within* a device — a different axis
+    /// entirely, and a wildcard device scope beside them is ordinary.
+    ///
+    /// Defaults to `false`, so a grant that does not say is left alone.
+    /// Implement it as `true` only when the two really do address the same
+    /// namespace.
+    fn subjects_are_targets(&self) -> bool {
+        false
+    }
 }
 
 /// A [`Grant`] that can live in a persisted token store.

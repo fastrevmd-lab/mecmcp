@@ -380,6 +380,11 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
             source: StoreError::Entry(crate::entry::EntryError::Invalid(error)),
         })?;
 
+        validate_scope_agreement(&updated).map_err(|error| FileError::Store {
+            path: path.to_path_buf(),
+            source: StoreError::Entry(crate::entry::EntryError::Invalid(error)),
+        })?;
+
         write_atomic(path, updated.entries(), version)?;
         Ok(secret)
     }
@@ -523,6 +528,11 @@ impl<G: Grant + serde::Serialize + serde::de::DeserializeOwned> TokenStoreFile<G
         })?;
 
         validate_references(&updated, known).map_err(|error| FileError::Store {
+            path: path.to_path_buf(),
+            source: StoreError::Entry(crate::entry::EntryError::Invalid(error)),
+        })?;
+
+        validate_scope_agreement(&updated).map_err(|error| FileError::Store {
             path: path.to_path_buf(),
             source: StoreError::Entry(crate::entry::EntryError::Invalid(error)),
         })?;
@@ -718,6 +728,38 @@ pub fn write_atomic<G: Grant + serde::Serialize>(
         path: path.to_path_buf(),
         source: error.error,
     })?;
+    Ok(())
+}
+/// Refuse a token whose two target scopes contradict each other.
+///
+/// When a grant's subjects name targets — org/site UUIDs, tenants — they are
+/// the same namespace `devices` names, and a `ScopeSet::Wildcard` there makes
+/// the early preflight check pass for any target. Reach is then enforced in
+/// exactly one place, the handler's grant check, and the layer that fails
+/// closed *first* is inert. That is a live deployment shape today
+/// (rustmistmcp#17), and it looks identical to a correctly narrowed token.
+///
+/// Deliberately **not** part of [`validate_references`]: that runs on `rotate`
+/// and `revoke` too, and refusing to rotate an existing token's secret because
+/// of a scope shape it already has would turn an emergency rotation into an
+/// outage. This runs only where scopes are chosen — `add` and `set_scopes`.
+///
+/// Grants whose subjects are regions *within* a target (PAN-OS XPaths) are a
+/// different axis and are unaffected; see [`Grant::subjects_are_targets`].
+fn validate_scope_agreement<G: Grant>(store: &TokenStore<G>) -> Result<(), String> {
+    for entry in store.entries() {
+        let target_scoped_grant = entry
+            .grant
+            .as_ref()
+            .is_some_and(Grant::subjects_are_targets);
+        if target_scoped_grant && matches!(entry.devices, ScopeSet::Wildcard) {
+            return Err(format!(
+                "token '{}' pairs a wildcard target scope with a grant that names specific \
+                 targets; narrow the scope to the grant's subjects so both layers agree",
+                entry.name
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1865,6 +1907,135 @@ mod tests {
         assert!(
             store_after.authenticate(secret.expose_secret()).is_some(),
             "original secret must still authenticate"
+        );
+    }
+
+    /// A grant whose subjects are *targets* — org/site UUIDs, tenants — names
+    /// the same namespace as `devices`. Pairing it with a wildcard `devices`
+    /// scope means two authorization layers disagree, and the one that fails
+    /// closed early is the inert one (rustmistmcp#17).
+    ///
+    /// A grant whose subjects are regions *within* a target (PAN-OS XPaths) is
+    /// a different axis and is unaffected — that is what the default says.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct TargetScopedGrant {
+        subjects: Vec<String>,
+    }
+    impl Grant for TargetScopedGrant {
+        type Action = ();
+        fn allows_action(&self, _action: ()) -> bool {
+            true
+        }
+        fn allows_subject(&self, subject: &str) -> bool {
+            self.subjects.iter().any(|s| s == subject)
+        }
+        fn validate(&self) -> Result<(), GrantError> {
+            Ok(())
+        }
+        fn subjects_are_targets(&self) -> bool {
+            true
+        }
+    }
+
+    fn org_grant() -> TargetScopedGrant {
+        TargetScopedGrant {
+            subjects: vec!["org/11111111-2222-3333-4444-555555555555".to_owned()],
+        }
+    }
+
+    #[test]
+    fn a_wildcard_target_scope_is_refused_beside_a_target_scoped_grant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: None,
+            tools: &["get_mist_org"],
+        };
+
+        let result = TokenStoreFile::<TargetScopedGrant>::add_with_options(
+            &path,
+            "acceptance",
+            ScopeSet::Wildcard,
+            ScopeSet::Wildcard,
+            None,
+            Some(org_grant()),
+            None,
+            None,
+            None,
+            None,
+            &known,
+        );
+
+        assert!(
+            result.is_err(),
+            "a wildcard target scope makes the grant's org scoping unenforceable at preflight"
+        );
+        assert!(
+            !path.exists(),
+            "a refused mint must not leave a token file behind"
+        );
+    }
+
+    #[test]
+    fn a_matching_target_scope_is_accepted_beside_the_same_grant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: None,
+            tools: &["get_mist_org"],
+        };
+
+        TokenStoreFile::<TargetScopedGrant>::add_with_options(
+            &path,
+            "acceptance",
+            ScopeSet::Allowlist(vec!["org/11111111-2222-3333-4444-555555555555".to_owned()]),
+            ScopeSet::Wildcard,
+            None,
+            Some(org_grant()),
+            None,
+            None,
+            None,
+            None,
+            &known,
+        )
+        .expect("scopes that agree must mint");
+    }
+
+    #[test]
+    fn set_scopes_cannot_widen_a_target_scope_back_to_wildcard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let known = KnownNames {
+            devices: None,
+            tools: &["get_mist_org"],
+        };
+        TokenStoreFile::<TargetScopedGrant>::add_with_options(
+            &path,
+            "acceptance",
+            ScopeSet::Allowlist(vec!["org/11111111-2222-3333-4444-555555555555".to_owned()]),
+            ScopeSet::Wildcard,
+            None,
+            Some(org_grant()),
+            None,
+            None,
+            None,
+            None,
+            &known,
+        )
+        .expect("add");
+
+        let result = TokenStoreFile::<TargetScopedGrant>::set_scopes(
+            &path,
+            "acceptance",
+            Some(ScopeSet::Wildcard),
+            None,
+            None,
+            &known,
+        );
+
+        assert!(
+            result.is_err(),
+            "widening back to wildcard reopens the same disagreement the mint refuses"
         );
     }
 
