@@ -215,11 +215,32 @@ impl SsdfSink {
     /// Returns the number of successfully delivered segments. Failures are
     /// retried with exponential backoff + jitter (capped at max_backoff).
     pub fn attempt_delivery(&self) -> Result<usize, SsdfSinkError> {
-        // Load all segments from the outbox.
-        let segments = self.load_outbox()?;
+        // Load all segments from the outbox, oldest sequence first per run.
+        // Order is not cosmetic here: dedup asks SSDF for the highest
+        // `segment_seq` it holds and treats everything at or below as landed.
+        // That is only true if segments go in ascending order and none is
+        // skipped — otherwise delivering N+1 after N failed makes the maximum
+        // claim N landed, and the chain acquires a gap that still verifies as a
+        // chain. Which is the exact failure this sink exists to prevent.
+        let mut segments = self.load_outbox()?;
+        segments.sort_by(|left, right| {
+            (&left.server_id, &left.run_id, left.segment_seq).cmp(&(
+                &right.server_id,
+                &right.run_id,
+                right.segment_seq,
+            ))
+        });
         let mut delivered_count = 0;
+        // Runs with a segment that failed this pass. Later segments of the same
+        // run must wait: they would otherwise overtake it.
+        let mut blocked_runs: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
 
         for segment in segments {
+            let run = (segment.server_id.clone(), segment.run_id.clone());
+            if blocked_runs.contains(&run) {
+                continue;
+            }
             let id = SegmentId {
                 server_id: segment.server_id.clone(),
                 run_id: segment.run_id.clone(),
@@ -266,6 +287,8 @@ impl SsdfSink {
                         .lock()
                         .expect("ledger mutex not poisoned")
                         .mark_failed(id, failed_at, e.to_string(), new_attempts)?;
+                    // Hold the rest of this run back until this segment lands.
+                    blocked_runs.insert(run);
                 }
             }
         }
@@ -337,12 +360,17 @@ impl SsdfSink {
     /// cannot be read — an unreadable mark must not be treated as "nothing
     /// landed", so the caller keeps the segment spooled rather than risking a
     /// duplicate.
-    fn high_water_mark(&self, segment: &ClosedSegment) -> Option<u64> {
+    fn high_water_mark(&self, segment: &ClosedSegment) -> Result<Option<u64>, SsdfSinkError> {
+        // `count()` alongside `max()` because `max()` over no rows and `max()`
+        // over a run whose only landed segment is sequence **0** both render as
+        // `0`. Treating the second as the first re-inserts segment 0 after a
+        // crash between the insert and the ledger write.
         let query = format!(
-            "SELECT max(JSONExtractUInt(args, 'segment_seq')) FROM {}.audit \
+            "SELECT count(), max(JSONExtractUInt(args, 'segment_seq')) FROM {}.audit \
              WHERE tier = 'evidence' \
                AND JSONExtractString(args, 'server_id') = {{server_id:String}} \
-               AND JSONExtractString(args, 'run_id') = {{run_id:String}}",
+               AND JSONExtractString(args, 'run_id') = {{run_id:String}} \
+             FORMAT TabSeparated",
             self.config.database
         );
         let url = format!(
@@ -367,14 +395,30 @@ impl SsdfSink {
             )],
             body: Vec::new(),
         };
-        let body = self.transport.send(&request).ok()?;
-        let trimmed = body.trim();
-        // ClickHouse renders `max()` over no rows as 0 or an empty cell; both
-        // mean "nothing landed for this run".
-        if trimmed.is_empty() {
-            return None;
+
+        // A read that fails is **not** "nothing landed". Expired verify
+        // credentials or a transient 5xx would otherwise green-light a plain
+        // INSERT and append a duplicate on a lost-ack replay. The error
+        // propagates, the segment stays spooled, and the next pass tries again.
+        let body = self.transport.send(&request)?;
+
+        let mut fields = body.split_whitespace();
+        let count: u64 = fields
+            .next()
+            .and_then(|field| field.parse().ok())
+            .ok_or_else(|| {
+                SsdfSinkError::Http(format!("unreadable high-water response: {body:?}"))
+            })?;
+        if count == 0 {
+            return Ok(None);
         }
-        trimmed.parse::<u64>().ok().filter(|mark| *mark > 0)
+        let max: u64 = fields
+            .next()
+            .and_then(|field| field.parse().ok())
+            .ok_or_else(|| {
+                SsdfSinkError::Http(format!("unreadable high-water maximum: {body:?}"))
+            })?;
+        Ok(Some(max))
     }
 
     fn deliver_segment(&self, segment: &ClosedSegment) -> Result<(), SsdfSinkError> {
@@ -382,7 +426,7 @@ impl SsdfSink {
         // carries the identical rows and identical `row_hash`; appending them
         // again would put a duplicate into a chain whose whole value is that it
         // can be verified.
-        if let Some(mark) = self.high_water_mark(segment)
+        if let Some(mark) = self.high_water_mark(segment)?
             && segment.segment_seq <= mark
         {
             return Ok(());
@@ -727,6 +771,7 @@ impl HttpTransport for StdHttpTransport {
 
         // Read headers until blank line.
         let mut _content_length = None;
+        let mut chunked = false;
         loop {
             let mut header_line = String::new();
             reader
@@ -735,15 +780,60 @@ impl HttpTransport for StdHttpTransport {
             if header_line == "\r\n" || header_line == "\n" {
                 break;
             }
-            if let Some((name, value)) = header_line.split_once(':')
-                && name.trim().eq_ignore_ascii_case("content-length")
-            {
-                _content_length = value.trim().parse::<usize>().ok();
+            if let Some((name, value)) = header_line.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    _content_length = value.trim().parse::<usize>().ok();
+                } else if name.trim().eq_ignore_ascii_case("transfer-encoding")
+                    && value.to_ascii_lowercase().contains("chunked")
+                {
+                    // ClickHouse returns query results chunked. Without
+                    // decoding, a body of `3` arrives as `2\r\n3\n\r\n0\r\n\r\n`
+                    // and every high-water read fails to parse — which, before
+                    // this, silently meant "nothing landed".
+                    chunked = true;
+                }
             }
         }
 
         // Read response body (up to 4KB for error messages).
         let mut body = Vec::new();
+        if chunked {
+            loop {
+                let mut size_line = String::new();
+                reader
+                    .read_line(&mut size_line)
+                    .map_err(|e| SsdfSinkError::Http(format!("read chunk size failed: {}", e)))?;
+                // A chunk header may carry extensions after a `;`.
+                let size_text = size_line.trim().split(';').next().unwrap_or("").trim();
+                let size = usize::from_str_radix(size_text, 16).map_err(|_| {
+                    SsdfSinkError::Http(format!("invalid chunk size: {size_text:?}"))
+                })?;
+                if size == 0 {
+                    break;
+                }
+                let mut chunk = vec![0u8; size];
+                reader
+                    .read_exact(&mut chunk)
+                    .map_err(|e| SsdfSinkError::Http(format!("read chunk failed: {}", e)))?;
+                body.extend_from_slice(&chunk);
+                let mut terminator = String::new();
+                reader.read_line(&mut terminator).map_err(|e| {
+                    SsdfSinkError::Http(format!("read chunk terminator failed: {}", e))
+                })?;
+                if body.len() > 4096 {
+                    break;
+                }
+            }
+            if !(200..300).contains(&status_code) {
+                let body_str = String::from_utf8_lossy(&body);
+                return Err(SsdfSinkError::Http(format!(
+                    "HTTP {} {}",
+                    status_code,
+                    body_str.chars().take(200).collect::<String>()
+                )));
+            }
+            return Ok(String::from_utf8_lossy(&body).into_owned());
+        }
         let mut buf = [0u8; 1024];
         loop {
             match reader.read(&mut buf) {
@@ -837,8 +927,16 @@ mod tests {
                 .lock()
                 .expect("mock transport mutex not poisoned")
                 .push(request.clone());
-            // Empty body: for the high-water read this means "SSDF holds nothing
-            // for this run", which is what these tests assume.
+            // The high-water read expects `count\tmax`. `0\t0` is "SSDF holds
+            // nothing for this run", which is what these tests assume; an empty
+            // body would now be an unreadable answer and correctly block
+            // delivery rather than allow it.
+            if urlencoding::decode(&request.url)
+                .map(|url| url.contains("SELECT"))
+                .unwrap_or(false)
+            {
+                return Ok("0\t0\n".to_string());
+            }
             Ok(String::new())
         }
     }

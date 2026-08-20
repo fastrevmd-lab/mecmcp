@@ -22,10 +22,19 @@ use mecmcp_audit::sinks::ssdf::{
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[derive(Default)]
 struct RecordingTransport {
     requests: Arc<Mutex<Vec<HttpRequest>>>,
+    /// `count\tmax` as ClickHouse renders it. Default: no rows for this run.
     high_water: Arc<Mutex<String>>,
+}
+
+impl Default for RecordingTransport {
+    fn default() -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            high_water: Arc::new(Mutex::new("0\t0\n".to_string())),
+        }
+    }
 }
 
 impl HttpTransport for RecordingTransport {
@@ -153,7 +162,7 @@ fn the_high_water_read_uses_the_verify_identity() {
 fn a_segment_at_or_below_the_high_water_mark_is_not_resent() {
     let dir = tempfile::tempdir().unwrap();
     let transport = Arc::new(RecordingTransport::default());
-    *transport.high_water.lock().unwrap() = "3\n".to_string();
+    *transport.high_water.lock().unwrap() = "4\t3\n".to_string();
     let sink = SsdfSink::new_with_transport(
         config(dir.path(), "ssdf_audit_verify"),
         transport.clone(),
@@ -177,7 +186,7 @@ fn a_segment_at_or_below_the_high_water_mark_is_not_resent() {
 fn a_segment_above_the_high_water_mark_is_delivered() {
     let dir = tempfile::tempdir().unwrap();
     let transport = Arc::new(RecordingTransport::default());
-    *transport.high_water.lock().unwrap() = "3\n".to_string();
+    *transport.high_water.lock().unwrap() = "4\t3\n".to_string();
     let sink = SsdfSink::new_with_transport(
         config(dir.path(), "ssdf_audit_verify"),
         transport.clone(),
@@ -194,4 +203,144 @@ fn a_segment_above_the_high_water_mark_is_delivered() {
         .filter(|r| urlencoding::decode(&r.url).unwrap().contains("INSERT"))
         .count();
     assert_eq!(inserts, 1, "segment 4 is above the high-water mark of 3");
+}
+
+/// A high-water **maximum** only describes what landed if segments go in
+/// ascending order and none is skipped. If N fails and N+1 is delivered anyway,
+/// the next pass sees a mark of N+1 and treats N as landed — leaving a hole in
+/// a chain that still verifies as a chain, which is the exact failure this sink
+/// exists to prevent.
+#[test]
+fn a_failed_segment_holds_back_the_rest_of_its_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(FailingInsertTransport::default());
+    let sink = SsdfSink::new_with_transport(
+        config(dir.path(), "ssdf_audit_verify"),
+        transport.clone(),
+        Arc::new(|_| {}),
+    )
+    .unwrap();
+
+    // Three segments of one run, spooled out of order for good measure.
+    sink.spool(segment(2)).unwrap();
+    sink.spool(segment(0)).unwrap();
+    sink.spool(segment(1)).unwrap();
+
+    // Segment 0's insert fails; 1 and 2 must not be attempted.
+    *transport.fail_seq.lock().unwrap() = Some(0);
+    let delivered = sink.attempt_delivery().unwrap();
+
+    assert_eq!(delivered, 0, "nothing may be delivered past the failure");
+    let attempted = transport.inserted_seqs.lock().unwrap().clone();
+    assert_eq!(
+        attempted,
+        vec![0],
+        "only the failing segment was attempted; later ones must not overtake it"
+    );
+}
+
+/// A read that fails is not evidence that nothing landed. Treating it as such
+/// green-lights a plain INSERT and appends a duplicate on a lost-ack replay.
+#[test]
+fn an_unreadable_high_water_mark_keeps_the_segment_spooled() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(FailingReadTransport);
+    let sink = SsdfSink::new_with_transport(
+        config(dir.path(), "ssdf_audit_verify"),
+        transport,
+        Arc::new(|_| {}),
+    )
+    .unwrap();
+    sink.spool(segment(0)).unwrap();
+
+    let delivered = sink.attempt_delivery().unwrap();
+
+    assert_eq!(
+        delivered, 0,
+        "an unreadable mark must not be read as 'nothing landed'"
+    );
+}
+
+/// `max()` over no rows and `max()` over a run whose only landed segment is
+/// sequence 0 both render as `0`. Confusing them re-inserts segment 0 after a
+/// crash between its insert and the ledger write.
+#[test]
+fn a_high_water_mark_of_zero_is_not_an_empty_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(RecordingTransport::default());
+    // count=1, max=0 — segment 0 has landed.
+    *transport.high_water.lock().unwrap() = "1\t0\n".to_string();
+    let sink = SsdfSink::new_with_transport(
+        config(dir.path(), "ssdf_audit_verify"),
+        transport.clone(),
+        Arc::new(|_| {}),
+    )
+    .unwrap();
+    sink.spool(segment(0)).unwrap();
+
+    sink.attempt_delivery().unwrap();
+
+    let requests = transport.requests.lock().unwrap();
+    let inserts = requests
+        .iter()
+        .filter(|r| urlencoding::decode(&r.url).unwrap().contains("INSERT"))
+        .count();
+    assert_eq!(
+        inserts, 0,
+        "segment 0 already landed and must not be resent"
+    );
+}
+
+#[derive(Default)]
+struct FailingInsertTransport {
+    fail_seq: Arc<Mutex<Option<u64>>>,
+    inserted_seqs: Arc<Mutex<Vec<u64>>>,
+}
+
+impl HttpTransport for FailingInsertTransport {
+    fn send(&self, request: &HttpRequest) -> Result<String, SsdfSinkError> {
+        let decoded = urlencoding::decode(&request.url)
+            .unwrap_or_default()
+            .into_owned();
+        if decoded.contains("SELECT") {
+            // Nothing landed yet for this run.
+            return Ok("0\t0\n".to_string());
+        }
+        let body = String::from_utf8_lossy(&request.body).into_owned();
+        // `segment_seq` is inside the escaped `args` JSON, so the key appears
+        // as \"segment_seq\" in the raw body.
+        let seq = body
+            .split("segment_seq")
+            .nth(1)
+            .and_then(|rest| {
+                let digits: String = rest
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits.parse::<u64>().ok()
+            })
+            .unwrap_or(u64::MAX);
+        self.inserted_seqs.lock().unwrap().push(seq);
+        if *self.fail_seq.lock().unwrap() == Some(seq) {
+            return Err(SsdfSinkError::Http("insert refused".to_string()));
+        }
+        Ok(String::new())
+    }
+}
+
+struct FailingReadTransport;
+
+impl HttpTransport for FailingReadTransport {
+    fn send(&self, request: &HttpRequest) -> Result<String, SsdfSinkError> {
+        let decoded = urlencoding::decode(&request.url)
+            .unwrap_or_default()
+            .into_owned();
+        if decoded.contains("SELECT") {
+            return Err(SsdfSinkError::Http(
+                "verify credentials expired".to_string(),
+            ));
+        }
+        panic!("an insert must not be attempted when the high-water read failed");
+    }
 }
