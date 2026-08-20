@@ -182,6 +182,17 @@ impl<G: Grant> From<&TokenEntry<G>> for CallerCtx<G> {
     }
 }
 
+impl<G: Grant> CallerCtx<G> {
+    /// The scope of targets this caller may address.
+    ///
+    /// The same scope as [`devices`](Self::devices), under the target-neutral
+    /// name a management-plane server needs (#91).
+    #[must_use]
+    pub fn targets(&self) -> &ScopeSet {
+        &self.devices
+    }
+}
+
 /// Filter inventory device names down to what this caller may see.
 ///
 /// Filtering starts from the inventory names, never from the scope entries, so
@@ -200,6 +211,20 @@ pub fn filter_device_names<G: Grant>(
             .collect(),
         None => names,
     }
+}
+
+/// Filter inventory target names down to what this caller may see.
+///
+/// [`filter_device_names`] under the target-neutral name, for servers whose
+/// inventory is tenants or sites rather than devices (#91). It delegates rather
+/// than reimplements: a second copy of this rule is a second thing to get
+/// wrong.
+#[must_use]
+pub fn filter_target_names<G: Grant>(
+    ctx: Option<&CallerCtx<G>>,
+    names: Vec<String>,
+) -> Vec<String> {
+    filter_device_names(ctx, names)
 }
 
 #[cfg(test)]
@@ -304,6 +329,32 @@ mod tests {
         let visible =
             filter_device_names(Some(&ctx), vec!["edge-fw".to_owned(), "core-fw".to_owned()]);
         assert_eq!(visible, vec!["edge-fw".to_owned()]);
+    }
+
+    #[test]
+    fn the_neutral_filter_and_accessor_authorize_identically() {
+        let ctx: CallerCtx = CallerCtx {
+            token_name: "lab".to_owned(),
+            devices: ScopeSet::Allowlist(vec!["tenant-a".to_owned()]),
+            tools: ScopeSet::Wildcard,
+            grant: None,
+            provider: None,
+            provider_tier: None,
+            on_behalf_of: None,
+            actor_type: crate::ActorType::Human,
+            client_name: None,
+            model_id: None,
+            session_id: None,
+            request_id: uuid::Uuid::new_v4(),
+        };
+        let names = vec!["tenant-a".to_owned(), "tenant-b".to_owned()];
+
+        assert_eq!(ctx.targets(), &ctx.devices, "one scope, two names");
+        assert_eq!(
+            filter_target_names(Some(&ctx), names.clone()),
+            filter_device_names(Some(&ctx), names),
+            "the neutral filter must not be a second set of rules"
+        );
     }
 
     #[test]
