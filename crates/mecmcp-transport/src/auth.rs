@@ -672,12 +672,13 @@ pub async fn bearer_preflight_middleware<G: Grant>(
     // and `next.run(...).await` would keep a second copy of every in-flight
     // body alive, and with the default 64-request concurrency that is hundreds
     // of megabytes of duplicate data.
-    let (request_provenance, audited_tool, audited_extras) = {
+    let (request_provenance, audited_tool, audited_extras, audited_calls) = {
         let parsed: Option<Value> = serde_json::from_slice(&body_bytes).ok();
         let identity = parsed.as_ref().and_then(identity_provenance);
         let tool = parsed.as_ref().and_then(tool_name);
         let extras = parsed.as_ref().and_then(audited_call_provenance);
-        (identity, tool, extras)
+        let calls = parsed.as_ref().map_or(0, audited_call_count);
+        (identity, tool, extras, calls)
     };
     if let Some(provenance) = request_provenance.as_ref() {
         if caller.client_name.is_none() {
@@ -735,9 +736,18 @@ pub async fn bearer_preflight_middleware<G: Grant>(
                     .as_ref()
                     .and_then(|p| p.client_version.clone())
             }),
-        client_call_id: audited_extras
-            .as_ref()
-            .and_then(|p| p.client_call_id.clone()),
+        // Withheld for a batch. The extension is per HTTP request, but a call id
+        // belongs to one call: a service that dispatches each element would read
+        // the *first* element's id for every one of them and attribute records
+        // to a call that did not make them. The version is unaffected — it
+        // describes the client, so it is true of every element.
+        client_call_id: (audited_calls == 1)
+            .then(|| {
+                audited_extras
+                    .as_ref()
+                    .and_then(|p| p.client_call_id.clone())
+            })
+            .flatten(),
     };
 
     let mut scope = audited_tool.map(|tool| {
@@ -901,6 +911,25 @@ fn identity_provenance(value: &Value) -> Option<crate::client_info::RequestProve
 /// In a batch those need not be the same element, and attributing one call's id
 /// to another call's audit record is worse than recording none — so the per-call
 /// id is read from the audited element only, and falls back to nothing.
+/// How many elements of this body are calls the audit path would attribute to.
+///
+/// One is the case where a per-call id can be safely handed to a handler; more
+/// than one means the id belongs to a specific element and the extension, which
+/// is per HTTP request, cannot say which.
+fn audited_call_count(value: &Value) -> usize {
+    elements(value)
+        .iter()
+        .filter(|request| {
+            request.get("method").and_then(Value::as_str) == Some("tools/call")
+                && request
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some()
+        })
+        .count()
+}
+
 fn audited_call_provenance(value: &Value) -> Option<crate::client_info::RequestProvenance> {
     let requests = elements(value);
 

@@ -173,7 +173,13 @@ impl ClientInfo {
 ///
 /// Both are **client-asserted and unverifiable**, exactly like the three on
 /// `CallerCtx`. Nothing here is vouched for by the token.
+/// `#[non_exhaustive]`: this exists precisely because growing `CallerCtx` is a
+/// breaking change for every consumer that builds it as a literal. A public
+/// struct with public fields would reproduce that failure the first time a
+/// sixth client-asserted field appears, which is the same reason
+/// `RequestProvenance` carries the attribute.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ClientExtras {
     /// Client version, from `clientInfo.version`. Describes the client, so any
     /// element of a batch that names it is authoritative for the whole batch.

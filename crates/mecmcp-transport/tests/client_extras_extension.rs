@@ -153,3 +153,26 @@ fn a_request_without_client_facts_carries_empty_extras() {
     assert!(body["client_version"].is_null(), "{body}");
     assert!(body["client_call_id"].is_null(), "{body}");
 }
+
+/// A batch is dispatched element by element, and the extension is per HTTP
+/// request. Handing it the first element's call id would attribute every
+/// element's record to that one call, so it is withheld — the client version,
+/// which describes the client rather than the call, still stands.
+#[test]
+fn a_batch_withholds_the_call_id_but_keeps_the_client_version() {
+    const BATCH: &str = r#"[
+        {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_config",
+         "_meta":{"io.modelcontextprotocol/clientInfo":{"name":"claude-code","version":"2.4.1"},
+                  "claudecode/toolUseId":"toolu_FIRST"}}},
+        {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_config",
+         "_meta":{"claudecode/toolUseId":"toolu_SECOND"}}}
+    ]"#;
+    let (status, body) = post_body(BATCH);
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["client_version"], "2.4.1", "{body}");
+    assert!(
+        body["client_call_id"].is_null(),
+        "a batch must not attribute one element's call id to all of them: {body}"
+    );
+}
