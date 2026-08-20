@@ -99,8 +99,15 @@ pub struct TokenEntry<G: Grant = NoGrant> {
     #[serde(alias = "hash")]
     pub digest: TokenDigest,
 
-    /// Devices this token may address.
-    #[serde(alias = "routers", default = "wildcard")]
+    /// Devices — or, for a management-plane server, targets — this token may
+    /// address.
+    ///
+    /// `targets` is an additive alias, not a second field: a tenant-scoped
+    /// server writes `targets` and reads it back through
+    /// [`targets()`](Self::targets), while the canonical serialized spelling
+    /// stays `devices` so every deployed `tokens.json` keeps round-tripping
+    /// unchanged (#91).
+    #[serde(alias = "routers", alias = "targets", default = "wildcard")]
     pub devices: ScopeSet,
 
     /// MCP tools this token may call.
@@ -186,6 +193,17 @@ fn no_grant<G>() -> Option<G> {
 }
 
 impl<G: Grant> TokenEntry<G> {
+    /// The scope of targets this token may address.
+    ///
+    /// The same scope as [`devices`](Self::devices), under a target-neutral
+    /// name. Management-plane consumers authorize tenants or sites rather than
+    /// devices and should not have to spell those values `devices` to do it
+    /// (#91). This is vocabulary only: one field, one set of rules.
+    #[must_use]
+    pub fn targets(&self) -> &ScopeSet {
+        &self.devices
+    }
+
     /// Whether this token is expired at the given instant.
     #[must_use]
     pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
@@ -469,6 +487,62 @@ mod tests {
         );
         let entry: TokenEntry = serde_json::from_str(&raw).expect("parse");
         assert!(entry.validate().is_err());
+    }
+
+    /// The shape a management-plane server writes: its scope entries are
+    /// tenants and sites, not devices (#91).
+    const TARGET_SHAPE: &str = r#"{
+        "name": "lab",
+        "digest": "sha256:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+        "targets": ["tenant-a", "tenant-b"],
+        "tools": ["*"],
+        "created_at_unix": 1783850400
+    }"#;
+
+    #[test]
+    fn loads_the_target_neutral_shape() {
+        let entry: TokenEntry = serde_json::from_str(TARGET_SHAPE).expect("parse target shape");
+        assert_eq!(
+            entry.devices,
+            ScopeSet::Allowlist(vec!["tenant-a".to_owned(), "tenant-b".to_owned()]),
+            "`targets` must land in the same scope field the other spellings do"
+        );
+    }
+
+    #[test]
+    fn all_three_spellings_produce_the_same_scope() {
+        let with_routers: TokenEntry = serde_json::from_str(&JUNOS_SHAPE.replace(
+            r#""routers": ["edge-fw", "core-fw"]"#,
+            r#""routers": ["a"]"#,
+        ))
+        .expect("routers");
+        let with_devices: TokenEntry =
+            serde_json::from_str(&PANOS_SHAPE.replace(r#""panosvm""#, r#""a""#)).expect("devices");
+        let with_targets: TokenEntry =
+            serde_json::from_str(&TARGET_SHAPE.replace(r#""tenant-a", "tenant-b""#, r#""a""#))
+                .expect("targets");
+
+        let expected = ScopeSet::Allowlist(vec!["a".to_owned()]);
+        assert_eq!(with_routers.devices, expected);
+        assert_eq!(with_devices.devices, expected);
+        assert_eq!(with_targets.devices, expected);
+    }
+
+    #[test]
+    fn the_neutral_accessor_reads_the_same_scope_as_the_field() {
+        let entry: TokenEntry = serde_json::from_str(TARGET_SHAPE).expect("parse");
+        assert_eq!(entry.targets(), &entry.devices);
+    }
+
+    #[test]
+    fn a_target_spelled_file_still_serializes_as_devices() {
+        let entry: TokenEntry = serde_json::from_str(TARGET_SHAPE).expect("parse");
+        let json = serde_json::to_string(&entry).expect("serialize");
+        assert!(json.contains("\"devices\""), "canonical spelling: {json}");
+        assert!(
+            !json.contains("\"targets\""),
+            "alias must not round-trip: {json}"
+        );
     }
 
     #[test]

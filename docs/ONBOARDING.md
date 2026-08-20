@@ -87,6 +87,16 @@ Same subcommands everywhere: `token add | list | revoke | rotate | set-scope`.
 Scopes have at least two axes: **which tools** and **which targets** (devices,
 tenant, or org/site UUIDs). Both are checked, tool first.
 
+The target axis accepts three spellings in `tokens.json`, all landing in the
+same field with the same rules: `devices` (canonical), `routers` (what
+rustjunosmcp wrote before extraction), and `targets` (for management-plane
+servers, whose scope entries are tenants or sites rather than devices).
+Whichever you write, the file **serializes back as `devices`** — the alias is
+vocabulary, not a schema variant, so a rotate or a scope change never rewrites
+your file into a spelling you did not choose. In code, `TokenEntry::targets()`,
+`CallerCtx::targets()` and `filter_target_names` are the neutral names for the
+device-named APIs, which remain available and behave identically.
+
 ### Step 3 — Run the server
 
 ```bash
