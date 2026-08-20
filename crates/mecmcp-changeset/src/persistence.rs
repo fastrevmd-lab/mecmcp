@@ -3,8 +3,8 @@
 use crate::{
     ChangeSetRecord, OperationRecord,
     digest::{
-        compute_approval_digest, compute_waiver_digest, compute_waiver_digest_v3,
-        validate_fingerprint, validate_principal_for_digest,
+        compute_approval_digest, compute_approval_digest_legacy, compute_waiver_digest,
+        compute_waiver_digest_v3, validate_fingerprint, validate_principal_for_digest,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -83,7 +83,7 @@ pub fn read_state(path: &Path, max_state_bytes: u64) -> Result<ChangesetState, P
     let on_disk: OnDiskChangesetState = serde_json::from_slice(bytes)
         .map_err(|error| PersistenceError::new(format!("invalid changeset state JSON: {error}")))?;
 
-    if on_disk.version != 1 && on_disk.version != 2 && on_disk.version != 3 {
+    if !(1..=4).contains(&on_disk.version) {
         return Err(PersistenceError::new(format!(
             "unsupported changeset state version {}",
             on_disk.version
@@ -111,6 +111,35 @@ pub fn read_state(path: &Path, max_state_bytes: u64) -> Result<ChangesetState, P
                     &record.owner,
                     approval.approved_at_unix,
                     waiver,
+                );
+            }
+        }
+    }
+
+    // Same reasoning for approvals (mecmcp#283): re-sign under v4 once the
+    // legacy digest has verified. Without it, the next `write_state` stamps the
+    // file version 4 — `approvals_need_v4` triggers on any real approval — while
+    // the digest stays legacy, and the following `read_state` rejects the file.
+    //
+    // Re-signing launders nothing here. The legacy approval digest already
+    // covers all five fields v4 binds, so promoting it authenticates no value
+    // that was previously unsigned. That is what made the waiver migration need
+    // its `reason == "lab-mode"` guard — `reason` was outside the legacy digest
+    // — and there is no analogue for approvals.
+    if on_disk.version < 4 {
+        for record in state.change_sets.values_mut() {
+            let id = record.id.clone();
+            let owner = record.owner.clone();
+            let change_set_digest = record.digest.clone();
+            if let Some(approval) = record.approval.as_mut()
+                && let Some(approver) = approval.approver.as_ref()
+            {
+                approval.digest = crate::digest::compute_approval_digest(
+                    &id,
+                    &change_set_digest,
+                    &owner,
+                    approver,
+                    approval.approved_at_unix,
                 );
             }
         }
@@ -239,18 +268,34 @@ pub fn validate_state(state: &ChangesetState, version: u32) -> Result<(), Persis
             }
 
             let expected_approval_digest = if let Some(approver) = &approval.approver {
-                // Genuine two-person approval: validate principals before digest computation.
-                validate_principal_for_digest("owner", &record.owner)
-                    .map_err(PersistenceError::new)?;
-                validate_principal_for_digest("approver", approver)
-                    .map_err(PersistenceError::new)?;
-                compute_approval_digest(
-                    id,
-                    &record.digest,
-                    &record.owner,
-                    approver,
-                    approval.approved_at_unix,
-                )
+                if version >= 4 {
+                    // The tuple encoding is unambiguous by construction, so the
+                    // separator rule is not needed to make it safe.
+                    compute_approval_digest(
+                        id,
+                        &record.digest,
+                        &record.owner,
+                        approver,
+                        approval.approved_at_unix,
+                    )
+                } else {
+                    // Legacy: the `|`-joined encoding, which is only safe for
+                    // values that cannot move a field boundary. Version decides
+                    // the rule outright — accepting "either digest verifies"
+                    // would let a forged legacy digest pass on a v4 record,
+                    // which is the downgrade hole #275 refused for waivers.
+                    validate_principal_for_digest("owner", &record.owner)
+                        .map_err(PersistenceError::new)?;
+                    validate_principal_for_digest("approver", approver)
+                        .map_err(PersistenceError::new)?;
+                    compute_approval_digest_legacy(
+                        id,
+                        &record.digest,
+                        &record.owner,
+                        approver,
+                        approval.approved_at_unix,
+                    )
+                }
             } else if let Some(waiver) = approval.waived.as_ref() {
                 // Defect 2 fix: reject v1/v2 waivers carrying v3-only metadata.
                 // A genuine legacy waiver could not have carried kind != LabMode,
@@ -390,7 +435,18 @@ pub fn write_state(
             .and_then(|a| a.waived.as_ref())
             .is_some()
     });
-    let version = if waivers_need_v3 {
+    // Version 4 is required once a record carries a genuine two-person approval,
+    // because its digest is computed under the unambiguous tuple encoding
+    // (mecmcp#283) and a v1–v3 reader would recompute the `|`-joined one and
+    // reject the file. Content-based, like every rule above it: a deployment
+    // with no real approvals keeps writing the version it wrote before.
+    let approvals_need_v4 = state
+        .change_sets
+        .values()
+        .any(|cs| cs.approval.as_ref().is_some_and(|a| a.approver.is_some()));
+    let version = if approvals_need_v4 {
+        4
+    } else if waivers_need_v3 {
         3
     } else if operations_need_v2 || change_sets_need_v2 || endpoints_need_v2 {
         2
