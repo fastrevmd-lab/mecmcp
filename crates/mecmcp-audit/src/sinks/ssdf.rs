@@ -663,6 +663,13 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
 }
 
+/// Largest response body this transport will read.
+///
+/// Enough for a high-water answer (`count\tmax`) or a ClickHouse error message,
+/// and small enough that a malformed or hostile response cannot be turned into
+/// an allocation.
+const MAX_RESPONSE_BYTES: usize = 4096;
+
 /// Standard HTTP transport using std::net::TcpStream.
 ///
 /// This is a minimal blocking HTTP/1.1 client for INSERT requests to ClickHouse.
@@ -811,6 +818,17 @@ impl HttpTransport for StdHttpTransport {
                 if size == 0 {
                     break;
                 }
+                // Refuse before allocating. The declared size is attacker- or
+                // fault-controlled — an on-path responder can claim gigabytes —
+                // and allocating first would make the 4 KiB body limit a limit
+                // on what is *kept* rather than on what is *reserved*.
+                let remaining = MAX_RESPONSE_BYTES.saturating_sub(body.len());
+                if size > remaining {
+                    return Err(SsdfSinkError::Http(format!(
+                        "chunked response declares {size} bytes, over the \
+                         {MAX_RESPONSE_BYTES}-byte response limit"
+                    )));
+                }
                 let mut chunk = vec![0u8; size];
                 reader
                     .read_exact(&mut chunk)
@@ -820,9 +838,6 @@ impl HttpTransport for StdHttpTransport {
                 reader.read_line(&mut terminator).map_err(|e| {
                     SsdfSinkError::Http(format!("read chunk terminator failed: {}", e))
                 })?;
-                if body.len() > 4096 {
-                    break;
-                }
             }
             if !(200..300).contains(&status_code) {
                 let body_str = String::from_utf8_lossy(&body);
@@ -840,7 +855,8 @@ impl HttpTransport for StdHttpTransport {
                 Ok(0) => break,
                 Ok(n) => {
                     body.extend_from_slice(&buf[..n]);
-                    if body.len() > 4096 {
+                    if body.len() >= MAX_RESPONSE_BYTES {
+                        body.truncate(MAX_RESPONSE_BYTES);
                         break;
                     }
                 }
@@ -1437,6 +1453,103 @@ mod tests {
         assert_eq!(
             row2.prev_hash, hash1,
             "second row's prev_hash must equal first row's hash"
+        );
+    }
+
+    /// ClickHouse returns query results chunked. Without decoding, a body of
+    /// `1\t3` arrives as `5\r\n1\t3\n\r\n0\r\n\r\n` and the high-water read
+    /// cannot parse it — which, before the surrounding fixes, silently meant
+    /// "nothing landed" and duplicated every delivery.
+    #[test]
+    fn std_http_transport_decodes_a_chunked_response() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            {
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" || header == "\n" {
+                        break;
+                    }
+                }
+            }
+            // Two chunks, to prove the decoder reassembles rather than reading
+            // only the first.
+            let response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                            2\r\n1\t\r\n2\r\n3\n\r\n0\r\n\r\n";
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let request = HttpRequest {
+            url: format!("http://{}/?query=SELECT+1", addr),
+            method: "POST".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let body = StdHttpTransport.send(&request).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(
+            body, "1\t3\n",
+            "both chunks must be reassembled, framing removed"
+        );
+    }
+
+    /// A declared chunk size is attacker- or fault-controlled. Allocating it
+    /// before applying the response limit turns a malformed reply into an
+    /// arbitrary allocation.
+    #[test]
+    fn std_http_transport_refuses_an_oversized_chunk_before_allocating() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            {
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" || header == "\n" {
+                        break;
+                    }
+                }
+            }
+            // Declares 256 MiB and sends nothing. A decoder that allocates on
+            // the declaration hangs or dies here.
+            let response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10000000\r\n";
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+
+        let request = HttpRequest {
+            url: format!("http://{}/?query=SELECT+1", addr),
+            method: "POST".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let result = StdHttpTransport.send(&request);
+        let _ = handle.join();
+
+        let error = result.expect_err("an oversized chunk must be refused");
+        assert!(
+            error.to_string().contains("response limit"),
+            "the refusal must name the limit rather than fail obscurely: {error}"
         );
     }
 }
