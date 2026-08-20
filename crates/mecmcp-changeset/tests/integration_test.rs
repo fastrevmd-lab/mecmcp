@@ -98,9 +98,12 @@ fn test_version_rejection() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state_path = temp_dir.path().join("state.json");
 
-    // Write a state file with version 4 (unsupported)
+    // Version 5 is the first unsupported one: 1-4 are readable, and 4 became
+    // valid with the unambiguous approval digest (mecmcp#283). The point of this
+    // test is that an *unknown future* version is refused rather than guessed
+    // at, so it tracks the top of the supported range.
     let invalid_version = serde_json::json!({
-        "version": 4,
+        "version": 5,
         "state": {
             "operations": {},
             "change_sets": {}
@@ -123,7 +126,7 @@ fn test_version_rejection() {
     assert!(result.is_err());
     let error_message = result.unwrap_err().to_string();
     assert!(
-        error_message.contains("unsupported changeset state version 4"),
+        error_message.contains("unsupported changeset state version 5"),
         "Expected version error, got: {error_message}"
     );
 }

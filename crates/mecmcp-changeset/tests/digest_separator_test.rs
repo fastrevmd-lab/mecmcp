@@ -17,12 +17,39 @@
 
 use mecmcp_changeset::{
     ChangeSetState, ChangesetCoordinator, ChangesetState as StateFile, OperationLimits,
-    digest::{compute_approval_digest, validate_principal_for_digest},
+    digest::{
+        compute_approval_digest, compute_approval_digest_legacy, validate_principal_for_digest,
+    },
     persistence::{read_state, write_state},
     records::{ApprovalRecord, ChangeSetRecord},
 };
 use serde_json::json;
 use std::{collections::BTreeMap, time::Duration};
+
+/// Write a state file at an explicit legacy schema version.
+///
+/// `write_state` stamps version 4 for any record carrying a real approval
+/// (mecmcp#283), so it cannot produce the legacy shape these tests are about.
+/// The separator rule now guards exactly one thing: verification of a record
+/// written *before* v4, whose digest is the ambiguous `|`-joined encoding.
+fn write_legacy_state_file(path: &std::path::Path, version: u64, state: &StateFile) {
+    let payload = json!({
+        "version": version,
+        "state": {
+            "operations": state.operations,
+            "change_sets": state.change_sets,
+        }
+    });
+    std::fs::write(path, serde_json::to_vec_pretty(&payload).unwrap()).unwrap();
+    // `read_state` refuses a group- or world-readable state file, and it is
+    // right to: this holds approval evidence.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
 use tempfile::TempDir;
 
 const LIMIT: u64 = 1024 * 1024;
@@ -38,8 +65,8 @@ struct TestAction {
 /// statement about the encoding, not a bug to fix here. The full fix is #283.
 #[test]
 fn collision_exists_with_separator_in_principals() {
-    let digest_a = compute_approval_digest("id", "plan", "a|b", "c", 1234567890);
-    let digest_b = compute_approval_digest("id", "plan", "a", "b|c", 1234567890);
+    let digest_a = compute_approval_digest_legacy("id", "plan", "a|b", "c", 1234567890);
+    let digest_b = compute_approval_digest_legacy("id", "plan", "a", "b|c", 1234567890);
     assert_eq!(
         digest_a, digest_b,
         "the collision proves why the guard is needed"
@@ -228,7 +255,7 @@ fn load_rejects_separator_in_approver() {
         targets: vec![],
         preview: None,
     };
-    let digest = compute_approval_digest(
+    let digest = compute_approval_digest_legacy(
         &change_set_id,
         &plan_digest,
         &record.owner,
@@ -248,7 +275,8 @@ fn load_rejects_separator_in_approver() {
         operations: BTreeMap::new(),
         change_sets,
     };
-    write_state(&path, &state, LIMIT).unwrap();
+    // Version 3: the last schema whose approvals used the `|`-joined encoding.
+    write_legacy_state_file(&path, 3, &state);
 
     let result = read_state(&path, LIMIT);
     assert!(
@@ -294,7 +322,7 @@ fn load_rejects_separator_in_owner() {
         targets: vec![],
         preview: None,
     };
-    let digest = compute_approval_digest(
+    let digest = compute_approval_digest_legacy(
         &change_set_id,
         &plan_digest,
         &record.owner,
@@ -314,7 +342,8 @@ fn load_rejects_separator_in_owner() {
         operations: BTreeMap::new(),
         change_sets,
     };
-    write_state(&path, &state, LIMIT).unwrap();
+    // Version 3: the last schema whose approvals used the `|`-joined encoding.
+    write_legacy_state_file(&path, 3, &state);
 
     let result = read_state(&path, LIMIT);
     assert!(
@@ -417,6 +446,8 @@ fn load_accepts_clean_approval() {
         targets: vec![],
         preview: None,
     };
+    // What a current writer produces. `write_state` stamps version 4 for any
+    // real approval, and v4 files verify under the tuple encoding.
     let digest = compute_approval_digest(
         &change_set_id,
         &plan_digest,
@@ -462,4 +493,151 @@ fn real_fleet_approvals_are_clean() {
     // - 3 claude-writer/claude-reviewer
     assert!(validate_principal_for_digest("owner", "claude-writer").is_ok());
     assert!(validate_principal_for_digest("approver", "claude-reviewer").is_ok());
+}
+
+// ---- mecmcp#283: the encoding fix itself ----
+
+/// The ambiguity the v4 encoding exists to remove.
+///
+/// Under the legacy encoding these two pairings hash identically, so an approval
+/// digest was valid for a pairing it was never computed for. Asserting the
+/// legacy collision as well as the v4 separation keeps the defect visible: if
+/// someone "fixes" the legacy function instead of migrating, this test says so.
+#[test]
+fn v4_distinguishes_pairings_the_legacy_encoding_conflated() {
+    let legacy_split_owner = compute_approval_digest_legacy("cs", "sha256:plan", "a|b", "c", 1);
+    let legacy_split_approver = compute_approval_digest_legacy("cs", "sha256:plan", "a", "b|c", 1);
+    assert_eq!(
+        legacy_split_owner, legacy_split_approver,
+        "the legacy encoding is ambiguous — that is the defect being migrated away from"
+    );
+
+    let split_owner = compute_approval_digest("cs", "sha256:plan", "a|b", "c", 1);
+    let split_approver = compute_approval_digest("cs", "sha256:plan", "a", "b|c", 1);
+    assert_ne!(
+        split_owner, split_approver,
+        "a serialized tuple encodes lengths, so no value can shift a boundary"
+    );
+}
+
+/// Deterministic, and every field is bound.
+#[test]
+fn v4_is_stable_and_binds_every_field() {
+    use compute_approval_digest as v4;
+
+    let base = v4("cs", "sha256:plan", "owner", "approver", 7);
+    assert_eq!(base, v4("cs", "sha256:plan", "owner", "approver", 7));
+    for altered in [
+        v4("other", "sha256:plan", "owner", "approver", 7),
+        v4("cs", "sha256:other", "owner", "approver", 7),
+        v4("cs", "sha256:plan", "other", "approver", 7),
+        v4("cs", "sha256:plan", "owner", "other", 7),
+        v4("cs", "sha256:plan", "owner", "approver", 8),
+    ] {
+        assert_ne!(base, altered, "every field must change the digest");
+    }
+}
+
+/// v4 must not reproduce the legacy value: the marker and the encoding both
+/// differ, so a legacy digest can never be presented as a v4 one.
+#[test]
+fn v4_never_equals_the_legacy_digest_for_the_same_inputs() {
+    let legacy = compute_approval_digest_legacy("cs", "sha256:plan", "owner", "approver", 7);
+    let v4 = compute_approval_digest("cs", "sha256:plan", "owner", "approver", 7);
+    assert_ne!(legacy, v4);
+}
+
+/// A legacy approval must survive the upgrade, and come out re-signed.
+///
+/// This is the migration the fleet actually performs: ten real approval records
+/// exist across LXC 950 and 960 (960 still on schema v1), all written under the
+/// `|`-joined encoding. They verify under the legacy rule on load, are re-signed
+/// to v4 in memory, and the next write stamps version 4 — so the following load
+/// verifies under the tuple rule and still passes.
+///
+/// Re-signing launders nothing: the legacy digest already covered all five
+/// fields v4 binds, so nothing previously unsigned is promoted. That is the
+/// difference from the waiver migration, whose `reason` was outside the legacy
+/// digest and needed a guard.
+#[test]
+fn a_legacy_approval_migrates_to_v4_and_still_verifies() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("state.json");
+
+    let change_set_id =
+        "0000000000000000000000000000000000000000000000000000000000000009".to_string();
+    let fingerprint = test_fingerprint();
+    let actions = vec![json!({"action": "test"})];
+    let plan_digest = mecmcp_changeset::digest::change_set_digest(
+        "demo-agent",
+        "device1",
+        &fingerprint,
+        &actions,
+    )
+    .unwrap();
+
+    let legacy_digest = compute_approval_digest_legacy(
+        &change_set_id,
+        &plan_digest,
+        "demo-agent",
+        "demo-approver",
+        1234567890,
+    );
+
+    let record = ChangeSetRecord {
+        id: change_set_id.clone(),
+        owner: "demo-agent".into(),
+        device: "device1".into(),
+        expected_candidate_fingerprint: fingerprint,
+        digest: plan_digest.clone(),
+        state: ChangeSetState::Approved,
+        expires_at_unix: 9999999999_u64,
+        actions,
+        approver: Some("demo-approver".into()),
+        approval: Some(ApprovalRecord {
+            approver: Some("demo-approver".into()),
+            approved_at_unix: 1234567890,
+            digest: legacy_digest.clone(),
+            waived: None,
+        }),
+        operation_id: None,
+        policy_signature: String::new(),
+        targets: vec![],
+        preview: None,
+    };
+
+    let mut change_sets = BTreeMap::new();
+    change_sets.insert(change_set_id.clone(), record);
+    let state = StateFile {
+        operations: BTreeMap::new(),
+        change_sets,
+    };
+    // Schema v1, as LXC 960 holds today.
+    write_legacy_state_file(&path, 1, &state);
+
+    let loaded = read_state(&path, LIMIT).expect("a legacy approval must still load");
+    let migrated = loaded.change_sets[&change_set_id]
+        .approval
+        .as_ref()
+        .expect("approval");
+    assert_ne!(
+        migrated.digest, legacy_digest,
+        "the record must be re-signed on load, or the next write leaves the file incoherent"
+    );
+    assert_eq!(
+        migrated.digest,
+        compute_approval_digest(
+            &change_set_id,
+            &plan_digest,
+            "demo-agent",
+            "demo-approver",
+            1234567890,
+        ),
+        "re-signed under v4 over the same inputs"
+    );
+
+    // The round trip a running server performs: write what was loaded, read it
+    // back. This is what fails if the migration is missing.
+    write_state(&path, &loaded, LIMIT).unwrap();
+    read_state(&path, LIMIT).expect("the migrated file must verify under v4");
 }

@@ -237,14 +237,20 @@ impl ChangesetCoordinator {
             ));
         }
 
-        // Validate principals before computing the approval digest. The digest joins
-        // fields with '|', so a principal containing '|' creates ambiguous boundaries.
+        // The v4 encoding is unambiguous by construction, so this check is no
+        // longer what keeps pairings apart. It stays as an input rule: a `|` in
+        // a principal is a sign of a malformed token name, and letting one in
+        // here would also make the record unverifiable if it ever had to be read
+        // back by a binary predating #283.
         validate_principal_for_digest("owner", &record.owner)
             .map_err(|msg| CoordinatorError::new("owner", msg))?;
         validate_principal_for_digest("approver", &approver)
             .map_err(|msg| CoordinatorError::new("approver", msg))?;
 
-        // Compute approval digest: (change_set_id, plan_digest, owner, approver, approved_at)
+        // v4: a serialized tuple over
+        // (marker, change_set_id, plan_digest, owner, approver, approved_at).
+        // Digests held in memory are always the current version; the legacy
+        // encoding survives only on disk, and `read_state` migrates it.
         let approval_digest = compute_approval_digest(
             &change_set_id,
             &record.digest,

@@ -171,7 +171,7 @@ pub fn digest_hex(bytes: &[u8]) -> String {
 /// This makes the approval itself tamper-evident: anyone editing the state file to swap
 /// the approver or mask a self-approval will invalidate the digest.
 #[must_use]
-pub fn compute_approval_digest(
+pub fn compute_approval_digest_legacy(
     change_set_id: &str,
     plan_digest: &str,
     owner: &str,
@@ -264,6 +264,48 @@ pub fn compute_waiver_digest_v3(
     format!("sha256:{}", digest_hex(&canonical))
 }
 
+/// Computes an approval digest under the version-4 encoding.
+///
+/// The v1–v3 encoding joined five fields with a literal `|` and no length
+/// prefix, and `owner`/`approver` are unconstrained strings, so field
+/// boundaries were ambiguous:
+///
+/// ```text
+/// owner="a|b", approver="c"   ->  id|plan|a|b|c|1
+/// owner="a",   approver="b|c" ->  id|plan|a|b|c|1
+/// ```
+///
+/// One digest was therefore valid for a pairing other than the one it was
+/// computed for — the wrong property for a mechanism whose whole job is proving
+/// that *this* approver approved *this* plan (mecmcp#283).
+///
+/// A serialized tuple encodes lengths, so no value can shift a boundary. This
+/// is the encoding [`change_set_digest`] has always used; the approval and
+/// waiver digests were the outliers, and [`compute_waiver_digest_v3`] moved
+/// first.
+///
+/// The leading marker keeps this digest distinguishable from every other tuple
+/// digest here, so a value can never be replayed across kinds.
+#[must_use]
+pub fn compute_approval_digest(
+    change_set_id: &str,
+    plan_digest: &str,
+    owner: &str,
+    approver: &str,
+    approved_at_unix: u64,
+) -> String {
+    let canonical = serde_json::to_vec(&(
+        "mecmcp-approval-v4",
+        change_set_id,
+        plan_digest,
+        owner,
+        approver,
+        approved_at_unix,
+    ))
+    .expect("approval digest inputs are primitives and cannot fail to serialize");
+    format!("sha256:{}", digest_hex(&canonical))
+}
+
 /// Validates that a principal identifier does not contain the digest separator.
 ///
 /// `compute_approval_digest` and the legacy `compute_waiver_digest` join their
@@ -276,9 +318,13 @@ pub fn compute_waiver_digest_v3(
 /// ```
 ///
 /// This function rejects such values before they can participate in a digest,
-/// closing the ambiguity at the input. The full fix (#283) is a length-prefixed
-/// or versioned tuple encoding, but that requires a schema bump; this validation
-/// is the interim mitigation and will remain part of the complete fix.
+/// closing the ambiguity at the input.
+///
+/// Since #283 the encoding itself is unambiguous —
+/// [`compute_approval_digest`] serializes a tuple — so this is no longer the
+/// only thing standing between a `|` and a forged pairing. It stays because the
+/// **legacy** verification path still computes the `|`-joined digest for records
+/// written before v4, and that path must never be handed an ambiguous value.
 ///
 /// # Errors
 ///
