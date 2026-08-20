@@ -19,10 +19,21 @@
 //! recorder, and nothing downstream can either.
 
 use crate::evidence::{
-    ApplyIntentRecord, ApprovalRecord, ChainSegment, ClosedSegment, EvidenceRecord,
-    GENESIS_PREV_HASH, ProposalRecord, ResultReceipt, append, close,
+    ApplyIntentRecord, ApprovalRecord, ChainSegment, ClosedSegment, EvidenceRecord, ProposalRecord,
+    ResultReceipt, append, close,
 };
+use std::collections::HashMap;
 use std::sync::Mutex;
+
+/// `prev_hash` of the first record in an SSDF evidence chain.
+///
+/// **Not** [`crate::evidence::GENESIS_PREV_HASH`], which is 64 zeroes for
+/// entsafe-audit compatibility. The SSDF contract says the first evidence
+/// record per tier carries `prev_hash = ""`, and its verifier reads any other
+/// unreachable predecessor as `missing_predecessor` — so seeding with the
+/// zero hash would make every chain this produces fail verification at the
+/// destination while looking correct here.
+const SSDF_CHAIN_START: &str = "";
 
 /// How a recorder identifies itself and when it rolls a segment.
 #[derive(Debug, Clone)]
@@ -43,6 +54,12 @@ pub struct RecorderConfig {
 pub struct EvidenceRecorder {
     config: RecorderConfig,
     state: Mutex<RecorderState>,
+    /// Durable sink for a segment that must survive the next instruction.
+    ///
+    /// Without one, [`apply_intent`](Self::apply_intent) can only reach memory,
+    /// and a crash during the device call it precedes loses the very record
+    /// that was supposed to prove the attempt happened.
+    spool: Option<Box<dyn Fn(ClosedSegment) + Send + Sync>>,
 }
 
 struct RecorderState {
@@ -51,6 +68,22 @@ struct RecorderState {
     /// Head hash of the last closed segment, linking the next one to it.
     prev_head: String,
     closed: Vec<ClosedSegment>,
+    /// What the proposal said, keyed by request, so later records describe the
+    /// same change rather than blanks.
+    context: HashMap<String, ChangeContext>,
+}
+
+/// The identifying facts of one change, carried across its lifecycle.
+///
+/// Without this, `approval` lands with no `device_id` and no `diff_hash`, and a
+/// receipt lands with no `principal` — rows that cannot establish that the
+/// approval and the result concern the change that was proposed, which is the
+/// only thing the evidence tier is for.
+#[derive(Debug, Clone, Default)]
+struct ChangeContext {
+    device_id: String,
+    principal: String,
+    diff_hash: String,
 }
 
 impl EvidenceRecorder {
@@ -61,17 +94,30 @@ impl EvidenceRecorder {
             config.run_id.clone(),
             config.server_id.clone(),
             0,
-            GENESIS_PREV_HASH.to_owned(),
+            SSDF_CHAIN_START.to_owned(),
         );
         Self {
             state: Mutex::new(RecorderState {
                 current,
                 next_seq: 1,
-                prev_head: GENESIS_PREV_HASH.to_owned(),
+                prev_head: SSDF_CHAIN_START.to_owned(),
                 closed: Vec::new(),
+                context: HashMap::new(),
             }),
             config,
+            spool: None,
         }
+    }
+
+    /// Attach the durable spool that [`apply_intent`](Self::apply_intent) needs.
+    ///
+    /// The callback must persist the segment before it returns — spooling to a
+    /// file that is fsynced, typically `SsdfSink::spool`. A callback that only
+    /// queues in memory reinstates exactly the gap this exists to close.
+    #[must_use]
+    pub fn with_spool(mut self, spool: impl Fn(ClosedSegment) + Send + Sync + 'static) -> Self {
+        self.spool = Some(Box::new(spool));
+        self
     }
 
     /// A change was proposed.
@@ -83,6 +129,14 @@ impl EvidenceRecorder {
         principal: &str,
         diff_hash: &str,
     ) {
+        self.remember(
+            request_id,
+            ChangeContext {
+                device_id: device_id.to_owned(),
+                principal: principal.to_owned(),
+                diff_hash: diff_hash.to_owned(),
+            },
+        );
         self.append(EvidenceRecord::Proposal(ProposalRecord {
             request_id: request_id.to_owned(),
             changeset_id: changeset_id.to_owned(),
@@ -104,12 +158,13 @@ impl EvidenceRecorder {
     /// refusal is evidence too, and omitting it would leave the trail unable to
     /// show that anyone declined.
     pub fn approval(&self, request_id: &str, changeset_id: &str, approver: &str, decision: &str) {
+        let context = self.context_for(request_id);
         self.append(EvidenceRecord::Approval(ApprovalRecord {
             request_id: request_id.to_owned(),
             changeset_id: changeset_id.to_owned(),
-            device_id: String::new(),
+            device_id: context.device_id,
             principal: approver.to_owned(),
-            diff_hash: String::new(),
+            diff_hash: context.diff_hash,
             timestamp: now(),
             run_id: String::new(),
             server_id: String::new(),
@@ -123,9 +178,14 @@ impl EvidenceRecorder {
 
     /// Execution is about to start.
     ///
-    /// Written *before* the device is touched, which is the point: if the
-    /// process dies mid-apply, the trail still shows the attempt. A record
-    /// written only on success cannot describe the case that matters most.
+    /// Written *before* the device is touched, and — when a spool is attached —
+    /// **persisted before this returns**. That is the point: if the process dies
+    /// during the device call, the trail still shows the attempt. A record
+    /// written only on success cannot describe the case that matters most, and
+    /// one held in memory until a later flush cannot either.
+    ///
+    /// Without a spool this only reaches memory, so
+    /// [`with_spool`](Self::with_spool) is what makes the guarantee real.
     pub fn apply_intent(
         &self,
         request_id: &str,
@@ -133,12 +193,13 @@ impl EvidenceRecorder {
         device_id: &str,
         principal: &str,
     ) {
+        let context = self.context_for(request_id);
         self.append(EvidenceRecord::ApplyIntent(ApplyIntentRecord {
             request_id: request_id.to_owned(),
             changeset_id: changeset_id.to_owned(),
             device_id: device_id.to_owned(),
             principal: principal.to_owned(),
-            diff_hash: String::new(),
+            diff_hash: context.diff_hash,
             timestamp: now(),
             run_id: String::new(),
             server_id: String::new(),
@@ -146,6 +207,9 @@ impl EvidenceRecorder {
             prev_hash: String::new(),
             metadata: None,
         }));
+        // Close and persist now. The caller is about to touch a device, and a
+        // record that survives only in memory proves nothing about a crash.
+        self.flush_now();
     }
 
     /// The device answered.
@@ -157,12 +221,13 @@ impl EvidenceRecorder {
         succeeded: bool,
         error: &str,
     ) {
+        let context = self.context_for(request_id);
         self.append(EvidenceRecord::ResultReceipt(ResultReceipt {
             request_id: request_id.to_owned(),
             changeset_id: changeset_id.to_owned(),
             device_id: device_id.to_owned(),
-            principal: String::new(),
-            diff_hash: String::new(),
+            principal: context.principal,
+            diff_hash: context.diff_hash,
             timestamp: now(),
             run_id: String::new(),
             server_id: String::new(),
@@ -188,6 +253,34 @@ impl EvidenceRecorder {
     pub fn close_current(&self) -> Option<ClosedSegment> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         self.roll(&mut state)
+    }
+
+    /// Close the open segment and hand it to the spool, if one is attached.
+    fn flush_now(&self) {
+        let Some(spool) = self.spool.as_ref() else {
+            return;
+        };
+        let mut pending = self.take_closed();
+        if let Some(closed) = self.close_current() {
+            pending.push(closed);
+        }
+        for segment in pending {
+            spool(segment);
+        }
+    }
+
+    /// Remember what a proposal said, for the records that follow it.
+    fn remember(&self, request_id: &str, context: ChangeContext) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.context.insert(request_id.to_owned(), context);
+    }
+
+    /// What the proposal said, or blanks if this request was never proposed
+    /// here — a server restarted mid-change has no memory of it, and an
+    /// incomplete record is better than none.
+    fn context_for(&self, request_id: &str) -> ChangeContext {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.context.get(request_id).cloned().unwrap_or_default()
     }
 
     /// Append, rolling the segment when it is full.

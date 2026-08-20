@@ -118,3 +118,95 @@ fn closing_an_empty_segment_produces_nothing() {
 
     assert!(recorder.close_current().is_none());
 }
+
+/// SSDF defines a chain start as `prev_hash == ""`. Seeding with the 64-zero
+/// `GENESIS_PREV_HASH` — which exists for entsafe-audit compatibility — makes
+/// every chain fail at the destination while verifying locally, because their
+/// verifier reads an unreachable predecessor as `missing_predecessor`.
+#[test]
+fn the_first_record_starts_the_chain_the_way_ssdf_defines_it() {
+    let recorder = recorder_of(8);
+    recorder.proposal("req-1", "cs-1", "vsrx-ci", "agent:test", "sha256:diff");
+
+    let closed = recorder.close_current().unwrap();
+
+    let EvidenceRecord::Proposal(first) = &closed.records()[0] else {
+        panic!("expected a proposal");
+    };
+    assert_eq!(
+        first.prev_hash, "",
+        "SSDF's chain start is the empty string, not the zero hash"
+    );
+}
+
+/// An approval that does not name the device or the plan digest cannot show it
+/// concerns the change that was proposed — which is the only thing the evidence
+/// tier is for.
+#[test]
+fn later_records_carry_the_change_they_describe() {
+    let recorder = recorder_of(8);
+    recorder.proposal("req-1", "cs-1", "vsrx-ci", "agent:planner", "sha256:plan");
+    recorder.approval("req-1", "cs-1", "user:alice", "approved");
+    recorder.result_receipt("req-1", "cs-1", "vsrx-ci", true, "");
+
+    let closed = recorder.close_current().unwrap();
+
+    let EvidenceRecord::Approval(approval) = &closed.records()[1] else {
+        panic!("expected an approval");
+    };
+    assert_eq!(
+        approval.device_id, "vsrx-ci",
+        "the approval must name the device"
+    );
+    assert_eq!(
+        approval.diff_hash, "sha256:plan",
+        "and the plan it approved"
+    );
+
+    let EvidenceRecord::ResultReceipt(receipt) = &closed.records()[2] else {
+        panic!("expected a receipt");
+    };
+    assert_eq!(
+        receipt.principal, "agent:planner",
+        "the receipt must name the actor"
+    );
+    assert_eq!(receipt.diff_hash, "sha256:plan");
+}
+
+/// `apply_intent` precedes a device call. If it only reaches memory, a crash
+/// during that call loses the record that was supposed to prove the attempt.
+#[test]
+fn apply_intent_is_persisted_before_it_returns() {
+    use std::sync::{Arc, Mutex};
+
+    let spooled: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&spooled);
+    let recorder = EvidenceRecorder::new(RecorderConfig {
+        server_id: "mecmcp-test".to_string(),
+        run_id: "run-001".to_string(),
+        records_per_segment: 8,
+    })
+    .with_spool(move |segment| {
+        sink.lock().unwrap().push(segment.records().len() as u64);
+    });
+
+    recorder.proposal("req-1", "cs-1", "vsrx-ci", "agent:test", "sha256:plan");
+    recorder.approval("req-1", "cs-1", "user:alice", "approved");
+    assert!(
+        spooled.lock().unwrap().is_empty(),
+        "nothing is forced out before the apply"
+    );
+
+    recorder.apply_intent("req-1", "cs-1", "vsrx-ci", "agent:test");
+
+    let segments = spooled.lock().unwrap();
+    assert_eq!(
+        segments.len(),
+        1,
+        "the intent must be spooled before returning"
+    );
+    assert_eq!(
+        segments[0], 3,
+        "the segment carries the proposal, approval and intent"
+    );
+}
