@@ -355,6 +355,209 @@ fn read_inventory_file(path: &Path) -> Result<mecmcp_secret::SecretBytes, Invent
 
 /// SHA-256 of the file at `path`. Returns zeros if the file doesn't exist.
 #[allow(dead_code)]
+/// What a migration did, so a caller can tell a conversion from a no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReport {
+    /// Whether the file was rewritten. `false` means it was already canonical.
+    pub converted: bool,
+    /// Where the pre-migration file was kept, when one was written.
+    pub backup: Option<PathBuf>,
+    /// How many devices the canonical file carries.
+    pub devices: usize,
+}
+
+/// Rewrite an inventory file in the canonical envelope.
+///
+/// #27 taught this crate to *read* three shapes and nothing to emit the
+/// canonical one, so every live file stayed legacy: junos cannot version its
+/// schema without an envelope, and `_blocklist_defaults` keeps sharing the
+/// device namespace (mecmcp#48).
+///
+/// Migration is **explicit** — a separate call, never a side effect of writing
+/// a device. An operator's inventory changing shape because they ran
+/// `add_device` is a surprise, and on a `protected` server it is a surprise
+/// during a change. Shape-preserving writes stay the default; this is the
+/// opt-in.
+///
+/// Idempotent: an already-canonical file is left untouched and reported as
+/// `converted: false`, so "run it and see" is a safe thing for an operator to
+/// do.
+///
+/// The original is kept beside the file as `<name>.pre-canonical`, at the same
+/// mode, which is what makes this reversible without a snapshot. The rewrite
+/// itself goes through the same atomic write the rest of this module uses, so a
+/// crash mid-write cannot leave a half-written inventory. The mode is preserved,
+/// because [`FileInventory::load`] refuses a group- or world-readable file (#173)
+/// and a widened mode would fail at the next restart rather than here.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, is not a shape this crate
+/// understands, or cannot be rewritten. A failed migration leaves the original
+/// in place.
+pub fn migrate_to_canonical<D, P>(path: impl AsRef<Path>) -> Result<MigrationReport, InventoryError>
+where
+    for<'de> D: Deserialize<'de> + serde::Serialize,
+    for<'de> P: Deserialize<'de> + serde::Serialize,
+{
+    let path = path.as_ref();
+    let bytes = read_inventory_file(path)?;
+    let value: serde_json::Value = serde_json::from_slice(bytes.expose())
+        .map_err(|e| InventoryError::ParseError(e.to_string()))?;
+
+    // Typed parsing runs for its checks — unknown shape, bad device name,
+    // duplicate — so an unreadable file is refused before anything is written.
+    // What gets written is derived from `value`, not from these: a device type
+    // that accepts unknown fields drops them on the way in, and rebuilding the
+    // file from the parsed structs would silently delete an operator's
+    // forward-compatible keys. The shape changes; the content does not.
+    let (devices, policy) = parse_inventory::<D, P>(bytes.expose())?;
+    let _ = &policy;
+
+    let shape = detect_shape(&value)?;
+    if shape == InventoryShape::Canonical {
+        return Ok(MigrationReport {
+            converted: false,
+            backup: None,
+            devices: devices.len(),
+        });
+    }
+
+    let canonical = canonical_from_value(shape, value)?;
+
+    // Exclusive create, so a predictable backup path in a directory a
+    // lower-privileged account can write cannot be pre-created as a symlink and
+    // used to have an operator overwrite an arbitrary file (`fs::copy` and
+    // `set_permissions` both follow symlinks; `create_new` does not).
+    let backup = path.with_extension("pre-canonical");
+    let original = std::fs::read(path).map_err(InventoryError::IoError)?;
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut handle = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&backup)
+            .map_err(|e| {
+                InventoryError::ParseError(format!(
+                    "could not create backup {}: {e}",
+                    backup.display()
+                ))
+            })?;
+        handle
+            .write_all(&original)
+            .map_err(InventoryError::IoError)?;
+        handle.sync_all().map_err(InventoryError::IoError)?;
+    }
+
+    // Compare-and-swap: refuse if the file moved under us between the read and
+    // here. An `add_device` interleaved with a migration would otherwise be
+    // written away, and the migration would report success.
+    let now = std::fs::read(path).map_err(InventoryError::IoError)?;
+    if now != original {
+        let _ = std::fs::remove_file(&backup);
+        return Err(InventoryError::ParseError(format!(
+            "{} changed while migrating; nothing was written",
+            path.display()
+        )));
+    }
+
+    let owner = file_owner(path);
+    write_atomic(path, &canonical).map_err(|e| {
+        InventoryError::ParseError(format!("could not write {}: {e}", path.display()))
+    })?;
+    // `write_atomic` copies mode, not ownership, so a migration run under sudo
+    // on a service-owned inventory would leave a root-owned 0600 file that the
+    // service cannot read — an outage at its next restart, not here. Restoring
+    // the owner fails closed: the file is unreadable to anyone but root until
+    // this succeeds.
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::chown(path, Some(uid), Some(gid)).map_err(|e| {
+            InventoryError::ParseError(format!(
+                "migrated {} but could not restore its owner: {e}",
+                path.display()
+            ))
+        })?;
+    }
+
+    Ok(MigrationReport {
+        converted: true,
+        backup: Some(backup),
+        devices: devices.len(),
+    })
+}
+
+/// Owner of an existing file, or `None` if it cannot be read.
+fn file_owner(path: &Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid()))
+}
+
+/// Restructure a legacy inventory into the canonical envelope, field for field.
+///
+/// Works on the raw JSON so nothing is lost in a round trip through the typed
+/// model: only the *shape* changes — the magic `_blocklist_defaults` key becomes
+/// the `policy` slot, and a PAN-OS device array becomes a map keyed by each
+/// device's own `name`.
+fn canonical_from_value(
+    shape: InventoryShape,
+    value: serde_json::Value,
+) -> Result<serde_json::Value, InventoryError> {
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("version".to_owned(), serde_json::json!(1));
+
+    match shape {
+        InventoryShape::Canonical => Ok(value),
+        InventoryShape::LegacyJunos => {
+            let serde_json::Value::Object(mut map) = value else {
+                return Err(InventoryError::ParseError(
+                    "legacy Junos inventory is not an object".to_owned(),
+                ));
+            };
+            // The one key that is not a device. Moving it out of the device
+            // namespace is the point of the envelope.
+            if let Some(policy) = map.remove("_blocklist_defaults") {
+                envelope.insert("policy".to_owned(), policy);
+            }
+            envelope.insert("devices".to_owned(), sorted_object(map));
+            Ok(serde_json::Value::Object(envelope))
+        }
+        InventoryShape::LegacyPanos => {
+            let devices = value
+                .get("devices")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    InventoryError::ParseError(
+                        "legacy PAN-OS inventory has no devices array".to_owned(),
+                    )
+                })?;
+            let mut by_name = serde_json::Map::new();
+            for device in devices {
+                let name = device
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        InventoryError::ParseError("legacy PAN-OS device has no name".to_owned())
+                    })?
+                    .to_owned();
+                by_name.insert(name, device.clone());
+            }
+            envelope.insert("devices".to_owned(), sorted_object(by_name));
+            Ok(serde_json::Value::Object(envelope))
+        }
+    }
+}
+
+/// Key-sorted copy, so a re-migration produces identical bytes rather than a
+/// diff that reviews as a change.
+fn sorted_object(map: serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    let ordered: std::collections::BTreeMap<String, serde_json::Value> = map.into_iter().collect();
+    serde_json::to_value(ordered).unwrap_or(serde_json::Value::Null)
+}
+
+/// SHA-256 of the file at `path`. Returns zeros if the file doesn't exist.
+#[allow(dead_code)]
 pub fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
     match std::fs::read(path) {
         Ok(bytes) => {
