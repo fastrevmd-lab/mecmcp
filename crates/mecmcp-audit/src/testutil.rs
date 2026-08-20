@@ -88,6 +88,12 @@ pub fn run_with_capture<F: FnOnce()>(f: F) -> String {
         .with_target(true)
         .with_max_level(tracing::Level::INFO)
         .finish();
+    // Force every callsite's cached `Interest` to be recomputed against the
+    // dispatcher about to be installed. Without this the capture can come back
+    // empty — including of its own events — when another thread emits the same
+    // callsites concurrently, because `Interest` is a process-wide property of
+    // the callsite while this subscriber is thread-local (mecmcp#305).
+    tracing::callsite::rebuild_interest_cache();
     tracing::subscriber::with_default(subscriber, f);
     let bytes = cap.0.lock().unwrap().clone();
     String::from_utf8(bytes).unwrap()
