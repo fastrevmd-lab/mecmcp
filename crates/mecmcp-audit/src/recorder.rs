@@ -22,7 +22,7 @@ use crate::evidence::{
     ApplyIntentRecord, ApprovalRecord, ChainSegment, ClosedSegment, EvidenceRecord, ProposalRecord,
     ResultReceipt, append, close,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 /// `prev_hash` of the first record in an SSDF evidence chain.
@@ -40,6 +40,22 @@ const SSDF_CHAIN_START: &str = "";
 /// Bounds a long-lived server: proposals that never reach a receipt or a
 /// rejection would otherwise accumulate for the life of the process.
 const MAX_TRACKED_CHANGES: usize = 1024;
+
+/// The head a new run must continue from.
+///
+/// `remote` is the newest `row_hash` SSDF holds for this writer; `outbox_tail`
+/// is the head of the newest segment still spooled locally and not yet
+/// acknowledged. **Local wins when present**, because anything in the outbox
+/// will be delivered on replay and will therefore sit between the remote head
+/// and whatever this run writes.
+///
+/// Seeding from `remote` while the outbox is non-empty forks the chain: the
+/// replayed segment and this run's first segment would both name the remote
+/// head as predecessor, and a fork verifies clean.
+#[must_use]
+pub fn resume_head(remote: Option<String>, outbox_tail: Option<String>) -> Option<String> {
+    outbox_tail.or(remote)
+}
 
 /// How a recorder identifies itself and when it rolls a segment.
 #[derive(Debug, Clone)]
@@ -92,6 +108,13 @@ struct RecorderState {
     /// Keying on it looks right and misses every time in production, which is
     /// the failure this map exists to prevent.
     context: HashMap<String, ChangeContext>,
+    /// Insertion order of `context` keys, oldest first.
+    ///
+    /// `HashMap` iteration order is randomised, so evicting `keys().next()`
+    /// drops an arbitrary entry — quite possibly a change still mid-lifecycle,
+    /// whose approval and receipt would then emit the blank fields this map
+    /// exists to prevent. The oldest is the only defensible victim.
+    context_order: VecDeque<String>,
 }
 
 /// The identifying facts of one change, carried across its lifecycle.
@@ -128,6 +151,7 @@ impl EvidenceRecorder {
                 prev_head: start,
                 closed: Vec::new(),
                 context: HashMap::new(),
+                context_order: VecDeque::new(),
             }),
             config,
             spool: None,
@@ -319,14 +343,22 @@ impl EvidenceRecorder {
     /// Remember what a proposal said, for the records that follow it.
     fn remember(&self, changeset_id: &str, context: ChangeContext) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.context.len() >= MAX_TRACKED_CHANGES {
-            // A server that is proposing more than this many changes without
-            // finishing any of them has a bigger problem than evidence context;
-            // dropping the oldest keeps the map bounded without failing a
-            // change.
-            if let Some(oldest) = state.context.keys().next().cloned() {
+        // Replacing an existing key evicts nothing: the map is not growing.
+        let replacing = state.context.contains_key(changeset_id);
+        if !replacing && state.context.len() >= MAX_TRACKED_CHANGES {
+            // A server proposing this many changes without finishing any has a
+            // bigger problem than evidence context, but dropping an *arbitrary*
+            // entry would silently blank a live change's later records. Evict
+            // the oldest.
+            while state.context.len() >= MAX_TRACKED_CHANGES {
+                let Some(oldest) = state.context_order.pop_front() else {
+                    break;
+                };
                 state.context.remove(&oldest);
             }
+        }
+        if !replacing {
+            state.context_order.push_back(changeset_id.to_owned());
         }
         state.context.insert(changeset_id.to_owned(), context);
     }
@@ -334,7 +366,11 @@ impl EvidenceRecorder {
     /// Forget a change that has reached a terminal point.
     fn forget(&self, changeset_id: &str) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.context.remove(changeset_id);
+        if state.context.remove(changeset_id).is_some() {
+            state
+                .context_order
+                .retain(|tracked| tracked != changeset_id);
+        }
     }
 
     /// What the proposal said, or blanks if this change was never proposed

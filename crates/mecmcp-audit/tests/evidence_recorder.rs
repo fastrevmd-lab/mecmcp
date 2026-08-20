@@ -296,3 +296,86 @@ fn a_rejected_change_stops_being_tracked() {
         "a rejected change's context must not survive its rejection"
     );
 }
+
+/// After a crash with fsynced-but-undelivered segments, SSDF's newest row is
+/// *behind* the local chain. Seeding from the remote head would make replay
+/// insert the pending segment and this run's first segment as siblings — and a
+/// fork verifies as two valid chains rather than as an error.
+#[test]
+fn a_pending_outbox_wins_over_the_remote_head() {
+    use mecmcp_audit::recorder::resume_head;
+
+    let remote = Some("sha256:delivered-head".to_string());
+    let pending = Some("sha256:spooled-but-unsent".to_string());
+
+    assert_eq!(
+        resume_head(remote.clone(), pending.clone()),
+        pending,
+        "anything still in the outbox will land between the remote head and this run"
+    );
+    assert_eq!(
+        resume_head(remote.clone(), None),
+        remote,
+        "with an empty outbox the remote head is the truth"
+    );
+    assert_eq!(
+        resume_head(None, None),
+        None,
+        "a genuinely empty writer starts a root"
+    );
+}
+
+/// Eviction must drop the *oldest* tracked change, not an arbitrary one.
+///
+/// `HashMap` iteration order is randomised, so evicting `keys().next()` drops
+/// whichever entry happens to come first — quite possibly a change still
+/// mid-lifecycle, whose approval and receipt then emit exactly the blank device
+/// and digest this map exists to prevent.
+///
+/// Asserting that the *oldest* is gone is what separates the two: correct
+/// eviction guarantees it, and random eviction spares it almost every time.
+#[test]
+fn eviction_drops_the_oldest_change_first() {
+    const CAP: usize = 1024;
+    let recorder = recorder_of(8192);
+
+    // Fill to exactly the cap, oldest first.
+    for n in 0..CAP {
+        recorder.proposal(
+            &format!("req-{n}"),
+            &format!("cs-{n}"),
+            &format!("device-{n}"),
+            "agent:test",
+            &format!("sha256:plan-{n}"),
+        );
+    }
+    // One more forces a single eviction, which must be `cs-0`.
+    recorder.proposal(
+        "req-new",
+        "cs-new",
+        "device-new",
+        "agent:test",
+        "sha256:new",
+    );
+
+    recorder.approval("req-a", "cs-0", "user:alice", "approved");
+    recorder.approval("req-b", "cs-1", "user:alice", "approved");
+    let closed = recorder.close_current().unwrap();
+
+    let records = closed.records();
+    let EvidenceRecord::Approval(oldest) = &records[records.len() - 2] else {
+        panic!("expected an approval for cs-0");
+    };
+    assert_eq!(
+        oldest.device_id, "",
+        "cs-0 is the oldest and must be the entry evicted"
+    );
+
+    let EvidenceRecord::Approval(survivor) = records.last().unwrap() else {
+        panic!("expected an approval for cs-1");
+    };
+    assert_eq!(
+        survivor.device_id, "device-1",
+        "only one entry was evicted, so cs-1 must still be tracked"
+    );
+}
