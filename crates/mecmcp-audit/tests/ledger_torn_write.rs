@@ -78,3 +78,41 @@ fn corruption_before_the_end_is_still_refused() {
         "a malformed line that is not the last one is corruption"
     );
 }
+
+/// A torn tail that splits a multibyte character is still just a torn tail.
+///
+/// Device and server identifiers are free-form strings, so a short write can
+/// land in the middle of a UTF-8 sequence. Decoding the file before locating
+/// the last newline fails on that with `InvalidData` — before any repair gets a
+/// chance to run — so the ledger stays unopenable and the outbox stays
+/// unreplayed, which is the exact failure the repair exists to prevent.
+#[test]
+fn a_torn_tail_split_mid_character_is_still_recoverable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.jsonl");
+    {
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(entry(0).as_bytes()).unwrap();
+        // "café" cut between the two bytes of 'é' (0xC3 0xA9).
+        file.write_all(b"{\"server_id\":\"caf\xc3").unwrap();
+    }
+
+    let Ok(mut ledger) = DeliveryLedger::open(&path) else {
+        panic!("a tail split mid-character is a crash, not corruption")
+    };
+    ledger
+        .mark_pending(mecmcp_audit::sinks::delivery_ledger::SegmentId {
+            server_id: "srv-a".to_owned(),
+            run_id: "run-1".to_owned(),
+            segment_seq: 1,
+        })
+        .unwrap();
+    drop(ledger);
+
+    let bytes = std::fs::read(&path).unwrap();
+    let text = String::from_utf8(bytes).expect("the repaired ledger must be valid UTF-8");
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|error| panic!("ledger line is not valid JSON ({error}): {line}"));
+    }
+}
