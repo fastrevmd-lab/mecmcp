@@ -82,6 +82,20 @@ pub struct RecorderConfig {
     pub records_per_segment: usize,
 }
 
+impl std::fmt::Debug for EvidenceRecorder {
+    /// Deliberately opaque: the state is a live chain behind a mutex, and the
+    /// spool is a closure. Printing the config identifies the writer, which is
+    /// what a reader of a `Debug` line actually wants.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EvidenceRecorder")
+            .field("server_id", &self.config.server_id)
+            .field("run_id", &self.config.run_id)
+            .field("has_spool", &self.spool.is_some())
+            .finish()
+    }
+}
+
 /// Appends evidence records to a run's chain and rolls segments.
 pub struct EvidenceRecorder {
     config: RecorderConfig,

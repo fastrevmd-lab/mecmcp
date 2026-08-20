@@ -6,6 +6,7 @@ use crate::{
     records::{ChangeSetRecord, OperationRecord},
     types::OperationLimits,
 };
+use mecmcp_audit::recorder::EvidenceRecorder;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -95,6 +96,31 @@ pub struct ChangesetCoordinator {
     limits: OperationLimits,
     approval_ttl: Duration,
     lab_mode: bool,
+    /// Emits the four evidence records, when a server wants an evidence trail.
+    ///
+    /// Optional because evidence is a deployment choice: a server with no sink
+    /// configured should not be forced to build chains nothing will read. When
+    /// absent, every emission point is a no-op (mecmcp#292).
+    evidence: Option<Arc<EvidenceRecorder>>,
+}
+
+impl ChangesetCoordinator {
+    /// Emit evidence records for every change this coordinator handles.
+    ///
+    /// Consuming a recorder rather than borrowing one: the chain must have a
+    /// single writer per `(tier, server_id)`, and sharing one coordinator's
+    /// recorder with another would fork it — a fork verifies as two valid
+    /// chains rather than as an error (ssdf#47).
+    #[must_use]
+    pub fn with_evidence(mut self, recorder: Arc<EvidenceRecorder>) -> Self {
+        self.evidence = Some(recorder);
+        self
+    }
+
+    /// The evidence recorder, if this coordinator has one.
+    pub(crate) fn evidence(&self) -> Option<&EvidenceRecorder> {
+        self.evidence.as_deref()
+    }
 }
 
 impl Default for ChangesetCoordinator {
@@ -105,6 +131,7 @@ impl Default for ChangesetCoordinator {
             state_path: None,
             limits: OperationLimits::default(),
             approval_ttl: Duration::from_secs(15 * 60),
+            evidence: None,
             lab_mode: false,
         }
     }
@@ -192,6 +219,7 @@ impl ChangesetCoordinator {
                 limits,
                 approval_ttl,
                 lab_mode,
+                evidence: None,
             });
         };
 
@@ -256,6 +284,7 @@ impl ChangesetCoordinator {
         }
 
         Ok(Self {
+            evidence: None,
             state: Mutex::new(state),
             endpoint_locks: Mutex::new(BTreeMap::new()),
             state_path: Some(path.to_path_buf()),

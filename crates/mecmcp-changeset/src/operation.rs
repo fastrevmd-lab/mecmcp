@@ -607,6 +607,20 @@ impl ChangesetCoordinator {
         record.state = LifecycleState::Committing;
         self.update(record.clone()).await?;
 
+        // The device is about to be touched. This is written — and, with a
+        // spool attached, persisted — *before* that happens, so a crash during
+        // the commit still leaves evidence that the attempt was made. A record
+        // written only on the way out cannot describe the case that matters
+        // most (mecmcp#292).
+        if let Some(evidence) = self.evidence() {
+            evidence.apply_intent(
+                &attribution.request_id.to_string(),
+                record.change_set_id.as_deref().unwrap_or(operation_id),
+                &record.device,
+                &attribution.principal.to_string(),
+            );
+        }
+
         // P1-b: Perform the commit with cancellation support
         // If cancelled, return Indeterminate consistently (no detached worker survives)
         let commit_result = tokio::select! {
@@ -644,7 +658,25 @@ impl ChangesetCoordinator {
                 if succeeded {
                     record.config_lock_held = false;
                 }
+                let receipt_device = record.device.clone();
+                let receipt_changeset = record
+                    .change_set_id
+                    .clone()
+                    .unwrap_or_else(|| operation_id.to_owned());
                 self.update(record).await?;
+
+                // The device answered. A failure is recorded as fully as a
+                // success — a trail that only shows what worked cannot answer
+                // the question anyone actually asks it.
+                if let Some(evidence) = self.evidence() {
+                    evidence.result_receipt(
+                        &attribution.request_id.to_string(),
+                        &receipt_changeset,
+                        &receipt_device,
+                        succeeded,
+                        details.as_deref().unwrap_or(""),
+                    );
+                }
 
                 Ok(CommitOutcome::Reconciled {
                     succeeded,

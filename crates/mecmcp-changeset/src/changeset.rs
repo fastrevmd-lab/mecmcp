@@ -171,6 +171,14 @@ impl ChangesetCoordinator {
 
         self.insert_change_set(record.clone()).await?;
 
+        // A change was proposed. `request_id` is the change-set id: this call
+        // has no MCP request id to hand, and the two later records key on
+        // `changeset_id` anyway, which is what carries context across the
+        // lifecycle (mecmcp#292).
+        if let Some(evidence) = self.evidence() {
+            evidence.proposal(&id, &id, &record.device, &record.owner, &record.digest);
+        }
+
         Ok(record.into())
     }
 
@@ -262,13 +270,19 @@ impl ChangesetCoordinator {
         record.state = ChangeSetState::Approved;
         record.approver = Some(approver.clone());
         record.approval = Some(ApprovalRecord {
-            approver: Some(approver),
+            approver: Some(approver.clone()),
             approved_at_unix: now,
             digest: approval_digest,
             waived: None,
         });
 
         self.update_change_set(record.clone()).await?;
+
+        // A human decided. Recorded after the state write, so the trail cannot
+        // claim an approval the coordinator failed to persist.
+        if let Some(evidence) = self.evidence() {
+            evidence.approval(&change_set_id, &change_set_id, &approver, "approved");
+        }
 
         Ok(record.into())
     }
