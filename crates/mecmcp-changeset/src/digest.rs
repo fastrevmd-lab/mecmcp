@@ -321,7 +321,7 @@ pub fn compute_approval_digest(
 /// closing the ambiguity at the input.
 ///
 /// Since #283 the encoding itself is unambiguous —
-/// [`compute_approval_digest_v4`] serializes a tuple — so this is no longer the
+/// [`compute_approval_digest`] serializes a tuple — so this is no longer the
 /// only thing standing between a `|` and a forged pairing. It stays because the
 /// **legacy** verification path still computes the `|`-joined digest for records
 /// written before v4, and that path must never be handed an ambiguous value.
