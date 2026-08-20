@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -92,15 +92,46 @@ impl DeliveryLedger {
             .read(true)
             .open(&path)?;
 
+        // A crash or a full disk partway through `write_entry` leaves a final
+        // line with no terminating newline. That is an interrupted append, not
+        // corruption, and it must not be fatal: the sink treats a ledger failure
+        // as survivable *because* the segment is already safe in the outbox, and
+        // that reasoning collapses if the next start cannot open the ledger to
+        // replay it. Drop the stump and truncate, so the next append does not
+        // weld itself onto a partial record.
+        //
+        // Only the last line gets this benefit. A malformed line anywhere else
+        // cannot be explained by an interrupted append, and rewritten history is
+        // the one thing this subsystem exists to notice.
+        let mut contents = String::new();
+        {
+            let mut reader = BufReader::new(&file);
+            reader.read_to_string(&mut contents)?;
+        }
+        let torn_tail = match contents.rfind('\n') {
+            Some(index) if index + 1 < contents.len() => contents.len() - (index + 1),
+            None if !contents.is_empty() => contents.len(),
+            _ => 0,
+        };
+        if torn_tail > 0 {
+            let keep = contents.len() - torn_tail;
+            tracing::warn!(
+                bytes = torn_tail,
+                path = %path.display(),
+                "discarding an unterminated final ledger entry left by an interrupted write"
+            );
+            file.set_len(keep as u64)?;
+            file.sync_all()?;
+            contents.truncate(keep);
+        }
+
         // Load existing entries into the index.
         let mut index = HashMap::new();
-        let reader = BufReader::new(&file);
-        for line in reader.lines() {
-            let line = line?;
+        for line in contents.lines() {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: LedgerEntry = serde_json::from_str(&line).map_err(|e| {
+            let entry: LedgerEntry = serde_json::from_str(line).map_err(|e| {
                 LedgerError::InvalidEntry(format!("failed to parse ledger entry: {}", e))
             })?;
             let id = SegmentId {

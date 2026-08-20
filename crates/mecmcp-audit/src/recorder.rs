@@ -42,6 +42,32 @@ const SSDF_CHAIN_START: &str = "";
 /// rejection would otherwise accumulate for the life of the process.
 const MAX_TRACKED_CHANGES: usize = 1024;
 
+/// Metadata for a waived approval.
+///
+/// The optional fields are **omitted** when absent, not set to `null`.
+/// `serde_json::json!` would emit `"ticket": null` for a `None`, and a
+/// presence-based audit query — "which waivers carried a change-control
+/// reference?" — counts a null as present. An unbounded, unticketed lab-mode
+/// waiver would then be indistinguishable from a bounded one whose fields went
+/// missing, which inverts the distinction this metadata exists to draw.
+fn waiver_metadata(
+    kind: &str,
+    reason: &str,
+    expires_at_unix: Option<u64>,
+    ticket: Option<&str>,
+) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("waived".to_owned(), kind.into());
+    metadata.insert("reason".to_owned(), reason.into());
+    if let Some(expires_at_unix) = expires_at_unix {
+        metadata.insert("expires_at_unix".to_owned(), expires_at_unix.into());
+    }
+    if let Some(ticket) = ticket {
+        metadata.insert("ticket".to_owned(), ticket.into());
+    }
+    serde_json::Value::Object(metadata)
+}
+
 /// Classify what [`SsdfSink::spool`](crate::SsdfSink::spool) reported.
 ///
 /// The sink writes and fsyncs the segment, *then* marks it pending in a
@@ -386,16 +412,7 @@ impl EvidenceRecorder {
             prev_hash: String::new(),
             approver: String::new(),
             decision: "approved".to_owned(),
-            metadata: Some(serde_json::json!({
-                "waived": kind,
-                "reason": reason,
-                // What separates a bounded, ticketed exception from an
-                // open-ended one. Omitted rather than nulled when absent, so a
-                // waiver that genuinely has no time box does not read as one
-                // whose time box went missing.
-                "expires_at_unix": expires_at_unix,
-                "ticket": ticket,
-            })),
+            metadata: Some(waiver_metadata(kind, reason, expires_at_unix, ticket)),
         }));
     }
 

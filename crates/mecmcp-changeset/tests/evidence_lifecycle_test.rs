@@ -392,6 +392,19 @@ async fn a_lab_mode_waiver_is_recorded_as_a_waiver() {
         "the trail must say the gate was waived, and why: {:?}",
         approval.metadata
     );
+    let metadata = approval.metadata.as_ref().expect("waiver metadata");
+    assert_eq!(
+        metadata.get("ticket"),
+        None,
+        "a lab-mode waiver has no ticket, and a null one is not the same as no \
+         key: a presence-based audit query counts it as ticketed. {metadata:?}"
+    );
+    assert_eq!(
+        metadata.get("expires_at_unix"),
+        None,
+        "likewise the time box — an unbounded waiver must not look bounded-then-\
+         emptied. {metadata:?}"
+    );
 }
 
 /// Commit-path evidence: what the receipt says, and whether it is written at all.
