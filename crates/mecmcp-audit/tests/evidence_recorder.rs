@@ -17,6 +17,7 @@ fn recorder_of(records_per_segment: usize) -> EvidenceRecorder {
     EvidenceRecorder::new(RecorderConfig {
         server_id: "mecmcp-test".to_string(),
         run_id: "run-001".to_string(),
+        resume_from: None,
         records_per_segment,
     })
 }
@@ -35,7 +36,7 @@ fn the_four_lifecycle_points_each_append_one_record() {
 
     recorder.proposal("req-1", "cs-1", "vsrx-ci", "agent:test", "sha256:diff");
     recorder.approval("req-1", "cs-1", "user:alice", "approved");
-    recorder.apply_intent("req-1", "cs-1", "vsrx-ci", "agent:test");
+    recorder.apply_intent("req-apply", "cs-1", "vsrx-ci", "agent:test");
     recorder.result_receipt("req-1", "cs-1", "vsrx-ci", true, "");
 
     let closed = recorder.close_current().unwrap();
@@ -145,9 +146,18 @@ fn the_first_record_starts_the_chain_the_way_ssdf_defines_it() {
 #[test]
 fn later_records_carry_the_change_they_describe() {
     let recorder = recorder_of(8);
-    recorder.proposal("req-1", "cs-1", "vsrx-ci", "agent:planner", "sha256:plan");
-    recorder.approval("req-1", "cs-1", "user:alice", "approved");
-    recorder.result_receipt("req-1", "cs-1", "vsrx-ci", true, "");
+    // Three separate MCP calls: three different request ids, one changeset.
+    // Reusing a single request id here is what let a lookup keyed on it pass
+    // while missing every time in production.
+    recorder.proposal(
+        "req-propose",
+        "cs-1",
+        "vsrx-ci",
+        "agent:planner",
+        "sha256:plan",
+    );
+    recorder.approval("req-approve", "cs-1", "user:alice", "approved");
+    recorder.result_receipt("req-apply", "cs-1", "vsrx-ci", true, "");
 
     let closed = recorder.close_current().unwrap();
 
@@ -184,20 +194,27 @@ fn apply_intent_is_persisted_before_it_returns() {
     let recorder = EvidenceRecorder::new(RecorderConfig {
         server_id: "mecmcp-test".to_string(),
         run_id: "run-001".to_string(),
+        resume_from: None,
         records_per_segment: 8,
     })
     .with_spool(move |segment| {
         sink.lock().unwrap().push(segment.records().len() as u64);
     });
 
-    recorder.proposal("req-1", "cs-1", "vsrx-ci", "agent:test", "sha256:plan");
-    recorder.approval("req-1", "cs-1", "user:alice", "approved");
+    recorder.proposal(
+        "req-propose",
+        "cs-1",
+        "vsrx-ci",
+        "agent:test",
+        "sha256:plan",
+    );
+    recorder.approval("req-approve", "cs-1", "user:alice", "approved");
     assert!(
         spooled.lock().unwrap().is_empty(),
         "nothing is forced out before the apply"
     );
 
-    recorder.apply_intent("req-1", "cs-1", "vsrx-ci", "agent:test");
+    recorder.apply_intent("req-apply", "cs-1", "vsrx-ci", "agent:test");
 
     let segments = spooled.lock().unwrap();
     assert_eq!(
@@ -208,5 +225,74 @@ fn apply_intent_is_persisted_before_it_returns() {
     assert_eq!(
         segments[0], 3,
         "the segment carries the proposal, approval and intent"
+    );
+}
+
+/// SSDF verifies by tier and reads an empty `prev_hash` as a chain root. A
+/// recorder that always starts empty mints a new accepted root every process
+/// start — and once a tier has many roots, deleting a whole run leaves no
+/// missing predecessor for the verifier to notice.
+#[test]
+fn a_restarted_run_continues_the_tier_chain() {
+    let resumed = EvidenceRecorder::new(RecorderConfig {
+        server_id: "mecmcp-test".to_string(),
+        run_id: "run-002".to_string(),
+        resume_from: Some("sha256:head-of-the-previous-run".to_string()),
+        records_per_segment: 8,
+    });
+
+    resumed.proposal("req-1", "cs-9", "vsrx-ci", "agent:test", "sha256:plan");
+    let closed = resumed.close_current().unwrap();
+
+    let EvidenceRecord::Proposal(first) = &closed.records()[0] else {
+        panic!("expected a proposal");
+    };
+    assert_eq!(
+        first.prev_hash, "sha256:head-of-the-previous-run",
+        "a resumed run must link to the tier's head, not start a second root"
+    );
+}
+
+/// A change that reaches a receipt is finished. Holding its context afterwards
+/// means a long-lived server accumulates every device, principal and digest it
+/// has ever seen — segment rolling bounds the records but not this.
+#[test]
+fn a_finished_change_stops_being_tracked() {
+    let recorder = recorder_of(64);
+    recorder.proposal("req-1", "cs-1", "vsrx-ci", "agent:planner", "sha256:plan");
+    recorder.result_receipt("req-2", "cs-1", "vsrx-ci", true, "");
+
+    // A later record for the same changeset finds nothing, which is correct:
+    // the change is over, and inventing context for it would be worse than
+    // leaving the fields empty.
+    recorder.approval("req-3", "cs-1", "user:alice", "approved");
+    let closed = recorder.close_current().unwrap();
+
+    let EvidenceRecord::Approval(approval) = &closed.records()[2] else {
+        panic!("expected an approval");
+    };
+    assert_eq!(
+        approval.device_id, "",
+        "a finished change's context must not be retained"
+    );
+}
+
+/// A rejected change never reaches a receipt, so the rejection is its terminal
+/// point — otherwise every refused proposal leaks its context forever.
+#[test]
+fn a_rejected_change_stops_being_tracked() {
+    let recorder = recorder_of(64);
+    recorder.proposal("req-1", "cs-1", "vsrx-ci", "agent:planner", "sha256:plan");
+    recorder.approval("req-2", "cs-1", "user:alice", "rejected");
+
+    recorder.apply_intent("req-3", "cs-1", "vsrx-ci", "agent:test");
+    let closed = recorder.close_current().unwrap();
+
+    let EvidenceRecord::ApplyIntent(intent) = &closed.records()[2] else {
+        panic!("expected an apply intent");
+    };
+    assert_eq!(
+        intent.diff_hash, "",
+        "a rejected change's context must not survive its rejection"
     );
 }

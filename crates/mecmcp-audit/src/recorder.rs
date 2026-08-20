@@ -35,6 +35,12 @@ use std::sync::Mutex;
 /// destination while looking correct here.
 const SSDF_CHAIN_START: &str = "";
 
+/// Changes whose context is held awaiting their later lifecycle records.
+///
+/// Bounds a long-lived server: proposals that never reach a receipt or a
+/// rejection would otherwise accumulate for the life of the process.
+const MAX_TRACKED_CHANGES: usize = 1024;
+
 /// How a recorder identifies itself and when it rolls a segment.
 #[derive(Debug, Clone)]
 pub struct RecorderConfig {
@@ -42,6 +48,16 @@ pub struct RecorderConfig {
     pub server_id: String,
     /// Audit run identifier — one per process lifetime.
     pub run_id: String,
+    /// Head hash this run's chain continues from.
+    ///
+    /// SSDF groups verification by **tier**, and reads an empty `prev_hash` as
+    /// a chain root. A recorder that always starts empty therefore mints a new
+    /// accepted root on every process start — and once there are many roots,
+    /// deleting a whole run leaves no missing predecessor for the verifier to
+    /// notice. Pass the tier's current head (the `row_hash` of its newest row,
+    /// read as `ssdf_audit_verify`); `None` only when the tier is genuinely
+    /// empty.
+    pub resume_from: Option<String>,
     /// Records per segment before it closes itself.
     ///
     /// A segment is the unit of delivery, so this trades latency against
@@ -68,8 +84,13 @@ struct RecorderState {
     /// Head hash of the last closed segment, linking the next one to it.
     prev_head: String,
     closed: Vec<ClosedSegment>,
-    /// What the proposal said, keyed by request, so later records describe the
-    /// same change rather than blanks.
+    /// What the proposal said, keyed by **changeset**, so later records
+    /// describe the same change rather than blanks.
+    ///
+    /// Not by `request_id`: that identifies one MCP call, and proposal,
+    /// approval and apply are three separate calls with three different values.
+    /// Keying on it looks right and misses every time in production, which is
+    /// the failure this map exists to prevent.
     context: HashMap<String, ChangeContext>,
 }
 
@@ -90,17 +111,21 @@ impl EvidenceRecorder {
     /// Start a run's chain.
     #[must_use]
     pub fn new(config: RecorderConfig) -> Self {
+        let start = config
+            .resume_from
+            .clone()
+            .unwrap_or_else(|| SSDF_CHAIN_START.to_owned());
         let current = ChainSegment::new(
             config.run_id.clone(),
             config.server_id.clone(),
             0,
-            SSDF_CHAIN_START.to_owned(),
+            start.clone(),
         );
         Self {
             state: Mutex::new(RecorderState {
                 current,
                 next_seq: 1,
-                prev_head: SSDF_CHAIN_START.to_owned(),
+                prev_head: start,
                 closed: Vec::new(),
                 context: HashMap::new(),
             }),
@@ -130,7 +155,7 @@ impl EvidenceRecorder {
         diff_hash: &str,
     ) {
         self.remember(
-            request_id,
+            changeset_id,
             ChangeContext {
                 device_id: device_id.to_owned(),
                 principal: principal.to_owned(),
@@ -158,7 +183,7 @@ impl EvidenceRecorder {
     /// refusal is evidence too, and omitting it would leave the trail unable to
     /// show that anyone declined.
     pub fn approval(&self, request_id: &str, changeset_id: &str, approver: &str, decision: &str) {
-        let context = self.context_for(request_id);
+        let context = self.context_for(changeset_id);
         self.append(EvidenceRecord::Approval(ApprovalRecord {
             request_id: request_id.to_owned(),
             changeset_id: changeset_id.to_owned(),
@@ -174,6 +199,11 @@ impl EvidenceRecorder {
             decision: decision.to_owned(),
             metadata: None,
         }));
+        if decision != "approved" {
+            // A rejected change never reaches a receipt, so this is its
+            // terminal point.
+            self.forget(changeset_id);
+        }
     }
 
     /// Execution is about to start.
@@ -193,7 +223,7 @@ impl EvidenceRecorder {
         device_id: &str,
         principal: &str,
     ) {
-        let context = self.context_for(request_id);
+        let context = self.context_for(changeset_id);
         self.append(EvidenceRecord::ApplyIntent(ApplyIntentRecord {
             request_id: request_id.to_owned(),
             changeset_id: changeset_id.to_owned(),
@@ -209,7 +239,7 @@ impl EvidenceRecorder {
         }));
         // Close and persist now. The caller is about to touch a device, and a
         // record that survives only in memory proves nothing about a crash.
-        self.flush_now();
+        self.flush_after_append();
     }
 
     /// The device answered.
@@ -221,7 +251,7 @@ impl EvidenceRecorder {
         succeeded: bool,
         error: &str,
     ) {
-        let context = self.context_for(request_id);
+        let context = self.context_for(changeset_id);
         self.append(EvidenceRecord::ResultReceipt(ResultReceipt {
             request_id: request_id.to_owned(),
             changeset_id: changeset_id.to_owned(),
@@ -237,6 +267,10 @@ impl EvidenceRecorder {
             error: (!error.is_empty()).then(|| error.to_owned()),
             metadata: None,
         }));
+        // Terminal: the change is done and its context is dead weight. Without
+        // this a long-lived server accumulates every device, principal and
+        // digest it has ever seen.
+        self.forget(changeset_id);
     }
 
     /// Take every segment closed so far, leaving the open one alone.
@@ -255,32 +289,60 @@ impl EvidenceRecorder {
         self.roll(&mut state)
     }
 
-    /// Close the open segment and hand it to the spool, if one is attached.
-    fn flush_now(&self) {
+    /// Close and hand every pending segment to the spool.
+    ///
+    /// The segments are claimed under **one** lock acquisition. Taking them in
+    /// two steps let a concurrent `take_closed` remove the intent's segment in
+    /// between, so this would return having spooled nothing while the drainer
+    /// still held it in memory — the guarantee gone, silently, under
+    /// concurrency only.
+    ///
+    /// The callback runs outside the lock: it does file I/O, and a spool that
+    /// called back into the recorder would otherwise deadlock.
+    fn flush_after_append(&self) {
         let Some(spool) = self.spool.as_ref() else {
             return;
         };
-        let mut pending = self.take_closed();
-        if let Some(closed) = self.close_current() {
-            pending.push(closed);
-        }
-        for segment in pending {
+        let claimed = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let mut pending = std::mem::take(&mut state.closed);
+            if let Some(closed) = self.roll(&mut state) {
+                pending.push(closed);
+            }
+            pending
+        };
+        for segment in claimed {
             spool(segment);
         }
     }
 
     /// Remember what a proposal said, for the records that follow it.
-    fn remember(&self, request_id: &str, context: ChangeContext) {
+    fn remember(&self, changeset_id: &str, context: ChangeContext) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.context.insert(request_id.to_owned(), context);
+        if state.context.len() >= MAX_TRACKED_CHANGES {
+            // A server that is proposing more than this many changes without
+            // finishing any of them has a bigger problem than evidence context;
+            // dropping the oldest keeps the map bounded without failing a
+            // change.
+            if let Some(oldest) = state.context.keys().next().cloned() {
+                state.context.remove(&oldest);
+            }
+        }
+        state.context.insert(changeset_id.to_owned(), context);
     }
 
-    /// What the proposal said, or blanks if this request was never proposed
+    /// Forget a change that has reached a terminal point.
+    fn forget(&self, changeset_id: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.context.remove(changeset_id);
+    }
+
+    /// What the proposal said, or blanks if this change was never proposed
     /// here — a server restarted mid-change has no memory of it, and an
     /// incomplete record is better than none.
-    fn context_for(&self, request_id: &str) -> ChangeContext {
+    fn context_for(&self, changeset_id: &str) -> ChangeContext {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.context.get(request_id).cloned().unwrap_or_default()
+        state.context.get(changeset_id).cloned().unwrap_or_default()
     }
 
     /// Append, rolling the segment when it is full.
