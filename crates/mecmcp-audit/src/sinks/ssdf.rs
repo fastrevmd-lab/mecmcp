@@ -1462,7 +1462,7 @@ mod tests {
     /// "nothing landed" and duplicated every delivery.
     #[test]
     fn std_http_transport_decodes_a_chunked_response() {
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
         use std::thread;
 
