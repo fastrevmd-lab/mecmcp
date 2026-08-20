@@ -5,12 +5,21 @@
 //! and delivery status is tracked in a separate ledger. Sink failures are
 //! non-fatal to the serving process (fail-open ship, fail-closed record).
 //!
-//! ## Server-Side Deduplication
+//! ## Deduplication
 //!
-//! Evidence records use server-side INSERT ... SELECT ... WHERE NOT EXISTS guard
-//! with ClickHouse HTTP parameter binding. Parameters are passed via URL query
-//! string in the format `param_X=value` and referenced in SQL as `{X:Type}`.
-//! This prevents SQL injection and enables ClickHouse-native deduplication.
+//! A high-water mark, read before each delivery, **not** an in-statement guard.
+//!
+//! The guard this sink used to send — `INSERT … WHERE NOT EXISTS (SELECT …)` —
+//! could never have executed: ClickHouse runs it as the inserting identity, and
+//! SSDF grants `ssdf_audit` INSERT and nothing else, deliberately, so a stolen
+//! writer credential can append but not enumerate. Every delivery would have
+//! been refused for missing SELECT.
+//!
+//! Instead the sink asks, as the separate `ssdf_audit_verify` identity SSDF
+//! provisions for chain-seeding, what the highest `segment_seq` for this run
+//! already is, and sends only what is above it. Parameters are still bound via
+//! `param_X=value` / `{X:Type}`, so the read is injection-safe. Resolved in
+//! ssdf#47.
 //!
 //! ## Background Delivery
 //!
@@ -50,6 +59,15 @@ pub struct SsdfSinkConfig {
     pub username: String,
     /// ClickHouse password.
     pub password: String,
+    /// Read identity used only for the dedup high-water mark.
+    ///
+    /// `ssdf_audit` is INSERT-only by design, so it cannot perform the read that
+    /// tells the sink what already landed. SSDF provisions `ssdf_audit_verify`
+    /// for exactly this — its migration calls it "startup chain-seeding and
+    /// verify_audit" (ssdf#47).
+    pub verify_username: String,
+    /// Password for [`verify_username`](Self::verify_username).
+    pub verify_password: String,
     /// Path to the durable outbox spool file.
     pub outbox_path: PathBuf,
     /// Path to the delivery ledger.
@@ -197,11 +215,32 @@ impl SsdfSink {
     /// Returns the number of successfully delivered segments. Failures are
     /// retried with exponential backoff + jitter (capped at max_backoff).
     pub fn attempt_delivery(&self) -> Result<usize, SsdfSinkError> {
-        // Load all segments from the outbox.
-        let segments = self.load_outbox()?;
+        // Load all segments from the outbox, oldest sequence first per run.
+        // Order is not cosmetic here: dedup asks SSDF for the highest
+        // `segment_seq` it holds and treats everything at or below as landed.
+        // That is only true if segments go in ascending order and none is
+        // skipped — otherwise delivering N+1 after N failed makes the maximum
+        // claim N landed, and the chain acquires a gap that still verifies as a
+        // chain. Which is the exact failure this sink exists to prevent.
+        let mut segments = self.load_outbox()?;
+        segments.sort_by(|left, right| {
+            (&left.server_id, &left.run_id, left.segment_seq).cmp(&(
+                &right.server_id,
+                &right.run_id,
+                right.segment_seq,
+            ))
+        });
         let mut delivered_count = 0;
+        // Runs with a segment that failed this pass. Later segments of the same
+        // run must wait: they would otherwise overtake it.
+        let mut blocked_runs: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
 
         for segment in segments {
+            let run = (segment.server_id.clone(), segment.run_id.clone());
+            if blocked_runs.contains(&run) {
+                continue;
+            }
             let id = SegmentId {
                 server_id: segment.server_id.clone(),
                 run_id: segment.run_id.clone(),
@@ -248,6 +287,8 @@ impl SsdfSink {
                         .lock()
                         .expect("ledger mutex not poisoned")
                         .mark_failed(id, failed_at, e.to_string(), new_attempts)?;
+                    // Hold the rest of this run back until this segment lands.
+                    blocked_runs.insert(run);
                 }
             }
         }
@@ -304,8 +345,93 @@ impl SsdfSink {
         Ok(segments)
     }
 
-    /// Deliver a single segment to SSDF via HTTP INSERT with server-side dedup guard.
+    /// Deliver a single segment to SSDF via HTTP INSERT.
+    ///
+    /// Dedup happens first, as a separate read under a separate identity — see
+    /// [`high_water_mark`](Self::high_water_mark).
+    /// Highest `segment_seq` SSDF already holds for this run.
+    ///
+    /// Read as the **verify** identity, because the writer has no SELECT. This
+    /// is the same read the sink needs for chain-seeding, so dedup costs nothing
+    /// extra: a segment at or below the mark was already accepted and a retry
+    /// would append a duplicate row to a hash chain.
+    ///
+    /// Returns `None` when SSDF holds nothing for this run, or when the answer
+    /// cannot be read — an unreadable mark must not be treated as "nothing
+    /// landed", so the caller keeps the segment spooled rather than risking a
+    /// duplicate.
+    fn high_water_mark(&self, segment: &ClosedSegment) -> Result<Option<u64>, SsdfSinkError> {
+        // `count()` alongside `max()` because `max()` over no rows and `max()`
+        // over a run whose only landed segment is sequence **0** both render as
+        // `0`. Treating the second as the first re-inserts segment 0 after a
+        // crash between the insert and the ledger write.
+        let query = format!(
+            "SELECT count(), max(JSONExtractUInt(args, 'segment_seq')) FROM {}.audit \
+             WHERE tier = 'evidence' \
+               AND JSONExtractString(args, 'server_id') = {{server_id:String}} \
+               AND JSONExtractString(args, 'run_id') = {{run_id:String}} \
+             FORMAT TabSeparated",
+            self.config.database
+        );
+        let url = format!(
+            "{}/?query={}&param_server_id={}&param_run_id={}",
+            self.config.endpoint,
+            urlencoding::encode(&query),
+            urlencoding::encode(&segment.server_id),
+            urlencoding::encode(&segment.run_id),
+        );
+        let request = HttpRequest {
+            url,
+            method: "POST".to_string(),
+            headers: vec![(
+                "Authorization".to_string(),
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(format!(
+                        "{}:{}",
+                        self.config.verify_username, self.config.verify_password
+                    ))
+                ),
+            )],
+            body: Vec::new(),
+        };
+
+        // A read that fails is **not** "nothing landed". Expired verify
+        // credentials or a transient 5xx would otherwise green-light a plain
+        // INSERT and append a duplicate on a lost-ack replay. The error
+        // propagates, the segment stays spooled, and the next pass tries again.
+        let body = self.transport.send(&request)?;
+
+        let mut fields = body.split_whitespace();
+        let count: u64 = fields
+            .next()
+            .and_then(|field| field.parse().ok())
+            .ok_or_else(|| {
+                SsdfSinkError::Http(format!("unreadable high-water response: {body:?}"))
+            })?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let max: u64 = fields
+            .next()
+            .and_then(|field| field.parse().ok())
+            .ok_or_else(|| {
+                SsdfSinkError::Http(format!("unreadable high-water maximum: {body:?}"))
+            })?;
+        Ok(Some(max))
+    }
+
     fn deliver_segment(&self, segment: &ClosedSegment) -> Result<(), SsdfSinkError> {
+        // Dedup, before anything is sent. A retry after a lost acknowledgement
+        // carries the identical rows and identical `row_hash`; appending them
+        // again would put a duplicate into a chain whose whole value is that it
+        // can be verified.
+        if let Some(mark) = self.high_water_mark(segment)?
+            && segment.segment_seq <= mark
+        {
+            return Ok(());
+        }
+
         // Convert segment records to SSDF rows.
         let rows: Vec<SsdfRow> = segment
             .records()
@@ -324,33 +450,21 @@ impl SsdfSink {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Build INSERT query with server-side deduplication guard using parameter binding.
-        // ClickHouse HTTP interface supports typed parameters via URL query string:
-        // ?param_X=value references {X:Type} in SQL.
+        // A plain INSERT. It carries no guard clause, and that is not a style
+        // choice: ClickHouse runs a guard's SELECT as the *inserting* identity,
+        // and `ssdf_audit` has no SELECT — SSDF gives it away deliberately so a
+        // stolen writer credential can append but not enumerate. A guarded
+        // insert is refused outright. Dedup happens before this, in
+        // `high_water_mark` (ssdf#47).
         let query = format!(
-            "INSERT INTO {}.audit \
-             SELECT * FROM input('ts DateTime64(3, \\'UTC\\'), principal LowCardinality(String), \
-             tier LowCardinality(String), tool LowCardinality(String), args String, \
-             data_classes Array(LowCardinality(String)), decision LowCardinality(String), \
-             row_count UInt32, error String, prev_hash String, row_hash String') \
-             WHERE NOT EXISTS (\
-               SELECT 1 FROM {}.audit \
-               WHERE tier = 'evidence' \
-                 AND JSONExtractString(args, 'server_id') = {{server_id:String}} \
-                 AND JSONExtractString(args, 'run_id') = {{run_id:String}} \
-                 AND JSONExtractUInt(args, 'segment_seq') = {{segment_seq:UInt64}}\
-             )",
-            self.config.database, self.config.database
+            "INSERT INTO {}.audit FORMAT JSONEachRow",
+            self.config.database
         );
 
-        // Build URL with query and parameters.
         let url = format!(
-            "{}/?query={}&param_server_id={}&param_run_id={}&param_segment_seq={}",
+            "{}/?query={}",
             self.config.endpoint,
-            urlencoding::encode(&query),
-            urlencoding::encode(&segment.server_id),
-            urlencoding::encode(&segment.run_id),
-            segment.segment_seq
+            urlencoding::encode(&query)
         );
 
         // Send HTTP request.
@@ -529,8 +643,11 @@ fn getrandom_u64() -> u64 {
 
 /// HTTP transport abstraction for testing.
 pub trait HttpTransport: Send + Sync {
-    /// Send an HTTP request.
-    fn send(&self, request: &HttpRequest) -> Result<(), SsdfSinkError>;
+    /// Send an HTTP request and return its response body.
+    ///
+    /// The body matters: dedup reads a high-water mark back from ClickHouse, so
+    /// a transport that discards responses cannot support it.
+    fn send(&self, request: &HttpRequest) -> Result<String, SsdfSinkError>;
 }
 
 /// HTTP request.
@@ -546,6 +663,13 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
 }
 
+/// Largest response body this transport will read.
+///
+/// Enough for a high-water answer (`count\tmax`) or a ClickHouse error message,
+/// and small enough that a malformed or hostile response cannot be turned into
+/// an allocation.
+const MAX_RESPONSE_BYTES: usize = 4096;
+
 /// Standard HTTP transport using std::net::TcpStream.
 ///
 /// This is a minimal blocking HTTP/1.1 client for INSERT requests to ClickHouse.
@@ -553,7 +677,7 @@ pub struct HttpRequest {
 struct StdHttpTransport;
 
 impl HttpTransport for StdHttpTransport {
-    fn send(&self, request: &HttpRequest) -> Result<(), SsdfSinkError> {
+    fn send(&self, request: &HttpRequest) -> Result<String, SsdfSinkError> {
         use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpStream;
         use std::time::Duration;
@@ -654,6 +778,7 @@ impl HttpTransport for StdHttpTransport {
 
         // Read headers until blank line.
         let mut _content_length = None;
+        let mut chunked = false;
         loop {
             let mut header_line = String::new();
             reader
@@ -662,22 +787,76 @@ impl HttpTransport for StdHttpTransport {
             if header_line == "\r\n" || header_line == "\n" {
                 break;
             }
-            if let Some((name, value)) = header_line.split_once(':')
-                && name.trim().eq_ignore_ascii_case("content-length")
-            {
-                _content_length = value.trim().parse::<usize>().ok();
+            if let Some((name, value)) = header_line.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    _content_length = value.trim().parse::<usize>().ok();
+                } else if name.trim().eq_ignore_ascii_case("transfer-encoding")
+                    && value.to_ascii_lowercase().contains("chunked")
+                {
+                    // ClickHouse returns query results chunked. Without
+                    // decoding, a body of `3` arrives as `2\r\n3\n\r\n0\r\n\r\n`
+                    // and every high-water read fails to parse — which, before
+                    // this, silently meant "nothing landed".
+                    chunked = true;
+                }
             }
         }
 
         // Read response body (up to 4KB for error messages).
         let mut body = Vec::new();
+        if chunked {
+            loop {
+                let mut size_line = String::new();
+                reader
+                    .read_line(&mut size_line)
+                    .map_err(|e| SsdfSinkError::Http(format!("read chunk size failed: {}", e)))?;
+                // A chunk header may carry extensions after a `;`.
+                let size_text = size_line.trim().split(';').next().unwrap_or("").trim();
+                let size = usize::from_str_radix(size_text, 16).map_err(|_| {
+                    SsdfSinkError::Http(format!("invalid chunk size: {size_text:?}"))
+                })?;
+                if size == 0 {
+                    break;
+                }
+                // Refuse before allocating. The declared size is attacker- or
+                // fault-controlled — an on-path responder can claim gigabytes —
+                // and allocating first would make the 4 KiB body limit a limit
+                // on what is *kept* rather than on what is *reserved*.
+                let remaining = MAX_RESPONSE_BYTES.saturating_sub(body.len());
+                if size > remaining {
+                    return Err(SsdfSinkError::Http(format!(
+                        "chunked response declares {size} bytes, over the \
+                         {MAX_RESPONSE_BYTES}-byte response limit"
+                    )));
+                }
+                let mut chunk = vec![0u8; size];
+                reader
+                    .read_exact(&mut chunk)
+                    .map_err(|e| SsdfSinkError::Http(format!("read chunk failed: {}", e)))?;
+                body.extend_from_slice(&chunk);
+                let mut terminator = String::new();
+                reader.read_line(&mut terminator).map_err(|e| {
+                    SsdfSinkError::Http(format!("read chunk terminator failed: {}", e))
+                })?;
+            }
+            if !(200..300).contains(&status_code) {
+                let body_str = String::from_utf8_lossy(&body);
+                return Err(SsdfSinkError::Http(format!(
+                    "HTTP {} {}",
+                    status_code,
+                    body_str.chars().take(200).collect::<String>()
+                )));
+            }
+            return Ok(String::from_utf8_lossy(&body).into_owned());
+        }
         let mut buf = [0u8; 1024];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     body.extend_from_slice(&buf[..n]);
-                    if body.len() > 4096 {
+                    if body.len() >= MAX_RESPONSE_BYTES {
+                        body.truncate(MAX_RESPONSE_BYTES);
                         break;
                     }
                 }
@@ -698,7 +877,7 @@ impl HttpTransport for StdHttpTransport {
             )));
         }
 
-        Ok(())
+        Ok(String::from_utf8_lossy(&body).into_owned())
     }
 }
 
@@ -741,8 +920,22 @@ mod tests {
         }
     }
 
+    /// Requests that actually insert, as opposed to the high-water read that
+    /// precedes each delivery. Counting raw requests would make every one of
+    /// these tests assert the shape of the dedup protocol by accident.
+    fn inserts(requests: &[HttpRequest]) -> Vec<&HttpRequest> {
+        requests
+            .iter()
+            .filter(|request| {
+                urlencoding::decode(&request.url)
+                    .map(|url| url.contains("INSERT"))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
     impl HttpTransport for MockHttpTransport {
-        fn send(&self, request: &HttpRequest) -> Result<(), SsdfSinkError> {
+        fn send(&self, request: &HttpRequest) -> Result<String, SsdfSinkError> {
             if self.should_fail {
                 return Err(SsdfSinkError::Http("mock transport failure".to_string()));
             }
@@ -750,7 +943,17 @@ mod tests {
                 .lock()
                 .expect("mock transport mutex not poisoned")
                 .push(request.clone());
-            Ok(())
+            // The high-water read expects `count\tmax`. `0\t0` is "SSDF holds
+            // nothing for this run", which is what these tests assume; an empty
+            // body would now be an unreadable answer and correctly block
+            // delivery rather than allow it.
+            if urlencoding::decode(&request.url)
+                .map(|url| url.contains("SELECT"))
+                .unwrap_or(false)
+            {
+                return Ok("0\t0\n".to_string());
+            }
+            Ok(String::new())
         }
     }
 
@@ -787,6 +990,8 @@ mod tests {
             database: "ssdf".to_string(),
             username: "ssdf_audit".to_string(),
             password: "test_password".to_string(),
+            verify_username: "ssdf_audit_verify".to_string(),
+            verify_password: "test_verify_password".to_string(),
             outbox_path: dir.path().join("outbox.jsonl"),
             ledger_path: dir.path().join("ledger.jsonl"),
             initial_backoff: Duration::from_millis(100),
@@ -853,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn attempt_delivery_sends_http_request_with_server_side_guard() {
+    fn attempt_delivery_sends_a_plain_insert() {
         let dir = TempDir::new().unwrap();
         let config = make_test_config(&dir);
         let transport = Arc::new(MockHttpTransport::new());
@@ -867,32 +1072,20 @@ mod tests {
         let delivered = sink.attempt_delivery().unwrap();
         assert_eq!(delivered, 1);
 
-        // Verify HTTP request was sent with server-side guard.
+        // One insert, preceded by the high-water read that replaces the old
+        // in-statement guard (ssdf#47).
         let requests = transport.requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].method, "POST");
-        assert!(requests[0].url.contains("INSERT"));
-        assert!(requests[0].url.contains("param_server_id"));
-        assert!(requests[0].url.contains("param_run_id"));
-        assert!(requests[0].url.contains("param_segment_seq"));
+        let inserts = inserts(&requests);
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].method, "POST");
 
-        // Decode query param and assert WHERE NOT EXISTS template.
-        let url = &requests[0].url;
-        let query_start = url.find("query=").unwrap() + 6;
-        let query_end = url[query_start..]
-            .find('&')
-            .map(|i| query_start + i)
-            .unwrap_or(url.len());
-        let encoded_query = &url[query_start..query_end];
-        let decoded_query = urlencoding::decode(encoded_query).unwrap();
-        assert!(decoded_query.contains("WHERE NOT EXISTS"));
+        let decoded_query = urlencoding::decode(&inserts[0].url).unwrap();
         assert!(
-            decoded_query.contains("JSONExtractString(args, 'server_id') = {server_id:String}")
+            !decoded_query.contains("NOT EXISTS"),
+            "the writer identity has no SELECT, so a guarded insert is refused \
+             outright: {decoded_query}"
         );
-        assert!(decoded_query.contains("JSONExtractString(args, 'run_id') = {run_id:String}"));
-        assert!(
-            decoded_query.contains("JSONExtractUInt(args, 'segment_seq') = {segment_seq:UInt64}")
-        );
+        assert!(decoded_query.contains("INSERT INTO ssdf.audit"));
 
         // Verify ledger marks it as delivered.
         let id = SegmentId {
@@ -964,9 +1157,9 @@ mod tests {
         let delivered = sink.attempt_delivery().unwrap();
         assert_eq!(delivered, 0);
 
-        // Only one HTTP request was sent.
+        // Only one insert was sent; the replay found the segment delivered.
         let requests = transport.requests();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(inserts(&requests).len(), 1);
     }
 
     #[test]
@@ -995,7 +1188,7 @@ mod tests {
 
         // Verify HTTP request was sent.
         let requests = transport.requests();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(inserts(&requests).len(), 1);
     }
 
     #[test]
@@ -1232,9 +1425,10 @@ mod tests {
 
         // Parse the NDJSON body and verify each row has its own row_hash.
         let requests = transport.requests();
-        assert_eq!(requests.len(), 1);
+        let inserts = inserts(&requests);
+        assert_eq!(inserts.len(), 1);
 
-        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        let body = String::from_utf8(inserts[0].body.clone()).unwrap();
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 2, "should have 2 SSDF rows");
 
@@ -1259,6 +1453,103 @@ mod tests {
         assert_eq!(
             row2.prev_hash, hash1,
             "second row's prev_hash must equal first row's hash"
+        );
+    }
+
+    /// ClickHouse returns query results chunked. Without decoding, a body of
+    /// `1\t3` arrives as `5\r\n1\t3\n\r\n0\r\n\r\n` and the high-water read
+    /// cannot parse it — which, before the surrounding fixes, silently meant
+    /// "nothing landed" and duplicated every delivery.
+    #[test]
+    fn std_http_transport_decodes_a_chunked_response() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            {
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" || header == "\n" {
+                        break;
+                    }
+                }
+            }
+            // Two chunks, to prove the decoder reassembles rather than reading
+            // only the first.
+            let response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                            2\r\n1\t\r\n2\r\n3\n\r\n0\r\n\r\n";
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let request = HttpRequest {
+            url: format!("http://{}/?query=SELECT+1", addr),
+            method: "POST".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let body = StdHttpTransport.send(&request).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(
+            body, "1\t3\n",
+            "both chunks must be reassembled, framing removed"
+        );
+    }
+
+    /// A declared chunk size is attacker- or fault-controlled. Allocating it
+    /// before applying the response limit turns a malformed reply into an
+    /// arbitrary allocation.
+    #[test]
+    fn std_http_transport_refuses_an_oversized_chunk_before_allocating() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            {
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" || header == "\n" {
+                        break;
+                    }
+                }
+            }
+            // Declares 256 MiB and sends nothing. A decoder that allocates on
+            // the declaration hangs or dies here.
+            let response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10000000\r\n";
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+
+        let request = HttpRequest {
+            url: format!("http://{}/?query=SELECT+1", addr),
+            method: "POST".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let result = StdHttpTransport.send(&request);
+        let _ = handle.join();
+
+        let error = result.expect_err("an oversized chunk must be refused");
+        assert!(
+            error.to_string().contains("response limit"),
+            "the refusal must name the limit rather than fail obscurely: {error}"
         );
     }
 }
