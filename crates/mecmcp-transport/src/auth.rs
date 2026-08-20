@@ -707,37 +707,46 @@ pub async fn bearer_preflight_middleware<G: Grant>(
     // the *only* record of the call — the handler never runs, so nothing
     // downstream can correct an optimistic outcome, and a `succeed()` here
     // would assert that a request answered with 403 was allowed.
+    // Resolved once, spent twice: on this scope, and in request extensions so a
+    // consuming server's own tool-level audit record can carry them too. It
+    // could not previously — `CallerCtx` is the only thing that reaches a
+    // handler, and it does not carry these (mecmcp#304).
+    //
+    // These are not on `CallerCtx` deliberately. It is constructed
+    // field-by-field by every consuming server, so adding to it is a breaking
+    // change across all of them.
+    //
+    // The version describes the *client*, so any element of a batch that names
+    // it is authoritative for all of them: session first — where a stateful
+    // client's `clientInfo` lives after `initialize` — then the audited call,
+    // then whichever element carried the identity. The call id is the opposite:
+    // it belongs to one call, so it comes from the audited element or not at
+    // all. See `audited_call_provenance`.
+    let client_extras = crate::client_info::ClientExtras {
+        client_version: session_client_version
+            .clone()
+            .or_else(|| {
+                audited_extras
+                    .as_ref()
+                    .and_then(|p| p.client_version.clone())
+            })
+            .or_else(|| {
+                request_provenance
+                    .as_ref()
+                    .and_then(|p| p.client_version.clone())
+            }),
+        client_call_id: audited_extras
+            .as_ref()
+            .and_then(|p| p.client_call_id.clone()),
+    };
+
     let mut scope = audited_tool.map(|tool| {
         let mut scope = AuditScope::from_caller(&caller, tool, "transport", Vec::new());
-        // These live on the scope rather than on `CallerCtx` deliberately.
-        // `CallerCtx` is constructed field-by-field by every consuming server,
-        // so adding to it is a breaking change across all of them; `AuditScope`
-        // is constructor-only, so this reaches the audit trail without one.
-        // The version prefers the session, which is where a stateful client's
-        // `clientInfo` lives after `initialize`; the request body is the
-        // stateless path's only source. The call id comes from the audited
-        // element alone — see `audited_call_provenance`.
+        // `AuditScope` is constructor-only, so this reaches the audit trail
+        // without the breaking change described above.
         scope.set_client_extras(
-            // The version describes the client, not the call, so any element
-            // of a batch that names it is authoritative for all of them:
-            // session first, then the audited call, then whichever element
-            // carried the identity. The call id is the opposite — it belongs to
-            // one call, so it comes from the audited element or not at all.
-            session_client_version
-                .clone()
-                .or_else(|| {
-                    audited_extras
-                        .as_ref()
-                        .and_then(|p| p.client_version.clone())
-                })
-                .or_else(|| {
-                    request_provenance
-                        .as_ref()
-                        .and_then(|p| p.client_version.clone())
-                }),
-            audited_extras
-                .as_ref()
-                .and_then(|p| p.client_call_id.clone()),
+            client_extras.client_version.clone(),
+            client_extras.client_call_id.clone(),
         );
         scope.meta("layer", "preflight");
         scope
@@ -772,6 +781,7 @@ pub async fn bearer_preflight_middleware<G: Grant>(
     // The parts are mutable here, so we can replace the extension.
     let mut request = Request::from_parts(parts, Body::from(body_bytes));
     request.extensions_mut().insert(caller);
+    request.extensions_mut().insert(client_extras);
 
     next.run(request).await
 }
