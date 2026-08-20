@@ -239,3 +239,31 @@ fn a_ledger_failure_after_fsync_is_not_a_spool_failure() {
         "an outbox failure means nothing was written and must still fail closed"
     );
 }
+
+/// Every insert must carry a deduplication token derived from the segment's
+/// identity.
+///
+/// The high-water read makes a *replay* idempotent, but it cannot help when an
+/// insert is already in flight: a request that times out while ClickHouse is
+/// still committing leaves the sink unable to tell whether the row landed, its
+/// pre-retry read can answer "nothing", and the original then commits alongside
+/// the retry. The hash chain cannot see the pair — identical content means an
+/// identical `row_hash` — so the fix has to be server-side, and the token is
+/// what lets ClickHouse recognise the retry as the same block (ssdf#49).
+#[test]
+fn an_insert_carries_a_dedup_token_for_its_segment() {
+    use mecmcp_audit::sinks::ssdf::dedup_token;
+
+    let token = dedup_token("junos-950", "run-7", 42);
+
+    assert_eq!(
+        token, "junos-950:run-7:42",
+        "the token must identify exactly one segment: two writers, or two runs \
+         of one writer, must never collide on it"
+    );
+    assert_ne!(
+        dedup_token("junos-950", "run-7", 42),
+        dedup_token("junos-950", "run-70", 4),
+        "a token built by concatenation without separators would collide here"
+    );
+}

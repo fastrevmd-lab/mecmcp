@@ -111,6 +111,22 @@ struct SsdfRow {
     row_hash: String,
 }
 
+/// The deduplication token for one segment.
+///
+/// ClickHouse drops an inserted block whose token it has seen recently, which
+/// is what makes a retry after an ambiguous timeout safe: the sink cannot tell
+/// whether a timed-out insert committed, and the high-water read it does before
+/// retrying is not atomic against a request still in flight. The token closes
+/// that window server-side (ssdf#49, migration 016).
+///
+/// Colon-separated rather than concatenated, so `("a", "b1", 2)` and
+/// `("a", "b", 12)` cannot produce the same token and silently suppress a real
+/// segment. It identifies exactly one segment of one run of one writer.
+#[must_use]
+pub fn dedup_token(server_id: &str, run_id: &str, segment_seq: u64) -> String {
+    format!("{server_id}:{run_id}:{segment_seq}")
+}
+
 /// The head of the newest segment a writer produced, read from its outbox.
 ///
 /// A newtype rather than a `String` on purpose. The whole defect it exists to
@@ -514,10 +530,21 @@ impl SsdfSink {
             self.config.database
         );
 
+        // The token is what makes a retry after an ambiguous timeout safe. The
+        // high-water read above narrows the window; it cannot close it, because
+        // a read-then-insert is not atomic against an insert already in flight.
+        // ClickHouse drops a block whose token it has seen — provided
+        // `non_replicated_deduplication_window` is set on the table, which
+        // migration 016 does. Sending it costs nothing where it is not.
         let url = format!(
-            "{}/?query={}",
+            "{}/?query={}&insert_deduplication_token={}",
             self.config.endpoint,
-            urlencoding::encode(&query)
+            urlencoding::encode(&query),
+            urlencoding::encode(&dedup_token(
+                &segment.server_id,
+                &segment.run_id,
+                segment.segment_seq
+            )),
         );
 
         // Send HTTP request.
@@ -1139,6 +1166,14 @@ mod tests {
              outright: {decoded_query}"
         );
         assert!(decoded_query.contains("INSERT INTO ssdf.audit"));
+        assert!(
+            decoded_query.contains(&format!(
+                "insert_deduplication_token={}",
+                dedup_token(&segment.server_id, &segment.run_id, segment.segment_seq)
+            )),
+            "without the token on the wire, a retry after an ambiguous timeout \
+             inserts a second copy that the hash chain cannot see: {decoded_query}"
+        );
 
         // Verify ledger marks it as delivered.
         let id = SegmentId {
