@@ -43,18 +43,28 @@ const MAX_TRACKED_CHANGES: usize = 1024;
 
 /// The head a new run must continue from.
 ///
-/// `remote` is the newest `row_hash` SSDF holds for this writer; `outbox_tail`
-/// is the head of the newest segment still spooled locally and not yet
-/// acknowledged. **Local wins when present**, because anything in the outbox
-/// will be delivered on replay and will therefore sit between the remote head
-/// and whatever this run writes.
+/// `local_newest` is the head of the highest-numbered segment this writer has
+/// **produced** — delivered or not — read from the outbox and ledger.
+/// `remote` is the newest `row_hash` SSDF holds for this writer.
 ///
-/// Seeding from `remote` while the outbox is non-empty forks the chain: the
-/// replayed segment and this run's first segment would both name the remote
-/// head as predecessor, and a fork verifies clean.
+/// Local wins whenever it exists, and "produced" rather than "pending" is the
+/// whole point. An earlier version preferred the newest *unacknowledged*
+/// segment, which forks the chain in a state the sink reaches on its own:
+/// `attempt_delivery` blocks only the failed `(server_id, run_id)`, so a later
+/// run can overtake a stalled one. Then the remote head is a **descendant** of
+/// the pending tail, and resuming from the tail makes the next segment a
+/// sibling of a segment that already landed.
+///
+/// Remote is the fallback only when this writer has produced nothing locally —
+/// a fresh spool after a host rebuild — and `None` from both means a genuinely
+/// new writer, which starts a root.
+///
+/// This assumes one writer per `server_id`. Two processes sharing one would
+/// make even "newest produced" wrong, and nothing here can detect that; see
+/// [`EvidenceRecorder`].
 #[must_use]
-pub fn resume_head(remote: Option<String>, outbox_tail: Option<String>) -> Option<String> {
-    outbox_tail.or(remote)
+pub fn resume_head(remote: Option<String>, local_newest: Option<String>) -> Option<String> {
+    local_newest.or(remote)
 }
 
 /// How a recorder identifies itself and when it rolls a segment.

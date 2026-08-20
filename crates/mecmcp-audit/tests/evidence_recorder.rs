@@ -297,31 +297,37 @@ fn a_rejected_change_stops_being_tracked() {
     );
 }
 
-/// After a crash with fsynced-but-undelivered segments, SSDF's newest row is
-/// *behind* the local chain. Seeding from the remote head would make replay
-/// insert the pending segment and this run's first segment as siblings — and a
-/// fork verifies as two valid chains rather than as an error.
+/// The head must be the newest segment this writer **produced**, not the newest
+/// still pending.
+///
+/// Two states, and only one rule survives both:
+///
+/// - crash with unsent segments — the remote head is *behind* the local chain,
+///   so resuming from it would make replay create a sibling;
+/// - a later run overtaking a stalled one — `attempt_delivery` blocks only the
+///   failed `(server_id, run_id)`, so the remote head can be a *descendant* of
+///   the pending tail, and resuming from the tail would rewind into a sibling.
 #[test]
-fn a_pending_outbox_wins_over_the_remote_head() {
+fn the_resume_head_is_the_newest_segment_produced() {
     use mecmcp_audit::recorder::resume_head;
 
-    let remote = Some("sha256:delivered-head".to_string());
-    let pending = Some("sha256:spooled-but-unsent".to_string());
+    let remote = Some("sha256:delivered".to_string());
+    let local_newest = Some("sha256:newest-produced".to_string());
 
     assert_eq!(
-        resume_head(remote.clone(), pending.clone()),
-        pending,
-        "anything still in the outbox will land between the remote head and this run"
+        resume_head(remote.clone(), local_newest.clone()),
+        local_newest,
+        "what this writer produced last is the chain tip, delivered or not"
     );
     assert_eq!(
         resume_head(remote.clone(), None),
         remote,
-        "with an empty outbox the remote head is the truth"
+        "with nothing produced locally — a rebuilt host — the remote head is the truth"
     );
     assert_eq!(
         resume_head(None, None),
         None,
-        "a genuinely empty writer starts a root"
+        "a genuinely new writer starts a root"
     );
 }
 
