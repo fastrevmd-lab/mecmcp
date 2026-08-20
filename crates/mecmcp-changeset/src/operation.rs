@@ -603,23 +603,44 @@ impl ChangesetCoordinator {
             ));
         }
 
-        // Transition to Committing
-        record.state = LifecycleState::Committing;
-        self.update(record.clone()).await?;
-
         // The device is about to be touched. This is written — and, with a
         // spool attached, persisted — *before* that happens, so a crash during
         // the commit still leaves evidence that the attempt was made. A record
         // written only on the way out cannot describe the case that matters
         // most (mecmcp#292).
+        //
+        // It also happens before the `Committing` transition below, so a spool
+        // that refuses leaves the record exactly where it was — still
+        // `Validated`, candidate on the device, retryable once the outbox is
+        // writable again. Refusing after the transition would strand it in
+        // `Committing` for a commit that never happened.
         if let Some(evidence) = self.evidence() {
-            evidence.apply_intent(
-                &attribution.request_id.to_string(),
-                record.change_set_id.as_deref().unwrap_or(operation_id),
-                &record.device,
-                &attribution.principal.to_string(),
-            );
+            evidence
+                .apply_intent(
+                    &attribution.request_id.to_string(),
+                    record.change_set_id.as_deref().unwrap_or(operation_id),
+                    &record.device,
+                    &attribution.principal.to_string(),
+                )
+                .map_err(|error| {
+                    // Fail closed. Committing anyway would produce the one state
+                    // the chain exists to rule out — a device changed with no
+                    // record that anyone tried — and #292 is explicit that such
+                    // a gap is worse than no audit at all because it is
+                    // invisible.
+                    CoordinatorError::new(
+                        "device",
+                        format!(
+                            "commit refused: the apply-intent evidence record could not be \
+                             persisted ({error}); the operation is still staged"
+                        ),
+                    )
+                })?;
         }
+
+        // Transition to Committing
+        record.state = LifecycleState::Committing;
+        self.update(record.clone()).await?;
 
         // P1-b: Perform the commit with cancellation support
         // If cancelled, return Indeterminate consistently (no detached worker survives)

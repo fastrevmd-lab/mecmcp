@@ -67,6 +67,39 @@ pub fn resume_head(remote: Option<String>, local_newest: Option<String>) -> Opti
     local_newest.or(remote)
 }
 
+/// The durable spool refused a segment.
+///
+/// Carries the underlying reason as text rather than wrapping the sink's error
+/// type: the recorder is deliberately ignorant of which sink it feeds, and a
+/// generic parameter here would spread through every caller for no gain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpoolError(String);
+
+impl SpoolError {
+    /// Build one from whatever the spool reported.
+    #[must_use]
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self(reason.into())
+    }
+
+    /// Why the spool refused.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SpoolError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "evidence spool refused the segment: {}", self.0)
+    }
+}
+
+impl std::error::Error for SpoolError {}
+
+/// The durable persist step a recorder calls before it lets an apply proceed.
+type Spool = Box<dyn Fn(ClosedSegment) -> Result<(), SpoolError> + Send + Sync>;
+
 /// How a recorder identifies itself and when it rolls a segment.
 #[derive(Debug, Clone)]
 pub struct RecorderConfig {
@@ -115,7 +148,7 @@ pub struct EvidenceRecorder {
     /// Without one, [`apply_intent`](Self::apply_intent) can only reach memory,
     /// and a crash during the device call it precedes loses the very record
     /// that was supposed to prove the attempt happened.
-    spool: Option<Box<dyn Fn(ClosedSegment) + Send + Sync>>,
+    spool: Option<Spool>,
 }
 
 struct RecorderState {
@@ -186,9 +219,13 @@ impl EvidenceRecorder {
     ///
     /// The callback must persist the segment before it returns — spooling to a
     /// file that is fsynced, typically `SsdfSink::spool`. A callback that only
-    /// queues in memory reinstates exactly the gap this exists to close.
+    /// queues in memory reinstates exactly the gap this exists to close, and one
+    /// that reports success it did not achieve reinstates it invisibly.
     #[must_use]
-    pub fn with_spool(mut self, spool: impl Fn(ClosedSegment) + Send + Sync + 'static) -> Self {
+    pub fn with_spool(
+        mut self,
+        spool: impl Fn(ClosedSegment) -> Result<(), SpoolError> + Send + Sync + 'static,
+    ) -> Self {
         self.spool = Some(Box::new(spool));
         self
     }
@@ -264,13 +301,21 @@ impl EvidenceRecorder {
     ///
     /// Without a spool this only reaches memory, so
     /// [`with_spool`](Self::with_spool) is what makes the guarantee real.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the spool could not persist the record. The
+    /// caller must treat that as a refusal and not touch the device: an applied
+    /// change with no record that it was attempted is the invisible gap this
+    /// whole chain exists to prevent. The unwritten records stay with the
+    /// recorder for a later flush.
     pub fn apply_intent(
         &self,
         request_id: &str,
         changeset_id: &str,
         device_id: &str,
         principal: &str,
-    ) {
+    ) -> Result<(), SpoolError> {
         let context = self.context_for(changeset_id);
         self.append(EvidenceRecord::ApplyIntent(ApplyIntentRecord {
             request_id: request_id.to_owned(),
@@ -287,7 +332,7 @@ impl EvidenceRecorder {
         }));
         // Close and persist now. The caller is about to touch a device, and a
         // record that survives only in memory proves nothing about a crash.
-        self.flush_after_append();
+        self.flush_after_append()
     }
 
     /// The device answered.
@@ -347,9 +392,9 @@ impl EvidenceRecorder {
     ///
     /// The callback runs outside the lock: it does file I/O, and a spool that
     /// called back into the recorder would otherwise deadlock.
-    fn flush_after_append(&self) {
+    fn flush_after_append(&self) -> Result<(), SpoolError> {
         let Some(spool) = self.spool.as_ref() else {
-            return;
+            return Ok(());
         };
         let claimed = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -359,9 +404,21 @@ impl EvidenceRecorder {
             }
             pending
         };
-        for segment in claimed {
-            spool(segment);
+        // The claim above *removed* these from the recorder, so a refusal that
+        // is merely reported still loses the records it is reporting about.
+        // Anything not written goes back, oldest first, for the next flush.
+        let mut pending = claimed.into_iter();
+        for segment in pending.by_ref() {
+            if let Err(error) = spool(segment.clone()) {
+                let mut unwritten = vec![segment];
+                unwritten.extend(pending);
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                unwritten.append(&mut state.closed);
+                state.closed = unwritten;
+                return Err(error);
+            }
         }
+        Ok(())
     }
 
     /// Remember what a proposal said, for the records that follow it.

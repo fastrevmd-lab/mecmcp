@@ -11,7 +11,7 @@
 #![allow(clippy::unwrap_used)]
 
 use mecmcp_audit::evidence::EvidenceRecord;
-use mecmcp_audit::recorder::{EvidenceRecorder, RecorderConfig};
+use mecmcp_audit::recorder::{EvidenceRecorder, RecorderConfig, SpoolError};
 
 fn recorder_of(records_per_segment: usize) -> EvidenceRecorder {
     EvidenceRecorder::new(RecorderConfig {
@@ -36,7 +36,9 @@ fn the_four_lifecycle_points_each_append_one_record() {
 
     recorder.proposal("req-1", "cs-1", "vsrx-ci", "agent:test", "sha256:diff");
     recorder.approval("req-1", "cs-1", "user:alice", "approved");
-    recorder.apply_intent("req-apply", "cs-1", "vsrx-ci", "agent:test");
+    recorder
+        .apply_intent("req-apply", "cs-1", "vsrx-ci", "agent:test")
+        .unwrap();
     recorder.result_receipt("req-1", "cs-1", "vsrx-ci", true, "");
 
     let closed = recorder.close_current().unwrap();
@@ -199,6 +201,7 @@ fn apply_intent_is_persisted_before_it_returns() {
     })
     .with_spool(move |segment| {
         sink.lock().unwrap().push(segment.records().len() as u64);
+        Ok(())
     });
 
     recorder.proposal(
@@ -214,7 +217,9 @@ fn apply_intent_is_persisted_before_it_returns() {
         "nothing is forced out before the apply"
     );
 
-    recorder.apply_intent("req-apply", "cs-1", "vsrx-ci", "agent:test");
+    recorder
+        .apply_intent("req-apply", "cs-1", "vsrx-ci", "agent:test")
+        .unwrap();
 
     let segments = spooled.lock().unwrap();
     assert_eq!(
@@ -285,7 +290,9 @@ fn a_rejected_change_stops_being_tracked() {
     recorder.proposal("req-1", "cs-1", "vsrx-ci", "agent:planner", "sha256:plan");
     recorder.approval("req-2", "cs-1", "user:alice", "rejected");
 
-    recorder.apply_intent("req-3", "cs-1", "vsrx-ci", "agent:test");
+    recorder
+        .apply_intent("req-3", "cs-1", "vsrx-ci", "agent:test")
+        .unwrap();
     let closed = recorder.close_current().unwrap();
 
     let EvidenceRecord::ApplyIntent(intent) = &closed.records()[2] else {
@@ -383,5 +390,47 @@ fn eviction_drops_the_oldest_change_first() {
     assert_eq!(
         survivor.device_id, "device-1",
         "only one entry was evicted, so cs-1 must still be tracked"
+    );
+}
+
+/// A spool that refuses must fail the apply, not be swallowed.
+///
+/// `apply_intent` is the "about to touch the device" marker, and #292 is
+/// explicit that a sink which loses records is worse than no sink because the
+/// gap is invisible. If the segment cannot be persisted, the caller has to
+/// learn that *before* it touches anything — a silent failure here produces a
+/// device change with no record that it was attempted.
+#[test]
+fn a_refused_spool_fails_the_apply() {
+    let recorder = recorder_of(8).with_spool(|_| Err(SpoolError::new("disk full")));
+    recorder.proposal("req-1", "cs-1", "dev-1", "alice", "sha256:diff");
+
+    let refused = recorder.apply_intent("req-2", "cs-1", "dev-1", "alice");
+
+    assert!(
+        refused.is_err(),
+        "the apply must not proceed when its intent record cannot be persisted"
+    );
+}
+
+/// A segment the spool refused stays in hand for the next attempt.
+///
+/// The flush *takes* the closed segments out of the recorder before handing
+/// them over, so a spool error that is merely reported still loses the records
+/// it was reporting about — the gap #292 calls invisible, arrived at from the
+/// other side.
+#[test]
+fn a_refused_segment_is_kept_for_retry() {
+    let recorder = recorder_of(8).with_spool(|_| Err(SpoolError::new("disk full")));
+    recorder.proposal("req-1", "cs-1", "dev-1", "alice", "sha256:diff");
+    let _ = recorder.apply_intent("req-2", "cs-1", "dev-1", "alice");
+
+    let held = recorder.take_closed();
+
+    let records: usize = held.iter().map(|segment| segment.records().len()).sum();
+    assert_eq!(
+        records, 2,
+        "the proposal and the apply_intent must both survive a refused spool, \
+         so a later flush can still deliver them: {held:?}"
     );
 }
