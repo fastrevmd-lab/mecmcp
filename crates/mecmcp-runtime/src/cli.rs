@@ -412,9 +412,7 @@ impl EvidenceArgs {
         mecmcp_audit::evidence::validate_server_id(&server_id)
             .map_err(EvidenceArgsError::InvalidServerId)?;
         if endpoint.starts_with("https://") && self.ssdf_audit_ca_file.is_none() {
-            return Err(EvidenceArgsError::MissingPath {
-                flag: "--ssdf-audit-ca-file",
-            });
+            return Err(EvidenceArgsError::MissingTrustAnchor);
         }
         let outbox_path = self
             .ssdf_audit_outbox
@@ -478,6 +476,13 @@ pub enum EvidenceArgsError {
         /// The flag that was omitted.
         flag: &'static str,
     },
+    /// An `https://` endpoint was configured with no trust anchor.
+    #[error(
+        "--ssdf-audit-endpoint is https, so --ssdf-audit-ca-file is required: SSDF \
+         issues the ClickHouse certificate from its own CA, which the public root \
+         set cannot validate"
+    )]
+    MissingTrustAnchor,
     /// An endpoint was configured without a chain identity.
     #[error(
         "--ssdf-audit-endpoint requires --ssdf-audit-server-id; it keys the hash \

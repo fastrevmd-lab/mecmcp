@@ -442,8 +442,14 @@ fn an_https_endpoint_without_a_ca_is_refused() {
     .into_config()
     .expect_err("https without a CA must be refused");
 
+    let text = format!("{error}");
     assert!(
-        format!("{error}").contains("--ssdf-audit-ca-file"),
-        "the error must name the flag: {error}"
+        text.contains("--ssdf-audit-ca-file"),
+        "must name the flag: {text}"
+    );
+    assert!(
+        !text.contains("ProtectSystem"),
+        "the CA refusal must not carry the spool-path rationale, which is about \
+         a different flag entirely: {text}"
     );
 }
