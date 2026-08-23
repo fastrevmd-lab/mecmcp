@@ -38,7 +38,7 @@ fn secret(dir: &std::path::Path, name: &str, value: &str) -> std::path::PathBuf 
 /// Absent flags mean absent pipeline. Evidence is a deployment choice.
 #[test]
 fn no_endpoint_means_no_evidence() {
-    assert!(parse(&[]).into_config("junos-950").unwrap().is_none());
+    assert!(parse(&[]).into_config().unwrap().is_none());
 }
 
 /// The full flag set produces a usable config.
@@ -51,6 +51,8 @@ fn a_configured_endpoint_produces_a_pipeline_config() {
     let config = parse(&[
         "--ssdf-audit-endpoint",
         "https://ch.example:8443",
+        "--ssdf-audit-server-id",
+        "junos-950",
         "--ssdf-audit-password-file",
         write.to_str().unwrap(),
         "--ssdf-audit-verify-password-file",
@@ -60,7 +62,7 @@ fn a_configured_endpoint_produces_a_pipeline_config() {
         "--ssdf-audit-ledger",
         dir.path().join("ledger").to_str().unwrap(),
     ])
-    .into_config("junos-950")
+    .into_config()
     .unwrap()
     .expect("an endpoint was given");
 
@@ -82,9 +84,14 @@ fn a_configured_endpoint_produces_a_pipeline_config() {
 /// An endpoint with no credentials is a misconfiguration, not a default.
 #[test]
 fn an_endpoint_without_credentials_is_refused() {
-    let error = parse(&["--ssdf-audit-endpoint", "https://ch.example:8443"])
-        .into_config("junos-950")
-        .expect_err("no password file was given");
+    let error = parse(&[
+        "--ssdf-audit-endpoint",
+        "https://ch.example:8443",
+        "--ssdf-audit-server-id",
+        "junos-950",
+    ])
+    .into_config()
+    .expect_err("no password file was given");
     assert!(
         format!("{error}").contains("password"),
         "the error must name what is missing: {error}"
@@ -104,15 +111,46 @@ fn a_loose_password_file_is_refused() {
     let error = parse(&[
         "--ssdf-audit-endpoint",
         "https://ch.example:8443",
+        "--ssdf-audit-server-id",
+        "junos-950",
         "--ssdf-audit-password-file",
         write.to_str().unwrap(),
         "--ssdf-audit-verify-password-file",
         verify.to_str().unwrap(),
     ])
-    .into_config("junos-950")
+    .into_config()
     .expect_err("0644 on a credential must be refused");
     assert!(
         format!("{error}").contains("0600") || format!("{error}").contains("permissions"),
         "the error must say what is wrong with the file: {error}"
+    );
+}
+
+/// An endpoint without a chain identity is refused.
+///
+/// The chain is keyed by `server_id`. Defaulting it to something incidental —
+/// the hostname, say — means a rename starts a second root, and a fork
+/// verifies as two valid chains, so nothing downstream would report it. This
+/// fleet has already renamed its hosts once.
+#[test]
+fn an_endpoint_without_a_server_id_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = secret(dir.path(), "w", "write-secret");
+    let verify = secret(dir.path(), "v", "verify-secret");
+
+    let error = parse(&[
+        "--ssdf-audit-endpoint",
+        "https://ch.example:8443",
+        "--ssdf-audit-password-file",
+        write.to_str().unwrap(),
+        "--ssdf-audit-verify-password-file",
+        verify.to_str().unwrap(),
+    ])
+    .into_config()
+    .expect_err("no chain identity was given");
+
+    assert!(
+        format!("{error}").contains("--ssdf-audit-server-id"),
+        "the error must name the flag to set: {error}"
     );
 }

@@ -308,6 +308,16 @@ pub struct EvidenceArgs {
     #[arg(long)]
     pub ssdf_audit_endpoint: Option<String>,
 
+    /// This writer's chain identity. Required whenever the endpoint is set.
+    ///
+    /// Deliberately not defaulted to the hostname. The chain is keyed by this
+    /// value, so if it ever changes the writer starts a second root -- and a
+    /// fork verifies as two valid chains, so nothing downstream reports it.
+    /// This fleet has already renamed its hosts once; a value that follows the
+    /// hostname would have forked every chain silently when it did.
+    #[arg(long)]
+    pub ssdf_audit_server_id: Option<String>,
+
     /// ClickHouse database holding the audit table.
     #[arg(long, default_value = "ssdf")]
     pub ssdf_audit_database: String,
@@ -348,9 +358,10 @@ pub struct EvidenceArgs {
 impl EvidenceArgs {
     /// Build a pipeline config, or `None` when no endpoint was given.
     ///
-    /// `server_id` names this writer's chain. **One process per `server_id`**:
-    /// two servers sharing one fork the chain, and a fork verifies as two valid
-    /// chains rather than as an error, so nothing downstream reports it.
+    /// `--ssdf-audit-server-id` names this writer's chain. **One process per
+    /// `server_id`**: two servers sharing one fork the chain, and a fork
+    /// verifies as two valid chains rather than as an error, so nothing
+    /// downstream reports it.
     ///
     /// # Errors
     ///
@@ -358,13 +369,14 @@ impl EvidenceArgs {
     /// when a credential file fails its permission checks. Both are refusals
     /// rather than warnings: a server that starts with a half-configured
     /// pipeline spools evidence it can never deliver.
-    pub fn into_config(
-        &self,
-        server_id: &str,
-    ) -> Result<Option<mecmcp_audit::EvidenceConfig>, EvidenceArgsError> {
+    pub fn into_config(&self) -> Result<Option<mecmcp_audit::EvidenceConfig>, EvidenceArgsError> {
         let Some(endpoint) = self.ssdf_audit_endpoint.clone() else {
             return Ok(None);
         };
+        let server_id = self
+            .ssdf_audit_server_id
+            .clone()
+            .ok_or(EvidenceArgsError::MissingServerId)?;
 
         let password = read_password(
             self.ssdf_audit_password_file.as_deref(),
@@ -376,7 +388,7 @@ impl EvidenceArgs {
         )?;
 
         Ok(Some(mecmcp_audit::EvidenceConfig {
-            server_id: server_id.to_owned(),
+            server_id,
             run_id: new_run_id(),
             records_per_segment: self.ssdf_audit_records_per_segment,
             delivery_interval: std::time::Duration::from_secs(self.ssdf_audit_interval_secs),
@@ -405,6 +417,13 @@ pub enum EvidenceArgsError {
         /// The flag that was omitted.
         flag: &'static str,
     },
+    /// An endpoint was configured without a chain identity.
+    #[error(
+        "--ssdf-audit-endpoint requires --ssdf-audit-server-id; it keys the hash \
+         chain, and a value that drifts starts a second root that verifies as a \
+         valid chain"
+    )]
+    MissingServerId,
     /// A credential file failed its checks — wrong mode, wrong owner, symlink.
     #[error("credential file rejected (must be a regular file, 0600, owned by this user): {0}")]
     Credential(#[from] mecmcp_secret::SecretError),
