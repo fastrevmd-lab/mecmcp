@@ -228,7 +228,7 @@ fn a_failed_segment_holds_back_the_rest_of_its_run() {
 
     // Segment 0's insert fails; 1 and 2 must not be attempted.
     *transport.fail_seq.lock().unwrap() = Some(0);
-    let delivered = sink.attempt_delivery().unwrap();
+    let delivered = sink.attempt_delivery().unwrap().delivered;
 
     assert_eq!(delivered, 0, "nothing may be delivered past the failure");
     let attempted = transport.inserted_seqs.lock().unwrap().clone();
@@ -253,7 +253,7 @@ fn an_unreadable_high_water_mark_keeps_the_segment_spooled() {
     .unwrap();
     sink.spool(segment(0)).unwrap();
 
-    let delivered = sink.attempt_delivery().unwrap();
+    let delivered = sink.attempt_delivery().unwrap().delivered;
 
     assert_eq!(
         delivered, 0,
@@ -343,4 +343,105 @@ impl HttpTransport for FailingReadTransport {
         }
         panic!("an insert must not be attempted when the high-water read failed");
     }
+}
+
+/// A restarting writer must seed from its own chain tail, read as the verify
+/// identity.
+///
+/// This is the query the contract specifies and nothing implemented: the tail
+/// is the row **nothing else points at**, found by following links rather than
+/// by sorting. Ordering by `ts` and `segment_seq` looks equivalent and is not —
+/// `segment_seq` restarts per run, so an older run's segment 40 outranks the
+/// real tail's segment 0, and a writer seeded from an interior hash forks its
+/// own chain (ssdf#47).
+#[test]
+fn the_remote_head_is_the_unreferenced_tail_for_this_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(RecordingTransport::default());
+    *transport.high_water.lock().unwrap() = "sha256:tail\n".to_string();
+    let requests = Arc::clone(&transport.requests);
+    let sink = SsdfSink::new_with_transport(
+        config(dir.path(), "ssdf_audit_verify"),
+        transport.clone(),
+        Arc::new(|_| {}),
+    )
+    .unwrap();
+
+    let head = sink.remote_head("server-a").unwrap();
+
+    assert_eq!(head.as_deref(), Some("sha256:tail"));
+    let sent = requests.lock().unwrap();
+    let url = urlencoding::decode(&sent[0].url).unwrap().into_owned();
+    assert!(
+        url.contains("DISTINCT"),
+        "two rows can share one unreferenced hash — a duplicated tail is one \
+         head, not a fork: {url}"
+    );
+    assert!(
+        url.contains("NOT IN"),
+        "the tail must be found by following links, not by sorting: {url}"
+    );
+    assert!(
+        !url.contains("ORDER BY"),
+        "sorting by ts/segment_seq picks an interior row across runs: {url}"
+    );
+    let auth = sent[0]
+        .headers
+        .iter()
+        .find(|(k, _)| k == "Authorization")
+        .map(|(_, v)| v.clone())
+        .expect("the read must authenticate");
+    let encoded = auth.trim_start_matches("Basic ");
+    let decoded = String::from_utf8(
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        decoded.starts_with("ssdf_audit_verify:"),
+        "the write identity has no SELECT; this read is the verify identity's: {decoded}"
+    );
+}
+
+/// A writer with no rows yet starts a root rather than inventing one.
+#[test]
+fn a_writer_with_no_rows_has_no_remote_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(RecordingTransport::default());
+    *transport.high_water.lock().unwrap() = String::new();
+    let sink = SsdfSink::new_with_transport(
+        config(dir.path(), "ssdf_audit_verify"),
+        transport.clone(),
+        Arc::new(|_| {}),
+    )
+    .unwrap();
+
+    assert_eq!(sink.remote_head("server-a").unwrap(), None);
+}
+
+/// Two distinct tails mean the chain has already forked, and a new run must
+/// not attach to either branch.
+///
+/// Picking one deepens the fork, and a fork verifies as two valid chains — so
+/// guessing here would bury the exact condition the design exists to make
+/// impossible. Refusing surfaces it while it is still one operator decision.
+#[test]
+fn two_tails_are_refused_rather_than_guessed_between() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(RecordingTransport::default());
+    *transport.high_water.lock().unwrap() = "sha256:branch-a\nsha256:branch-b\n".to_string();
+    let sink = SsdfSink::new_with_transport(
+        config(dir.path(), "ssdf_audit_verify"),
+        transport.clone(),
+        Arc::new(|_| {}),
+    )
+    .unwrap();
+
+    let error = sink
+        .remote_head("server-a")
+        .expect_err("a forked chain must not silently pick a branch");
+
+    assert!(
+        format!("{error}").contains("forked"),
+        "the error must name the condition an operator has to act on: {error}"
+    );
 }

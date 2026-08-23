@@ -11,6 +11,7 @@ mod client_info;
 mod concurrency;
 mod config;
 mod consent;
+pub mod evidence_transport;
 mod identity;
 mod listener;
 mod metrics;
