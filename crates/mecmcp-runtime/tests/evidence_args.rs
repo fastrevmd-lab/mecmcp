@@ -23,6 +23,14 @@ fn parse(args: &[&str]) -> EvidenceArgs {
     Harness::parse_from(argv).evidence
 }
 
+/// A stand-in trust anchor. Never parsed here — `into_config` only checks that
+/// a path was given; the transport is what reads it.
+fn anchor(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("ca.pem");
+    std::fs::write(&path, "-----BEGIN CERTIFICATE-----\n").unwrap();
+    path
+}
+
 fn secret(dir: &std::path::Path, name: &str, value: &str) -> std::path::PathBuf {
     let path = dir.join(name);
     let mut file = std::fs::File::create(&path).unwrap();
@@ -45,6 +53,7 @@ fn no_endpoint_means_no_evidence() {
 #[test]
 fn a_configured_endpoint_produces_a_pipeline_config() {
     let dir = tempfile::tempdir().unwrap();
+    let ca = anchor(dir.path());
     let write = secret(dir.path(), "w", "write-secret\n");
     let verify = secret(dir.path(), "v", "verify-secret");
 
@@ -57,6 +66,8 @@ fn a_configured_endpoint_produces_a_pipeline_config() {
         write.to_str().unwrap(),
         "--ssdf-audit-verify-password-file",
         verify.to_str().unwrap(),
+        "--ssdf-audit-ca-file",
+        ca.to_str().unwrap(),
         "--ssdf-audit-outbox",
         dir.path().join("outbox").to_str().unwrap(),
         "--ssdf-audit-ledger",
@@ -85,11 +96,14 @@ fn a_configured_endpoint_produces_a_pipeline_config() {
 #[test]
 fn an_endpoint_without_credentials_is_refused() {
     let dir = tempfile::tempdir().unwrap();
+    let ca = anchor(dir.path());
     let error = parse(&[
         "--ssdf-audit-endpoint",
         "https://ch.example:8443",
         "--ssdf-audit-server-id",
         "junos-950",
+        "--ssdf-audit-ca-file",
+        ca.to_str().unwrap(),
         "--ssdf-audit-outbox",
         dir.path().join("outbox").to_str().unwrap(),
         "--ssdf-audit-ledger",
@@ -109,6 +123,7 @@ fn an_endpoint_without_credentials_is_refused() {
 fn a_loose_password_file_is_refused() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
+    let ca = anchor(dir.path());
     let write = secret(dir.path(), "w", "write-secret");
     let verify = secret(dir.path(), "v", "verify-secret");
     std::fs::set_permissions(&write, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -122,6 +137,8 @@ fn a_loose_password_file_is_refused() {
         write.to_str().unwrap(),
         "--ssdf-audit-verify-password-file",
         verify.to_str().unwrap(),
+        "--ssdf-audit-ca-file",
+        ca.to_str().unwrap(),
         "--ssdf-audit-outbox",
         dir.path().join("outbox").to_str().unwrap(),
         "--ssdf-audit-ledger",
@@ -144,6 +161,7 @@ fn a_loose_password_file_is_refused() {
 #[test]
 fn an_endpoint_without_a_server_id_is_refused() {
     let dir = tempfile::tempdir().unwrap();
+    let ca = anchor(dir.path());
     let write = secret(dir.path(), "w", "write-secret");
     let verify = secret(dir.path(), "v", "verify-secret");
 
@@ -154,6 +172,8 @@ fn an_endpoint_without_a_server_id_is_refused() {
         write.to_str().unwrap(),
         "--ssdf-audit-verify-password-file",
         verify.to_str().unwrap(),
+        "--ssdf-audit-ca-file",
+        ca.to_str().unwrap(),
         "--ssdf-audit-outbox",
         dir.path().join("outbox").to_str().unwrap(),
         "--ssdf-audit-ledger",
@@ -192,6 +212,7 @@ fn a_zero_delivery_interval_is_refused() {
 #[test]
 fn run_ids_do_not_repeat() {
     let dir = tempfile::tempdir().unwrap();
+    let ca = anchor(dir.path());
     let write = secret(dir.path(), "w", "write-secret");
     let verify = secret(dir.path(), "v", "verify-secret");
     let args = parse(&[
@@ -203,6 +224,8 @@ fn run_ids_do_not_repeat() {
         write.to_str().unwrap(),
         "--ssdf-audit-verify-password-file",
         verify.to_str().unwrap(),
+        "--ssdf-audit-ca-file",
+        ca.to_str().unwrap(),
         "--ssdf-audit-outbox",
         dir.path().join("outbox").to_str().unwrap(),
         "--ssdf-audit-ledger",
@@ -228,6 +251,7 @@ fn run_ids_do_not_repeat() {
 #[test]
 fn only_one_line_ending_is_stripped_from_a_password() {
     let dir = tempfile::tempdir().unwrap();
+    let ca = anchor(dir.path());
     let write = secret(dir.path(), "w", "trailing space \n");
     let verify = secret(dir.path(), "v", "verify-secret");
 
@@ -240,6 +264,8 @@ fn only_one_line_ending_is_stripped_from_a_password() {
         write.to_str().unwrap(),
         "--ssdf-audit-verify-password-file",
         verify.to_str().unwrap(),
+        "--ssdf-audit-ca-file",
+        ca.to_str().unwrap(),
         "--ssdf-audit-outbox",
         dir.path().join("outbox").to_str().unwrap(),
         "--ssdf-audit-ledger",
@@ -256,6 +282,7 @@ fn only_one_line_ending_is_stripped_from_a_password() {
 #[test]
 fn an_empty_password_file_is_refused() {
     let dir = tempfile::tempdir().unwrap();
+    let ca = anchor(dir.path());
     let write = secret(dir.path(), "w", "\n");
     let verify = secret(dir.path(), "v", "verify-secret");
 
@@ -268,6 +295,8 @@ fn an_empty_password_file_is_refused() {
         write.to_str().unwrap(),
         "--ssdf-audit-verify-password-file",
         verify.to_str().unwrap(),
+        "--ssdf-audit-ca-file",
+        ca.to_str().unwrap(),
         "--ssdf-audit-outbox",
         dir.path().join("outbox").to_str().unwrap(),
         "--ssdf-audit-ledger",
@@ -284,6 +313,7 @@ fn an_endpoint_without_spool_paths_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let write = secret(dir.path(), "w", "write-secret");
     let verify = secret(dir.path(), "v", "verify-secret");
+    let ca = anchor(dir.path());
 
     let error = parse(&[
         "--ssdf-audit-endpoint",
@@ -294,6 +324,8 @@ fn an_endpoint_without_spool_paths_is_refused() {
         write.to_str().unwrap(),
         "--ssdf-audit-verify-password-file",
         verify.to_str().unwrap(),
+        "--ssdf-audit-ca-file",
+        ca.to_str().unwrap(),
     ])
     .into_config()
     .expect_err("no spool path was given");
@@ -347,6 +379,7 @@ fn a_blank_server_id_is_refused() {
 #[test]
 fn run_ids_sort_in_creation_order() {
     let dir = tempfile::tempdir().unwrap();
+    let ca = anchor(dir.path());
     let write = secret(dir.path(), "w", "write-secret");
     let verify = secret(dir.path(), "v", "verify-secret");
     let args = parse(&[
@@ -358,6 +391,8 @@ fn run_ids_sort_in_creation_order() {
         write.to_str().unwrap(),
         "--ssdf-audit-verify-password-file",
         verify.to_str().unwrap(),
+        "--ssdf-audit-ca-file",
+        ca.to_str().unwrap(),
         "--ssdf-audit-outbox",
         dir.path().join("outbox").to_str().unwrap(),
         "--ssdf-audit-ledger",
@@ -377,4 +412,38 @@ fn run_ids_sort_in_creation_order() {
         );
         previous = next;
     }
+}
+
+/// An https endpoint without a trust anchor is refused at configuration time.
+///
+/// The transport refuses it too, but there it surfaces as a failed delivery
+/// once per interval, which reads as an outage. Catching it here fails the
+/// server at startup, where a missing flag looks like a missing flag.
+#[test]
+fn an_https_endpoint_without_a_ca_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = secret(dir.path(), "w", "write-secret");
+    let verify = secret(dir.path(), "v", "verify-secret");
+
+    let error = parse(&[
+        "--ssdf-audit-endpoint",
+        "https://ch.example:8443",
+        "--ssdf-audit-server-id",
+        "junos-950",
+        "--ssdf-audit-password-file",
+        write.to_str().unwrap(),
+        "--ssdf-audit-verify-password-file",
+        verify.to_str().unwrap(),
+        "--ssdf-audit-outbox",
+        dir.path().join("outbox").to_str().unwrap(),
+        "--ssdf-audit-ledger",
+        dir.path().join("ledger").to_str().unwrap(),
+    ])
+    .into_config()
+    .expect_err("https without a CA must be refused");
+
+    assert!(
+        format!("{error}").contains("--ssdf-audit-ca-file"),
+        "the error must name the flag: {error}"
+    );
 }
