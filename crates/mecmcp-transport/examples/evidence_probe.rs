@@ -21,6 +21,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("usage: evidence_probe <endpoint> <ca.pem>")?;
 
+    // The whole point is the handshake. An `http://` endpoint takes the
+    // plaintext branch and prints `ok` having proved nothing, which is a
+    // reassuring result for a probe that did not run.
+    if !endpoint.starts_with("https://") {
+        return Err(format!("endpoint must be https:// to probe TLS, got: {endpoint}").into());
+    }
+
     let transport = mecmcp_transport::evidence_transport::EvidenceHttpTransport::new(
         Some(ca.as_ref()),
         std::sync::Arc::new(rustls::crypto::ring::default_provider()),

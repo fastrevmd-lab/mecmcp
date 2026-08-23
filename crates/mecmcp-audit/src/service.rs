@@ -212,6 +212,24 @@ impl Drop for EvidenceService {
 /// keeps.
 ///
 /// The first genuine error is returned once everything has been attempted.
+///
+/// **On a genuine failure it keeps going, deliberately.** Stopping looks safer
+/// -- it avoids putting segment N+1 in the outbox when N never landed -- but
+/// the two outcomes are not equally visible, and visibility is the whole
+/// product here:
+///
+/// - **Continue.** N is lost, N+1 lands. N+1's `prev_hash` names a row that is
+///   not there, and `verify_audit.py`'s linkage check reports
+///   `missing_predecessor`. Someone finds out.
+/// - **Stop.** N through M are lost, and nothing after them is written. The
+///   remote chain simply ends at N-1; the next run seeds from N-1 (the outbox
+///   is what `produced_head` reads) and continues cleanly from there.
+///   Verification is clean. Nobody ever finds out.
+///
+/// The second is the failure mode this entire subsystem exists to prevent --
+/// SSDF's own contract calls a silently truncated chain worse than no chain,
+/// because it still verifies. So a detectable hole beats a silent truncation,
+/// and the error is returned either way.
 pub(crate) fn spool_everything(
     recorder: &EvidenceRecorder,
     mut spool: impl FnMut(crate::evidence::ClosedSegment) -> Result<(), SsdfSinkError>,
@@ -377,6 +395,35 @@ mod tests {
         assert_eq!(
             seen, 4,
             "every held segment must be offered, not just the first"
+        );
+    }
+
+    /// A failure part-way through must not silence the segments after it.
+    ///
+    /// Deliberate, and the opposite of what looks safe. Holding the successors
+    /// back would leave the chain ending cleanly at the last good segment: the
+    /// next run seeds from there and verification reports clean, so the loss is
+    /// invisible. Letting them through leaves a `prev_hash` naming a row that
+    /// is not present, which `verify_audit.py` reports as
+    /// `missing_predecessor`. A detectable hole beats a silent truncation.
+    #[test]
+    fn a_failure_part_way_through_does_not_silence_the_rest() {
+        let recorder = recorder_holding(4, false);
+        let mut seen = 0usize;
+
+        let result = spool_everything(&recorder, |_segment| {
+            seen += 1;
+            if seen == 2 {
+                return Err(SsdfSinkError::Http("transient outbox failure".to_owned()));
+            }
+            Ok(())
+        });
+
+        assert!(result.is_err(), "the failure must still be reported");
+        assert_eq!(
+            seen, 4,
+            "the segments after the failure were dropped, which ends the chain \
+             cleanly at the last good one and hides the loss from verification"
         );
     }
 
