@@ -338,6 +338,16 @@ pub struct EvidenceArgs {
     #[arg(long)]
     pub ssdf_audit_verify_password_file: Option<PathBuf>,
 
+    /// PEM trust anchor for the ClickHouse certificate. Required for `https://`.
+    ///
+    /// SSDF issues that certificate from its own CA, so the public root set
+    /// cannot validate it and trusting the public set as well would only widen
+    /// what can impersonate the audit destination. Lives with the other
+    /// evidence flags rather than in each server's CLI so all five configure it
+    /// the same way.
+    #[arg(long)]
+    pub ssdf_audit_ca_file: Option<PathBuf>,
+
     /// Durable outbox for closed segments. Required when the endpoint is set.
     ///
     /// Deliberately undefaulted. Every packaged unit runs `ProtectSystem=strict`
@@ -367,6 +377,12 @@ pub struct EvidenceArgs {
 }
 
 impl EvidenceArgs {
+    /// The trust anchor to give the transport, if one was configured.
+    #[must_use]
+    pub fn ca_file(&self) -> Option<&Path> {
+        self.ssdf_audit_ca_file.as_deref()
+    }
+
     /// Build a pipeline config, or `None` when no endpoint was given.
     ///
     /// `--ssdf-audit-server-id` names this writer's chain. **One process per
@@ -395,6 +411,11 @@ impl EvidenceArgs {
         // `mecmcp-verify` cannot disagree about it.
         mecmcp_audit::evidence::validate_server_id(&server_id)
             .map_err(EvidenceArgsError::InvalidServerId)?;
+        if endpoint.starts_with("https://") && self.ssdf_audit_ca_file.is_none() {
+            return Err(EvidenceArgsError::MissingPath {
+                flag: "--ssdf-audit-ca-file",
+            });
+        }
         let outbox_path = self
             .ssdf_audit_outbox
             .clone()
