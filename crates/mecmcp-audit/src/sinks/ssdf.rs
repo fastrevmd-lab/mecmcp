@@ -139,6 +139,29 @@ pub fn dedup_token(server_id: &str, run_id: &str, segment_seq: u64) -> String {
     )
 }
 
+/// What one delivery pass achieved.
+///
+/// `attempt_delivery` returns `Ok` for a pass that ran, even when every segment
+/// in it was refused — the per-segment outcome goes to the ledger, and the
+/// outer `Result` describes the pass. A caller that reads only that result
+/// reports healthy while the outbox grows without limit, which is the failure
+/// this subsystem exists to make visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeliveryReport {
+    /// Segments accepted by ClickHouse this pass.
+    pub delivered: usize,
+    /// Segments refused this pass. They stay spooled and are retried.
+    pub failed: usize,
+}
+
+impl DeliveryReport {
+    /// Whether anything was refused.
+    #[must_use]
+    pub const fn degraded(&self) -> bool {
+        self.failed > 0
+    }
+}
+
 /// The head of the newest segment a writer produced, read from its outbox.
 ///
 /// A newtype rather than a `String` on purpose. The whole defect it exists to
@@ -381,7 +404,7 @@ impl SsdfSink {
     ///
     /// Returns the number of successfully delivered segments. Failures are
     /// retried with exponential backoff + jitter (capped at max_backoff).
-    pub fn attempt_delivery(&self) -> Result<usize, SsdfSinkError> {
+    pub fn attempt_delivery(&self) -> Result<DeliveryReport, SsdfSinkError> {
         // Load all segments from the outbox, oldest sequence first per run.
         // Order is not cosmetic here: dedup asks SSDF for the highest
         // `segment_seq` it holds and treats everything at or below as landed.
@@ -397,7 +420,7 @@ impl SsdfSink {
                 right.segment_seq,
             ))
         });
-        let mut delivered_count = 0;
+        let mut report = DeliveryReport::default();
         // Runs with a segment that failed this pass. Later segments of the same
         // run must wait: they would otherwise overtake it.
         let mut blocked_runs: std::collections::HashSet<(String, String)> =
@@ -445,7 +468,7 @@ impl SsdfSink {
                         .lock()
                         .expect("ledger mutex not poisoned")
                         .mark_delivered(id, delivered_at)?;
-                    delivered_count += 1;
+                    report.delivered += 1;
                 }
                 Err(e) => {
                     let failed_at = chrono::Utc::now().to_rfc3339();
@@ -454,13 +477,14 @@ impl SsdfSink {
                         .lock()
                         .expect("ledger mutex not poisoned")
                         .mark_failed(id, failed_at, e.to_string(), new_attempts)?;
+                    report.failed += 1;
                     // Hold the rest of this run back until this segment lands.
                     blocked_runs.insert(run);
                 }
             }
         }
 
-        Ok(delivered_count)
+        Ok(report)
     }
 
     /// Compute exponential backoff delay with jitter, capped at max_backoff.
@@ -474,9 +498,17 @@ impl SsdfSink {
         let exp_ms = base_ms.saturating_mul(2u64.saturating_pow(attempts.saturating_sub(1) as u32));
         let capped_ms = min(exp_ms, max_ms);
 
-        // Jitter: +/- 10%
+        // Jitter: +/- 10%. Skipped when the range rounds to zero — any backoff
+        // under 10ms gives `jitter_range == 0`, and the modulo below would then
+        // divide by zero and take the delivery thread down with it. A panicking
+        // drain is the worst shape this failure could have: the process keeps
+        // serving and keeps recording, and only the shipping stops.
         let jitter_range = capped_ms / 10;
-        let jitter = (getrandom_u64() % (jitter_range * 2)).saturating_sub(jitter_range);
+        let jitter = if jitter_range == 0 {
+            0
+        } else {
+            (getrandom_u64() % (jitter_range * 2)).saturating_sub(jitter_range)
+        };
         let final_ms = capped_ms.saturating_add(jitter);
 
         Duration::from_millis(final_ms)
@@ -843,7 +875,7 @@ const MAX_RESPONSE_BYTES: usize = 4096;
 ///
 /// This is a minimal blocking HTTP/1.1 client for INSERT requests to ClickHouse.
 /// Only HTTP is supported; for HTTPS, use a TLS-terminating proxy.
-struct StdHttpTransport;
+pub struct StdHttpTransport;
 
 impl HttpTransport for StdHttpTransport {
     fn send(&self, request: &HttpRequest) -> Result<String, SsdfSinkError> {
@@ -1238,7 +1270,7 @@ mod tests {
         let segment = make_test_segment();
         sink.spool(segment.clone()).unwrap();
 
-        let delivered = sink.attempt_delivery().unwrap();
+        let delivered = sink.attempt_delivery().unwrap().delivered;
         assert_eq!(delivered, 1);
 
         // One insert, preceded by the high-water read that replaces the old
@@ -1292,7 +1324,7 @@ mod tests {
         sink.spool(segment.clone()).unwrap();
 
         // Delivery fails but spool succeeds (fail-open ship).
-        let delivered = sink.attempt_delivery().unwrap();
+        let delivered = sink.attempt_delivery().unwrap().delivered;
         assert_eq!(delivered, 0);
 
         // Verify outbox still contains the segment.
@@ -1327,11 +1359,11 @@ mod tests {
         sink.spool(segment.clone()).unwrap();
 
         // First delivery.
-        let delivered = sink.attempt_delivery().unwrap();
+        let delivered = sink.attempt_delivery().unwrap().delivered;
         assert_eq!(delivered, 1);
 
         // Second delivery (idempotent replay).
-        let delivered = sink.attempt_delivery().unwrap();
+        let delivered = sink.attempt_delivery().unwrap().delivered;
         assert_eq!(delivered, 0);
 
         // Only one insert was sent; the replay found the segment delivered.
@@ -1360,7 +1392,7 @@ mod tests {
         let sleep = MockSleep::new();
         let sink =
             SsdfSink::new_with_transport(config.clone(), transport.clone(), sleep.as_fn()).unwrap();
-        let delivered = sink.attempt_delivery().unwrap();
+        let delivered = sink.attempt_delivery().unwrap().delivered;
         assert_eq!(delivered, 1);
 
         // Verify HTTP request was sent.
@@ -1404,7 +1436,7 @@ mod tests {
         let segment = close(seg).unwrap();
 
         sink.spool(segment.clone()).unwrap();
-        let delivered = sink.attempt_delivery().unwrap();
+        let delivered = sink.attempt_delivery().unwrap().delivered;
         assert_eq!(delivered, 1);
 
         // Verify the injection attempt is URL-encoded in parameters (inert).
@@ -1597,7 +1629,7 @@ mod tests {
         assert_ne!(hash1, hash2, "two records must have different hashes");
 
         sink.spool(segment.clone()).unwrap();
-        let delivered = sink.attempt_delivery().unwrap();
+        let delivered = sink.attempt_delivery().unwrap().delivered;
         assert_eq!(delivered, 1);
 
         // Parse the NDJSON body and verify each row has its own row_hash.

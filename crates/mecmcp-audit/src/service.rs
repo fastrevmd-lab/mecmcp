@@ -57,8 +57,13 @@ impl EvidenceService {
     /// alternative is starting a second root, which produces a fork that
     /// verifies as two valid chains and is therefore invisible downstream.
     pub fn start(config: EvidenceConfig) -> Result<Self, SsdfSinkError> {
-        let sink = Arc::new(SsdfSink::new(config.sink.clone())?);
-        Self::from_sink(config, sink)
+        let stop = new_stop();
+        let sink = Arc::new(SsdfSink::new_with_transport(
+            config.sink.clone(),
+            Arc::new(crate::sinks::ssdf::StdHttpTransport),
+            interruptible_sleep(&stop),
+        )?);
+        Self::from_sink(config, sink, stop)
     }
 
     /// Start a pipeline against a supplied transport, for tests.
@@ -70,15 +75,20 @@ impl EvidenceService {
         config: EvidenceConfig,
         transport: Arc<dyn HttpTransport>,
     ) -> Result<Self, SsdfSinkError> {
+        let stop = new_stop();
         let sink = Arc::new(SsdfSink::new_with_transport(
             config.sink.clone(),
             transport,
-            Arc::new(|_| {}),
+            interruptible_sleep(&stop),
         )?);
-        Self::from_sink(config, sink)
+        Self::from_sink(config, sink, stop)
     }
 
-    fn from_sink(config: EvidenceConfig, sink: Arc<SsdfSink>) -> Result<Self, SsdfSinkError> {
+    fn from_sink(
+        config: EvidenceConfig,
+        sink: Arc<SsdfSink>,
+        stop: Arc<(Mutex<bool>, Condvar)>,
+    ) -> Result<Self, SsdfSinkError> {
         // **Replay first, then read the tail.** A segment still in flight when
         // the last process died has not landed yet, so a tail read taken before
         // the replay returns that segment's predecessor; the next record
@@ -101,7 +111,6 @@ impl EvidenceService {
             .spooling_to(Arc::clone(&sink)),
         );
 
-        let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let degraded = Arc::new(AtomicBool::new(false));
         let worker = {
             let sink = Arc::clone(&sink);
@@ -142,9 +151,16 @@ impl EvidenceService {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        // Close the open segment first: without this, every record written
-        // since the last roll is still in memory and the flush below has
-        // nothing to find.
+        // Everything the recorder still holds, not just the open segment.
+        // Only `apply_intent` and `result_receipt` flush, so a server whose
+        // change sets are planned but not yet applied accumulates *finished*
+        // segments in memory: `take_closed` is the difference between losing
+        // them and shipping them. If one were dropped and a later segment did
+        // get through, the chain would land with a missing predecessor -- a
+        // hole that still verifies as a chain.
+        for segment in self.recorder.take_closed() {
+            self.sink.spool(segment)?;
+        }
         if let Some(segment) = self.recorder.close_current() {
             self.sink.spool(segment)?;
         }
@@ -180,6 +196,34 @@ impl Drop for EvidenceService {
     }
 }
 
+/// A fresh stop signal.
+fn new_stop() -> Arc<(Mutex<bool>, Condvar)> {
+    Arc::new((Mutex::new(false), Condvar::new()))
+}
+
+/// A sleep for the sink's retry backoff that gives up once shutdown is asked
+/// for.
+///
+/// The sink sleeps between attempts for a segment already marked failed. During
+/// a ClickHouse outage that backoff grows to a minute, and a shutdown that
+/// waits it out is a multi-minute stall -- at which point an operator reaches
+/// for SIGKILL and loses exactly the open segment the final flush exists to
+/// save. Returning early costs one wasted retry; the segment stays spooled
+/// either way.
+fn interruptible_sleep(stop: &Arc<(Mutex<bool>, Condvar)>) -> Arc<dyn Fn(Duration) + Send + Sync> {
+    let stop = Arc::clone(stop);
+    Arc::new(move |duration: Duration| {
+        let (lock, condvar) = &*stop;
+        let stopped = lock.lock().unwrap_or_else(|error| error.into_inner());
+        if *stopped {
+            return;
+        }
+        let _unused = condvar
+            .wait_timeout(stopped, duration)
+            .unwrap_or_else(|error| error.into_inner());
+    })
+}
+
 /// Deliver on an interval until told to stop.
 fn drain_until_stopped(
     sink: &SsdfSink,
@@ -203,14 +247,27 @@ fn drain_until_stopped(
         let should_stop = *stopped;
         drop(stopped);
 
-        if let Err(error) = sink.attempt_delivery() {
-            degraded.store(true, Ordering::SeqCst);
-            tracing::warn!(
-                %error,
-                "evidence delivery failed; segments stay spooled and will be retried"
-            );
-        } else {
-            degraded.store(false, Ordering::SeqCst);
+        match sink.attempt_delivery() {
+            // `Ok` describes the pass, not the segments: a pass in which every
+            // segment was refused still returns `Ok`. Reading only the outer
+            // result reports healthy while the outbox grows without limit.
+            Ok(report) => {
+                degraded.store(report.degraded(), Ordering::SeqCst);
+                if report.degraded() {
+                    tracing::warn!(
+                        delivered = report.delivered,
+                        failed = report.failed,
+                        "some evidence segments were refused; they stay spooled for retry"
+                    );
+                }
+            }
+            Err(error) => {
+                degraded.store(true, Ordering::SeqCst);
+                tracing::warn!(
+                    %error,
+                    "evidence delivery pass failed; segments stay spooled and will be retried"
+                );
+            }
         }
 
         if should_stop {

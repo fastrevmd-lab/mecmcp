@@ -23,6 +23,8 @@ struct CountingTransport {
     /// Ordered log of what was sent, so a test can assert sequence rather than
     /// merely that something happened.
     log: Mutex<Vec<&'static str>>,
+    /// When set, every INSERT is refused.
+    fail_inserts: std::sync::atomic::AtomicBool,
 }
 
 impl HttpTransport for CountingTransport {
@@ -45,6 +47,9 @@ impl HttpTransport for CountingTransport {
         }
         self.inserts.fetch_add(1, Ordering::SeqCst);
         self.log.lock().unwrap().push("insert");
+        if self.fail_inserts.load(Ordering::SeqCst) {
+            return Err(SsdfSinkError::Http("clickhouse unreachable".to_string()));
+        }
         Ok(String::new())
     }
 }
@@ -218,5 +223,143 @@ fn the_tail_is_read_after_replay_not_before() {
         first_insert < tail_read,
         "the tail was read before the stranded segment was replayed, so it \
          predates that segment and the new run will fork: {log:?}"
+    );
+}
+
+/// Segments that rolled without a flush must still be delivered at shutdown.
+///
+/// Only `apply_intent` and `result_receipt` flush. A `proposal` or `approval`
+/// that fills a segment rolls it into the recorder's in-memory `closed` list
+/// and nothing else — so a server whose change sets are planned but not yet
+/// applied holds finished segments that never reached the outbox. Spooling only
+/// the *open* segment at shutdown discards them, and if a later segment does
+/// get through, it lands with a missing predecessor: a chain with a hole that
+/// still verifies as a chain.
+#[test]
+fn segments_rolled_without_a_flush_survive_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(CountingTransport::default());
+    let service = EvidenceService::start_with_transport(
+        EvidenceConfig {
+            server_id: "junos-950".to_string(),
+            run_id: "run-1".to_string(),
+            // One record per segment, so each proposal rolls one.
+            records_per_segment: 1,
+            delivery_interval: Duration::from_secs(3600),
+            sink: sink_config(dir.path()),
+        },
+        transport.clone(),
+    )
+    .unwrap();
+
+    for n in 0..3 {
+        service.recorder().proposal(
+            &format!("req-{n}"),
+            &format!("cs-{n}"),
+            "vsrx-ci",
+            "alice",
+            "sha256:d",
+        );
+    }
+    assert_eq!(
+        transport.inserts.load(Ordering::SeqCst),
+        0,
+        "proposals do not flush, so nothing should have been delivered yet"
+    );
+
+    service.shutdown().unwrap();
+
+    assert!(
+        transport.inserts.load(Ordering::SeqCst) >= 3,
+        "rolled-but-unflushed segments were dropped: {} delivered, expected at \
+         least the 3 that rolled",
+        transport.inserts.load(Ordering::SeqCst)
+    );
+}
+
+/// Delivery that fails every time must not report healthy.
+///
+/// `attempt_delivery` marks each segment failed in the ledger and returns
+/// `Ok(0)` — the outer `Result` describes the pass, not the segments. A drain
+/// that reads only that result clears its degraded flag while the outbox grows
+/// without limit, which is the failure this whole subsystem exists to make
+/// visible.
+#[test]
+fn a_failing_delivery_is_reported_as_degraded() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(CountingTransport::default());
+    transport.fail_inserts.store(true, Ordering::SeqCst);
+    let service = EvidenceService::start_with_transport(
+        EvidenceConfig {
+            server_id: "junos-950".to_string(),
+            run_id: "run-1".to_string(),
+            records_per_segment: 1,
+            delivery_interval: Duration::from_millis(20),
+            sink: sink_config(dir.path()),
+        },
+        transport.clone(),
+    )
+    .unwrap();
+
+    service
+        .recorder()
+        .apply_intent("req-1", "cs-1", "vsrx-ci", "alice")
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !service.delivery_degraded() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let degraded = service.delivery_degraded();
+    let _ = service.shutdown();
+
+    assert!(
+        degraded,
+        "every delivery failed and the service still reported healthy"
+    );
+}
+
+/// Shutdown must not wait out retry backoff.
+///
+/// The sink sleeps between attempts for a segment already marked failed. During
+/// a ClickHouse outage that turns graceful shutdown into a multi-minute stall,
+/// and an operator who reaches for SIGKILL loses precisely the open segment the
+/// final flush exists to save.
+#[test]
+fn shutdown_does_not_wait_out_backoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(CountingTransport::default());
+    transport.fail_inserts.store(true, Ordering::SeqCst);
+    let mut sink = sink_config(dir.path());
+    // Far longer than the assertion below tolerates, so honouring it is
+    // unmistakable.
+    sink.initial_backoff = Duration::from_secs(30);
+    sink.max_backoff = Duration::from_secs(60);
+    let service = EvidenceService::start_with_transport(
+        EvidenceConfig {
+            server_id: "junos-950".to_string(),
+            run_id: "run-1".to_string(),
+            records_per_segment: 1,
+            delivery_interval: Duration::from_millis(20),
+            sink,
+        },
+        transport.clone(),
+    )
+    .unwrap();
+
+    service
+        .recorder()
+        .apply_intent("req-1", "cs-1", "vsrx-ci", "alice")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    let started = std::time::Instant::now();
+    let _ = service.shutdown();
+    let took = started.elapsed();
+
+    assert!(
+        took < Duration::from_secs(10),
+        "shutdown waited out the backoff ({took:?}); during an outage that is a \
+         stall long enough for an operator to SIGKILL through the final flush"
     );
 }

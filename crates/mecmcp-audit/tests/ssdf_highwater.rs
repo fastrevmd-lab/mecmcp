@@ -228,7 +228,7 @@ fn a_failed_segment_holds_back_the_rest_of_its_run() {
 
     // Segment 0's insert fails; 1 and 2 must not be attempted.
     *transport.fail_seq.lock().unwrap() = Some(0);
-    let delivered = sink.attempt_delivery().unwrap();
+    let delivered = sink.attempt_delivery().unwrap().delivered;
 
     assert_eq!(delivered, 0, "nothing may be delivered past the failure");
     let attempted = transport.inserted_seqs.lock().unwrap().clone();
@@ -253,7 +253,7 @@ fn an_unreadable_high_water_mark_keeps_the_segment_spooled() {
     .unwrap();
     sink.spool(segment(0)).unwrap();
 
-    let delivered = sink.attempt_delivery().unwrap();
+    let delivered = sink.attempt_delivery().unwrap().delivered;
 
     assert_eq!(
         delivered, 0,
