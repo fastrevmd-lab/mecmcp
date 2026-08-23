@@ -190,6 +190,36 @@ pub struct SegmentArchive {
     segments: Vec<ClosedSegment>,
 }
 
+/// Reject a `server_id` that cannot safely key a chain.
+///
+/// The chain is keyed by this value and it is interpolated into ClickHouse
+/// query parameters and dedup tokens, so it is restricted to
+/// `[A-Za-z0-9_-]` — and an empty one is refused outright, because several
+/// writers sharing the empty key would share a chain and fork it.
+///
+/// This is the single implementation. `mecmcp-verify` enforced the same rule
+/// on the read side while the write side enforced nothing, which is how an
+/// empty id could be written and then rejected only when someone came to
+/// verify it.
+///
+/// # Errors
+///
+/// Returns a message naming the problem, suitable for a CLI error.
+pub fn validate_server_id(server_id: &str) -> Result<(), String> {
+    if server_id.trim().is_empty() {
+        return Err("server_id is empty".to_string());
+    }
+    if !server_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "server_id '{server_id}' contains unsafe characters (only [A-Za-z0-9_-] allowed)"
+        ));
+    }
+    Ok(())
+}
+
 impl SegmentArchive {
     /// Create a new empty archive.
     pub fn new() -> Self {

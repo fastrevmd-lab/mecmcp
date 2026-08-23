@@ -302,3 +302,76 @@ fn an_endpoint_without_spool_paths_is_refused() {
         "the error must name the flag: {error}"
     );
 }
+
+/// A blank chain identity is refused.
+///
+/// `--ssdf-audit-server-id ""` is what a unit file produces when the variable
+/// behind it is unset, and clap hands it over as `Some("")`. Every writer that
+/// did it would share the empty chain key, which is a fork — and a fork
+/// verifies as two valid chains, so nothing downstream would say so.
+#[test]
+fn a_blank_server_id_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = secret(dir.path(), "w", "write-secret");
+    let verify = secret(dir.path(), "v", "verify-secret");
+
+    for blank in ["", "   "] {
+        let error = parse(&[
+            "--ssdf-audit-endpoint",
+            "https://ch.example:8443",
+            "--ssdf-audit-server-id",
+            blank,
+            "--ssdf-audit-password-file",
+            write.to_str().unwrap(),
+            "--ssdf-audit-verify-password-file",
+            verify.to_str().unwrap(),
+            "--ssdf-audit-outbox",
+            dir.path().join("outbox").to_str().unwrap(),
+            "--ssdf-audit-ledger",
+            dir.path().join("ledger").to_str().unwrap(),
+        ])
+        .into_config()
+        .expect_err("a blank chain identity must be refused");
+        assert!(
+            format!("{error}").contains("empty"),
+            "the error must name the problem for {blank:?}: {error}"
+        );
+    }
+}
+
+/// Run ids must sort in the order they were created.
+///
+/// `SegmentArchive::archive` requires run ids to be non-decreasing and rejects
+/// anything else as `RunIdNotMonotonic`, so a purely random id fails archival
+/// on roughly half of all ordinary restarts — unique but unusable.
+#[test]
+fn run_ids_sort_in_creation_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = secret(dir.path(), "w", "write-secret");
+    let verify = secret(dir.path(), "v", "verify-secret");
+    let args = parse(&[
+        "--ssdf-audit-endpoint",
+        "https://ch.example:8443",
+        "--ssdf-audit-server-id",
+        "junos-950",
+        "--ssdf-audit-password-file",
+        write.to_str().unwrap(),
+        "--ssdf-audit-verify-password-file",
+        verify.to_str().unwrap(),
+        "--ssdf-audit-outbox",
+        dir.path().join("outbox").to_str().unwrap(),
+        "--ssdf-audit-ledger",
+        dir.path().join("ledger").to_str().unwrap(),
+    ]);
+
+    let mut previous = args.into_config().unwrap().unwrap().run_id;
+    for _ in 0..32 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let next = args.into_config().unwrap().unwrap().run_id;
+        assert!(
+            next > previous,
+            "run ids must not sort below their predecessor: {next} after {previous}"
+        );
+        previous = next;
+    }
+}

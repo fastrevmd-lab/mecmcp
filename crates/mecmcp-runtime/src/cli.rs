@@ -388,6 +388,13 @@ impl EvidenceArgs {
             .ssdf_audit_server_id
             .clone()
             .ok_or(EvidenceArgsError::MissingServerId)?;
+        // An empty expansion -- `--ssdf-audit-server-id ""` from a unit file
+        // whose variable is unset -- reaches here as `Some("")`, and every
+        // writer that does it would share the empty chain key and fork the
+        // chain. The rule lives in mecmcp-audit so the write side and
+        // `mecmcp-verify` cannot disagree about it.
+        mecmcp_audit::evidence::validate_server_id(&server_id)
+            .map_err(EvidenceArgsError::InvalidServerId)?;
         let outbox_path = self
             .ssdf_audit_outbox
             .clone()
@@ -457,6 +464,9 @@ pub enum EvidenceArgsError {
          valid chain"
     )]
     MissingServerId,
+    /// The chain identity is empty or holds characters that cannot key a chain.
+    #[error("--ssdf-audit-server-id is not usable: {0}")]
+    InvalidServerId(String),
     /// A credential file failed its checks — wrong mode, wrong owner, symlink.
     #[error("credential file rejected (must be a regular file, 0600, owned by this user): {0}")]
     Credential(#[from] mecmcp_secret::SecretError),
@@ -479,17 +489,31 @@ fn read_password(path: Option<&Path>, flag: &'static str) -> Result<String, Evid
 
 /// A fresh run identifier for this process lifetime.
 ///
-/// Random, not clock-plus-pid. Delivery identity is
-/// `(server_id, run_id, segment_seq)`, so a repeated run id makes a new run's
-/// segment 0 collide with one already delivered and be skipped as landed --
-/// losing the head of the chain. A container that restarts into a reused pid
-/// within the same millisecond is unlikely; one restored from a snapshot, with
-/// the clock rolled back and pid 1 taken again, is not.
+/// Time-ordered **and** random, because two different invariants apply.
+///
+/// Delivery identity is `(server_id, run_id, segment_seq)`, so a *repeated* run
+/// id makes a new run's segment 0 collide with one already delivered and be
+/// skipped as landed -- losing the head of the chain. Clock-plus-pid repeats
+/// after a snapshot restore, where the clock rolls back and pid 1 is taken
+/// again; the random half rules that out.
+///
+/// But `SegmentArchive::archive` also requires run ids to be non-decreasing and
+/// rejects anything else as `RunIdNotMonotonic` -- so a purely random id fails
+/// archival on roughly half of all ordinary restarts. The millisecond prefix,
+/// zero-padded so lexicographic order matches chronological order, satisfies
+/// that. A clock that rolls backwards still breaks ordering, but it breaks it
+/// loudly, as a named error rather than as a silently skipped segment.
 fn new_run_id() -> String {
-    let mut bytes = [0u8; 16];
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    let mut bytes = [0u8; 8];
     getrandom::fill(&mut bytes).expect("the OS RNG is required for a run id");
-    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("run-{hex}")
+    let random: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    // Zero-padded to 13 digits so lexicographic order is chronological order
+    // (13 digits of milliseconds runs to the year 2286).
+    format!("run-{millis:013}-{random}")
 }
 
 /// Reject a non-positive interval at parse time.

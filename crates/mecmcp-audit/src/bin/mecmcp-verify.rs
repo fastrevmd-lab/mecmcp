@@ -360,24 +360,7 @@ fn print_usage(program: &str) {
 ///
 /// Allowed: [A-Za-z0-9_-]+
 /// Rejects: empty, path traversal (..), absolute paths, or any unsafe characters.
-fn validate_server_id(server_id: &str) -> Result<(), String> {
-    if server_id.is_empty() {
-        return Err("server_id is empty".to_string());
-    }
-
-    // Allow only alphanumeric, underscore, and hyphen
-    if !server_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err(format!(
-            "server_id '{}' contains unsafe characters (only [A-Za-z0-9_-] allowed)",
-            server_id
-        ));
-    }
-
-    Ok(())
-}
+use mecmcp_audit::evidence::validate_server_id;
 
 fn verify_run(
     run_id: &str,
