@@ -877,198 +877,213 @@ const MAX_RESPONSE_BYTES: usize = 4096;
 /// Only HTTP is supported; for HTTPS, use a TLS-terminating proxy.
 pub struct StdHttpTransport;
 
-impl HttpTransport for StdHttpTransport {
-    fn send(&self, request: &HttpRequest) -> Result<String, SsdfSinkError> {
-        use std::io::{BufRead, BufReader, Read, Write};
-        use std::net::TcpStream;
-        use std::time::Duration;
+/// Where an endpoint URL points, split into the parts a connection needs.
+///
+/// Returns `(tls, host, port, path)`. Both `http://` and `https://` are
+/// accepted; the caller decides whether it can honour the first field.
+///
+/// # Errors
+///
+/// Returns [`SsdfSinkError`] for a URL with no recognised scheme or an
+/// unparseable port.
+pub fn split_endpoint(url: &str) -> Result<(bool, String, u16, String), SsdfSinkError> {
+    let (tls, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        return Err(SsdfSinkError::Http(format!(
+            "endpoint must start with http:// or https://, got: {url}"
+        )));
+    };
 
-        // Parse URL to extract host, port, and path.
-        let url = &request.url;
-        if !url.starts_with("http://") {
-            return Err(SsdfSinkError::Http(format!(
-                "only http:// URLs supported, got: {}",
-                url
-            )));
-        }
-
-        let url_without_scheme = url
-            .strip_prefix("http://")
-            .expect("URL starts with http://");
-        let (host_port, path) = url_without_scheme
-            .split_once('/')
-            .unwrap_or((url_without_scheme, ""));
-
-        let (host, port) = if let Some((h, p)) = host_port.split_once(':') {
-            (
-                h,
-                p.parse::<u16>()
-                    .map_err(|e| SsdfSinkError::Http(format!("invalid port: {}", e)))?,
-            )
-        } else {
-            (host_port, 80u16)
-        };
-
-        // Connect with timeout.
-        let addr = format!("{}:{}", host, port);
-        let mut stream = TcpStream::connect_timeout(
-            &addr
-                .parse()
-                .map_err(|e| SsdfSinkError::Http(format!("invalid address {}: {}", addr, e)))?,
-            Duration::from_secs(10),
-        )
-        .map_err(|e| SsdfSinkError::Http(format!("connection failed: {}", e)))?;
-
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .map_err(|e| SsdfSinkError::Http(format!("set_read_timeout failed: {}", e)))?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(30)))
-            .map_err(|e| SsdfSinkError::Http(format!("set_write_timeout failed: {}", e)))?;
-
-        // Build HTTP/1.1 request.
-        let path_with_slash = if path.is_empty() {
-            "/".to_string()
-        } else {
-            format!("/{}", path)
-        };
-
-        let mut http_request = format!(
-            "{} {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             Connection: close\r\n\
-             Content-Length: {}\r\n",
-            request.method,
-            path_with_slash,
+    let (host_port, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) => (
             host,
-            request.body.len()
-        );
+            port.parse::<u16>()
+                .map_err(|error| SsdfSinkError::Http(format!("invalid port: {error}")))?,
+        ),
+        None => (host_port, if tls { 443 } else { 80 }),
+    };
 
-        for (name, value) in &request.headers {
-            http_request.push_str(&format!("{}: {}\r\n", name, value));
+    let path_with_slash = if path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{path}")
+    };
+    Ok((tls, host.to_string(), port, path_with_slash))
+}
+
+/// Open a TCP connection to `host:port`, resolving names.
+///
+/// Resolution goes through `to_socket_addrs`. An earlier version parsed the
+/// pair as a `SocketAddr`, which accepts only a numeric IP -- so any endpoint
+/// named rather than numbered failed to connect, and the SSDF documentation
+/// names its host.
+///
+/// # Errors
+///
+/// Returns [`SsdfSinkError`] if the name does not resolve or the connection
+/// fails.
+pub fn connect(host: &str, port: u16) -> Result<std::net::TcpStream, SsdfSinkError> {
+    use std::net::ToSocketAddrs;
+
+    let mut last = None;
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| SsdfSinkError::Http(format!("resolving {host}:{port}: {error}")))?;
+    for address in addresses {
+        match std::net::TcpStream::connect_timeout(&address, Duration::from_secs(10)) {
+            Ok(stream) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .map_err(|error| {
+                        SsdfSinkError::Http(format!("set_read_timeout failed: {error}"))
+                    })?;
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(30)))
+                    .map_err(|error| {
+                        SsdfSinkError::Http(format!("set_write_timeout failed: {error}"))
+                    })?;
+                return Ok(stream);
+            }
+            Err(error) => last = Some(error),
         }
+    }
+    Err(SsdfSinkError::Http(format!(
+        "connection to {host}:{port} failed: {}",
+        last.map_or_else(
+            || "no addresses resolved".to_string(),
+            |error| error.to_string()
+        )
+    )))
+}
 
-        http_request.push_str("\r\n");
+/// Perform one HTTP/1.1 exchange over an already-connected stream.
+///
+/// Split out so the plain and TLS transports share one implementation of the
+/// request framing, the chunked-body decoding and the response limit. Two
+/// copies of this would be two places for the 4 KiB cap to drift.
+///
+/// The connection is used once (`Connection: close`), so the stream is
+/// consumed.
+///
+/// # Errors
+///
+/// Returns [`SsdfSinkError`] on I/O failure, an unparseable response, a
+/// non-2xx status, or a chunk declaring more than the response limit.
+pub fn exchange<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    host: &str,
+    path_with_slash: &str,
+    request: &HttpRequest,
+) -> Result<String, SsdfSinkError> {
+    use std::io::{BufRead, BufReader, Read};
 
-        // Send request and body.
-        stream
-            .write_all(http_request.as_bytes())
-            .map_err(|e| SsdfSinkError::Http(format!("write request failed: {}", e)))?;
-        stream
-            .write_all(&request.body)
-            .map_err(|e| SsdfSinkError::Http(format!("write body failed: {}", e)))?;
-        stream
-            .flush()
-            .map_err(|e| SsdfSinkError::Http(format!("flush failed: {}", e)))?;
+    let mut http_request = format!(
+        "{} {} HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Connection: close\r\n\
+         Content-Length: {}\r\n",
+        request.method,
+        path_with_slash,
+        host,
+        request.body.len()
+    );
+    for (name, value) in &request.headers {
+        http_request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    http_request.push_str("\r\n");
 
-        // Read response.
-        let mut reader = BufReader::new(&stream);
-        let mut status_line = String::new();
+    stream
+        .write_all(http_request.as_bytes())
+        .map_err(|error| SsdfSinkError::Http(format!("write request failed: {error}")))?;
+    stream
+        .write_all(&request.body)
+        .map_err(|error| SsdfSinkError::Http(format!("write body failed: {error}")))?;
+    stream
+        .flush()
+        .map_err(|error| SsdfSinkError::Http(format!("flush failed: {error}")))?;
+
+    // Read response.
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .map_err(|e| SsdfSinkError::Http(format!("read status line failed: {}", e)))?;
+
+    // Parse status code.
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| {
+            SsdfSinkError::Http(format!("invalid status line: {}", status_line.trim()))
+        })?;
+
+    // Read headers until blank line.
+    let mut _content_length = None;
+    let mut chunked = false;
+    loop {
+        let mut header_line = String::new();
         reader
-            .read_line(&mut status_line)
-            .map_err(|e| SsdfSinkError::Http(format!("read status line failed: {}", e)))?;
+            .read_line(&mut header_line)
+            .map_err(|e| SsdfSinkError::Http(format!("read header failed: {}", e)))?;
+        if header_line == "\r\n" || header_line == "\n" {
+            break;
+        }
+        if let Some((name, value)) = header_line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                _content_length = value.trim().parse::<usize>().ok();
+            } else if name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && value.to_ascii_lowercase().contains("chunked")
+            {
+                // ClickHouse returns query results chunked. Without
+                // decoding, a body of `3` arrives as `2\r\n3\n\r\n0\r\n\r\n`
+                // and every high-water read fails to parse — which, before
+                // this, silently meant "nothing landed".
+                chunked = true;
+            }
+        }
+    }
 
-        // Parse status code.
-        let status_code = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse::<u16>().ok())
-            .ok_or_else(|| {
-                SsdfSinkError::Http(format!("invalid status line: {}", status_line.trim()))
-            })?;
-
-        // Read headers until blank line.
-        let mut _content_length = None;
-        let mut chunked = false;
+    // Read response body (up to 4KB for error messages).
+    let mut body = Vec::new();
+    if chunked {
         loop {
-            let mut header_line = String::new();
+            let mut size_line = String::new();
             reader
-                .read_line(&mut header_line)
-                .map_err(|e| SsdfSinkError::Http(format!("read header failed: {}", e)))?;
-            if header_line == "\r\n" || header_line == "\n" {
+                .read_line(&mut size_line)
+                .map_err(|e| SsdfSinkError::Http(format!("read chunk size failed: {}", e)))?;
+            // A chunk header may carry extensions after a `;`.
+            let size_text = size_line.trim().split(';').next().unwrap_or("").trim();
+            let size = usize::from_str_radix(size_text, 16)
+                .map_err(|_| SsdfSinkError::Http(format!("invalid chunk size: {size_text:?}")))?;
+            if size == 0 {
                 break;
             }
-            if let Some((name, value)) = header_line.split_once(':') {
-                if name.trim().eq_ignore_ascii_case("content-length") {
-                    _content_length = value.trim().parse::<usize>().ok();
-                } else if name.trim().eq_ignore_ascii_case("transfer-encoding")
-                    && value.to_ascii_lowercase().contains("chunked")
-                {
-                    // ClickHouse returns query results chunked. Without
-                    // decoding, a body of `3` arrives as `2\r\n3\n\r\n0\r\n\r\n`
-                    // and every high-water read fails to parse — which, before
-                    // this, silently meant "nothing landed".
-                    chunked = true;
-                }
-            }
-        }
-
-        // Read response body (up to 4KB for error messages).
-        let mut body = Vec::new();
-        if chunked {
-            loop {
-                let mut size_line = String::new();
-                reader
-                    .read_line(&mut size_line)
-                    .map_err(|e| SsdfSinkError::Http(format!("read chunk size failed: {}", e)))?;
-                // A chunk header may carry extensions after a `;`.
-                let size_text = size_line.trim().split(';').next().unwrap_or("").trim();
-                let size = usize::from_str_radix(size_text, 16).map_err(|_| {
-                    SsdfSinkError::Http(format!("invalid chunk size: {size_text:?}"))
-                })?;
-                if size == 0 {
-                    break;
-                }
-                // Refuse before allocating. The declared size is attacker- or
-                // fault-controlled — an on-path responder can claim gigabytes —
-                // and allocating first would make the 4 KiB body limit a limit
-                // on what is *kept* rather than on what is *reserved*.
-                let remaining = MAX_RESPONSE_BYTES.saturating_sub(body.len());
-                if size > remaining {
-                    return Err(SsdfSinkError::Http(format!(
-                        "chunked response declares {size} bytes, over the \
-                         {MAX_RESPONSE_BYTES}-byte response limit"
-                    )));
-                }
-                let mut chunk = vec![0u8; size];
-                reader
-                    .read_exact(&mut chunk)
-                    .map_err(|e| SsdfSinkError::Http(format!("read chunk failed: {}", e)))?;
-                body.extend_from_slice(&chunk);
-                let mut terminator = String::new();
-                reader.read_line(&mut terminator).map_err(|e| {
-                    SsdfSinkError::Http(format!("read chunk terminator failed: {}", e))
-                })?;
-            }
-            if !(200..300).contains(&status_code) {
-                let body_str = String::from_utf8_lossy(&body);
+            // Refuse before allocating. The declared size is attacker- or
+            // fault-controlled — an on-path responder can claim gigabytes —
+            // and allocating first would make the 4 KiB body limit a limit
+            // on what is *kept* rather than on what is *reserved*.
+            let remaining = MAX_RESPONSE_BYTES.saturating_sub(body.len());
+            if size > remaining {
                 return Err(SsdfSinkError::Http(format!(
-                    "HTTP {} {}",
-                    status_code,
-                    body_str.chars().take(200).collect::<String>()
+                    "chunked response declares {size} bytes, over the \
+                     {MAX_RESPONSE_BYTES}-byte response limit"
                 )));
             }
-            return Ok(String::from_utf8_lossy(&body).into_owned());
+            let mut chunk = vec![0u8; size];
+            reader
+                .read_exact(&mut chunk)
+                .map_err(|e| SsdfSinkError::Http(format!("read chunk failed: {}", e)))?;
+            body.extend_from_slice(&chunk);
+            let mut terminator = String::new();
+            reader
+                .read_line(&mut terminator)
+                .map_err(|e| SsdfSinkError::Http(format!("read chunk terminator failed: {}", e)))?;
         }
-        let mut buf = [0u8; 1024];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    body.extend_from_slice(&buf[..n]);
-                    if body.len() >= MAX_RESPONSE_BYTES {
-                        body.truncate(MAX_RESPONSE_BYTES);
-                        break;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    return Err(SsdfSinkError::Http(format!("read body failed: {}", e)));
-                }
-            }
-        }
-
-        // Check status code.
         if !(200..300).contains(&status_code) {
             let body_str = String::from_utf8_lossy(&body);
             return Err(SsdfSinkError::Http(format!(
@@ -1077,8 +1092,66 @@ impl HttpTransport for StdHttpTransport {
                 body_str.chars().take(200).collect::<String>()
             )));
         }
+        return Ok(String::from_utf8_lossy(&body).into_owned());
+    }
+    let mut buf = [0u8; 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                body.extend_from_slice(&buf[..n]);
+                if body.len() >= MAX_RESPONSE_BYTES {
+                    body.truncate(MAX_RESPONSE_BYTES);
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            // An unclean EOF ends the body rather than failing it. The request
+            // says `Connection: close`, so the server closing *is* the
+            // terminator, and plenty of servers drop the socket without a TLS
+            // `close_notify` -- rustls reports that as `UnexpectedEof`, which
+            // would otherwise fail every delivery against a TLS ClickHouse.
+            //
+            // The cost is that a truncated body reads as a short one. That is
+            // already true of the plain path, which ignores `Content-Length`
+            // and reads to EOF, and the bodies here are a row hash or a count.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => {
+                return Err(SsdfSinkError::Http(format!("read body failed: {}", e)));
+            }
+        }
+    }
 
-        Ok(String::from_utf8_lossy(&body).into_owned())
+    // Check status code.
+    if !(200..300).contains(&status_code) {
+        let body_str = String::from_utf8_lossy(&body);
+        return Err(SsdfSinkError::Http(format!(
+            "HTTP {} {}",
+            status_code,
+            body_str.chars().take(200).collect::<String>()
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+impl HttpTransport for StdHttpTransport {
+    fn send(&self, request: &HttpRequest) -> Result<String, SsdfSinkError> {
+        let (tls, host, port, path) = split_endpoint(&request.url)?;
+        if tls {
+            // This transport speaks no TLS. `mecmcp-transport` supplies one
+            // that does, because adding a TLS stack here would mean choosing a
+            // rustls crypto provider in a second crate -- and that choice going
+            // two ways at once is what linked aws-lc-rs into a ring build and
+            // broke TLS in a downstream server.
+            return Err(SsdfSinkError::Http(format!(
+                "{} needs TLS; use the transport from mecmcp-transport, which owns \
+                 the provider decision",
+                request.url
+            )));
+        }
+        let mut stream = connect(&host, port)?;
+        exchange(&mut stream, &host, &path, request)
     }
 }
 
