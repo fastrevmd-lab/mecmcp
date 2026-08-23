@@ -158,13 +158,10 @@ impl EvidenceService {
         // them and shipping them. If one were dropped and a later segment did
         // get through, the chain would land with a missing predecessor -- a
         // hole that still verifies as a chain.
-        for segment in self.recorder.take_closed() {
-            self.sink.spool(segment)?;
-        }
-        if let Some(segment) = self.recorder.close_current() {
-            self.sink.spool(segment)?;
-        }
-        self.sink.shutdown_flush()
+        let sink = Arc::clone(&self.sink);
+        let outcome = spool_everything(&self.recorder, |segment| sink.spool(segment));
+        let flushed = self.sink.shutdown_flush();
+        outcome.and(flushed)
     }
 
     /// Whether the background drain has reported a delivery failure.
@@ -194,6 +191,57 @@ impl Drop for EvidenceService {
             }
         }
     }
+}
+
+/// Hand every segment the recorder still holds to `spool`, without stopping.
+///
+/// Two properties matter here and neither is obvious from the happy path.
+///
+/// **It must not stop at the first error.** `take_closed` *removes* the
+/// segments from the recorder, so a `?` on the first one drops every segment
+/// after it and skips the open one entirely -- they exist nowhere else, and the
+/// service is being consumed. Losing the rest of the trail because one write
+/// failed is the opposite of what a shutdown flush is for.
+///
+/// **A ledger error is not a spool failure.** `SsdfSink::spool` fsyncs the
+/// segment and *then* marks it pending in a separate file; if only that second
+/// step fails the record is already durable and `attempt_delivery` will still
+/// find it, because delivery reads the outbox rather than the ledger. The drain
+/// already classifies it that way in `spool_outcome`, and shutdown treating the
+/// same condition as fatal would have made it lose records the running server
+/// keeps.
+///
+/// The first genuine error is returned once everything has been attempted.
+pub(crate) fn spool_everything(
+    recorder: &EvidenceRecorder,
+    mut spool: impl FnMut(crate::evidence::ClosedSegment) -> Result<(), SsdfSinkError>,
+) -> Result<(), SsdfSinkError> {
+    let mut first_error = None;
+    let mut attempt = |segment| match spool(segment) {
+        Ok(()) => {}
+        Err(SsdfSinkError::Ledger(error)) => {
+            tracing::warn!(
+                %error,
+                "segment is durable in the outbox but the delivery ledger could not \
+                 be updated; delivery is unaffected"
+            );
+        }
+        Err(error) => {
+            tracing::error!(%error, "an evidence segment could not be spooled at shutdown");
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    };
+
+    for segment in recorder.take_closed() {
+        attempt(segment);
+    }
+    if let Some(segment) = recorder.close_current() {
+        attempt(segment);
+    }
+
+    first_error.map_or(Ok(()), Err)
 }
 
 /// A fresh stop signal.
@@ -273,5 +321,80 @@ fn drain_until_stopped(
         if should_stop {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::recorder::{EvidenceRecorder, RecorderConfig};
+
+    fn recorder_holding(rolled: usize, plus_open: bool) -> EvidenceRecorder {
+        let recorder = EvidenceRecorder::new(RecorderConfig {
+            server_id: "srv".to_string(),
+            run_id: "run".to_string(),
+            resume_from: None,
+            records_per_segment: 1,
+        });
+        for n in 0..rolled {
+            recorder.proposal(
+                &format!("r{n}"),
+                &format!("c{n}"),
+                "dev",
+                "alice",
+                "sha256:d",
+            );
+        }
+        if plus_open {
+            // records_per_segment is 1, so this rolls too; a segment stays open
+            // only because the roll happens on the *next* append. Use a
+            // recorder-visible fact instead: close_current() returns Some when
+            // anything is unrolled.
+        }
+        recorder
+    }
+
+    /// A ledger-only failure must not stop the flush.
+    ///
+    /// `take_closed` removes the segments, so stopping at the first error drops
+    /// every one after it -- and this particular error means the segment is
+    /// already durable in the outbox, which is exactly why the running drain
+    /// treats it as success.
+    #[test]
+    fn a_ledger_error_does_not_abandon_the_remaining_segments() {
+        let recorder = recorder_holding(4, false);
+        let mut seen = 0usize;
+
+        let result = spool_everything(&recorder, |_segment| {
+            seen += 1;
+            Err(SsdfSinkError::Ledger(
+                crate::sinks::delivery_ledger::LedgerError::InvalidEntry("full".to_owned()),
+            ))
+        });
+
+        assert!(result.is_ok(), "a ledger-only error is not a spool failure");
+        assert_eq!(
+            seen, 4,
+            "every held segment must be offered, not just the first"
+        );
+    }
+
+    /// A real spool failure is reported, but only after everything is tried.
+    #[test]
+    fn a_real_failure_is_reported_after_every_segment_is_attempted() {
+        let recorder = recorder_holding(3, false);
+        let mut seen = 0usize;
+
+        let result = spool_everything(&recorder, |_segment| {
+            seen += 1;
+            Err(SsdfSinkError::Http("disk gone".to_owned()))
+        });
+
+        assert!(result.is_err(), "a genuine failure must be reported");
+        assert_eq!(
+            seen, 3,
+            "stopping early would drop segments that exist nowhere else"
+        );
     }
 }

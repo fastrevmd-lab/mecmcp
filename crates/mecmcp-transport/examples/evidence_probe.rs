@@ -14,8 +14,12 @@
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let endpoint = args.next().ok_or("usage: evidence_probe <endpoint> <ca.pem>")?;
-    let ca = args.next().ok_or("usage: evidence_probe <endpoint> <ca.pem>")?;
+    let endpoint = args
+        .next()
+        .ok_or("usage: evidence_probe <endpoint> <ca.pem>")?;
+    let ca = args
+        .next()
+        .ok_or("usage: evidence_probe <endpoint> <ca.pem>")?;
 
     let transport =
         mecmcp_transport::evidence_transport::EvidenceHttpTransport::new(Some(ca.as_ref()))?;
