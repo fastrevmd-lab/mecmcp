@@ -261,6 +261,92 @@ impl SsdfSink {
         Ok(())
     }
 
+    /// Basic auth for the SELECT-only identity.
+    ///
+    /// The two reads this sink performs — the high-water mark and the chain
+    /// tail — both use it, and neither may use the writer's credential: SSDF
+    /// grants `ssdf_audit` INSERT and nothing else on purpose, so that a stolen
+    /// writer credential can append but not enumerate.
+    fn verify_authorization(&self) -> String {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!(
+                "{}:{}",
+                self.config.verify_username, self.config.verify_password
+            ))
+        )
+    }
+
+    /// This writer's chain tail as SSDF holds it, for seeding a new run.
+    ///
+    /// The tail is the row **nothing else points at**, found by following links
+    /// rather than by sorting. `ORDER BY ts, segment_seq` looks equivalent and
+    /// is not: `segment_seq` restarts at 0 each run, so an older run's segment
+    /// 40 outranks the real tail's segment 0, and records sharing a millisecond
+    /// or a clock that stepped backwards break the tiebreak too. A writer that
+    /// seeds from an interior hash forks its own chain, and a fork verifies as
+    /// two valid chains rather than as an error.
+    ///
+    /// `DISTINCT` matters as much. Two *rows* can carry one unreferenced
+    /// `row_hash` — that is what an ambiguous-timeout duplicate of the current
+    /// tail looks like — and that is one head, not a fork.
+    ///
+    /// **Call this after replay, not before.** A segment still in flight when
+    /// the process restarted has not landed yet, so a tail read taken first
+    /// returns its predecessor; the next record then attaches there and forks
+    /// the chain with no duplicate anywhere in it for the verifier to catch.
+    /// [`EvidenceService`](crate::EvidenceService) enforces that order.
+    ///
+    /// Read as the verify identity: `ssdf_audit` has no `SELECT`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SsdfSinkError`] if the read fails. A failed read is not "no
+    /// chain" — treating it as one starts a second root.
+    pub fn remote_head(&self, server_id: &str) -> Result<Option<String>, SsdfSinkError> {
+        let query = format!(
+            "SELECT DISTINCT row_hash FROM {db}.audit \
+             WHERE tier = 'evidence' \
+               AND JSONExtractString(args, 'server_id') = {{server_id:String}} \
+               AND row_hash NOT IN ( \
+                   SELECT prev_hash FROM {db}.audit \
+                   WHERE tier = 'evidence' \
+                     AND JSONExtractString(args, 'server_id') = {{server_id:String}} \
+                     AND prev_hash != '' \
+               ) \
+             FORMAT TabSeparated",
+            db = self.config.database
+        );
+        let url = format!(
+            "{}/?query={}&param_server_id={}",
+            self.config.endpoint,
+            urlencoding::encode(&query),
+            urlencoding::encode(server_id),
+        );
+        let body = self.transport.send(&HttpRequest {
+            url,
+            method: "POST".to_string(),
+            headers: vec![("Authorization".to_string(), self.verify_authorization())],
+            body: Vec::new(),
+        })?;
+
+        let mut heads = body.lines().map(str::trim).filter(|line| !line.is_empty());
+        let Some(head) = heads.next() else {
+            return Ok(None);
+        };
+        if heads.next().is_some() {
+            // Two distinct unreferenced hashes is a chain that has already
+            // forked. Picking one deepens it, so refuse and let an operator
+            // look — this is the condition the whole design exists to make
+            // impossible, and guessing here would hide it.
+            return Err(SsdfSinkError::Http(format!(
+                "chain for server_id {server_id} has more than one tail; it has forked \
+                 and a new run must not attach to either branch"
+            )));
+        }
+        Ok(Some(head.to_owned()))
+    }
+
     /// The head of the newest segment this writer has **produced**.
     ///
     /// This is what a restarting recorder must resume from, and it is derived
@@ -464,16 +550,7 @@ impl SsdfSink {
         let request = HttpRequest {
             url,
             method: "POST".to_string(),
-            headers: vec![(
-                "Authorization".to_string(),
-                format!(
-                    "Basic {}",
-                    base64::engine::general_purpose::STANDARD.encode(format!(
-                        "{}:{}",
-                        self.config.verify_username, self.config.verify_password
-                    ))
-                ),
-            )],
+            headers: vec![("Authorization".to_string(), self.verify_authorization())],
             body: Vec::new(),
         };
 

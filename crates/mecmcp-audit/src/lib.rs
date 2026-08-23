@@ -13,6 +13,7 @@ pub mod recorder;
 mod redact;
 mod schema;
 mod scope;
+pub mod service;
 pub mod signing;
 pub mod sinks;
 pub mod testutil;
@@ -32,6 +33,7 @@ pub use schema::{AuditOutcome, AuditValue};
 pub use scope::{
     AuditScope, DEFAULT_DURATION_METRIC, duration_metric_name, install_duration_metric_name,
 };
+pub use service::{EvidenceConfig, EvidenceService};
 pub use sinks::{
     DeliveryLedger, DeliveryStatus, ProducedHead, SsdfSink, SsdfSinkConfig, SsdfSinkError,
 };
