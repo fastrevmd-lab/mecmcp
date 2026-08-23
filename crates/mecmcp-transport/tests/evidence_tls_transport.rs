@@ -72,7 +72,11 @@ fn an_https_endpoint_is_reachable_with_a_private_ca() {
     std::fs::write(&ca_file, &ca_pem).unwrap();
 
     let (port, server) = serve_once(issued, "sha256:tail\n");
-    let transport = EvidenceHttpTransport::new(Some(&ca_file)).unwrap();
+    let transport = EvidenceHttpTransport::new(
+        Some(&ca_file),
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .unwrap();
 
     let body = transport
         .send(&HttpRequest {
@@ -101,7 +105,11 @@ fn an_untrusted_certificate_is_refused() {
     std::fs::write(&ca_file, unrelated.cert.pem()).unwrap();
 
     let (port, server) = serve_once(issued, "never read");
-    let transport = EvidenceHttpTransport::new(Some(&ca_file)).unwrap();
+    let transport = EvidenceHttpTransport::new(
+        Some(&ca_file),
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .unwrap();
 
     let error = transport
         .send(&HttpRequest {
@@ -140,7 +148,9 @@ fn a_plain_http_endpoint_still_works() {
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
     });
 
-    let transport = EvidenceHttpTransport::new(None).unwrap();
+    let transport =
+        EvidenceHttpTransport::new(None, Arc::new(rustls::crypto::ring::default_provider()))
+            .unwrap();
     let body = transport
         .send(&HttpRequest {
             url: format!("http://127.0.0.1:{port}/ping"),
@@ -174,7 +184,9 @@ fn an_https_endpoint_without_a_ca_is_refused_not_downgraded() {
         }
     });
 
-    let transport = EvidenceHttpTransport::new(None).unwrap();
+    let transport =
+        EvidenceHttpTransport::new(None, Arc::new(rustls::crypto::ring::default_provider()))
+            .unwrap();
     let error = transport
         .send(&HttpRequest {
             url: format!("https://127.0.0.1:{port}/?query=SELECT+1"),
@@ -201,7 +213,10 @@ fn an_empty_ca_file_is_refused() {
     let ca_file = directory.path().join("ca.pem");
     std::fs::write(&ca_file, "# no certificate here\n").unwrap();
 
-    let Err(error) = EvidenceHttpTransport::new(Some(&ca_file)) else {
+    let Err(error) = EvidenceHttpTransport::new(
+        Some(&ca_file),
+        Arc::new(rustls::crypto::ring::default_provider()),
+    ) else {
         panic!("a CA file with no certificate must be refused")
     };
 

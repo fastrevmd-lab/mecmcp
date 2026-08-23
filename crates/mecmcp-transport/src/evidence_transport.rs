@@ -35,6 +35,13 @@ impl std::fmt::Debug for EvidenceHttpTransport {
 impl EvidenceHttpTransport {
     /// Build a transport, trusting `ca_file` as the only anchor when given.
     ///
+    /// The crypto provider is **supplied by the caller**, exactly as
+    /// [`crate::tls::load`] takes one. Constructing `rustls::crypto::ring`
+    /// here would not even compile in a library build -- the module is behind
+    /// the `ring` feature, which only this crate's dev-dependencies enable --
+    /// and reaching for a provider feature to fix that is the move decision D4
+    /// exists to prevent. The servers already install one; they pass it in.
+    ///
     /// SSDF issues its ClickHouse certificate from a private CA, so the public
     /// root set is useless here and trusting it as well would only widen what
     /// can impersonate the audit destination. When no CA is supplied the
@@ -45,8 +52,12 @@ impl EvidenceHttpTransport {
     ///
     /// Returns [`SsdfSinkError`] if the CA file cannot be read or holds no
     /// usable certificate.
-    pub fn new(ca_file: Option<&Path>) -> Result<Self, SsdfSinkError> {
+    pub fn new(
+        ca_file: Option<&Path>,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    ) -> Result<Self, SsdfSinkError> {
         let Some(ca_file) = ca_file else {
+            drop(provider);
             return Ok(Self { client: None });
         };
 
@@ -72,7 +83,6 @@ impl EvidenceHttpTransport {
             )));
         }
 
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let client = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(|error| SsdfSinkError::Http(format!("TLS versions: {error}")))?

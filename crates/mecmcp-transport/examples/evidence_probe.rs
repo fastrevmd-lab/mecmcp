@@ -21,8 +21,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("usage: evidence_probe <endpoint> <ca.pem>")?;
 
-    let transport =
-        mecmcp_transport::evidence_transport::EvidenceHttpTransport::new(Some(ca.as_ref()))?;
+    let transport = mecmcp_transport::evidence_transport::EvidenceHttpTransport::new(
+        Some(ca.as_ref()),
+        std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+    )?;
     let body = mecmcp_audit::sinks::ssdf::HttpTransport::send(
         &transport,
         &mecmcp_audit::sinks::ssdf::HttpRequest {
