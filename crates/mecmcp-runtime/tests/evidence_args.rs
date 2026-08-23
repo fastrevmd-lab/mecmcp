@@ -84,11 +84,16 @@ fn a_configured_endpoint_produces_a_pipeline_config() {
 /// An endpoint with no credentials is a misconfiguration, not a default.
 #[test]
 fn an_endpoint_without_credentials_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
     let error = parse(&[
         "--ssdf-audit-endpoint",
         "https://ch.example:8443",
         "--ssdf-audit-server-id",
         "junos-950",
+        "--ssdf-audit-outbox",
+        dir.path().join("outbox").to_str().unwrap(),
+        "--ssdf-audit-ledger",
+        dir.path().join("ledger").to_str().unwrap(),
     ])
     .into_config()
     .expect_err("no password file was given");
@@ -117,6 +122,10 @@ fn a_loose_password_file_is_refused() {
         write.to_str().unwrap(),
         "--ssdf-audit-verify-password-file",
         verify.to_str().unwrap(),
+        "--ssdf-audit-outbox",
+        dir.path().join("outbox").to_str().unwrap(),
+        "--ssdf-audit-ledger",
+        dir.path().join("ledger").to_str().unwrap(),
     ])
     .into_config()
     .expect_err("0644 on a credential must be refused");
@@ -145,6 +154,10 @@ fn an_endpoint_without_a_server_id_is_refused() {
         write.to_str().unwrap(),
         "--ssdf-audit-verify-password-file",
         verify.to_str().unwrap(),
+        "--ssdf-audit-outbox",
+        dir.path().join("outbox").to_str().unwrap(),
+        "--ssdf-audit-ledger",
+        dir.path().join("ledger").to_str().unwrap(),
     ])
     .into_config()
     .expect_err("no chain identity was given");
@@ -152,5 +165,140 @@ fn an_endpoint_without_a_server_id_is_refused() {
     assert!(
         format!("{error}").contains("--ssdf-audit-server-id"),
         "the error must name the flag to set: {error}"
+    );
+}
+
+/// A zero delivery interval is refused at parse time.
+///
+/// `Duration::ZERO` makes the drain's `wait_timeout` return immediately every
+/// iteration, reloading the outbox in a tight loop — a busy spin on CPU and
+/// disk that presents as a wedged server rather than as a misconfiguration.
+#[test]
+fn a_zero_delivery_interval_is_refused() {
+    let parsed = Harness::try_parse_from(["test", "--ssdf-audit-interval-secs", "0"]);
+    let error = parsed.expect_err("zero must not parse").to_string();
+    assert!(
+        error.contains("at least 1 second"),
+        "the error must say what to use instead: {error}"
+    );
+}
+
+/// Run ids must not be derived from clock and pid.
+///
+/// Delivery identity is `(server_id, run_id, segment_seq)`, so a repeated run
+/// id makes a new run's segment 0 collide with one already delivered and be
+/// skipped as landed — losing the head of the chain. A snapshot restore brings
+/// back both the clock and pid 1.
+#[test]
+fn run_ids_do_not_repeat() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = secret(dir.path(), "w", "write-secret");
+    let verify = secret(dir.path(), "v", "verify-secret");
+    let args = parse(&[
+        "--ssdf-audit-endpoint",
+        "https://ch.example:8443",
+        "--ssdf-audit-server-id",
+        "junos-950",
+        "--ssdf-audit-password-file",
+        write.to_str().unwrap(),
+        "--ssdf-audit-verify-password-file",
+        verify.to_str().unwrap(),
+        "--ssdf-audit-outbox",
+        dir.path().join("outbox").to_str().unwrap(),
+        "--ssdf-audit-ledger",
+        dir.path().join("ledger").to_str().unwrap(),
+    ]);
+
+    let seen: std::collections::HashSet<String> = (0..64)
+        .map(|_| args.into_config().unwrap().unwrap().run_id)
+        .collect();
+
+    assert_eq!(
+        seen.len(),
+        64,
+        "run ids repeated within one process, so they cannot be distinguishing \
+         two runs of one server either"
+    );
+}
+
+/// A password ending in real whitespace keeps it; only one line ending goes.
+///
+/// `trim_end` would eat the trailing space, and the resulting auth failure
+/// reads as a wrong password rather than a mangled one.
+#[test]
+fn only_one_line_ending_is_stripped_from_a_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = secret(dir.path(), "w", "trailing space \n");
+    let verify = secret(dir.path(), "v", "verify-secret");
+
+    let config = parse(&[
+        "--ssdf-audit-endpoint",
+        "https://ch.example:8443",
+        "--ssdf-audit-server-id",
+        "junos-950",
+        "--ssdf-audit-password-file",
+        write.to_str().unwrap(),
+        "--ssdf-audit-verify-password-file",
+        verify.to_str().unwrap(),
+        "--ssdf-audit-outbox",
+        dir.path().join("outbox").to_str().unwrap(),
+        "--ssdf-audit-ledger",
+        dir.path().join("ledger").to_str().unwrap(),
+    ])
+    .into_config()
+    .unwrap()
+    .expect("configured");
+
+    assert_eq!(config.sink.password, "trailing space ");
+}
+
+/// An empty credential file is a configuration error, not an empty password.
+#[test]
+fn an_empty_password_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = secret(dir.path(), "w", "\n");
+    let verify = secret(dir.path(), "v", "verify-secret");
+
+    let error = parse(&[
+        "--ssdf-audit-endpoint",
+        "https://ch.example:8443",
+        "--ssdf-audit-server-id",
+        "junos-950",
+        "--ssdf-audit-password-file",
+        write.to_str().unwrap(),
+        "--ssdf-audit-verify-password-file",
+        verify.to_str().unwrap(),
+        "--ssdf-audit-outbox",
+        dir.path().join("outbox").to_str().unwrap(),
+        "--ssdf-audit-ledger",
+        dir.path().join("ledger").to_str().unwrap(),
+    ])
+    .into_config()
+    .expect_err("an empty credential must be refused");
+    assert!(!format!("{error}").is_empty());
+}
+
+/// Spool paths have no default, because no default is writable anywhere.
+#[test]
+fn an_endpoint_without_spool_paths_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = secret(dir.path(), "w", "write-secret");
+    let verify = secret(dir.path(), "v", "verify-secret");
+
+    let error = parse(&[
+        "--ssdf-audit-endpoint",
+        "https://ch.example:8443",
+        "--ssdf-audit-server-id",
+        "junos-950",
+        "--ssdf-audit-password-file",
+        write.to_str().unwrap(),
+        "--ssdf-audit-verify-password-file",
+        verify.to_str().unwrap(),
+    ])
+    .into_config()
+    .expect_err("no spool path was given");
+    assert!(
+        format!("{error}").contains("--ssdf-audit-outbox"),
+        "the error must name the flag: {error}"
     );
 }

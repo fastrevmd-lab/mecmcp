@@ -338,16 +338,27 @@ pub struct EvidenceArgs {
     #[arg(long)]
     pub ssdf_audit_verify_password_file: Option<PathBuf>,
 
-    /// Durable outbox for closed segments.
-    #[arg(long, default_value = "/var/lib/mecmcp/evidence-outbox.ndjson")]
-    pub ssdf_audit_outbox: PathBuf,
+    /// Durable outbox for closed segments. Required when the endpoint is set.
+    ///
+    /// Deliberately undefaulted. Every packaged unit runs `ProtectSystem=strict`
+    /// with only its own state directory writable -- `/var/lib/jmcp`,
+    /// `/var/lib/rust-panosmcp`, and so on -- so a shared default like
+    /// `/var/lib/mecmcp` is writable on none of them, and the service would
+    /// fail to start. There is no value that is right for every consumer, so
+    /// there is no default.
+    #[arg(long)]
+    pub ssdf_audit_outbox: Option<PathBuf>,
 
-    /// Delivery ledger.
-    #[arg(long, default_value = "/var/lib/mecmcp/evidence-ledger.ndjson")]
-    pub ssdf_audit_ledger: PathBuf,
+    /// Delivery ledger. Required when the endpoint is set.
+    #[arg(long)]
+    pub ssdf_audit_ledger: Option<PathBuf>,
 
-    /// Seconds between delivery attempts.
-    #[arg(long, default_value_t = 30)]
+    /// Seconds between delivery attempts. Must be positive.
+    ///
+    /// Zero would make the drain's `wait_timeout` return immediately on every
+    /// iteration, reloading the outbox in a tight loop -- a busy spin on CPU
+    /// and disk that looks like a wedged server.
+    #[arg(long, default_value_t = 30, value_parser = positive_seconds)]
     pub ssdf_audit_interval_secs: u64,
 
     /// Records per segment before one is closed and spooled.
@@ -377,6 +388,18 @@ impl EvidenceArgs {
             .ssdf_audit_server_id
             .clone()
             .ok_or(EvidenceArgsError::MissingServerId)?;
+        let outbox_path = self
+            .ssdf_audit_outbox
+            .clone()
+            .ok_or(EvidenceArgsError::MissingPath {
+                flag: "--ssdf-audit-outbox",
+            })?;
+        let ledger_path = self
+            .ssdf_audit_ledger
+            .clone()
+            .ok_or(EvidenceArgsError::MissingPath {
+                flag: "--ssdf-audit-ledger",
+            })?;
 
         let password = read_password(
             self.ssdf_audit_password_file.as_deref(),
@@ -399,8 +422,8 @@ impl EvidenceArgs {
                 password,
                 verify_username: self.ssdf_audit_verify_user.clone(),
                 verify_password,
-                outbox_path: self.ssdf_audit_outbox.clone(),
-                ledger_path: self.ssdf_audit_ledger.clone(),
+                outbox_path,
+                ledger_path,
                 initial_backoff: std::time::Duration::from_secs(1),
                 max_backoff: std::time::Duration::from_secs(60),
             },
@@ -417,6 +440,16 @@ pub enum EvidenceArgsError {
         /// The flag that was omitted.
         flag: &'static str,
     },
+    /// An endpoint was configured without a spool path.
+    #[error(
+        "--ssdf-audit-endpoint requires {flag}; every unit runs ProtectSystem=strict \
+         with only its own state directory writable, so there is no default that \
+         works anywhere"
+    )]
+    MissingPath {
+        /// The flag that was omitted.
+        flag: &'static str,
+    },
     /// An endpoint was configured without a chain identity.
     #[error(
         "--ssdf-audit-endpoint requires --ssdf-audit-server-id; it keys the hash \
@@ -429,29 +462,43 @@ pub enum EvidenceArgsError {
     Credential(#[from] mecmcp_secret::SecretError),
 }
 
-/// Read a password file, stripping the trailing newline an editor leaves.
+/// Read a password file through the workspace's canonical secret loader.
 ///
-/// Sending that newline fails authentication in a way that reads like a wrong
-/// password rather than a stray byte, which is an unpleasant hour for whoever
-/// deploys this.
+/// Its semantics are the ones that matter here and are easy to get wrong by
+/// hand: strip **at most one** trailing newline, reject invalid UTF-8, reject
+/// an empty or whitespace-only file. A `trim_end` instead would eat real
+/// password bytes when a password legitimately ends in a space, and a lossy
+/// UTF-8 conversion would silently substitute replacement characters -- both
+/// surfacing later as an authentication failure that looks like a wrong
+/// password rather than a mangled one.
 fn read_password(path: Option<&Path>, flag: &'static str) -> Result<String, EvidenceArgsError> {
     let path = path.ok_or(EvidenceArgsError::MissingPassword { flag })?;
-    let bytes = mecmcp_secret::read_hardened_file(path, mecmcp_secret::FileLimits::default())?;
-    Ok(String::from_utf8_lossy(bytes.expose())
-        .trim_end()
-        .to_owned())
+    let secret = mecmcp_secret::load_from_file(path, mecmcp_secret::SecretLimits::default())?;
+    Ok(secret.expose().to_owned())
 }
 
 /// A fresh run identifier for this process lifetime.
 ///
-/// Monotonic wall-clock plus pid: two runs of one server must not collide, and
-/// the pair is enough because one `server_id` is one process at a time.
+/// Random, not clock-plus-pid. Delivery identity is
+/// `(server_id, run_id, segment_seq)`, so a repeated run id makes a new run's
+/// segment 0 collide with one already delivered and be skipped as landed --
+/// losing the head of the chain. A container that restarts into a reused pid
+/// within the same millisecond is unlikely; one restored from a snapshot, with
+/// the clock rolled back and pid 1 taken again, is not.
 fn new_run_id() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or_default();
-    format!("run-{now}-{}", std::process::id())
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("the OS RNG is required for a run id");
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("run-{hex}")
+}
+
+/// Reject a non-positive interval at parse time.
+fn positive_seconds(raw: &str) -> Result<u64, String> {
+    let seconds: u64 = raw.parse().map_err(|_| format!("not a number: {raw}"))?;
+    if seconds == 0 {
+        return Err("must be at least 1 second; 0 spins the delivery thread".to_owned());
+    }
+    Ok(seconds)
 }
 
 /// Common CLI arguments for MCP servers.
