@@ -458,7 +458,15 @@ impl EvidenceArgs {
 }
 
 /// Why an evidence configuration was refused.
+///
+/// `#[non_exhaustive]`: the list of ways a pipeline can be misconfigured is
+/// exactly the kind that grows, and adding a variant to a public enum breaks
+/// any consumer matching it exhaustively -- inside a patch release, where
+/// Cargo would apply the update automatically. Marked now, while a check across
+/// all five servers shows zero matches on this type, because doing it later is
+/// the breaking change it exists to avoid.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum EvidenceArgsError {
     /// An endpoint was configured without the credential to use it.
     #[error("--ssdf-audit-endpoint requires a password: {flag} was not given")]
