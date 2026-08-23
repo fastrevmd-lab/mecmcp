@@ -504,16 +504,20 @@ fn read_password(path: Option<&Path>, flag: &'static str) -> Result<String, Evid
 /// that. A clock that rolls backwards still breaks ordering, but it breaks it
 /// loudly, as a named error rather than as a silently skipped segment.
 fn new_run_id() -> String {
-    let millis = std::time::SystemTime::now()
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
+        .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
     let mut bytes = [0u8; 8];
     getrandom::fill(&mut bytes).expect("the OS RNG is required for a run id");
     let random: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    // Zero-padded to 13 digits so lexicographic order is chronological order
-    // (13 digits of milliseconds runs to the year 2286).
-    format!("run-{millis:013}-{random}")
+    // Nanoseconds, zero-padded to 19 digits so lexicographic order is
+    // chronological order. Milliseconds were not enough: two ids inside one
+    // millisecond share a prefix, and the random suffix then decides their
+    // order -- sorting the later one first about half the time. There is no
+    // coordination-free way to make this exact across processes, so the
+    // resolution is pushed below the time it takes to start one.
+    format!("run-{nanos:019}-{random}")
 }
 
 /// Reject a non-positive interval at parse time.

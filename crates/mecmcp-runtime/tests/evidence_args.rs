@@ -364,9 +364,12 @@ fn run_ids_sort_in_creation_order() {
         dir.path().join("ledger").to_str().unwrap(),
     ]);
 
+    // No sleep. An earlier version of this test paused 2ms between ids, which
+    // hid the case that actually breaks: two ids inside one clock tick share
+    // their prefix, and the random half then decides the order. Generating them
+    // back to back is what exercises it.
     let mut previous = args.into_config().unwrap().unwrap().run_id;
-    for _ in 0..32 {
-        std::thread::sleep(std::time::Duration::from_millis(2));
+    for _ in 0..256 {
         let next = args.into_config().unwrap().unwrap().run_id;
         assert!(
             next > previous,
