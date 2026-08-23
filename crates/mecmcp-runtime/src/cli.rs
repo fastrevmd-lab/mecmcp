@@ -5,7 +5,7 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// MCP transport mode.
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -289,6 +289,152 @@ pub struct WebApproverArgs {
     pub web_enabled_approver: bool,
 }
 
+/// SSDF evidence-pipeline switches, defined once and flattened into every
+/// server's CLI.
+///
+/// Absent `--ssdf-audit-endpoint` means no pipeline: evidence is a deployment
+/// choice, and a server without it behaves exactly as before.
+///
+/// **Passwords come from files, never from flags.** A password in `argv` is
+/// readable by any process that can run `ps`, which would hand the audit
+/// writer's credential to every account on the host — the opposite of what a
+/// tamper-evident trail is for. The files go through
+/// [`mecmcp_secret::read_hardened_file`], the workspace's single implementation
+/// of the symlink / regular-file / mode / owner checks, so a 0644 credential is
+/// refused here exactly as it is for a token store.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct EvidenceArgs {
+    /// ClickHouse endpoint for the SSDF evidence sink. Enables the pipeline.
+    #[arg(long)]
+    pub ssdf_audit_endpoint: Option<String>,
+
+    /// ClickHouse database holding the audit table.
+    #[arg(long, default_value = "ssdf")]
+    pub ssdf_audit_database: String,
+
+    /// INSERT-only write identity.
+    #[arg(long, default_value = "ssdf_audit")]
+    pub ssdf_audit_user: String,
+
+    /// File holding the write identity's password. Must be 0600.
+    #[arg(long)]
+    pub ssdf_audit_password_file: Option<PathBuf>,
+
+    /// SELECT-only read identity, used for the high-water and tail reads.
+    #[arg(long, default_value = "ssdf_audit_verify")]
+    pub ssdf_audit_verify_user: String,
+
+    /// File holding the read identity's password. Must be 0600.
+    #[arg(long)]
+    pub ssdf_audit_verify_password_file: Option<PathBuf>,
+
+    /// Durable outbox for closed segments.
+    #[arg(long, default_value = "/var/lib/mecmcp/evidence-outbox.ndjson")]
+    pub ssdf_audit_outbox: PathBuf,
+
+    /// Delivery ledger.
+    #[arg(long, default_value = "/var/lib/mecmcp/evidence-ledger.ndjson")]
+    pub ssdf_audit_ledger: PathBuf,
+
+    /// Seconds between delivery attempts.
+    #[arg(long, default_value_t = 30)]
+    pub ssdf_audit_interval_secs: u64,
+
+    /// Records per segment before one is closed and spooled.
+    #[arg(long, default_value_t = 64)]
+    pub ssdf_audit_records_per_segment: usize,
+}
+
+impl EvidenceArgs {
+    /// Build a pipeline config, or `None` when no endpoint was given.
+    ///
+    /// `server_id` names this writer's chain. **One process per `server_id`**:
+    /// two servers sharing one fork the chain, and a fork verifies as two valid
+    /// chains rather than as an error, so nothing downstream reports it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an endpoint is configured without credentials, or
+    /// when a credential file fails its permission checks. Both are refusals
+    /// rather than warnings: a server that starts with a half-configured
+    /// pipeline spools evidence it can never deliver.
+    pub fn into_config(
+        &self,
+        server_id: &str,
+    ) -> Result<Option<mecmcp_audit::EvidenceConfig>, EvidenceArgsError> {
+        let Some(endpoint) = self.ssdf_audit_endpoint.clone() else {
+            return Ok(None);
+        };
+
+        let password = read_password(
+            self.ssdf_audit_password_file.as_deref(),
+            "--ssdf-audit-password-file",
+        )?;
+        let verify_password = read_password(
+            self.ssdf_audit_verify_password_file.as_deref(),
+            "--ssdf-audit-verify-password-file",
+        )?;
+
+        Ok(Some(mecmcp_audit::EvidenceConfig {
+            server_id: server_id.to_owned(),
+            run_id: new_run_id(),
+            records_per_segment: self.ssdf_audit_records_per_segment,
+            delivery_interval: std::time::Duration::from_secs(self.ssdf_audit_interval_secs),
+            sink: mecmcp_audit::SsdfSinkConfig {
+                endpoint,
+                database: self.ssdf_audit_database.clone(),
+                username: self.ssdf_audit_user.clone(),
+                password,
+                verify_username: self.ssdf_audit_verify_user.clone(),
+                verify_password,
+                outbox_path: self.ssdf_audit_outbox.clone(),
+                ledger_path: self.ssdf_audit_ledger.clone(),
+                initial_backoff: std::time::Duration::from_secs(1),
+                max_backoff: std::time::Duration::from_secs(60),
+            },
+        }))
+    }
+}
+
+/// Why an evidence configuration was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum EvidenceArgsError {
+    /// An endpoint was configured without the credential to use it.
+    #[error("--ssdf-audit-endpoint requires a password: {flag} was not given")]
+    MissingPassword {
+        /// The flag that was omitted.
+        flag: &'static str,
+    },
+    /// A credential file failed its checks — wrong mode, wrong owner, symlink.
+    #[error("credential file rejected (must be a regular file, 0600, owned by this user): {0}")]
+    Credential(#[from] mecmcp_secret::SecretError),
+}
+
+/// Read a password file, stripping the trailing newline an editor leaves.
+///
+/// Sending that newline fails authentication in a way that reads like a wrong
+/// password rather than a stray byte, which is an unpleasant hour for whoever
+/// deploys this.
+fn read_password(path: Option<&Path>, flag: &'static str) -> Result<String, EvidenceArgsError> {
+    let path = path.ok_or(EvidenceArgsError::MissingPassword { flag })?;
+    let bytes = mecmcp_secret::read_hardened_file(path, mecmcp_secret::FileLimits::default())?;
+    Ok(String::from_utf8_lossy(bytes.expose())
+        .trim_end()
+        .to_owned())
+}
+
+/// A fresh run identifier for this process lifetime.
+///
+/// Monotonic wall-clock plus pid: two runs of one server must not collide, and
+/// the pair is enough because one `server_id` is one process at a time.
+fn new_run_id() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    format!("run-{now}-{}", std::process::id())
+}
+
 /// Common CLI arguments for MCP servers.
 ///
 /// This struct holds only the flags every vendor needs. Vendor servers
@@ -355,6 +501,10 @@ pub struct Cli {
     /// Also send structured audit events directly to journald.
     #[arg(long)]
     pub audit_journald: bool,
+
+    /// SSDF evidence pipeline. Inert unless `--ssdf-audit-endpoint` is given.
+    #[command(flatten)]
+    pub evidence: EvidenceArgs,
 
     /// Per-field audit redaction, e.g. `devices=hmac,host=drop`.
     /// Fields: devices, host, name, basename, command, pfe_command.
