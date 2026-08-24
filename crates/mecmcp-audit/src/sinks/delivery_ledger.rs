@@ -6,8 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -112,12 +113,24 @@ impl DeliveryLedger {
         // Anchor the path before storing it (same reasoning as FileHandle).
         let path = std::path::absolute(path)?;
 
-        // Open for append, create if absent.
+        // Open for append, create if absent, with restrictive permissions.
+        // Create new files with 0600, and tighten pre-existing files if they are
+        // wider than 0600. This guards against systemd units that lack UMask=0077.
+        // Tightening is done via File::set_permissions on the open handle, not a
+        // path-based chmod — path-based operations follow symlinks; handle-based
+        // ones do not. Same reasoning as crates/mecmcp-scp/src/scp.rs:1594-1607.
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
+            .mode(0o600)
             .open(&path)?;
+
+        // Tighten pre-existing file if it is wider than 0600.
+        let current_mode = file.metadata()?.permissions().mode();
+        if (current_mode & 0o777) > 0o600 {
+            file.set_permissions(Permissions::from_mode(0o600))?;
+        }
 
         // A crash or a full disk partway through `write_entry` leaves a final
         // line with no terminating newline. That is an interrupted append, not

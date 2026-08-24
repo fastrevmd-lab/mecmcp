@@ -865,7 +865,90 @@ fn map_secret_error(path: &Path, source: mecmcp_secret::SecretError) -> FileErro
     }
 }
 
+/// Result of resolving a token file path with fallback.
+///
+/// Contains the path to use and metadata about whether the fallback was used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTokenPath {
+    /// The path to use for the token file.
+    pub path: PathBuf,
+    /// Whether the fallback path was used instead of the primary.
+    pub used_fallback: bool,
+    /// The path that was checked for fallback, if any.
+    pub fallback_from: Option<PathBuf>,
+}
+
+/// Resolve a token file path with fallback support.
+///
+/// This function implements a read-only resolution strategy to locate token files
+/// that may have been moved between `/etc` and `/var/lib` paths due to systemd
+/// sandboxing (`ProtectSystem=strict` makes `/etc` read-only to the service
+/// process, but startup args may still reference `/etc/<service>/tokens.json`).
+///
+/// ## Resolution Rules
+///
+/// 1. If `primary` exists → use it, `used_fallback: false`
+/// 2. Else if `fallback` exists → use it, `used_fallback: true`,
+///    `fallback_from: Some(primary)`
+/// 3. Else → return `primary` (the caller will create it there), `used_fallback: false`
+///
+/// ## Important: Read-Only Operation
+///
+/// **This function NEVER copies, moves, writes, or creates anything.** A silent copy
+/// would leave a stale credential file behind — exactly the defect this mechanism
+/// is designed to prevent. All file system operations are read-only existence checks.
+///
+/// The caller is responsible for:
+/// - Logging a warning if `used_fallback` is true (include both `path` and
+///   `fallback_from` so operators know which file was chosen and which was missing)
+/// - Creating the file at the resolved path if it doesn't exist
+///
+/// ## Example
+///
+/// ```no_run
+/// use mecmcp_auth::file::resolve_token_path;
+/// use std::path::Path;
+///
+/// let primary = Path::new("/etc/rust-junosmcp/tokens.json");
+/// let fallback = Path::new("/var/lib/rust-junosmcp/tokens.json");
+///
+/// let resolved = resolve_token_path(primary, fallback);
+///
+/// if resolved.used_fallback {
+///     eprintln!(
+///         "Warning: using fallback token file at {} (primary {} does not exist)",
+///         resolved.path.display(),
+///         resolved.fallback_from.as_ref().unwrap().display()
+///     );
+/// }
+/// ```
+pub fn resolve_token_path(primary: &Path, fallback: &Path) -> ResolvedTokenPath {
+    if primary.exists() {
+        // Primary exists, use it
+        ResolvedTokenPath {
+            path: primary.to_path_buf(),
+            used_fallback: false,
+            fallback_from: None,
+        }
+    } else if fallback.exists() {
+        // Primary missing but fallback exists, use fallback
+        ResolvedTokenPath {
+            path: fallback.to_path_buf(),
+            used_fallback: true,
+            fallback_from: Some(primary.to_path_buf()),
+        }
+    } else {
+        // Neither exists, return primary so caller can create it there
+        ResolvedTokenPath {
+            path: primary.to_path_buf(),
+            used_fallback: false,
+            fallback_from: None,
+        }
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::grant::GrantError;
@@ -2687,5 +2770,93 @@ mod tests {
             entry_after.devices,
             ScopeSet::Allowlist(vec!["edge-fw".to_owned()])
         );
+    }
+
+    // Tests for resolve_token_path
+
+    #[test]
+    fn test_resolve_token_path_primary_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary.json");
+        let fallback = temp.path().join("fallback.json");
+
+        // Create only primary
+        std::fs::write(&primary, "{}").unwrap();
+
+        let resolved = resolve_token_path(&primary, &fallback);
+
+        assert_eq!(resolved.path, primary);
+        assert!(!resolved.used_fallback);
+        assert_eq!(resolved.fallback_from, None);
+    }
+
+    #[test]
+    fn test_resolve_token_path_only_fallback_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary.json");
+        let fallback = temp.path().join("fallback.json");
+
+        // Create only fallback
+        std::fs::write(&fallback, "{}").unwrap();
+
+        let resolved = resolve_token_path(&primary, &fallback);
+
+        assert_eq!(resolved.path, fallback);
+        assert!(resolved.used_fallback);
+        assert_eq!(resolved.fallback_from, Some(primary.clone()));
+    }
+
+    #[test]
+    fn test_resolve_token_path_neither_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary.json");
+        let fallback = temp.path().join("fallback.json");
+
+        // Neither file exists
+
+        let resolved = resolve_token_path(&primary, &fallback);
+
+        assert_eq!(resolved.path, primary);
+        assert!(!resolved.used_fallback);
+        assert_eq!(resolved.fallback_from, None);
+    }
+
+    #[test]
+    fn test_resolve_token_path_both_exist_prefers_primary() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary.json");
+        let fallback = temp.path().join("fallback.json");
+
+        // Create both
+        std::fs::write(&primary, "{}").unwrap();
+        std::fs::write(&fallback, "{}").unwrap();
+
+        let resolved = resolve_token_path(&primary, &fallback);
+
+        assert_eq!(resolved.path, primary);
+        assert!(!resolved.used_fallback);
+        assert_eq!(resolved.fallback_from, None);
+    }
+
+    #[test]
+    fn test_resolve_token_path_does_not_create_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary.json");
+        let fallback = temp.path().join("fallback.json");
+
+        // Create only fallback
+        std::fs::write(&fallback, "{}").unwrap();
+
+        // Call resolve
+        let _resolved = resolve_token_path(&primary, &fallback);
+
+        // Primary should still not exist (proves no copy happened)
+        assert!(
+            !primary.exists(),
+            "Primary path should not have been created by resolve_token_path"
+        );
+
+        // Fallback should still exist
+        assert!(fallback.exists());
     }
 }

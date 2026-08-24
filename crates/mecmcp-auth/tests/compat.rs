@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! Regression gate: both deployed `tokens.json` shapes must keep loading.
 
 use mecmcp_auth::{Grant, GrantError, ScopeSet, TokenStoreFile};

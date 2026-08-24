@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! Backward compatibility: old token file format must keep parsing.
 //!
 //! This file exercises the pre-rename serde aliases. If any alias is deleted,

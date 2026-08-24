@@ -8,6 +8,7 @@ pub mod bearer;
 pub mod entry;
 pub mod grant;
 pub mod scope;
+pub mod stale;
 pub mod store;
 pub mod token;
 
@@ -15,9 +16,12 @@ pub mod file;
 
 pub use bearer::{BearerHeaderError, BearerSyntax, parse_bearer_header};
 pub use entry::{ActorType, EntryError, MAX_TOKEN_NAME, Tier, TokenEntry};
-pub use file::{FileError, KnownNames, TokenStoreFile, write_atomic};
+pub use file::{
+    FileError, KnownNames, ResolvedTokenPath, TokenStoreFile, resolve_token_path, write_atomic,
+};
 pub use grant::{Grant, GrantError, NoAction, NoGrant, StoredGrant};
 pub use scope::{MAX_SCOPE_NAMES, ScopeError, ScopeSet};
+pub use stale::{StaleReason, StaleSecret, find_stale_secrets};
 pub use store::{
     CallerCtx, MAX_TOKENS, StoreError, TokenStore, filter_device_names, filter_target_names,
 };

@@ -40,8 +40,9 @@ use crate::evidence::ClosedSegment;
 use crate::sinks::delivery_ledger::{DeliveryLedger, DeliveryStatus, SegmentId};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -231,11 +232,23 @@ impl SsdfSink {
         let outbox_path = std::path::absolute(&config.outbox_path)?;
         let ledger_path = std::path::absolute(&config.ledger_path)?;
 
-        // Open outbox for append.
+        // Open outbox for append with restrictive permissions.
+        // Create new files with 0600, and tighten pre-existing files if they are
+        // wider than 0600. This guards against systemd units that lack UMask=0077.
+        // Tightening is done via File::set_permissions on the open handle, not a
+        // path-based chmod — path-based operations follow symlinks; handle-based
+        // ones do not. Same reasoning as crates/mecmcp-scp/src/scp.rs:1594-1607.
         let outbox_file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&outbox_path)?;
+
+        // Tighten pre-existing file if it is wider than 0600.
+        let current_mode = outbox_file.metadata()?.permissions().mode();
+        if (current_mode & 0o777) > 0o600 {
+            outbox_file.set_permissions(Permissions::from_mode(0o600))?;
+        }
 
         let outbox = Arc::new(Mutex::new(OutboxState {
             file: outbox_file,

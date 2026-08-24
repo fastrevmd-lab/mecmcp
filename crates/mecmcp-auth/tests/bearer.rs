@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! Public bearer-header parsing contracts.
 
 use mecmcp_auth::{BearerHeaderError, BearerSyntax, parse_bearer_header};
