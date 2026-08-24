@@ -892,6 +892,17 @@ pub struct ResolvedTokenPath {
 ///    `fallback_from: Some(primary)`
 /// 3. Else → return `primary` (the caller will create it there), `used_fallback: false`
 ///
+/// ## Error Handling
+///
+/// **This function surfaces permission and access errors instead of silently
+/// falling back.** If the primary path exists but metadata retrieval fails
+/// (e.g., EACCES from a restrictive parent directory), the error is returned
+/// rather than silently choosing the fallback. This prevents the service from
+/// loading stale credentials from a deprecated fallback when the real problem
+/// is a permission issue on the canonical path.
+///
+/// Only `NotFound` errors trigger fallback. Any other I/O error is surfaced.
+///
 /// ## Important: Read-Only Operation
 ///
 /// **This function NEVER copies, moves, writes, or creates anything.** A silent copy
@@ -909,10 +920,10 @@ pub struct ResolvedTokenPath {
 /// use mecmcp_auth::file::resolve_token_path;
 /// use std::path::Path;
 ///
-/// let primary = Path::new("/etc/rust-junosmcp/tokens.json");
-/// let fallback = Path::new("/var/lib/rust-junosmcp/tokens.json");
+/// let primary = Path::new("/var/lib/rust-junosmcp/tokens.json");
+/// let fallback = Path::new("/etc/rust-junosmcp/tokens.json");
 ///
-/// let resolved = resolve_token_path(primary, fallback);
+/// let resolved = resolve_token_path(primary, fallback)?;
 ///
 /// if resolved.used_fallback {
 ///     eprintln!(
@@ -921,28 +932,50 @@ pub struct ResolvedTokenPath {
 ///         resolved.fallback_from.as_ref().unwrap().display()
 ///     );
 /// }
+/// # Ok::<(), std::io::Error>(())
 /// ```
-pub fn resolve_token_path(primary: &Path, fallback: &Path) -> ResolvedTokenPath {
-    if primary.exists() {
-        // Primary exists, use it
-        ResolvedTokenPath {
-            path: primary.to_path_buf(),
-            used_fallback: false,
-            fallback_from: None,
+pub fn resolve_token_path(primary: &Path, fallback: &Path) -> std::io::Result<ResolvedTokenPath> {
+    // Use metadata instead of exists() to detect permission errors.
+    // Only fall back if the primary is truly absent (NotFound), not if
+    // stat fails with EACCES or other errors.
+    match std::fs::metadata(primary) {
+        Ok(_) => {
+            // Primary exists and is accessible, use it
+            Ok(ResolvedTokenPath {
+                path: primary.to_path_buf(),
+                used_fallback: false,
+                fallback_from: None,
+            })
         }
-    } else if fallback.exists() {
-        // Primary missing but fallback exists, use fallback
-        ResolvedTokenPath {
-            path: fallback.to_path_buf(),
-            used_fallback: true,
-            fallback_from: Some(primary.to_path_buf()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Primary not found, try fallback
+            match std::fs::metadata(fallback) {
+                Ok(_) => {
+                    // Fallback exists, use it
+                    Ok(ResolvedTokenPath {
+                        path: fallback.to_path_buf(),
+                        used_fallback: true,
+                        fallback_from: Some(primary.to_path_buf()),
+                    })
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Neither exists, return primary so caller can create it there
+                    Ok(ResolvedTokenPath {
+                        path: primary.to_path_buf(),
+                        used_fallback: false,
+                        fallback_from: None,
+                    })
+                }
+                Err(e) => {
+                    // Fallback exists but cannot be accessed - surface the error
+                    Err(e)
+                }
+            }
         }
-    } else {
-        // Neither exists, return primary so caller can create it there
-        ResolvedTokenPath {
-            path: primary.to_path_buf(),
-            used_fallback: false,
-            fallback_from: None,
+        Err(e) => {
+            // Primary exists but cannot be accessed (EACCES, etc.) - surface the error
+            // instead of silently falling back to potentially stale credentials
+            Err(e)
         }
     }
 }
@@ -2783,7 +2816,7 @@ mod tests {
         // Create only primary
         std::fs::write(&primary, "{}").unwrap();
 
-        let resolved = resolve_token_path(&primary, &fallback);
+        let resolved = resolve_token_path(&primary, &fallback).unwrap();
 
         assert_eq!(resolved.path, primary);
         assert!(!resolved.used_fallback);
@@ -2799,7 +2832,7 @@ mod tests {
         // Create only fallback
         std::fs::write(&fallback, "{}").unwrap();
 
-        let resolved = resolve_token_path(&primary, &fallback);
+        let resolved = resolve_token_path(&primary, &fallback).unwrap();
 
         assert_eq!(resolved.path, fallback);
         assert!(resolved.used_fallback);
@@ -2814,7 +2847,7 @@ mod tests {
 
         // Neither file exists
 
-        let resolved = resolve_token_path(&primary, &fallback);
+        let resolved = resolve_token_path(&primary, &fallback).unwrap();
 
         assert_eq!(resolved.path, primary);
         assert!(!resolved.used_fallback);
@@ -2831,7 +2864,7 @@ mod tests {
         std::fs::write(&primary, "{}").unwrap();
         std::fs::write(&fallback, "{}").unwrap();
 
-        let resolved = resolve_token_path(&primary, &fallback);
+        let resolved = resolve_token_path(&primary, &fallback).unwrap();
 
         assert_eq!(resolved.path, primary);
         assert!(!resolved.used_fallback);
@@ -2848,7 +2881,7 @@ mod tests {
         std::fs::write(&fallback, "{}").unwrap();
 
         // Call resolve
-        let _resolved = resolve_token_path(&primary, &fallback);
+        let _resolved = resolve_token_path(&primary, &fallback).unwrap();
 
         // Primary should still not exist (proves no copy happened)
         assert!(
@@ -2858,5 +2891,65 @@ mod tests {
 
         // Fallback should still exist
         assert!(fallback.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_resolve_token_path_surfaces_permission_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Check if running as root - root bypasses permission checks
+        // We test this by creating a file with mode 000 and trying to read it
+        let test_temp = tempfile::tempdir().unwrap();
+        let test_file = test_temp.path().join("rootcheck");
+        std::fs::write(&test_file, "test").unwrap();
+        std::fs::set_permissions(&test_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let running_as_root = std::fs::read(&test_file).is_ok();
+        if running_as_root {
+            eprintln!("SKIP: test requires non-root user (root bypasses mode bits)");
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+
+        // Create a subdirectory that will be made inaccessible
+        let restricted_dir = temp.path().join("restricted");
+        std::fs::create_dir(&restricted_dir).unwrap();
+
+        // Create a primary file inside the restricted directory
+        let primary = restricted_dir.join("tokens.json");
+        std::fs::write(&primary, "{}").unwrap();
+
+        // Create a fallback file that's accessible
+        let fallback = temp.path().join("fallback.json");
+        std::fs::write(&fallback, "{}").unwrap();
+
+        // Make the directory inaccessible (mode 000 blocks stat on the file inside)
+        std::fs::set_permissions(&restricted_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // The resolver should return an error, not silently fall back to the fallback
+        let result = resolve_token_path(&primary, &fallback);
+
+        // Clean up before asserting (so temp dir can be removed)
+        std::fs::set_permissions(&restricted_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // This will fail with the current implementation because resolve_token_path
+        // returns ResolvedTokenPath, not Result<ResolvedTokenPath, _>
+        // After the fix, this should be an Err with PermissionDenied
+        match result {
+            Err(e) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied,
+                    "Expected PermissionDenied error, got: {:?}",
+                    e
+                );
+            }
+            Ok(_) => {
+                panic!(
+                    "Expected an error when primary path is inaccessible, but got Ok. This means the resolver silently fell back to the fallback, which is the bug."
+                );
+            }
+        }
     }
 }

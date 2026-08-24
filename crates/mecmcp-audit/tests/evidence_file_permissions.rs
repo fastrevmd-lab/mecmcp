@@ -8,19 +8,29 @@ use rustix::fs::Mode;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::sync::Mutex;
 use std::time::Duration;
 use tempfile::TempDir;
 
-/// Guard that restores the previous umask when dropped. umask is process-global
-/// so this ensures tests don't interfere with each other.
+/// Global mutex to serialize umask-manipulating tests. umask is process-global,
+/// so tests that change it must not run concurrently to avoid interference.
+static UMASK_LOCK: Mutex<()> = Mutex::new(());
+
+/// Guard that restores the previous umask when dropped and holds the global
+/// umask lock to prevent concurrent tests from interfering with each other.
 struct UmaskGuard {
     previous: Mode,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl UmaskGuard {
     fn set(new_mask: Mode) -> Self {
+        let lock = UMASK_LOCK.lock().unwrap();
         let previous = rustix::process::umask(new_mask);
-        Self { previous }
+        Self {
+            previous,
+            _lock: lock,
+        }
     }
 }
 
@@ -79,29 +89,31 @@ fn test_pre_existing_0644_tightened_to_0600() {
     let outbox_path = temp_dir.path().join("outbox.jsonl");
     let ledger_path = temp_dir.path().join("ledger.jsonl");
 
-    // Create pre-existing files with 0644 permissions
+    // Create pre-existing files, then set to 0644 permissions
+    // (using set_permissions after creation to avoid umask interference)
     {
         let mut outbox = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .mode(0o644)
             .open(&outbox_path)
             .unwrap();
         // Write a valid JSONL line for the outbox
         outbox.write_all(b"{\"test\":\"data\"}\n").unwrap();
     }
+    fs::set_permissions(&outbox_path, fs::Permissions::from_mode(0o644)).unwrap();
+
     {
         let mut ledger = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .mode(0o644)
             .open(&ledger_path)
             .unwrap();
         // Write a valid ledger entry (server_id, run_id, segment_seq, status)
         ledger.write_all(b"{\"server_id\":\"test-server\",\"run_id\":\"test-run\",\"segment_seq\":1,\"status\":\"delivered\",\"delivered_at\":\"2024-01-01T00:00:00Z\"}\n").unwrap();
     }
+    fs::set_permissions(&ledger_path, fs::Permissions::from_mode(0o644)).unwrap();
 
     // Verify they are indeed 0644
     assert_eq!(
@@ -166,25 +178,26 @@ fn test_already_0600_left_alone() {
     let outbox_path = temp_dir.path().join("outbox.jsonl");
     let ledger_path = temp_dir.path().join("ledger.jsonl");
 
-    // Create pre-existing files with exactly 0600 permissions
+    // Create pre-existing files, then set to exactly 0600 permissions
     {
         OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .mode(0o600)
             .open(&outbox_path)
             .unwrap();
     }
+    fs::set_permissions(&outbox_path, fs::Permissions::from_mode(0o600)).unwrap();
+
     {
         OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .mode(0o600)
             .open(&ledger_path)
             .unwrap();
     }
+    fs::set_permissions(&ledger_path, fs::Permissions::from_mode(0o600)).unwrap();
 
     let config = SsdfSinkConfig {
         endpoint: "http://localhost:9999".to_string(),
@@ -215,29 +228,30 @@ fn test_already_0400_not_widened() {
     let outbox_path = temp_dir.path().join("outbox.jsonl");
     let ledger_path = temp_dir.path().join("ledger.jsonl");
 
-    // Create pre-existing files with 0400 permissions (read-only)
+    // Create pre-existing files, then set to 0400 permissions (read-only)
     {
         let outbox = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .mode(0o400)
             .open(&outbox_path)
             .unwrap();
         drop(outbox);
-        // File is now read-only, can't append to it
     }
+    fs::set_permissions(&outbox_path, fs::Permissions::from_mode(0o400)).unwrap();
+    // File is now read-only, can't append to it
+
     {
         let ledger = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .mode(0o400)
             .open(&ledger_path)
             .unwrap();
         drop(ledger);
-        // File is now read-only, can't append to it
     }
+    fs::set_permissions(&ledger_path, fs::Permissions::from_mode(0o400)).unwrap();
+    // File is now read-only, can't append to it
 
     let config = SsdfSinkConfig {
         endpoint: "http://localhost:9999".to_string(),

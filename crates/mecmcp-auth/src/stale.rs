@@ -39,10 +39,19 @@ pub struct StaleSecret {
 /// This function scans `dir` (non-recursively) for files that appear to be
 /// superseded or backup copies of secret files. It classifies them as:
 ///
-/// - **SupersededToken**: Files whose name starts with `live_file_name` followed
-///   by `.` (e.g., `tokens.json.pre-provenance`, `tokens.json.pre-17`).
+/// - **SupersededToken**: Files whose name starts with one of `live_file_names`
+///   followed by `.` (e.g., `tokens.json.pre-provenance`, `tokens.json.pre-17`).
 /// - **Backup**: Files ending in `.bak`, `.old`, `.prev`, or `.orig`.
-/// - **RetiredKey**: Files ending in `.key` or `.pem` that are NOT the live file.
+/// - **RetiredKey**: Files ending in `.key` or `.pem` that carry an explicit
+///   retirement marker (`.old`, `.prev`, `.bak`, `.orig`, or `.pre-*`) and are
+///   NOT among the live files.
+///
+/// ## Important: Conservative Classification
+///
+/// **This function NEVER reports a file as stale unless it has clear evidence.**
+/// A false "stale" classification is more dangerous than a missed one — the
+/// scanner exists to tell an operator what to delete, and it must never name
+/// an active credential. When in doubt, the file is NOT reported.
 ///
 /// ## Important: Read-Only Operation
 ///
@@ -62,14 +71,14 @@ pub struct StaleSecret {
 /// use std::path::Path;
 ///
 /// let secrets_dir = Path::new("/var/lib/rust-junosmcp");
-/// let live_file = "tokens.json";
+/// let live_files = &["tokens.json", "audit-hmac.key", "cert.pem", "key.pem"];
 ///
-/// let stale = find_stale_secrets(secrets_dir, live_file);
+/// let stale = find_stale_secrets(secrets_dir, live_files);
 /// for secret in &stale {
 ///     eprintln!("Warning: stale secret file found: {}", secret.path.display());
 /// }
 /// ```
-pub fn find_stale_secrets(dir: &Path, live_file_name: &str) -> Vec<StaleSecret> {
+pub fn find_stale_secrets(dir: &Path, live_file_names: &[&str]) -> Vec<StaleSecret> {
     // Return empty if directory doesn't exist or can't be read
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -95,8 +104,8 @@ pub fn find_stale_secrets(dir: &Path, live_file_name: &str) -> Vec<StaleSecret> 
             continue;
         };
 
-        // Skip the live file itself
-        if file_name == live_file_name {
+        // Skip any live file
+        if live_file_names.contains(&file_name) {
             continue;
         }
 
@@ -116,25 +125,46 @@ pub fn find_stale_secrets(dir: &Path, live_file_name: &str) -> Vec<StaleSecret> 
         }
 
         // Check for superseded token files (e.g., tokens.json.pre-17)
-        if file_name.starts_with(live_file_name) && file_name.len() > live_file_name.len() {
-            let suffix = &file_name[live_file_name.len()..];
-            if suffix.starts_with('.') {
-                results.push(StaleSecret {
-                    path: path.clone(),
-                    reason: StaleReason::SupersededToken,
-                });
-                continue;
+        for live_name in live_file_names {
+            if file_name.starts_with(live_name) && file_name.len() > live_name.len() {
+                let suffix = &file_name[live_name.len()..];
+                if suffix.starts_with('.') {
+                    results.push(StaleSecret {
+                        path: path.clone(),
+                        reason: StaleReason::SupersededToken,
+                    });
+                    // Don't break - we found a match, move to next file
+                    break;
+                }
             }
         }
 
-        // Check for retired keys
-        if (file_name.ends_with(".key") || file_name.ends_with(".pem"))
-            && file_name != live_file_name
-        {
-            results.push(StaleSecret {
-                path: path.clone(),
-                reason: StaleReason::RetiredKey,
-            });
+        // Check for retired keys - ONLY if they have an explicit retirement marker
+        // A .key or .pem file without a marker could be an active credential
+        // that coexists with others (e.g., cert.pem + key.pem + audit-hmac.key).
+        // Better to miss a retired key than to falsely report an active one.
+        if file_name.ends_with(".key") || file_name.ends_with(".pem") {
+            // Extract the base name before the extension
+            let base_name = if let Some(stripped) = file_name.strip_suffix(".key") {
+                stripped
+            } else if let Some(stripped) = file_name.strip_suffix(".pem") {
+                stripped
+            } else {
+                continue;
+            };
+
+            // Only report as retired if there's an explicit retirement marker
+            if base_name.ends_with(".old")
+                || base_name.ends_with(".prev")
+                || base_name.ends_with(".bak")
+                || base_name.ends_with(".orig")
+                || base_name.contains(".pre-")
+            {
+                results.push(StaleSecret {
+                    path: path.clone(),
+                    reason: StaleReason::RetiredKey,
+                });
+            }
         }
     }
 
@@ -162,7 +192,7 @@ mod tests {
         fs::write(temp.path().join("tokens.json.pre-17"), "{}").unwrap();
         fs::write(temp.path().join("tokens.json.pre-provenance"), "{}").unwrap();
 
-        let stale = find_stale_secrets(temp.path(), "tokens.json");
+        let stale = find_stale_secrets(temp.path(), &["tokens.json"]);
 
         assert_eq!(stale.len(), 2);
         assert!(
@@ -185,7 +215,7 @@ mod tests {
         fs::write(temp.path().join("config.json.prev"), "{}").unwrap();
         fs::write(temp.path().join("data.json.orig"), "{}").unwrap();
 
-        let stale = find_stale_secrets(temp.path(), "tokens.json");
+        let stale = find_stale_secrets(temp.path(), &["tokens.json"]);
 
         assert_eq!(stale.len(), 4);
         assert!(stale.iter().all(|s| s.reason == StaleReason::Backup));
@@ -195,14 +225,15 @@ mod tests {
     fn test_find_stale_retired_keys() {
         let temp = TempDir::new().unwrap();
 
-        // Create live file
+        // Create live files
         fs::write(temp.path().join("tokens.json"), "{}").unwrap();
+        fs::write(temp.path().join("server.key"), "{}").unwrap(); // active key
 
-        // Create retired keys
-        fs::write(temp.path().join("server.key"), "{}").unwrap();
-        fs::write(temp.path().join("old-cert.pem"), "{}").unwrap();
+        // Create retired keys WITH explicit markers
+        fs::write(temp.path().join("server.old.key"), "{}").unwrap();
+        fs::write(temp.path().join("cert.prev.pem"), "{}").unwrap();
 
-        let stale = find_stale_secrets(temp.path(), "tokens.json");
+        let stale = find_stale_secrets(temp.path(), &["tokens.json", "server.key"]);
 
         assert_eq!(stale.len(), 2);
         assert!(stale.iter().all(|s| s.reason == StaleReason::RetiredKey));
@@ -215,7 +246,7 @@ mod tests {
         // Create live file
         fs::write(temp.path().join("tokens.json"), "{}").unwrap();
 
-        let stale = find_stale_secrets(temp.path(), "tokens.json");
+        let stale = find_stale_secrets(temp.path(), &["tokens.json"]);
 
         assert_eq!(stale.len(), 0);
     }
@@ -225,7 +256,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let missing = temp.path().join("does-not-exist");
 
-        let stale = find_stale_secrets(&missing, "tokens.json");
+        let stale = find_stale_secrets(&missing, &["tokens.json"]);
 
         assert_eq!(stale.len(), 0);
     }
@@ -242,7 +273,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
 
-            let stale = find_stale_secrets(&unreadable, "tokens.json");
+            let stale = find_stale_secrets(&unreadable, &["tokens.json"]);
 
             assert_eq!(stale.len(), 0);
 
@@ -271,7 +302,7 @@ mod tests {
             .unwrap();
 
         // Scan
-        let _stale = find_stale_secrets(temp.path(), "tokens.json");
+        let _stale = find_stale_secrets(temp.path(), &["tokens.json"]);
 
         // Verify files not modified
         assert_eq!(
@@ -299,7 +330,7 @@ mod tests {
         fs::write(temp.path().join("a.json.bak"), "{}").unwrap();
         fs::write(temp.path().join("m.json.bak"), "{}").unwrap();
 
-        let stale = find_stale_secrets(temp.path(), "tokens.json");
+        let stale = find_stale_secrets(temp.path(), &["tokens.json"]);
 
         assert_eq!(stale.len(), 3);
         assert!(stale[0].path < stale[1].path);
@@ -316,9 +347,9 @@ mod tests {
         // Create files with different reasons
         fs::write(temp.path().join("tokens.json.pre-17"), "{}").unwrap(); // SupersededToken
         fs::write(temp.path().join("state.json.bak"), "{}").unwrap(); // Backup
-        fs::write(temp.path().join("server.key"), "{}").unwrap(); // RetiredKey
+        fs::write(temp.path().join("server.old.key"), "{}").unwrap(); // RetiredKey (with explicit marker)
 
-        let stale = find_stale_secrets(temp.path(), "tokens.json");
+        let stale = find_stale_secrets(temp.path(), &["tokens.json"]);
 
         assert_eq!(stale.len(), 3);
 
@@ -330,5 +361,68 @@ mod tests {
         );
         assert!(stale.iter().any(|s| s.reason == StaleReason::Backup));
         assert!(stale.iter().any(|s| s.reason == StaleReason::RetiredKey));
+    }
+
+    #[test]
+    fn test_multiple_live_files_not_reported_as_retired() {
+        let temp = TempDir::new().unwrap();
+
+        // Create multiple ACTIVE credential files that should coexist
+        fs::write(temp.path().join("tokens.json"), "{}").unwrap();
+        fs::write(temp.path().join("audit-hmac.key"), "{}").unwrap();
+        fs::write(temp.path().join("cert.pem"), "{}").unwrap();
+        fs::write(temp.path().join("key.pem"), "{}").unwrap();
+
+        // Create actually retired files with explicit markers
+        fs::write(temp.path().join("tokens.json.pre-provenance"), "{}").unwrap();
+        fs::write(temp.path().join("key.pem.old"), "{}").unwrap();
+
+        // With the current implementation (single live_file_name), this will FAIL
+        // because audit-hmac.key, cert.pem, and key.pem all != "tokens.json"
+        // and end with .key or .pem, so they'll be marked RetiredKey
+        let stale = find_stale_secrets(
+            temp.path(),
+            &["tokens.json", "audit-hmac.key", "cert.pem", "key.pem"],
+        );
+
+        // Should only find the two actually retired files
+        assert_eq!(
+            stale.len(),
+            2,
+            "Expected 2 stale files, got {}: {:?}",
+            stale.len(),
+            stale
+                .iter()
+                .map(|s| s.path.file_name().unwrap().to_string_lossy())
+                .collect::<Vec<_>>()
+        );
+
+        // Verify they're the right ones
+        let stale_names: Vec<_> = stale
+            .iter()
+            .map(|s| s.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            stale_names.contains(&"tokens.json.pre-provenance".to_string()),
+            "Should find tokens.json.pre-provenance"
+        );
+        assert!(
+            stale_names.contains(&"key.pem.old".to_string()),
+            "Should find key.pem.old"
+        );
+
+        // Verify none of the active files are reported
+        assert!(
+            !stale_names.contains(&"audit-hmac.key".to_string()),
+            "audit-hmac.key is ACTIVE, should not be reported as stale"
+        );
+        assert!(
+            !stale_names.contains(&"cert.pem".to_string()),
+            "cert.pem is ACTIVE, should not be reported as stale"
+        );
+        assert!(
+            !stale_names.contains(&"key.pem".to_string()),
+            "key.pem is ACTIVE, should not be reported as stale"
+        );
     }
 }
