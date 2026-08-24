@@ -201,7 +201,7 @@ fn a_receipt_is_persisted_not_just_appended() {
         .apply_intent("req-2", "cs-1", "vsrx-ci", "alice")
         .unwrap();
     recorder
-        .result_receipt("req-3", "cs-1", "vsrx-ci", true, "")
+        .result_receipt("req-3", "cs-1", "vsrx-ci", "agent:applier", true, "")
         .unwrap();
 
     let spooled = std::fs::read_to_string(&outbox).unwrap();

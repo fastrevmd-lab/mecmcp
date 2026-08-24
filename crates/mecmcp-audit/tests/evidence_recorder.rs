@@ -40,7 +40,7 @@ fn the_four_lifecycle_points_each_append_one_record() {
         .apply_intent("req-apply", "cs-1", "vsrx-ci", "agent:test")
         .unwrap();
     recorder
-        .result_receipt("req-1", "cs-1", "vsrx-ci", true, "")
+        .result_receipt("req-1", "cs-1", "vsrx-ci", "agent:applier", true, "")
         .unwrap();
 
     let closed = recorder.close_current().unwrap();
@@ -162,7 +162,7 @@ fn later_records_carry_the_change_they_describe() {
     );
     recorder.approval("req-approve", "cs-1", "user:alice", "approved");
     recorder
-        .result_receipt("req-apply", "cs-1", "vsrx-ci", true, "")
+        .result_receipt("req-apply", "cs-1", "vsrx-ci", "agent:applier", true, "")
         .unwrap();
 
     let closed = recorder.close_current().unwrap();
@@ -183,8 +183,11 @@ fn later_records_carry_the_change_they_describe() {
         panic!("expected a receipt");
     };
     assert_eq!(
-        receipt.principal, "agent:planner",
-        "the receipt must name the actor"
+        receipt.principal, "agent:applier",
+        "the receipt names who executed. This assertion used to expect the \
+         planner, which encoded the defect as the contract: a change planned by \
+         one principal and applied by another was recorded as executed by the \
+         planner."
     );
     assert_eq!(receipt.diff_hash, "sha256:plan");
 }
@@ -270,7 +273,7 @@ fn a_finished_change_stops_being_tracked() {
     let recorder = recorder_of(64);
     recorder.proposal("req-1", "cs-1", "vsrx-ci", "agent:planner", "sha256:plan");
     recorder
-        .result_receipt("req-2", "cs-1", "vsrx-ci", true, "")
+        .result_receipt("req-2", "cs-1", "vsrx-ci", "agent:applier", true, "")
         .unwrap();
 
     // A later record for the same changeset finds nothing, which is correct:
@@ -429,5 +432,43 @@ fn a_refused_segment_is_kept_for_retry() {
         records, 2,
         "the proposal and the apply_intent must both survive a refused spool, \
          so a later flush can still deliver them: {held:?}"
+    );
+}
+
+/// A receipt names who executed, not who proposed.
+///
+/// The two are different people whenever two-person control is doing its job,
+/// and an earlier version copied the principal stored at proposal time — so a
+/// change planned by one token and applied by another was recorded as executed
+/// by the planner. That is precisely the fact the control exists to establish,
+/// recorded backwards.
+#[test]
+fn a_receipt_names_the_executor_not_the_proposer() {
+    let recorder = recorder_of(64);
+    recorder.proposal("req-1", "cs-1", "vsrx-ci", "agent:planner", "sha256:diff");
+    recorder
+        .apply_intent("req-2", "cs-1", "vsrx-ci", "agent:applier")
+        .unwrap();
+    recorder
+        .result_receipt("req-3", "cs-1", "vsrx-ci", "agent:applier", true, "")
+        .unwrap();
+
+    let closed = recorder.close_current().expect("records were written");
+    let EvidenceRecord::ResultReceipt(receipt) = closed
+        .records()
+        .iter()
+        .find(|record| matches!(record, EvidenceRecord::ResultReceipt(_)))
+        .expect("a receipt")
+    else {
+        unreachable!("filtered above")
+    };
+
+    assert_eq!(
+        receipt.principal, "agent:applier",
+        "the receipt must name who applied the change"
+    );
+    assert_eq!(
+        receipt.diff_hash, "sha256:diff",
+        "the diff is still the proposal's, and that part was never in question"
     );
 }
