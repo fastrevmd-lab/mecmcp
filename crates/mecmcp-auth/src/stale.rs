@@ -124,7 +124,14 @@ pub fn find_stale_secrets(dir: &Path, live_file_names: &[&str]) -> Vec<StaleSecr
             continue;
         }
 
-        // Check for superseded token files (e.g., tokens.json.pre-17)
+        // Check for superseded token files (e.g., tokens.json.pre-17).
+        //
+        // A match must skip the rest of the classification for this entry, not
+        // just stop scanning live names: `break` leaves only the inner loop, so
+        // a file like `server.old.key` (with a live name of `server`) fell
+        // through to the retired-key check and was reported a second time with
+        // a conflicting reason. One file, one finding.
+        let mut classified = false;
         for live_name in live_file_names {
             if file_name.starts_with(live_name) && file_name.len() > live_name.len() {
                 let suffix = &file_name[live_name.len()..];
@@ -133,10 +140,13 @@ pub fn find_stale_secrets(dir: &Path, live_file_names: &[&str]) -> Vec<StaleSecr
                         path: path.clone(),
                         reason: StaleReason::SupersededToken,
                     });
-                    // Don't break - we found a match, move to next file
+                    classified = true;
                     break;
                 }
             }
+        }
+        if classified {
+            continue;
         }
 
         // Check for retired keys - ONLY if they have an explicit retirement marker
@@ -423,6 +433,40 @@ mod tests {
         assert!(
             !stale_names.contains(&"key.pem".to_string()),
             "key.pem is ACTIVE, should not be reported as stale"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod dedup_tests {
+    use super::*;
+
+    /// Each file must produce exactly one finding.
+    ///
+    /// The superseded-token check ran an inner loop over `live_file_names` and
+    /// `break`ed on a match — which leaves only the inner loop, so the
+    /// retired-key check below then classified the same path a second time.
+    /// An operator reading the report would see one file listed twice with two
+    /// different reasons.
+    #[test]
+    fn a_file_is_never_classified_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        // Live name without an extension, so `server.old.key` matches BOTH the
+        // superseded-token rule (prefix `server` + `.`) and the retired-key
+        // rule (`.key` with an `.old` marker).
+        std::fs::write(dir.path().join("server"), b"live").unwrap();
+        std::fs::write(dir.path().join("server.old.key"), b"retired").unwrap();
+
+        let found = find_stale_secrets(dir.path(), &["server"]);
+
+        let occurrences = found
+            .iter()
+            .filter(|s| s.path.ends_with("server.old.key"))
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "server.old.key must appear exactly once, got {occurrences}: {found:?}"
         );
     }
 }
