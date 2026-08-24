@@ -249,3 +249,72 @@ commits.
 Production guests 950 / 951 / 952 / 960 / 971; LXC 970 (`notmechub`, not ours);
 the MCP 2026-07-28 spec adoption beyond #167 and possibly #164; SSDF #26; the
 Security Director unification described in `RELEASE-PROGRAMME.md`.
+
+---
+
+# Outcome
+
+Everything above is the plan **as written before the work started**, kept
+unedited. This section records what actually happened, including where the
+plan was wrong.
+
+**Completed 2026-08-24.** Open issues across the seven repos went from **48 to
+13**; `rustsdcmcp` and `rustproxmoxmcp` reached zero. Waves 0–4 all landed:
+`mecmcp v0.17.0` tagged, Tier 1 (14 issues) and Tier 2 (21 issues) merged in
+all five servers, rig rehearsal completed on 610–619, and trackers #318/#319
+closed (#320 stays open — its spikes were deliberately not attempted).
+
+Of the 13 issues still open, five were **filed during this sprint**, four are
+deferred with written reasons, one is blocked on an upstream release, one is a
+spike tracker, one is out of scope. None is open by neglect.
+
+## Where the plan was wrong
+
+**The `ssdf` publication plan was unsafe as designed.** It called for a history
+rewrite and force-push. That would have leaked anyway: GitHub retains
+`refs/pull/*` permanently, and `git fetch origin refs/pull/1/head` returned the
+full pre-rewrite tree — hostnames, the `192.168.1.0/24` layout, the root SSH
+key path. 41 such refs existed. Resolved by publishing a **new** repo, which
+has no PR refs; the original is private as `ssdf-archive`. Verified after
+publishing by cloning `--mirror` back: `refs/heads` only.
+
+**The plan treated the token-path move as routine packaging.** It was the most
+dangerous change of the sprint. Four separate defects would each have caused a
+silent authentication wipe — service healthy, every bearer token rejected. All
+ten rigs were in the vulnerable state and production is configured identically.
+Found by review of a *fix to a fix*; one part (a dropped `chmod 0600` leaving
+the still-live `/etc` store unhardened) survived six review rounds and was
+caught only by this repo family's pre-existing distribution smoke test.
+
+**`IPAddressDeny` was added believing it did something.** It is accepted by
+systemd, reported by `systemctl show`, and **not enforced** in an unprivileged
+LXC — measured, not argued. Four servers added it in Tier 2; only `rustsdcmcp`
+knew. Tracked as #322.
+
+**The CI premise was inverted.** The plan said six of seven repos were already
+public so Actions cost was not a constraint. In fact `ssdf`'s CI had been dead
+since 2026-08-20 on an Actions **billing** failure, not a code defect — every
+run died in ~4s. Publishing fixed it. `ssdf-archive` and `mechub` remain
+private and therefore still have no CI.
+
+## What the rig wave proved
+
+The riskiest claim — that junos's syscall denylist does not break a device
+behind a `ProxyCommand` jump host — was verified rather than asserted: the
+bastion's `sshd` logged the accepted session while the hardened service
+completed NETCONF. The `openssh-client` removal proposed in #329 would have
+broken exactly that path, since the subprocess lives one crate down in
+`rustnetconf`.
+
+Also verified on hardware: the empty-primary guard refusing to shadow live
+`/etc` stores, stale-secret detection finding the real files, `UMask=0077`,
+`StateDirectoryMode=0700`, evidence files at `0600`, and proxmox's new
+`--host 127.0.0.1` default. **No rig lost its tokens.**
+
+## Process note
+
+Three commits were made while a gate was failing, because `run && commit` was
+chained without reading the output; CI caught all three. Two tests were written
+that passed with the code deleted; the sabotage step caught both. A guard that
+refuses to commit on any gate failure was adopted mid-sprint and should be the
+default next time.
