@@ -11,9 +11,9 @@ authors.workspace    = true
 anyhow      = "1"
 clap        = { version = "4", features = ["derive"] }
 getrandom   = { workspace = true }
-mecmcp-audit = { version = "0.16.0", path = "../mecmcp-audit" }
-mecmcp-auth = { version = "0.16.0", path = "../mecmcp-auth" }
-mecmcp-secret = { version = "0.16.0", path = "../mecmcp-secret" }
+mecmcp-audit = { version = "0.17.0", path = "../mecmcp-audit" }
+mecmcp-auth = { version = "0.17.0", path = "../mecmcp-auth" }
+mecmcp-secret = { version = "0.17.0", path = "../mecmcp-secret" }
 rustix      = { workspace = true, features = ["process", "fs"] }
 thiserror   = { workspace = true }
 tokio       = { version = "1", features = ["rt", "signal", "sync"] }

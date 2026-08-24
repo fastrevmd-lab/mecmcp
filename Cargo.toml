@@ -3,7 +3,7 @@ members  = ["crates/mecmcp-auth", "crates/mecmcp-audit", "crates/mecmcp-changese
 resolver = "2"
 
 [workspace.package]
-version      = "0.16.0"
+version      = "0.17.0"
 edition      = "2024"
 rust-version = "1.88"
 license      = "MIT"
@@ -49,3 +49,8 @@ all         = { level = "warn", priority = -1 }
 dbg_macro   = "deny"
 todo        = "deny"
 unwrap_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
