@@ -260,3 +260,64 @@ fn test_already_0400_not_widened() {
         "Should fail to open read-only files for append"
     );
 }
+
+/// A numeric `mode > 0o600` comparison is not the same as "wider than 0600".
+///
+/// The outbox is opened append-only, so it needs owner **write** but not owner
+/// read. `0o244` — owner write-only, group- and world-readable — therefore
+/// opens successfully, yet is numerically 164, *below* `0o600` (384). A
+/// magnitude comparison leaves it untouched and the evidence stays
+/// world-readable, which is the exact exposure this fix exists to close.
+///
+/// (`0o044` is not a counterexample: with no owner-write bit the append open
+/// fails first, so that case fails closed rather than leaking.)
+///
+/// The predicate must test for bits outside owner-rw — `mode & 0o177` — rather
+/// than magnitude.
+#[test]
+fn outbox_write_only_owner_with_world_read_is_tightened() {
+    let dir = tempfile::tempdir().unwrap();
+    let outbox_path = dir.path().join("outbox.ndjson");
+    let ledger_path = dir.path().join("ledger.ndjson");
+
+    {
+        let _ = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&outbox_path)
+            .unwrap();
+        let mut ledger = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&ledger_path)
+            .unwrap();
+        ledger.write_all(b"{\"server_id\":\"test-server\",\"run_id\":\"test-run\",\"segment_seq\":1,\"status\":\"delivered\",\"delivered_at\":\"2024-01-01T00:00:00Z\"}\n").unwrap();
+    }
+
+    // Owner write-only, group + world readable. Numerically 164 < 384.
+    fs::set_permissions(&outbox_path, fs::Permissions::from_mode(0o244)).unwrap();
+
+    let config = SsdfSinkConfig {
+        endpoint: "http://localhost:9999".to_string(),
+        database: "test".to_string(),
+        username: "test".to_string(),
+        password: "test".to_string(),
+        verify_username: "test_verify".to_string(),
+        verify_password: "test_verify".to_string(),
+        outbox_path: outbox_path.clone(),
+        ledger_path: ledger_path.clone(),
+        initial_backoff: Duration::from_secs(1),
+        max_backoff: Duration::from_secs(60),
+    };
+    let _sink = SsdfSink::new(config).unwrap();
+
+    let mode = fs::metadata(&outbox_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "outbox at 0o244 is group- and world-readable and must be tightened to 0600, got {mode:o}"
+    );
+}

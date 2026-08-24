@@ -244,9 +244,16 @@ impl SsdfSink {
             .mode(0o600)
             .open(&outbox_path)?;
 
-        // Tighten pre-existing file if it is wider than 0600.
+        // Tighten a pre-existing file that carries any bit outside owner-rw.
+        //
+        // This is a bitmask test, not a magnitude comparison. `mode > 0o600`
+        // looks equivalent but is not: the outbox is opened append-only, so a
+        // file at `0o244` (owner write-only, group- and world-readable) opens
+        // fine yet is numerically 164 — below 0o600 — and a comparison would
+        // leave the evidence world-readable. `0o177` is every group bit, every
+        // other bit, and owner-execute.
         let current_mode = outbox_file.metadata()?.permissions().mode();
-        if (current_mode & 0o777) > 0o600 {
+        if current_mode & 0o177 != 0 {
             outbox_file.set_permissions(Permissions::from_mode(0o600))?;
         }
 
