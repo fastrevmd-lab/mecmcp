@@ -462,6 +462,13 @@ impl EvidenceRecorder {
 
     /// The device answered.
     ///
+    /// `principal` is **who executed**, which need not be who proposed. Earlier
+    /// this copied the principal stored at `proposal` time, so a change planned
+    /// by one token and applied by another was recorded as executed by the
+    /// planner -- exactly the fact two-person control exists to establish, and
+    /// exactly backwards. The diff hash still comes from the proposal, because
+    /// that genuinely is the proposal's.
+    ///
     /// Persisted before it returns, like [`apply_intent`](Self::apply_intent)
     /// and for the same reason turned around: this is the terminal record of a
     /// change, and the case it exists for — the device acted, local state did
@@ -478,6 +485,7 @@ impl EvidenceRecorder {
         request_id: &str,
         changeset_id: &str,
         device_id: &str,
+        principal: &str,
         succeeded: bool,
         error: &str,
     ) -> Result<(), SpoolError> {
@@ -486,7 +494,7 @@ impl EvidenceRecorder {
             request_id: request_id.to_owned(),
             changeset_id: changeset_id.to_owned(),
             device_id: device_id.to_owned(),
-            principal: context.principal,
+            principal: principal.to_owned(),
             diff_hash: context.diff_hash,
             timestamp: now(),
             run_id: String::new(),

@@ -707,6 +707,10 @@ impl ChangesetCoordinator {
                         &attribution.request_id.to_string(),
                         &receipt_changeset,
                         &receipt_device,
+                        // The principal that *applied*, which need not be the
+                        // one that proposed -- two-person control exists to
+                        // make those different people.
+                        &attribution.principal.to_string(),
                         succeeded,
                         // Only a failure's details are an error. A successful
                         // commit's details are warnings or a job note, and
