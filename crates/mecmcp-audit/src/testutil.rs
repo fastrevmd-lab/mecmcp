@@ -144,8 +144,27 @@ impl<S: tracing::Subscriber> tracing::Subscriber for AlwaysAsk<S> {
     }
 }
 
+/// Serialises [`run_with_capture`].
+///
+/// The subscriber is thread-local, but the callsite interest cache this helper
+/// rebuilds is process-global. Two captures running at once invalidate each
+/// other's callsite verdicts and silently drop events, which presents as an
+/// empty capture rather than a failed assertion (mecmcp#324, rustjunosmcp#339).
+///
+/// Serialising is cheap here — these captures are sub-millisecond — and putting
+/// the lock inside the helper means no caller can reintroduce the race by
+/// forgetting to take it.
+static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Run `f` with a temporary subscriber capturing INFO output; return the text.
 pub fn run_with_capture<F: FnOnce()>(f: F) -> String {
+    // Recover from poisoning rather than propagating it: a panicking test inside
+    // the closure would otherwise turn one real failure into a cascade of
+    // unrelated ones in every later capture test.
+    let _guard = CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let cap = CapturingWriter::default();
     let subscriber = AlwaysAsk(
         tracing_subscriber::fmt()

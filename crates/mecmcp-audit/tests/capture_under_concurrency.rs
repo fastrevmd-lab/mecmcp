@@ -51,3 +51,41 @@ fn concurrent_emission_does_not_empty_the_capture() {
         &captured[..captured.len().min(200)]
     );
 }
+/// Many concurrent captures must each see their own event.
+///
+/// `run_with_capture` rebuilds the process-global callsite interest cache. Two
+/// threads doing that at once can re-evaluate a callsite against a thread whose
+/// subscriber does not capture, dropping the event — so a capture comes back
+/// empty even though the audit code ran correctly.
+#[test]
+fn many_concurrent_captures_each_see_their_own_event() {
+    let failures: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                scope.spawn(move || {
+                    let tool: &'static str = if i % 2 == 0 { "alpha" } else { "beta" };
+                    let out = mecmcp_audit::testutil::run_with_capture(|| {
+                        let mut scope = mecmcp_audit::AuditScope::stdio(tool, "read", Vec::new());
+                        scope.succeed();
+                    });
+                    if out.contains(tool) {
+                        None
+                    } else {
+                        Some(format!("thread {i} ({tool}) captured: {out:?}"))
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().expect("capture thread panicked"))
+            .collect()
+    });
+
+    assert!(
+        failures.is_empty(),
+        "{} of 16 concurrent captures lost their event:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
