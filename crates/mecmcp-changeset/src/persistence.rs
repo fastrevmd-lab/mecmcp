@@ -407,13 +407,21 @@ pub fn write_state(
         .values()
         .any(|op| op.attribution.is_some() || op.rollback_deadline_unix.is_some());
     let change_sets_need_v2 = state.change_sets.values().any(|cs| {
-        // `targets` and `preview` join `policy_signature` here for the same
-        // reason: `ChangeSetRecord` is `deny_unknown_fields`, so a binary that
-        // predates a field rejects the WHOLE file rather than the one record,
-        // and rolling a release back is a documented deploy step. A deployment
-        // using none of them keeps producing version-1 files the older binary
-        // reads — which is what LXC 608 is doing today.
-        !cs.policy_signature.is_empty() || !cs.targets.is_empty() || cs.preview.is_some()
+        // `targets`, `preview` and `task_id` join `policy_signature` here for
+        // the same reason: `ChangeSetRecord` is `deny_unknown_fields`, so a
+        // binary that predates a field rejects the WHOLE file rather than the
+        // one record, and rolling a release back is a documented deploy step.
+        // A deployment using none of them keeps producing version-1 files the
+        // older binary reads — which is what LXC 608 is doing today.
+        //
+        // `task_id` is the sharpest case of the three. It is written while an
+        // apply is in flight, so a rollback performed *during* an apply is
+        // exactly when the file would carry one — the moment an unreadable
+        // state file hurts most.
+        !cs.policy_signature.is_empty()
+            || !cs.targets.is_empty()
+            || cs.preview.is_some()
+            || cs.task_id.is_some()
     });
     // A non-HTTPS endpoint is a version-2 record too. It is not a new *field*,
     // but the version-1 reader validated `starts_with("https://")` and would

@@ -247,6 +247,27 @@ pub struct ChangeSetRecord {
     /// forward-compatibility reason as `targets`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<PreviewRecord>,
+    /// Vendor task handle for an apply that is still running.
+    ///
+    /// Written **before** the apply begins polling, so a crash between
+    /// starting the vendor operation and observing its result leaves a handle
+    /// to re-probe. Without it, a crashed apply is detectable — the record is
+    /// stuck in `Applying` — but not *recoverable*, because nothing records
+    /// which vendor operation to ask about. The change set then has to be
+    /// resolved by a human reading the device.
+    ///
+    /// A Proxmox UPID, a Junos commit token, or whatever the product's task
+    /// identifier is; this crate stores it opaquely and never parses it.
+    ///
+    /// Cleared when the apply reaches a definitive outcome, so a present
+    /// `task_id` on a non-`Applying` record means the process died between
+    /// finishing and recording that fact.
+    ///
+    /// Absent by default for the same forward-compatibility reason as
+    /// `targets` and `preview`: this type is `deny_unknown_fields`, so a
+    /// binary predating this field rejects the whole state file if it appears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 /// A preview of what a change set will do, bound to a digest.

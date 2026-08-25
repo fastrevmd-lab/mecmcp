@@ -695,6 +695,7 @@ mod tests {
             policy_signature: "test".to_owned(),
             targets: vec![],
             preview: None,
+            task_id: None,
         };
 
         // One second before expiry: still valid

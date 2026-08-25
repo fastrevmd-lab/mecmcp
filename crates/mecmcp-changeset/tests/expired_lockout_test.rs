@@ -49,6 +49,7 @@ fn record(
         policy_signature: String::new(),
         targets: Vec::new(),
         preview: None,
+        task_id: None,
     }
 }
 

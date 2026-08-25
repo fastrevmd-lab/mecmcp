@@ -88,6 +88,7 @@ fn make_change_set_record(id: &str, state: ChangeSetState) -> ChangeSetRecord {
         policy_signature: String::new(),
         targets: Vec::new(),
         preview: None,
+        task_id: None,
     }
 }
 

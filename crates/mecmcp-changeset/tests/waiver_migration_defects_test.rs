@@ -90,6 +90,7 @@ fn defect_4_edited_reason_is_rejected_on_load() {
         policy_signature: String::new(),
         targets: Vec::new(),
         preview: None,
+        task_id: None,
     };
 
     let mut state = ChangesetState {
@@ -185,6 +186,7 @@ fn defect_5_both_approver_and_waived_is_rejected() {
         policy_signature: String::new(),
         targets: Vec::new(),
         preview: None,
+        task_id: None,
     };
 
     let mut state = ChangesetState {

@@ -167,6 +167,8 @@ impl ChangesetCoordinator {
             // version 1 — which is what LXC 608 is running.
             targets: Vec::new(),
             preview: None,
+            // No apply has begun, so there is no vendor task to re-probe.
+            task_id: None,
         };
 
         self.insert_change_set(record.clone()).await?;
