@@ -185,3 +185,50 @@ Eight issues are deliberately not in this block:
 | mist #39 | 78 MB catalog perf; diagnosis recorded, own block |
 | ssdf #1 | Device-native alarms ingest; check the UniFi CEF path first |
 | junos #110 | Blocked upstream on `ssh-key` 0.7.0 |
+
+## Outcome (2026-08-24)
+
+All seven tasks shipped. Every target issue is closed: mecmcp #324 and #322,
+junos #338 and #339, panos #133.
+
+| Task | Repos | Result |
+|---|---|---|
+| 1 | mecmcp | `run_with_capture` serialised against the global interest cache |
+| 2 | mecmcp | v0.18.0 tagged (`a0a59ad`) |
+| 3 | junos | consumes mecmcp 0.18.0 |
+| 4+5 | junos, sdc, proxmox | `docker` ecosystem added to dependabot |
+| 6 | panos | scheduled digest-drift backstop (advisory) |
+| 7 | junos, panos, mist, proxmox | egress-enforcement probe ported from sdc |
+
+Final whole-branch review across all six repos: spec compliance PASS, quality
+APPROVED, no findings.
+
+### What the block actually taught
+
+**The dependency fix proved itself rather than being assumed.** Task 4 added the
+`docker` ecosystem to junos because nothing was watching the base image. The
+prediction above — "expect a backlog on first run, including majors" — held
+exactly: Dependabot's first run opened twelve PRs. One of them, #342, bumped the
+precise stale digest that #338 was filed for. That is the fix demonstrating
+itself end to end, not a hand-bump that would have left the blind spot intact.
+
+The majors in that backlog (`actions/checkout` 4→7, `rustix` 0.38→1.1,
+`tower-http` 0.6→0.7) are deliberately left open for review, per this spec's own
+warning. The `russh` pin was not touched.
+
+**A digest is an identity, not a magnitude.** An earlier reading called
+`a77defd6` a downgrade from `d97bc0a9`. SHA-256 digests have no ordering; the
+registry settles which is current, and comparison is equality only.
+
+**`UNKNOWN` is the load-bearing verdict.** The egress probe's value is not that
+it detects unenforced policy — it is that it refuses to answer when it cannot
+measure. A host where the probe cannot run reports `UNKNOWN`, never
+`NOT ENFORCED`. Reporting the latter would send an operator after a problem that
+may not exist: the same false-assurance error this block exists to remove,
+merely inverted. Verified by observation — the probe returns `UNKNOWN` on an
+unprivileged workstation.
+
+**Keeping the directive was the right call.** `IPAddressDeny` is inert only under
+unprivileged LXC. Deleting it would have traded a silent false positive for a
+real loss of defence everywhere the mechanism works. The fix was to stop
+*implying* enforcement and start *measuring* it.
