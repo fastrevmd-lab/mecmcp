@@ -366,6 +366,16 @@ pub async fn concurrency_middleware(
     attach_permits(resp, permits)
 }
 
+// Rust 1.98's `clippy::result_large_err` flags the 128-byte `Response` in the
+// `Err` position and suggests boxing it. Boxing would achieve nothing here: a
+// `Result` is as large as its largest variant, and the `Ok` variant is the
+// bigger one. Measured on this toolchain: `Response` 128 bytes,
+// `(Request, Vec<String>)` 264, and the `Result` is 264 either way — boxing the
+// error leaves it at 264 and adds a heap allocation on the rejection path.
+//
+// The `Err` is a fully-formed HTTP rejection (413 or 400) handed back for early
+// return, which is the natural currency of this layer.
+#[allow(clippy::result_large_err)]
 async fn inspect_target_devices(
     req: Request,
     target_keys: &[String],
