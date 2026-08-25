@@ -2,11 +2,24 @@
 #![cfg(any(test, feature = "test-util"))]
 #![allow(clippy::unwrap_used)]
 
+use std::cell::RefCell;
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use tracing_subscriber::fmt::MakeWriter;
 
+thread_local! {
+    /// The buffer the *current thread* is capturing into, if any.
+    ///
+    /// `None` means this thread is not capturing, so its audit events are
+    /// discarded. That is what makes a noisy neighbour harmless: it emits into
+    /// its own absent buffer instead of racing the capturing thread.
+    static CAPTURE_BUF: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
 /// A cloneable in-memory writer collecting everything written to it.
+///
+/// Public because downstream servers build their own capture subscribers with
+/// it. [`run_with_capture`] does **not** use it — see [`ThreadLocalWriter`].
 #[derive(Clone, Default)]
 pub struct CapturingWriter(pub Arc<Mutex<Vec<u8>>>);
 
@@ -24,6 +37,38 @@ impl<'a> MakeWriter<'a> for CapturingWriter {
     type Writer = Self;
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
+    }
+}
+
+/// Writer that appends to whatever buffer the *current thread* is capturing into.
+///
+/// This is what makes one always-on subscriber able to serve per-thread
+/// captures: routing happens at write time, by thread, rather than by swapping
+/// subscribers. A thread that is not capturing has no buffer, so its events are
+/// discarded instead of racing a thread that is.
+#[derive(Clone, Copy, Default)]
+struct ThreadLocalWriter;
+
+impl Write for ThreadLocalWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CAPTURE_BUF.with(|cell| {
+            if let Ok(mut slot) = cell.try_borrow_mut()
+                && let Some(active) = slot.as_mut()
+            {
+                active.extend_from_slice(buf);
+            }
+        });
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for ThreadLocalWriter {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        *self
     }
 }
 
@@ -79,95 +124,58 @@ fn emits_audit_for_tool(captured: &str, tool: &str) -> bool {
     })
 }
 
-/// A subscriber that refuses to let its callsites be cached as uninteresting.
-///
-/// `tracing` caches an `Interest` per callsite **process-wide**, while
-/// [`run_with_capture`] installs its subscriber **thread-locally**. So a second
-/// thread that reaches a callsite with no subscriber of its own can have
-/// `Interest::never` cached for it, and the capturing thread then silently skips
-/// its own events — the capture comes back empty, which reads at the assertion
-/// as "the field was empty" rather than "the capture broke" (mecmcp#305).
-///
-/// Answering `Interest::sometimes()` opts every callsite out of that cache, so
-/// `enabled` is consulted per event against whatever dispatcher the *current*
-/// thread has. That is the only answer that is correct for a thread-local
-/// subscriber.
-///
-/// **This is defence for a case that has not been reproduced.** The cache
-/// rebuild below is what the tests actually need: with `AlwaysAsk` removed and
-/// the rebuild kept, both pass; with the rebuild removed and `AlwaysAsk` kept,
-/// `capture_under_concurrency` fails. A callsite whose *first* registration
-/// happens on a subscriber-less thread mid-capture is the window the rebuild
-/// cannot close — `capture_callsite_registration` drives exactly that and
-/// passes either way, so the window is argued from `tracing`'s API rather than
-/// demonstrated. Kept because the failure it would cause is silent and reads as
-/// someone else's regression; delete it if it ever gets in the way, and that
-/// test is the guard.
-struct AlwaysAsk<S>(S);
-
-impl<S: tracing::Subscriber> tracing::Subscriber for AlwaysAsk<S> {
-    fn register_callsite(
-        &self,
-        metadata: &'static tracing::Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
-        // Ask the inner subscriber so its own bookkeeping still happens, then
-        // discard its answer: any cacheable verdict is what causes the bug.
-        let _ = self.0.register_callsite(metadata);
-        tracing::subscriber::Interest::sometimes()
-    }
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        self.0.enabled(metadata)
-    }
-    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        self.0.new_span(span)
-    }
-    fn record(&self, span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
-        self.0.record(span, values);
-    }
-    fn record_follows_from(&self, span: &tracing::span::Id, follows: &tracing::span::Id) {
-        self.0.record_follows_from(span, follows);
-    }
-    fn event(&self, event: &tracing::Event<'_>) {
-        self.0.event(event);
-    }
-    fn enter(&self, span: &tracing::span::Id) {
-        self.0.enter(span);
-    }
-    fn exit(&self, span: &tracing::span::Id) {
-        self.0.exit(span);
-    }
-    fn clone_span(&self, id: &tracing::span::Id) -> tracing::span::Id {
-        self.0.clone_span(id)
-    }
-    fn try_close(&self, id: tracing::span::Id) -> bool {
-        self.0.try_close(id)
-    }
-}
+/// Installs the process-wide capture subscriber exactly once.
+static INSTALL_SUBSCRIBER: Once = Once::new();
 
 /// Serialises [`run_with_capture`].
 ///
-/// The subscriber is thread-local, but the callsite interest cache this helper
-/// rebuilds is process-global. Two captures running at once invalidate each
-/// other's callsite verdicts and silently drop events, which presents as an
-/// empty capture rather than a failed assertion (mecmcp#324, rustjunosmcp#339).
-///
-/// Serialising is cheap here — these captures are sub-millisecond — and putting
-/// the lock inside the helper means no caller can reintroduce the race by
-/// forgetting to take it.
+/// Not needed for buffer safety any more — each capture owns a thread-local
+/// buffer, so two captures cannot see each other's events. It is kept because
+/// the helper is also used to assert on *absence* (see
+/// [`tools_without_audit_events`]), and overlapping captures would make a
+/// "nothing was emitted" result depend on scheduling.
 static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Sentinel marker emitted by the capture to prove the mechanism works.
+/// Sentinel proving the capture mechanism itself is alive.
 ///
-/// Must be a string that cannot appear in any legitimate audit output. The
-/// UUID-like format and explicit prefix make collision with real output
-/// effectively impossible.
+/// Emitted from *this* module, so it only proves the subscriber and writer are
+/// working. It deliberately does **not** prove the `audit` callsite in
+/// `scope.rs` is enabled — see [`run_with_capture`].
 const SENTINEL_MARKER: &str = "__CAPTURE_SENTINEL_3c7f8a2b__";
 
-/// Run `f` with a temporary subscriber capturing INFO output; return the text.
+/// Run `f` with audit output captured for this thread only; return the text.
 ///
-/// If the sentinel is absent from the captured output, the capture mechanism
-/// itself failed — a silent failure that would otherwise masquerade as an empty
-/// result and send people debugging audit code that is fine (mecmcp#324).
+/// # Why a global subscriber and a thread-local buffer
+///
+/// The obvious implementation — build a subscriber, install it with
+/// `with_default`, read the buffer — is subtly broken, and it broke twice
+/// (mecmcp#305, mecmcp#324, rustjunosmcp#339).
+///
+/// `with_default` installs a subscriber **per thread**, but `tracing` caches
+/// each callsite's `Interest` **per process**. A thread with no subscriber that
+/// reaches the same callsite can get `Interest::never` cached for it, and the
+/// capturing thread then skips its own events. The capture comes back empty,
+/// which reads at the assertion as "the audit field was missing" rather than
+/// "the capture broke" — so people debug audit code that was fine all along.
+///
+/// A mutex around the capture does not fix this: the offending thread is not
+/// capturing, it is merely *emitting*, so it never takes the lock. That is
+/// exactly the case `capture_under_concurrency.rs` reproduces, and it failed
+/// about half the time with the serialising fix in place.
+///
+/// So the subscriber is installed **once, globally, and is always enabled**.
+/// Interest is therefore computed once against a subscriber that always says
+/// yes, and no thread can flip it. Routing is done by the writer instead: it
+/// appends to the calling thread's buffer if that thread is capturing, and
+/// discards otherwise. A noisy neighbour writes into its own absent buffer.
+///
+/// # Panics
+///
+/// If the sentinel does not survive the round trip, meaning something else has
+/// already claimed the process's global subscriber and this capture cannot
+/// work. Returning an empty string there would masquerade as "`f` emitted
+/// nothing", and [`tools_without_audit_events`] would report every tool as
+/// un-audited.
 pub fn run_with_capture<F: FnOnce()>(f: F) -> String {
     // Recover from poisoning rather than propagating it: a panicking test inside
     // the closure would otherwise turn one real failure into a cascade of
@@ -176,48 +184,59 @@ pub fn run_with_capture<F: FnOnce()>(f: F) -> String {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let cap = CapturingWriter::default();
-    let subscriber = AlwaysAsk(
-        tracing_subscriber::fmt()
-            .with_writer(cap.clone())
+    // A process-wide "floor" subscriber, installed once and always enabled.
+    //
+    // Its only job is to keep every audit callsite's `Interest` alive. Without
+    // it, a thread that has no subscriber can reach the callsite first and get
+    // `Interest::never` cached for it process-wide, after which the capturing
+    // thread silently skips its own events.
+    //
+    // Installing it is best-effort: `mecmcp_audit::init` legitimately claims the
+    // global subscriber in its own tests. Either subscriber keeps interest
+    // alive, which is all this needs, so losing the race is harmless.
+    INSTALL_SUBSCRIBER.call_once(|| {
+        let floor = tracing_subscriber::fmt()
+            .with_writer(ThreadLocalWriter)
             .with_ansi(false)
             .with_target(true)
             .with_max_level(tracing::Level::INFO)
-            .finish(),
-    );
-
-    tracing::subscriber::with_default(subscriber, || {
-        // Rebuild interest cache INSIDE with_default so callsites re-register
-        // against the capturing subscriber, not against whatever dispatcher was
-        // default before. Rebuilding outside left the cache pointing at the wrong
-        // subscriber and dropped events (mecmcp#324).
-        tracing::callsite::rebuild_interest_cache();
-
-        // Emit a sentinel event FIRST to prove the capture mechanism works. If
-        // this does not appear in the output, the capture broke — the subscriber
-        // or its writer is not receiving events — and returning an empty string
-        // would masquerade as "`f` emitted nothing" rather than "the mechanism
-        // failed". That distinction matters: `tools_without_audit_events` depends
-        // on genuinely-empty captures to detect un-audited tools.
-        tracing::info!(target: "audit", "{}", SENTINEL_MARKER);
-
-        f();
+            .finish();
+        let _ = tracing::subscriber::set_global_default(floor);
     });
 
-    let bytes = cap.0.lock().unwrap().clone();
+    // Capture through a thread-local subscriber as well, so this works whether
+    // or not we won the global. Both write through `CapturingWriter`, which
+    // routes by thread-local buffer, so events land in this capture exactly
+    // once regardless of which subscriber handled them.
+    let local = tracing_subscriber::fmt()
+        .with_writer(ThreadLocalWriter)
+        .with_ansi(false)
+        .with_target(true)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+
+    CAPTURE_BUF.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
+    tracing::subscriber::with_default(local, || {
+        tracing::info!(target: "audit", "{}", SENTINEL_MARKER);
+        f();
+    });
+    let bytes = CAPTURE_BUF
+        .with(|cell| cell.borrow_mut().take())
+        .unwrap_or_default();
+
     let captured = String::from_utf8(bytes).unwrap();
+    assert!(
+        captured.contains(SENTINEL_MARKER),
+        "tracing capture never observed its own sentinel event — the capture \
+         mechanism is broken. This is NOT a missing audit field; do not go \
+         looking for one (mecmcp#324). Likely causes: another global subscriber \
+         owns this process and filters the `audit` target, or the writer is not \
+         reaching this thread's buffer."
+    );
 
-    // Check the sentinel is present. If it is missing, the capture mechanism
-    // itself broke — not a missing audit field, not an empty result.
-    if !captured.contains(SENTINEL_MARKER) {
-        panic!(
-            "tracing capture never observed its own sentinel event — the capture broke; \
-             this is NOT a missing audit field (mecmcp#324)"
-        );
-    }
-
-    // Strip the sentinel line from the output so callers' assertions and
-    // `tools_without_audit_events` see only the events `f` emitted.
+    // Strip the sentinel so callers — and `tools_without_audit_events`, which
+    // treats an empty result as "this tool emitted nothing" — see only `f`'s
+    // output.
     captured
         .lines()
         .filter(|line| !line.contains(SENTINEL_MARKER))
