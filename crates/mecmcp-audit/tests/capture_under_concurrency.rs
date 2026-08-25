@@ -7,9 +7,9 @@
 //! subscriber is the first to reach the callsite — which is exactly the shape
 //! that broke `bearer_boundary.rs` (mecmcp#305).
 //!
-//! **One test per binary.** Two of these in one process is not a reproduction —
-//! whichever runs first registers the callsite under a capture subscriber and
-//! immunises the second.
+//! **Exactly one test in this binary.** A second test would be immunised by the
+//! first test's callsite registration and would prove less than it claims. See
+//! `concurrent_parallel_captures.rs` for the sibling concurrency test.
 
 #![allow(clippy::unwrap_used)]
 
@@ -49,43 +49,5 @@ fn concurrent_emission_does_not_empty_the_capture() {
         captured.contains("tool=under_capture"),
         "capture lost its own events while another thread emitted: {:?}",
         &captured[..captured.len().min(200)]
-    );
-}
-/// Many concurrent captures must each see their own event.
-///
-/// `run_with_capture` rebuilds the process-global callsite interest cache. Two
-/// threads doing that at once can re-evaluate a callsite against a thread whose
-/// subscriber does not capture, dropping the event — so a capture comes back
-/// empty even though the audit code ran correctly.
-#[test]
-fn many_concurrent_captures_each_see_their_own_event() {
-    let failures: Vec<String> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..16)
-            .map(|i| {
-                scope.spawn(move || {
-                    let tool: &'static str = if i % 2 == 0 { "alpha" } else { "beta" };
-                    let out = mecmcp_audit::testutil::run_with_capture(|| {
-                        let mut scope = mecmcp_audit::AuditScope::stdio(tool, "read", Vec::new());
-                        scope.succeed();
-                    });
-                    if out.contains(tool) {
-                        None
-                    } else {
-                        Some(format!("thread {i} ({tool}) captured: {out:?}"))
-                    }
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .filter_map(|h| h.join().expect("capture thread panicked"))
-            .collect()
-    });
-
-    assert!(
-        failures.is_empty(),
-        "{} of 16 concurrent captures lost their event:\n{}",
-        failures.len(),
-        failures.join("\n")
     );
 }

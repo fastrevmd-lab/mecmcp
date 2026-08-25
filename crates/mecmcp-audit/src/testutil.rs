@@ -156,7 +156,18 @@ impl<S: tracing::Subscriber> tracing::Subscriber for AlwaysAsk<S> {
 /// forgetting to take it.
 static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Sentinel marker emitted by the capture to prove the mechanism works.
+///
+/// Must be a string that cannot appear in any legitimate audit output. The
+/// UUID-like format and explicit prefix make collision with real output
+/// effectively impossible.
+const SENTINEL_MARKER: &str = "__CAPTURE_SENTINEL_3c7f8a2b__";
+
 /// Run `f` with a temporary subscriber capturing INFO output; return the text.
+///
+/// If the sentinel is absent from the captured output, the capture mechanism
+/// itself failed — a silent failure that would otherwise masquerade as an empty
+/// result and send people debugging audit code that is fine (mecmcp#324).
 pub fn run_with_capture<F: FnOnce()>(f: F) -> String {
     // Recover from poisoning rather than propagating it: a panicking test inside
     // the closure would otherwise turn one real failure into a cascade of
@@ -174,12 +185,44 @@ pub fn run_with_capture<F: FnOnce()>(f: F) -> String {
             .with_max_level(tracing::Level::INFO)
             .finish(),
     );
-    // Existing callsites may already hold a cached verdict from before this
-    // subscriber existed; `AlwaysAsk` only governs registrations it sees.
-    tracing::callsite::rebuild_interest_cache();
-    tracing::subscriber::with_default(subscriber, f);
+
+    tracing::subscriber::with_default(subscriber, || {
+        // Rebuild interest cache INSIDE with_default so callsites re-register
+        // against the capturing subscriber, not against whatever dispatcher was
+        // default before. Rebuilding outside left the cache pointing at the wrong
+        // subscriber and dropped events (mecmcp#324).
+        tracing::callsite::rebuild_interest_cache();
+
+        // Emit a sentinel event FIRST to prove the capture mechanism works. If
+        // this does not appear in the output, the capture broke — the subscriber
+        // or its writer is not receiving events — and returning an empty string
+        // would masquerade as "`f` emitted nothing" rather than "the mechanism
+        // failed". That distinction matters: `tools_without_audit_events` depends
+        // on genuinely-empty captures to detect un-audited tools.
+        tracing::info!(target: "audit", "{}", SENTINEL_MARKER);
+
+        f();
+    });
+
     let bytes = cap.0.lock().unwrap().clone();
-    String::from_utf8(bytes).unwrap()
+    let captured = String::from_utf8(bytes).unwrap();
+
+    // Check the sentinel is present. If it is missing, the capture mechanism
+    // itself broke — not a missing audit field, not an empty result.
+    if !captured.contains(SENTINEL_MARKER) {
+        panic!(
+            "tracing capture never observed its own sentinel event — the capture broke; \
+             this is NOT a missing audit field (mecmcp#324)"
+        );
+    }
+
+    // Strip the sentinel line from the output so callers' assertions and
+    // `tools_without_audit_events` see only the events `f` emitted.
+    captured
+        .lines()
+        .filter(|line| !line.contains(SENTINEL_MARKER))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
