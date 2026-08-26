@@ -270,9 +270,33 @@ impl ChangesetCoordinator {
             }
         }
 
-        // Mark in-flight change sets as failed
+        // Normalise first, then settle. Load is the boundary where a file
+        // written by an older binary enters memory, so it is where the
+        // `Some("")` invariant has to be established — otherwise the
+        // coordinator hands back an empty handle that `write_state` has
+        // already dropped from the file, and memory and disk disagree about
+        // the same record. Non-`Applying` legacy records matter too: nothing
+        // else rewrites them, so without this they keep the empty handle
+        // indefinitely.
+        //
+        // With the invariant established, settling can ask the plain question.
+        //
+        // A record carrying a real `task_id` names a vendor operation that is
+        // still running, or has finished and holds its own answer. Marking it
+        // `Failed` would assert an outcome nobody observed — and the likelier
+        // outcome is success, because the vendor accepted the operation before
+        // this process died. It would also hide the record from the caller's
+        // re-probe, which looks for `Applying` plus a handle, so the feature
+        // that field exists for would never fire.
+        //
+        // Without a handle there is genuinely nothing to ask, and `Failed` is
+        // the existing behaviour for those.
         for record in state.change_sets.values_mut() {
-            if record.state == ChangeSetState::Applying {
+            if record.task_id.as_deref().is_some_and(str::is_empty) {
+                record.task_id = None;
+                recovered = true;
+            }
+            if record.state == ChangeSetState::Applying && record.task_id.is_none() {
                 record.state = ChangeSetState::Failed;
                 recovered = true;
             }
@@ -517,6 +541,10 @@ impl ChangesetCoordinator {
             .validate_preview(self.limits.max_preview_bytes)
             .map_err(|error| CoordinatorError::new("preview", error.to_string()))?;
 
+        // Every boundary the record crosses into the store normalises, so no
+        // caller can seed `Some("")` here either.
+        let record = normalise_task_handle(record);
+
         let mut state = self.state.lock().await;
 
         // Retire anything past its approval deadline before doing anything else.
@@ -660,6 +688,13 @@ impl ChangesetCoordinator {
     pub async fn update_change_set(&self, record: ChangeSetRecord) -> Result<(), CoordinatorError> {
         let mut state = self.state.lock().await;
         let id = record.id.clone();
+        // Normalise before the record enters the map, not only on the way to
+        // disk. `write_state` drops an empty handle from its own copy, so
+        // normalising there alone would leave the coordinator returning
+        // `Some("")` from `change_set()` while the file holds `None` — and a
+        // restart would then observe a different record than the running
+        // process reports. Memory and file must agree.
+        let record = normalise_task_handle(record);
         let previous = state.change_sets.insert(id.clone(), record);
 
         // Roll back on persist failure
@@ -725,4 +760,21 @@ fn validate_operation_id(value: &str) -> Result<(), CoordinatorError> {
             "value must contain exactly 64 hexadecimal characters",
         ))
     }
+}
+
+/// Drop an empty vendor task handle, so `Some("")` never enters the store.
+///
+/// An empty handle names no vendor operation: nothing can re-probe it, yet it
+/// is still `Some`, so a recovery path asking `is_none()` reads it as "this
+/// apply is recoverable" and holds the record `Applying` forever. Absent means
+/// absent.
+///
+/// Applied at every boundary the record crosses — into the coordinator's map
+/// here, and onto disk in `write_state` — because normalising only one of them
+/// makes the API and the file disagree about the same change set.
+fn normalise_task_handle(mut record: ChangeSetRecord) -> ChangeSetRecord {
+    if record.task_id.as_deref().is_some_and(str::is_empty) {
+        record.task_id = None;
+    }
+    record
 }

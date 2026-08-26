@@ -12,7 +12,7 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
-mecmcp-secret = { version = "0.19.0", path = "../mecmcp-secret" }
+mecmcp-secret = { version = "0.20.0", path = "../mecmcp-secret" }
 # "rustls-no-provider", NOT "rustls". Decision D4: the provider is a parameter
 # the consumer picks, and reqwest's "rustls" feature would enable
 # rustls/aws-lc-rs as a Cargo feature across the whole graph. That unification is

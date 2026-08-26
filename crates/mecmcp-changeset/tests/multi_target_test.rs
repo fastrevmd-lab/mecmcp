@@ -41,6 +41,7 @@ fn record(device: &str, targets: Vec<String>) -> ChangeSetRecord {
         policy_signature: String::new(),
         targets,
         preview: None,
+        task_id: None,
     }
 }
 
@@ -511,4 +512,61 @@ mod insert_boundary {
             .await
             .expect("a preview inside the ceiling must be accepted");
     }
+}
+
+/// A `task_id` forces version 2, for the same reason as `targets` and
+/// `preview` — and this is the sharpest case of the three.
+///
+/// `task_id` is written while an apply is in flight, so a rollback performed
+/// *during* an apply is exactly when the file carries one. That is the moment
+/// an unreadable state file hurts most: the operator is already recovering.
+#[test]
+fn a_task_id_forces_version_two_and_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+
+    let mut changeset = record("fw-01", Vec::new());
+    changeset.task_id = Some("UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:617:root@pam:".into());
+
+    let mut state = ChangesetState::default();
+    state.change_sets.insert("a".repeat(64), changeset);
+    write_state(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
+
+    let on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        on_disk["version"], 2,
+        "an in-flight task handle must gate to v2"
+    );
+
+    let reloaded = read_state(&path, OperationLimits::default().max_state_bytes).unwrap();
+    let stored = reloaded.change_sets.get(&"a".repeat(64)).unwrap();
+    assert_eq!(
+        stored.task_id.as_deref(),
+        Some("UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:617:root@pam:"),
+        "the handle must survive a round trip, or recovery has nothing to ask about"
+    );
+}
+
+/// Absent when unused, so a deployment that never applies keeps writing
+/// version-1 files an older binary can read.
+#[test]
+fn no_task_id_is_serialised_when_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+
+    let mut state = ChangesetState::default();
+    state
+        .change_sets
+        .insert("a".repeat(64), record("fw-01", Vec::new()));
+    write_state(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
+
+    let on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(on_disk["version"], 1);
+    let stored = &on_disk["state"]["change_sets"][&"a".repeat(64)];
+    assert!(
+        stored.get("task_id").is_none(),
+        "task_id was serialised as null, which a v1 reader rejects"
+    );
 }

@@ -250,6 +250,7 @@ fn v3_waiver_round_trip_and_version_dependence() {
         policy_signature: String::new(),
         targets: vec![],
         preview: None,
+        task_id: None,
     };
 
     let mut state = ChangesetState {

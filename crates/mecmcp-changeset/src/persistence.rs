@@ -396,6 +396,42 @@ pub fn write_state(
         .parent()
         .ok_or_else(|| PersistenceError::new("changeset state path has no parent"))?;
 
+    // Drop an empty task handle before anything else looks at the state.
+    //
+    // `Some("")` names no vendor operation, so it carries no information and
+    // nothing can re-probe it — but it is still `Some`, so a recovery path
+    // asking `is_none()` would read it as "this apply is recoverable" and hold
+    // the record `Applying` across every restart, pinning the principal/device
+    // pending slot against a task that does not exist.
+    //
+    // Normalised here rather than rejected in `validate_state`, and the
+    // distinction matters: `write_state` does not validate, so a rejection
+    // would only fire on the *next* load and would refuse the whole file —
+    // turning one bad handle into a server that will not start. Dropping the
+    // field loses nothing and guarantees no file this binary writes contains
+    // one. Files written by older binaries still reach recovery, which treats
+    // an empty handle as absent.
+    //
+    // Cloned only when there is something to fix, so the common path does not
+    // copy the state on every write.
+    let normalised;
+    let state = if state
+        .change_sets
+        .values()
+        .any(|cs| cs.task_id.as_deref().is_some_and(str::is_empty))
+    {
+        let mut copy = state.clone();
+        for record in copy.change_sets.values_mut() {
+            if record.task_id.as_deref().is_some_and(str::is_empty) {
+                record.task_id = None;
+            }
+        }
+        normalised = copy;
+        &normalised
+    } else {
+        state
+    };
+
     // Write version 2 only when a record actually carries a field the version-1
     // reader does not know. Both record types are `deny_unknown_fields`, so a
     // previous binary handed an unexpected key rejects the WHOLE file, not one
@@ -407,13 +443,21 @@ pub fn write_state(
         .values()
         .any(|op| op.attribution.is_some() || op.rollback_deadline_unix.is_some());
     let change_sets_need_v2 = state.change_sets.values().any(|cs| {
-        // `targets` and `preview` join `policy_signature` here for the same
-        // reason: `ChangeSetRecord` is `deny_unknown_fields`, so a binary that
-        // predates a field rejects the WHOLE file rather than the one record,
-        // and rolling a release back is a documented deploy step. A deployment
-        // using none of them keeps producing version-1 files the older binary
-        // reads — which is what LXC 608 is doing today.
-        !cs.policy_signature.is_empty() || !cs.targets.is_empty() || cs.preview.is_some()
+        // `targets`, `preview` and `task_id` join `policy_signature` here for
+        // the same reason: `ChangeSetRecord` is `deny_unknown_fields`, so a
+        // binary that predates a field rejects the WHOLE file rather than the
+        // one record, and rolling a release back is a documented deploy step.
+        // A deployment using none of them keeps producing version-1 files the
+        // older binary reads — which is what LXC 608 is doing today.
+        //
+        // `task_id` is the sharpest case of the three. It is written while an
+        // apply is in flight, so a rollback performed *during* an apply is
+        // exactly when the file would carry one — the moment an unreadable
+        // state file hurts most.
+        !cs.policy_signature.is_empty()
+            || !cs.targets.is_empty()
+            || cs.preview.is_some()
+            || cs.task_id.is_some()
     });
     // A non-HTTPS endpoint is a version-2 record too. It is not a new *field*,
     // but the version-1 reader validated `starts_with("https://")` and would
