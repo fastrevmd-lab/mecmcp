@@ -834,6 +834,37 @@ pub async fn serve_router(
     // so it happens ahead of the bind (mecmcp#273).
     crate::listener::check_listener(&plan.policy, address, tls.is_some())?;
 
+    let listener = std::net::TcpListener::bind(address)
+        .map_err(|error| HttpServeError::Bind { address, error })?;
+
+    serve_router_on_listener(plan, listener, tls, shutdown_timeout).await
+}
+
+/// [`serve_router`] over a listener the caller already bound.
+///
+/// The bind and the serve are one step for a normal caller, but a test harness
+/// needs the port *before* it can hand out a URL. Binding to discover a port and
+/// then releasing it leaves a window in which another process -- another test in
+/// the same binary, most often -- can take that port, after which two servers
+/// believe they own one address and a client reaches the wrong one. Passing the
+/// bound listener straight through closes the window instead of narrowing it.
+///
+/// # Errors
+///
+/// As [`serve_router`], minus the bind.
+pub async fn serve_router_on_listener(
+    plan: ServePlan,
+    listener: std::net::TcpListener,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    shutdown_timeout: std::time::Duration,
+) -> Result<(), HttpServeError> {
+    let address = listener
+        .local_addr()
+        .map_err(|error| HttpServeError::Bind {
+            address: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+            error,
+        })?;
+
     let ServePlan {
         router, shutdown, ..
     } = plan;
@@ -843,8 +874,6 @@ pub async fn serve_router(
     // it waits on every in-flight connection task forever, and an MCP SSE
     // stream never ends on its own, so the plaintext listener would hang
     // until systemd's TimeoutStopSec SIGKILL.
-    let listener = std::net::TcpListener::bind(address)
-        .map_err(|error| HttpServeError::Bind { address, error })?;
     listener
         .set_nonblocking(true)
         .map_err(|error| HttpServeError::Bind { address, error })?;

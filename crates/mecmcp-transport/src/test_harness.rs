@@ -22,7 +22,7 @@
 //!
 //! Test-only. Never reachable from a release build.
 
-use crate::server::{HttpServeError, ServePlan, serve_router};
+use crate::server::{HttpServeError, ServePlan, serve_router_on_listener};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -69,22 +69,30 @@ pub async fn serve_on_loopback_with_timeout(
     plan: ServePlan,
     shutdown_timeout: Duration,
 ) -> ServedPlan {
-    // Bind to discover a free port, then release it. There is a race between
-    // the drop and the rebind, which is why this is test-only: the alternative
-    // is a fixed port, which collides with concurrently running tests far more
-    // often than this races.
-    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
+    // Bind once and keep it. The port is discovered and used by the same
+    // listener, so there is no window in which anything else can take it.
+    //
+    // This used to bind, read the port, drop the listener and let `serve_router`
+    // re-bind. Between the drop and the re-bind another test in the same binary
+    // could win the port; two harnesses then believed they owned one address,
+    // and a client dialing "its" server reached the other one and was refused
+    // with a 401 at initialize, because that server had never heard of its
+    // bearer token. Rare locally, regular under CI's parallelism.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
         .expect("no loopback port available for the test harness");
-    let address = probe
+    let address = listener
         .local_addr()
         .expect("bound listener has no local address");
-    drop(probe);
 
-    let serving = tokio::spawn(serve_router(plan, address, None, shutdown_timeout));
+    let serving = tokio::spawn(serve_router_on_listener(
+        plan,
+        listener,
+        None,
+        shutdown_timeout,
+    ));
 
-    // Give the listener a moment to come up before the caller dials it.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The socket is already bound and its backlog is accepting, so a caller may
+    // dial immediately. The old sleep existed to cover the re-bind gap.
 
     ServedPlan { address, serving }
 }
