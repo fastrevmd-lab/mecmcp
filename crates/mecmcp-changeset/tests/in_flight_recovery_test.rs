@@ -115,3 +115,165 @@ async fn an_apply_without_a_handle_is_still_settled() {
         "a handleless apply has nothing to re-probe and must still be settled"
     );
 }
+
+/// An empty handle is dropped at the write boundary, not rejected at the read
+/// boundary.
+///
+/// The distinction is the whole point. `write_state` does not validate, so
+/// rejecting an empty handle on load would fire only on the *next* start and
+/// would refuse the whole file — turning one bad handle into a server that
+/// will not boot. Dropping it loses nothing, because an empty handle names no
+/// vendor operation.
+#[test]
+fn an_empty_task_handle_is_dropped_on_write_and_the_file_still_loads() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.json");
+    write_applying(&path, Some(""));
+
+    // The file must still load. A refusal here would be a boot failure.
+    let state = read_state(&path, OperationLimits::default().max_state_bytes)
+        .expect("a file with an empty handle must still load");
+
+    assert_eq!(
+        state.change_sets[ID].task_id, None,
+        "the empty handle must have been dropped, not stored"
+    );
+
+    // And with no handle left, it writes as version 1 — an older binary can
+    // still read it.
+    let on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
+    assert_eq!(on_disk["version"], 1);
+    assert!(
+        on_disk["state"]["change_sets"][ID].get("task_id").is_none(),
+        "task_id must be absent, not null"
+    );
+}
+
+/// A file written by an older binary can still carry one, so recovery must
+/// treat it as absent rather than preserve it.
+#[tokio::test]
+async fn recovery_settles_a_pre_existing_empty_handle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.json");
+
+    // Written past the normaliser, the way an older binary would have.
+    let mut state = ChangesetState::default();
+    state
+        .change_sets
+        .insert(ID.to_owned(), applying_record(Some("")));
+    let json = serde_json::json!({ "version": 2, "state": state });
+    std::fs::write(&path, serde_json::to_vec(&json).expect("serialise")).expect("write");
+    // The store refuses a group- or world-readable state file, so a hand-made
+    // one has to match what the library itself writes.
+    std::fs::set_permissions(
+        &path,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("chmod");
+
+    let coordinator = ChangesetCoordinator::load(
+        Some(&path),
+        OperationLimits::default(),
+        Duration::from_secs(900),
+        false,
+    )
+    .expect("a legacy file with an empty handle must load, not brick the server");
+
+    let records = coordinator.change_sets().await;
+    assert_eq!(
+        records.first().expect("one change set").state,
+        ChangeSetState::Failed,
+        "an empty handle has nothing to re-probe, so it must settle rather than \
+         hold the pending slot forever"
+    );
+}
+
+/// The API and the file must report the same record.
+///
+/// `write_state` normalises its own copy on the way to disk, so normalising
+/// only there would leave the coordinator returning `Some("")` while the file
+/// held `None` — and a restart would then observe a different record than the
+/// running process reports.
+#[tokio::test]
+async fn the_coordinator_and_the_file_agree_after_an_empty_handle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.json");
+
+    let coordinator = ChangesetCoordinator::load(
+        Some(&path),
+        OperationLimits::default(),
+        Duration::from_secs(900),
+        false,
+    )
+    .expect("load");
+
+    coordinator
+        .insert_change_set(applying_record(Some("")))
+        .await
+        .expect("insert");
+
+    let in_memory = coordinator.change_sets().await;
+    assert_eq!(
+        in_memory.first().expect("one record").task_id,
+        None,
+        "the coordinator handed back an empty handle it had already dropped on disk"
+    );
+
+    let on_disk = read_state(&path, OperationLimits::default().max_state_bytes).expect("read");
+    assert_eq!(
+        on_disk.change_sets[ID].task_id, None,
+        "the file must agree with the API"
+    );
+}
+
+/// Load is a boundary too, and the one an older file crosses.
+///
+/// A legacy record that is *not* `Applying` is never rewritten by the settling
+/// loop, so without normalising on load it would keep its empty handle
+/// indefinitely while `write_state` dropped it from the file — the same
+/// memory/disk disagreement, on a record nothing else touches.
+#[tokio::test]
+async fn a_legacy_empty_handle_is_normalised_on_load_even_when_settled() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.json");
+
+    // An *Applied* record carrying an empty handle: terminal, so the settling
+    // loop has no reason to touch it.
+    let mut record = applying_record(Some(""));
+    record.state = ChangeSetState::Applied;
+
+    let mut state = ChangesetState::default();
+    state.change_sets.insert(ID.to_owned(), record);
+    let json = serde_json::json!({ "version": 2, "state": state });
+    std::fs::write(&path, serde_json::to_vec(&json).expect("serialise")).expect("write");
+    std::fs::set_permissions(
+        &path,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("chmod");
+
+    let coordinator = ChangesetCoordinator::load(
+        Some(&path),
+        OperationLimits::default(),
+        Duration::from_secs(900),
+        false,
+    )
+    .expect("load");
+
+    let records = coordinator.change_sets().await;
+    let loaded = records.first().expect("one record");
+    assert_eq!(
+        loaded.task_id, None,
+        "the coordinator kept an empty handle that the file no longer has"
+    );
+    assert_eq!(
+        loaded.state,
+        ChangeSetState::Applied,
+        "normalising the handle must not change the lifecycle state"
+    );
+
+    let on_disk = read_state(&path, OperationLimits::default().max_state_bytes).expect("read");
+    assert_eq!(on_disk.change_sets[ID].task_id, None);
+    assert_eq!(on_disk.change_sets[ID].state, ChangeSetState::Applied);
+}
