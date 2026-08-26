@@ -41,7 +41,7 @@ pub struct ServedPlan {
 /// Loopback is exempt from every listener refusal, so a plan that would be
 /// refused off-loopback still serves here — which is what makes this usable for
 /// testing handler behaviour. To test the refusals themselves, call
-/// [`serve_router`] directly with a non-loopback address.
+/// [`crate::server::serve_router`] directly with a non-loopback address.
 ///
 /// # Panics
 ///
