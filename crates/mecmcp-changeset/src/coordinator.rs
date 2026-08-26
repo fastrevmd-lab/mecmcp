@@ -270,9 +270,21 @@ impl ChangesetCoordinator {
             }
         }
 
-        // Mark in-flight change sets as failed
+        // Settle in-flight change sets, but only the ones nothing can be asked
+        // about.
+        //
+        // A record carrying a `task_id` names a vendor operation that is still
+        // running, or has finished and holds its own answer. Marking it
+        // `Failed` here would assert an outcome nobody observed — and the
+        // likelier outcome is success, because the vendor accepted the
+        // operation before this process died. It would also hide the record
+        // from the caller's re-probe, which looks for `Applying` plus a
+        // handle, so the feature that field exists for would never fire.
+        //
+        // Without a handle there is genuinely nothing to ask, and `Failed` is
+        // the existing behaviour for those.
         for record in state.change_sets.values_mut() {
-            if record.state == ChangeSetState::Applying {
+            if record.state == ChangeSetState::Applying && record.task_id.is_none() {
                 record.state = ChangeSetState::Failed;
                 recovered = true;
             }
