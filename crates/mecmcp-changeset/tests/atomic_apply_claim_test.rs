@@ -228,3 +228,63 @@ async fn a_handle_expecting_apply_without_one_is_still_failed() {
         "an apply that was going to record a handle and did not never started"
     );
 }
+
+/// The claim must be the *only* way into `Applying`, or it is advisory.
+///
+/// The first version of this change added a safe path and left the unsafe one
+/// open: `update_change_set` still replaced the record unconditionally, so the
+/// original read-`Approved`/write-`Applying` sequence still worked and still
+/// raced. Caught by the review gate.
+#[tokio::test]
+async fn update_change_set_cannot_perform_the_apply_transition() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = coordinator(dir.path()).await;
+    let id = "f".repeat(64);
+    coord.insert_change_set(approved(&id)).await.unwrap();
+
+    let mut sneaky = coord.change_set(&id, "vsrx-ci").await.unwrap();
+    sneaky.state = ChangeSetState::Applying;
+    let error = coord
+        .update_change_set(sneaky)
+        .await
+        .expect_err("Approved -> Applying must not be writable directly");
+    assert!(
+        error.to_string().contains("claim_change_set_for_apply"),
+        "the refusal should name the method that owns this transition, got: {error}"
+    );
+
+    let record = coord.change_set(&id, "vsrx-ci").await.unwrap();
+    assert_eq!(record.state, ChangeSetState::Approved);
+}
+
+/// A handleless in-flight apply must not be re-approved.
+///
+/// Whether the command ran is unknown, so re-opening it hands out a second
+/// execution of something that may already have happened — the exact outcome
+/// preserving `Applying` across a restart exists to prevent.
+#[tokio::test]
+async fn a_handleless_applying_record_cannot_be_returned_to_approved() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = coordinator(dir.path()).await;
+    let id = "9".repeat(64);
+    coord.insert_change_set(approved(&id)).await.unwrap();
+    coord
+        .claim_change_set_for_apply(&id, "vsrx-ci", ApplyHandle::None)
+        .await
+        .unwrap();
+
+    let mut reopened = coord.change_set(&id, "vsrx-ci").await.unwrap();
+    reopened.state = ChangeSetState::Approved;
+    let error = coord
+        .update_change_set(reopened)
+        .await
+        .expect_err("a handleless apply must not be re-approved");
+    assert!(
+        error.to_string().contains("second execution"),
+        "the refusal should say why, got: {error}"
+    );
+    assert_eq!(
+        coord.change_set(&id, "vsrx-ci").await.unwrap().state,
+        ChangeSetState::Applying
+    );
+}

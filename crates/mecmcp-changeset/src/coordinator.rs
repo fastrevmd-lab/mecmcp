@@ -752,7 +752,20 @@ impl ChangesetCoordinator {
         state.change_sets.insert(id.to_owned(), claimed.clone());
 
         if let Err(error) = self.persist_locked(&state) {
-            state.change_sets.insert(id.to_owned(), previous);
+            // Deliberately no rollback here, unlike `update_change_set`.
+            //
+            // `write_state` renames the new file into place before it fsyncs
+            // the directory, so a failure can mean either "nothing was written"
+            // or "it was written and we cannot prove it is durable". Rolling
+            // memory back to `Approved` on the second of those would leave disk
+            // saying `Applying` and memory saying `Approved` — and this process
+            // would then let a *second* apply claim it.
+            //
+            // Keeping the claim is the fail-closed choice: the caller gets an
+            // error and does not execute, nobody else can claim, and a human
+            // resolves a record that is at worst stuck. A replayed approval is
+            // the outcome worth spending a stuck record to avoid.
+            let _ = previous;
             return Err(error);
         }
         Ok(claimed)
@@ -775,6 +788,38 @@ impl ChangesetCoordinator {
         // restart would then observe a different record than the running
         // process reports. Memory and file must agree.
         let record = normalise_task_handle(record);
+
+        // The two transitions this updater must not perform, or
+        // `claim_change_set_for_apply` would be advisory. It is not: it is the
+        // only way a change set may start being applied, and enforcing that
+        // here is what makes "one approval, one execution" a property of the
+        // crate rather than of whoever remembered to call the right method.
+        if let Some(current) = state.change_sets.get(&id) {
+            if current.state == ChangeSetState::Approved && record.state == ChangeSetState::Applying
+            {
+                return Err(CoordinatorError::new(
+                    "state",
+                    "Approved -> Applying must go through claim_change_set_for_apply; \
+                     writing it here reintroduces the race where two applies both \
+                     read Approved and both execute",
+                ));
+            }
+            // Re-opening a handleless in-flight apply would hand out a second
+            // execution of a command that may already have run, which is the
+            // whole reason that state is preserved across a restart.
+            if current.state == ChangeSetState::Applying
+                && current.apply_without_handle
+                && record.state == ChangeSetState::Approved
+            {
+                return Err(CoordinatorError::new(
+                    "state",
+                    "an apply with no vendor handle cannot be returned to Approved: \
+                     whether the operation ran is unknown, and re-approving it would \
+                     permit a second execution",
+                ));
+            }
+        }
+
         let previous = state.change_sets.insert(id.clone(), record);
 
         // Roll back on persist failure

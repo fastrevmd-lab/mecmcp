@@ -1,5 +1,6 @@
 //! Change-set apply operation.
 
+use crate::lifecycle::ApplyHandle;
 use crate::{
     changeset::{new_operation_id, now_unix},
     coordinator::{ChangesetCoordinator, CoordinatorError},
@@ -418,9 +419,25 @@ impl ChangesetCoordinator {
 
         self.insert(operation_record).await?;
 
-        // Mark change set as Applying. On failure, remove the operation reservation
-        // to unblock the endpoint.
-        change_set.state = ChangeSetState::Applying;
+        // Claim the change set, rather than writing `Applying` onto the copy
+        // read earlier. That read and this write used to be two operations with
+        // the lock released between them, so two applies could both see
+        // `Approved` and both proceed. The claim does the check and the
+        // transition under one lock, so exactly one gets through and the rest
+        // are refused here instead of at the device.
+        //
+        // On failure the operation reservation is removed, or the endpoint
+        // stays blocked by an apply that never started.
+        let mut change_set = match self
+            .claim_change_set_for_apply(&change_set.id, &change_set.device, ApplyHandle::Expected)
+            .await
+        {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                self.remove(&operation_id).await;
+                return Err(error);
+            }
+        };
         change_set.operation_id = Some(operation_id.clone());
         if let Err(error) = self.update_change_set(change_set.clone()).await {
             self.remove(&operation_id).await;
