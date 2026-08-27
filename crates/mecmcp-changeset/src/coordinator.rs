@@ -570,13 +570,19 @@ impl ChangesetCoordinator {
             ));
         }
 
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
 
-        // Before anything expires or is evicted. An existing id is refused
-        // whatever state it holds — otherwise, at capacity, an `Applying`
-        // record could be settled to `Failed`, evicted as terminal, and
-        // re-inserted under its own id as `Approved` to be claimed a second
-        // time. The review gate found that sequence.
+        // Before anything expires or is evicted, and under the same lock that
+        // performs the insert.
+        //
+        // Both halves matter. Before eviction, because at capacity an
+        // `Applying` record could otherwise be settled to `Failed`, evicted as
+        // terminal, and re-inserted under its own id to be claimed a second
+        // time. Under one lock, because checking absence and then releasing
+        // before inserting lets two concurrent inserts of the same id both find
+        // nothing and the later one overwrite the earlier — which is the same
+        // check-then-act race this whole change exists to remove, and the first
+        // version of this guard reintroduced it by taking its own lock.
         if let Some(existing) = state.change_sets.get(&record.id) {
             return Err(CoordinatorError::new(
                 "change_set_id",
@@ -587,9 +593,6 @@ impl ChangesetCoordinator {
                 ),
             ));
         }
-        drop(state);
-
-        let mut state = self.state.lock().await;
 
         // Retire anything past its approval deadline before doing anything else.
         //
@@ -730,8 +733,12 @@ impl ChangesetCoordinator {
     /// so on to exercise sweeps and refusals, and walking each one through the
     /// full lifecycle would obscure what they are actually asserting.
     ///
-    /// Behind a feature so a server cannot reach it by accident: the point of
-    /// the policy is that production has exactly one creation door.
+    /// Behind a feature to keep it out of an ordinary build — but a feature is
+    /// **not** a security boundary, and this must not be read as one. Cargo
+    /// features are additive: if any crate in a build enables
+    /// `mecmcp-changeset/test-util`, this becomes available to every user of
+    /// the package in that build. It is a signpost, not a lock. The boundary
+    /// that does hold is `insert_change_set` accepting only `Planned`.
     ///
     /// Still refuses to overwrite an existing id — seeding is creation too.
     ///

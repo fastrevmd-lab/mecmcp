@@ -454,10 +454,19 @@ pub fn write_state(
         // apply is in flight, so a rollback performed *during* an apply is
         // exactly when the file would carry one — the moment an unreadable
         // state file hurts most.
+        //
+        // `apply_without_handle` belongs in the same list, and for the sharpest
+        // version of `task_id`'s reason. It is only ever `true` while an apply
+        // with no vendor handle is in flight, so a rollback performed during
+        // one is exactly when the file carries it — and unlike `task_id`, that
+        // record cannot be settled by re-probing, so the file being unreadable
+        // is the difference between "a human checks the guest" and "nothing can
+        // read the state at all".
         !cs.policy_signature.is_empty()
             || !cs.targets.is_empty()
             || cs.preview.is_some()
             || cs.task_id.is_some()
+            || cs.apply_without_handle
     });
     // A non-HTTPS endpoint is a version-2 record too. It is not a new *field*,
     // but the version-1 reader validated `starts_with("https://")` and would

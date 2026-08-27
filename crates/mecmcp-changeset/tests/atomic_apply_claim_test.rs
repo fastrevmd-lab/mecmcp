@@ -454,3 +454,48 @@ async fn a_write_decided_against_a_stale_read_is_refused() {
         "the claim must survive a stale cancellation"
     );
 }
+
+/// The production insert refuses a duplicate id, and does so under one lock.
+///
+/// The earlier test for this went through the test-only seeding door, so it
+/// never exercised `insert_change_set` — and the first version of that guard
+/// took its own lock, checked, released it, and inserted later, which is the
+/// same check-then-act race the rest of this change removes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_inserts_of_one_id_do_not_both_land() {
+    // Enough rounds that a broken implementation is caught reliably rather than
+    // occasionally: at 25 it failed roughly one run in three, which is a test
+    // that reports "fine" on code that is not.
+    for round in 0..250 {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = coordinator(dir.path()).await;
+        let id = "7".repeat(64);
+
+        let gate = Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = Vec::new();
+        for n in 0..8 {
+            let coord = Arc::clone(&coord);
+            let gate = Arc::clone(&gate);
+            let id = id.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut record = planned(&id);
+                // Distinct owners, so the one-pending-per-principal guard is
+                // not what refuses these. The id check has to be.
+                record.owner = format!("owner-{n}");
+                gate.wait().await;
+                coord.insert_change_set(record).await.is_ok()
+            }));
+        }
+        let mut landed = 0;
+        for task in tasks {
+            if task.await.unwrap() {
+                landed += 1;
+            }
+        }
+        assert_eq!(
+            landed, 1,
+            "round {round}: one id, one record; {landed} inserts landed, so a \
+             later insert overwrote an earlier one"
+        );
+    }
+}
