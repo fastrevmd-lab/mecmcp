@@ -499,3 +499,118 @@ async fn concurrent_inserts_of_one_id_do_not_both_land() {
         );
     }
 }
+
+/// `Applied` is written before diff, validation and commit, so a later failure
+/// has to be able to correct it.
+///
+/// The closed table forbade this at first, which broke rustjunosmcp at runtime
+/// while every test here stayed green: its `settle_change_set` exists to stop a
+/// record claiming a change landed when it did not, on the grounds that a
+/// wedged device is recoverable by an operator and a false `Applied` is not.
+#[tokio::test]
+async fn an_applied_record_can_still_be_corrected_to_failed() {
+    use mecmcp_changeset::change_set_transition_allowed as allowed;
+    assert!(allowed(ChangeSetState::Applied, ChangeSetState::Failed));
+    // ...and it opens no way back to a claimable state.
+    assert!(!allowed(ChangeSetState::Failed, ChangeSetState::Approved));
+    assert!(!allowed(ChangeSetState::Failed, ChangeSetState::Applying));
+
+    let dir = tempfile::tempdir().unwrap();
+    let coord = coordinator(dir.path()).await;
+    let id = "8".repeat(64);
+    seed_approved(&coord, &id).await;
+    let mut record = coord
+        .claim_change_set_for_apply(&id, "vsrx-ci", ApplyHandle::Expected)
+        .await
+        .unwrap();
+    let observed = record.state;
+    record.state = ChangeSetState::Applied;
+    coord
+        .update_change_set_from(observed, record.clone())
+        .await
+        .unwrap();
+
+    record.state = ChangeSetState::Failed;
+    coord
+        .update_change_set_from(ChangeSetState::Applied, record)
+        .await
+        .expect("a settled-too-early Applied must be correctable to Failed");
+}
+
+/// The handleless marker is cleared once the record leaves `Applying`.
+///
+/// It answers "is this in-flight outcome unknown?", so on a settled record it
+/// is noise — and expensive noise, because its presence forces a schema version
+/// an older binary cannot read.
+#[tokio::test]
+async fn the_handleless_marker_does_not_outlive_the_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = coordinator(dir.path()).await;
+    let id = "a".repeat(63) + "b";
+    seed_approved(&coord, &id).await;
+    coord
+        .claim_change_set_for_apply(&id, "vsrx-ci", ApplyHandle::None)
+        .await
+        .unwrap();
+
+    let mut record = coord.change_set(&id, "vsrx-ci").await.unwrap();
+    assert!(record.apply_without_handle, "set while in flight");
+
+    // A caller that settles by writing `state` alone must not leave it behind.
+    let observed = record.state;
+    record.state = ChangeSetState::Failed;
+    coord
+        .update_change_set_from(observed, record)
+        .await
+        .unwrap();
+
+    assert!(
+        !coord
+            .change_set(&id, "vsrx-ci")
+            .await
+            .unwrap()
+            .apply_without_handle,
+        "the marker must not outlive the apply it described"
+    );
+}
+
+/// A file carrying the handleless marker must declare version 5.
+///
+/// `ChangeSetRecord` is `deny_unknown_fields`, so a binary that predates the
+/// field rejects the whole file over it. 0.21.0 accepts versions 1..=4, and
+/// version selection takes the highest match — so listing the field among the
+/// version-2 conditions achieved nothing: a record with a real approval is
+/// version 4 regardless, and 0.21.0 would read that as a supported schema and
+/// then fail on the unknown field. The gate is only a gate if the version moves
+/// past what the old reader accepts.
+#[tokio::test]
+async fn a_handleless_apply_forces_a_state_file_version_older_readers_refuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+    let coord = coordinator(dir.path()).await;
+    let id = "c".repeat(64);
+    seed_approved(&coord, &id).await;
+
+    let before: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let before_version = before["version"].as_u64().unwrap();
+    assert!(
+        before_version <= 4,
+        "an ordinary approved record should still write a version an older \
+         binary reads, got {before_version}"
+    );
+
+    coord
+        .claim_change_set_for_apply(&id, "vsrx-ci", ApplyHandle::None)
+        .await
+        .unwrap();
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        after["version"].as_u64().unwrap(),
+        5,
+        "a file carrying apply_without_handle must declare version 5, or a \
+         0.21.0 binary reads it as supported and then rejects the record"
+    );
+}

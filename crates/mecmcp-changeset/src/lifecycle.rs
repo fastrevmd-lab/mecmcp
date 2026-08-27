@@ -98,7 +98,19 @@ pub const fn change_set_transition_allowed(from: ChangeSetState, to: ChangeSetSt
         // these out and did exactly that.
         (S::Expired | S::Failed, S::Cancelled) => true,
 
-        // Terminal. `Applied` and `Cancelled` are ends.
+        // `Applied` is written after staging but before diff, validation and
+        // commit, so a later step failing has to be able to correct it.
+        // rustjunosmcp does exactly that — its `settle_change_set` exists to
+        // stop a record claiming a change landed when it did not, on the
+        // grounds that a wedged device is recoverable by an operator and a
+        // false `Applied` is not. Forbidding this edge broke that at runtime
+        // while every test here stayed green.
+        //
+        // It opens no route back: `Failed` reaches only `Cancelled`.
+        (S::Applied, S::Failed) => true,
+
+        // Terminal. `Cancelled` is an end, and `Applied` now has the one exit
+        // above.
         _ => false,
     }
 }

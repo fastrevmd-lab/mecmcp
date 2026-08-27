@@ -153,8 +153,15 @@ async fn lapsed_waiver_frees_the_owners_pending_slot() {
         .await
         .unwrap();
 
+    // The replacement goes through the production door on purpose. Seeding it
+    // skips the expiry sweep and the pending-slot check, which are exactly what
+    // this test asserts about — it passed either way, which made it vacuous.
+    let mut replacement = waived_record("d", OWNER, Some(now() + 600), now());
+    replacement.state = ChangeSetState::Planned;
+    replacement.approval = None;
+    replacement.approver = None;
     coordinator
-        .seed_change_set_for_test(waived_record("d", OWNER, Some(now() + 600), now()))
+        .insert_change_set(replacement)
         .await
         .expect("a lapsed waiver must not block a replacement change set");
 }

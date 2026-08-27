@@ -553,7 +553,7 @@ impl ChangesetCoordinator {
 
         // Every boundary the record crosses into the store normalises, so no
         // caller can seed `Some("")` here either.
-        let record = normalise_task_handle(record);
+        let record = normalise_apply_marker(normalise_task_handle(record));
 
         // A change set is created `Planned`. Every later state is reached by a
         // transition the policy governs, so accepting one here would be a door
@@ -888,7 +888,7 @@ impl ChangesetCoordinator {
                 ),
             ));
         }
-        let record = normalise_task_handle(record);
+        let record = normalise_apply_marker(normalise_task_handle(record));
         check_change_set_write(state.change_sets.get(&id), &record, WriteVia::Update)?;
         let previous = state.change_sets.insert(id.clone(), record);
         if let Err(error) = self.persist_locked(&state) {
@@ -921,7 +921,7 @@ impl ChangesetCoordinator {
         // `Some("")` from `change_set()` while the file holds `None` — and a
         // restart would then observe a different record than the running
         // process reports. Memory and file must agree.
-        let record = normalise_task_handle(record);
+        let record = normalise_apply_marker(normalise_task_handle(record));
 
         check_change_set_write(state.change_sets.get(&id), &record, WriteVia::Update)?;
 
@@ -1071,6 +1071,20 @@ fn check_change_set_write(
     }
 
     Ok(())
+}
+
+/// Clear the handleless marker once the record is no longer in flight.
+///
+/// It answers one question — "is this `Applying` record's outcome unknown?" —
+/// so on a settled record it is noise, and expensive noise: the field forces a
+/// version-5 state file, which a binary predating it cannot read. A caller that
+/// settles a record by writing `state` alone would otherwise leave it set
+/// forever and pin the whole file to v5 for nothing.
+fn normalise_apply_marker(mut record: ChangeSetRecord) -> ChangeSetRecord {
+    if record.state != ChangeSetState::Applying {
+        record.apply_without_handle = false;
+    }
+    record
 }
 
 fn normalise_task_handle(mut record: ChangeSetRecord) -> ChangeSetRecord {
