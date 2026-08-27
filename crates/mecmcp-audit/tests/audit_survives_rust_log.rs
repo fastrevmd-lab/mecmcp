@@ -49,11 +49,18 @@ fn run_as_child(audit_log: &Path) {
     .expect("installation must succeed");
     assert!(sink.is_some(), "the rotation handle must be returned");
 
-    // Exactly the shape a server emits for a privileged mutation.
+    // The field names matter, not just the target. `EnvFilter` supports
+    // field-qualified directives, so a record carrying `tool` can be aimed at
+    // by `audit[{tool}]=off` in a way a bare target filter cannot reach. This
+    // mirrors what the servers actually emit — rust-proxmoxmcp's token audit
+    // record is `tool="token_set_scopes" action=... result=...` — so the
+    // hostile-filter test below is exercising the real shape rather than a
+    // synthetic one that happens to have no matching field.
     tracing::info!(
         target: "audit",
-        event = "token_set_scopes",
-        actor = "operator",
+        tool = "token_set_scopes",
+        action = "set_scopes",
+        result = "ok",
         "scopes widened"
     );
 
@@ -102,6 +109,50 @@ fn a_target_specific_rust_log_does_not_silence_the_audit_trail() {
          was recorded nowhere.\naudit file: {written:?}\nchild stderr: {}",
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+/// The filters that were specifically aimed at the audit trail.
+///
+/// A target-name filter is the accidental case — someone debugging one crate.
+/// These are the deliberate ones. `audit=off` names the target; `audit[{tool}]=off`
+/// is worse, because `EnvFilter` picks the most specific matching directive, so a
+/// field-qualified value beats a target-only one. rust-proxmoxmcp measured exactly
+/// that against its token CLI: `audit=off` left the record, `audit[{tool}]=off`
+/// removed it while the scope widening still applied.
+///
+/// The fix has to be structural for this reason. Adding an `audit=info`
+/// directive to the parsed filter loses to the *field-qualified* one: EnvFilter
+/// orders directives by target length, then span presence, then field count, so
+/// `audit[{tool}]=off` sorts ahead of a target-only directive and wins whatever
+/// the insertion order. (Against a bare `audit=off` the added directive has
+/// equal specificity and merely replaces it, so that case would have been
+/// survivable — which is exactly why testing only the bare form would have let
+/// the weaker fix through.) Taking the filter off the audit layers entirely
+/// loses to none of them.
+#[test]
+fn a_filter_aimed_at_the_audit_target_cannot_silence_it() {
+    for hostile in ["audit=off", "audit[{tool}]=off", "off", "audit=error"] {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = dir.path().join("audit.log");
+        let exe = std::env::current_exe().unwrap();
+        let output = Command::new(&exe)
+            .args([CHILD_TEST_NAME, "--exact", "--ignored", "--nocapture"])
+            .env("RUST_LOG", hostile)
+            .env(CHILD_MARKER, audit_log.to_str().unwrap())
+            .output()
+            .expect("the child must run");
+        assert!(
+            output.status.success(),
+            "child failed under RUST_LOG={hostile}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let written = std::fs::read_to_string(&audit_log).unwrap_or_default();
+        assert!(
+            written.contains("token_set_scopes"),
+            "RUST_LOG={hostile} silenced the audit trail. An environment variable \
+             must not be able to aim at the audit target and hit it.\naudit file: {written:?}"
+        );
+    }
 }
 
 /// The console layer must still honour `RUST_LOG`, or the fix would have traded
