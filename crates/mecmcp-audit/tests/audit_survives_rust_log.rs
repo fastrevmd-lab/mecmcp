@@ -120,9 +120,15 @@ fn a_target_specific_rust_log_does_not_silence_the_audit_trail() {
 /// that against its token CLI: `audit=off` left the record, `audit[{tool}]=off`
 /// removed it while the scope widening still applied.
 ///
-/// The fix has to be structural for this reason. Adding an `audit=info` directive
-/// to the parsed filter would lose to both of these; taking the filter off the
-/// audit layers entirely does not.
+/// The fix has to be structural for this reason. Adding an `audit=info`
+/// directive to the parsed filter loses to the *field-qualified* one: EnvFilter
+/// orders directives by target length, then span presence, then field count, so
+/// `audit[{tool}]=off` sorts ahead of a target-only directive and wins whatever
+/// the insertion order. (Against a bare `audit=off` the added directive has
+/// equal specificity and merely replaces it, so that case would have been
+/// survivable — which is exactly why testing only the bare form would have let
+/// the weaker fix through.) Taking the filter off the audit layers entirely
+/// loses to none of them.
 #[test]
 fn a_filter_aimed_at_the_audit_target_cannot_silence_it() {
     for hostile in ["audit=off", "audit[{tool}]=off", "off", "audit=error"] {
