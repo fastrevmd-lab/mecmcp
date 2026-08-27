@@ -696,6 +696,7 @@ mod tests {
             targets: vec![],
             preview: None,
             task_id: None,
+            apply_without_handle: false,
         };
 
         // One second before expiry: still valid

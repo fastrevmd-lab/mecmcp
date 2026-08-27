@@ -27,6 +27,10 @@ url          = "2"
 
 [dev-dependencies]
 hex = "0.4"
+# `rt-multi-thread` for tests only. The atomic-claim test has to be able to
+# fail: on a current-thread runtime the claimants never interleave, so a
+# non-atomic claim would pass it.
+tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 

@@ -169,6 +169,7 @@ impl ChangesetCoordinator {
             preview: None,
             // No apply has begun, so there is no vendor task to re-probe.
             task_id: None,
+            apply_without_handle: false,
         };
 
         self.insert_change_set(record.clone()).await?;

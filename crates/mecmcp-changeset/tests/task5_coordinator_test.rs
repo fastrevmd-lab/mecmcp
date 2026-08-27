@@ -89,6 +89,7 @@ fn make_change_set_record(id: &str, state: ChangeSetState) -> ChangeSetRecord {
         targets: Vec::new(),
         preview: None,
         task_id: None,
+        apply_without_handle: false,
     }
 }
 

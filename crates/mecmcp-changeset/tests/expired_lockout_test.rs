@@ -50,6 +50,7 @@ fn record(
         targets: Vec::new(),
         preview: None,
         task_id: None,
+        apply_without_handle: false,
     }
 }
 

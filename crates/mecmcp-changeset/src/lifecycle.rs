@@ -50,6 +50,21 @@ impl LifecycleState {
     }
 }
 
+/// Whether an apply is expected to produce a vendor task handle.
+///
+/// Passed to [`crate::ChangesetCoordinator::claim_change_set_for_apply`], and
+/// what it records decides how a crashed apply is read at the next start. See
+/// [`crate::ChangeSetRecord::apply_without_handle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyHandle {
+    /// The operation ends in a handle — a UPID, a commit token — that the
+    /// caller will persist before polling.
+    Expected,
+    /// The operation has no handle to persist, so a crash mid-apply leaves an
+    /// outcome only the device knows.
+    None,
+}
+
 /// Lifecycle state of a change set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

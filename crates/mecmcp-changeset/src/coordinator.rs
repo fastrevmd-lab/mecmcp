@@ -1,5 +1,6 @@
 //! Changeset coordinator for managing in-memory state and endpoint locking.
 
+use crate::lifecycle::ApplyHandle;
 use crate::{
     lifecycle::{ChangeSetState, LifecycleState},
     persistence::{ChangesetState, PersistenceError, read_state, write_state},
@@ -296,7 +297,16 @@ impl ChangesetCoordinator {
                 record.task_id = None;
                 recovered = true;
             }
-            if record.state == ChangeSetState::Applying && record.task_id.is_none() {
+            // ...unless the apply never had a handle to write. Then `Applying`
+            // with none is not evidence that nothing started; it is the state
+            // that says only the device knows, and settling it as `Failed`
+            // would assert an outcome nobody observed on an operation that is
+            // usually not idempotent. It also keeps the approval spent, which
+            // is the point: a record left `Approved` could run again.
+            if record.state == ChangeSetState::Applying
+                && record.task_id.is_none()
+                && !record.apply_without_handle
+            {
                 record.state = ChangeSetState::Failed;
                 recovered = true;
             }
@@ -676,6 +686,76 @@ impl ChangesetCoordinator {
             ));
         }
         Ok(record.clone())
+    }
+
+    /// Atomically claim an approved change set for apply.
+    ///
+    /// Checking `Approved` with `change_set()` and then writing `Applying` with
+    /// `update_change_set()` is two operations, and the lock is released
+    /// between them. Two applies could therefore both read `Approved`, both
+    /// pass the check, and both execute — one approval, two executions. The
+    /// second write could also land on top of an `Applied` written by the
+    /// first, erasing the outcome.
+    ///
+    /// For a destroy that is close to harmless, because a second destroy of an
+    /// absent guest fails. For an operation that runs an arbitrary command it
+    /// is not harmless at all, which is why this exists.
+    ///
+    /// The check and the transition happen under one lock here, so exactly one
+    /// caller can move a record out of `Approved`. Everyone else is refused and
+    /// told which state they lost to.
+    ///
+    /// Pass [`ApplyHandle::None`] when the operation produces no vendor task
+    /// handle; see [`ChangeSetRecord::apply_without_handle`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the change set is unknown, belongs to another
+    /// device, is not `Approved`, or if persistence fails. On persistence
+    /// failure the in-memory claim is rolled back, so a failed claim never
+    /// leaves a record that no one is applying stuck in `Applying`.
+    pub async fn claim_change_set_for_apply(
+        &self,
+        id: &str,
+        device: &str,
+        handle: ApplyHandle,
+    ) -> Result<ChangeSetRecord, CoordinatorError> {
+        validate_operation_id(id)?;
+        let mut state = self.state.lock().await;
+        let record = state
+            .change_sets
+            .get(id)
+            .ok_or_else(|| CoordinatorError::new("change_set_id", "unknown change set"))?;
+        if record.device != device {
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                "change set belongs to another device",
+            ));
+        }
+        if record.state != ChangeSetState::Approved {
+            // Naming the state it is in matters: "already applying" and
+            // "expired" send the caller to different places, and a caller that
+            // lost a race needs to know it was a race.
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                format!(
+                    "change set is {:?}, not Approved; it cannot be claimed for apply",
+                    record.state
+                ),
+            ));
+        }
+
+        let previous = record.clone();
+        let mut claimed = previous.clone();
+        claimed.state = ChangeSetState::Applying;
+        claimed.apply_without_handle = matches!(handle, ApplyHandle::None);
+        state.change_sets.insert(id.to_owned(), claimed.clone());
+
+        if let Err(error) = self.persist_locked(&state) {
+            state.change_sets.insert(id.to_owned(), previous);
+            return Err(error);
+        }
+        Ok(claimed)
     }
 
     /// Updates an existing change-set record.
