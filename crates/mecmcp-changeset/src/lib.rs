@@ -26,7 +26,7 @@ pub use commit_metadata::{
     AttachOutcome, CommitMetaError, CommitMetadataSink, apply_commit_metadata,
 };
 pub use coordinator::{ChangesetCoordinator, CoordinatorError, StagedRecovery};
-pub use lifecycle::{ApplyHandle, ChangeSetState, LifecycleState};
+pub use lifecycle::{ApplyHandle, ChangeSetState, LifecycleState, change_set_transition_allowed};
 pub use operation::StageOutput;
 pub use persistence::{ChangesetState, PersistenceError, read_state, validate_state, write_state};
 pub use records::{

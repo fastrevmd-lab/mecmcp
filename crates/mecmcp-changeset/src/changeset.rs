@@ -233,8 +233,9 @@ impl ChangesetCoordinator {
 
         let now = now_unix()?;
         if now >= record.expires_at_unix {
+            let observed = record.state;
             record.state = ChangeSetState::Expired;
-            self.update_change_set(record).await?;
+            self.update_change_set_from(observed, record).await?;
             return Err(CoordinatorError::new(
                 "change_set_id",
                 "change-set approval window expired",
@@ -270,6 +271,7 @@ impl ChangesetCoordinator {
             now,
         );
 
+        let observed = record.state;
         record.state = ChangeSetState::Approved;
         record.approver = Some(approver.clone());
         record.approval = Some(ApprovalRecord {
@@ -279,7 +281,8 @@ impl ChangesetCoordinator {
             waived: None,
         });
 
-        self.update_change_set(record.clone()).await?;
+        self.update_change_set_from(observed, record.clone())
+            .await?;
 
         // A human decided. Recorded after the state write, so the trail cannot
         // claim an approval the coordinator failed to persist.
@@ -345,8 +348,9 @@ impl ChangesetCoordinator {
 
         let now = now_unix()?;
         if now >= record.expires_at_unix {
+            let observed = record.state;
             record.state = ChangeSetState::Expired;
-            self.update_change_set(record).await?;
+            self.update_change_set_from(observed, record).await?;
             return Err(CoordinatorError::new(
                 "change_set_id",
                 "change-set approval window expired",
@@ -375,6 +379,7 @@ impl ChangesetCoordinator {
         let waiver_digest =
             compute_waiver_digest_v3(&change_set_id, &record.digest, &record.owner, now, &waiver);
 
+        let observed = record.state;
         record.state = ChangeSetState::Approved;
         record.approver = None;
         record.approval = Some(ApprovalRecord {
@@ -384,7 +389,8 @@ impl ChangesetCoordinator {
             waived: Some(waiver),
         });
 
-        self.update_change_set(record.clone()).await?;
+        self.update_change_set_from(observed, record.clone())
+            .await?;
 
         // Every prod server in this fleet runs lab mode, so this — not
         // `approve_change_set` — is the path a real change takes. Emitting
@@ -462,8 +468,9 @@ impl ChangesetCoordinator {
 
         let now = now_unix()?;
         if now >= record.expires_at_unix {
+            let observed = record.state;
             record.state = ChangeSetState::Expired;
-            self.update_change_set(record).await?;
+            self.update_change_set_from(observed, record).await?;
             return Err(CoordinatorError::new(
                 "change_set_id",
                 "change-set approval window expired",
@@ -502,6 +509,7 @@ impl ChangesetCoordinator {
         let waiver_digest =
             compute_waiver_digest_v3(&change_set_id, &record.digest, &record.owner, now, &waiver);
 
+        let observed = record.state;
         record.state = ChangeSetState::Approved;
         record.approver = None;
         record.approval = Some(ApprovalRecord {
@@ -511,7 +519,8 @@ impl ChangesetCoordinator {
             waived: Some(waiver),
         });
 
-        self.update_change_set(record.clone()).await?;
+        self.update_change_set_from(observed, record.clone())
+            .await?;
 
         // Same reasoning as the lab-mode path, and more pointed: an operator
         // waiver is a bounded, ticketed exception, and the trail is where that
@@ -556,8 +565,10 @@ impl ChangesetCoordinator {
             && crate::apply::waiver_lapsed(record, now);
 
         if approval_ttl_passed || waiver_lapsed {
+            let observed = record.state;
             record.state = ChangeSetState::Expired;
-            self.update_change_set(record.clone()).await?;
+            self.update_change_set_from(observed, record.clone())
+                .await?;
         }
 
         Ok(())
@@ -677,8 +688,10 @@ impl ChangesetCoordinator {
         }
 
         // Transition to Cancelled (valid from Planned, Approved, Expired, or Failed)
+        let observed = record.state;
         record.state = ChangeSetState::Cancelled;
-        self.update_change_set(record.clone()).await?;
+        self.update_change_set_from(observed, record.clone())
+            .await?;
 
         Ok(record.into())
     }

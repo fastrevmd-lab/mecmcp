@@ -279,12 +279,171 @@ async fn a_handleless_applying_record_cannot_be_returned_to_approved() {
         .update_change_set(reopened)
         .await
         .expect_err("a handleless apply must not be re-approved");
+    // The table refuses this outright now, for every `Applying` record rather
+    // than only handleless ones: there is no edge back to `Approved` at all,
+    // which is what keeps an approval spent once it has been claimed.
     assert!(
-        error.to_string().contains("second execution"),
-        "the refusal should say why, got: {error}"
+        error
+            .to_string()
+            .contains("not a permitted change-set transition"),
+        "the refusal should come from the transition policy, got: {error}"
     );
     assert_eq!(
         coord.change_set(&id, "vsrx-ci").await.unwrap().state,
         ChangeSetState::Applying
+    );
+}
+
+/// Every laundering route the review gate found, closed by one policy.
+///
+/// The version before this one rejected two *edges* and left the graph open.
+/// Each case below reached `Applying`, or reached a claimable state from an
+/// in-flight one, without ever writing the forbidden edge directly.
+#[tokio::test]
+async fn the_transition_policy_closes_the_indirect_routes() {
+    use ChangeSetState as S;
+    use mecmcp_changeset::change_set_transition_allowed as allowed;
+
+    // Approved -> anything -> Applying: the intermediate hop is what made the
+    // two-edge guard useless.
+    for hop in [S::Failed, S::Planned, S::Cancelled, S::Expired, S::Applied] {
+        assert!(
+            !allowed(S::Approved, hop) || !allowed(hop, S::Applying),
+            "Approved -> {hop:?} -> Applying is a route back into Applying"
+        );
+    }
+
+    // Nothing returns to Approved. An approval is spent once claimed.
+    for from in [S::Applying, S::Applied, S::Failed, S::Expired, S::Cancelled] {
+        assert!(
+            !allowed(from, S::Approved),
+            "{from:?} -> Approved would make a spent approval claimable again"
+        );
+    }
+
+    // Applying is reachable from nowhere in the table at all: the claim owns it.
+    for from in [
+        S::Planned,
+        S::Approved,
+        S::Applied,
+        S::Failed,
+        S::Expired,
+        S::Cancelled,
+    ] {
+        assert!(
+            !allowed(from, S::Applying),
+            "{from:?} -> Applying must go through the claim, not the table"
+        );
+    }
+
+    // ...while the lifecycle the servers actually use still works.
+    assert!(allowed(S::Planned, S::Approved));
+    assert!(allowed(S::Planned, S::Expired));
+    assert!(allowed(S::Approved, S::Cancelled));
+    assert!(allowed(S::Applying, S::Applied));
+    assert!(allowed(S::Applying, S::Failed));
+    assert!(allowed(S::Expired, S::Cancelled));
+    assert!(allowed(S::Failed, S::Cancelled));
+}
+
+/// Clearing the handleless marker in place was the other laundering route:
+/// `Applying(true) -> Applying(false)` is an allowed edge, and it would have
+/// removed the only thing keeping that record out of reach.
+#[tokio::test]
+async fn the_handleless_marker_cannot_be_cleared_while_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = coordinator(dir.path()).await;
+    let id = "1".repeat(64);
+    coord.insert_change_set(approved(&id)).await.unwrap();
+    coord
+        .claim_change_set_for_apply(&id, "vsrx-ci", ApplyHandle::None)
+        .await
+        .unwrap();
+
+    let mut laundered = coord.change_set(&id, "vsrx-ci").await.unwrap();
+    laundered.apply_without_handle = false;
+    let error = coord
+        .update_change_set(laundered)
+        .await
+        .expect_err("the marker must not be clearable in flight");
+    assert!(
+        error.to_string().contains("second execution"),
+        "got: {error}"
+    );
+    assert!(
+        coord
+            .change_set(&id, "vsrx-ci")
+            .await
+            .unwrap()
+            .apply_without_handle
+    );
+}
+
+/// Insert creates; it does not overwrite. Replacing a live record through that
+/// door would skip the policy entirely.
+#[tokio::test]
+async fn insert_cannot_overwrite_a_live_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = coordinator(dir.path()).await;
+    let id = "2".repeat(64);
+    coord.insert_change_set(approved(&id)).await.unwrap();
+    coord
+        .claim_change_set_for_apply(&id, "vsrx-ci", ApplyHandle::None)
+        .await
+        .unwrap();
+
+    // A different owner on purpose. The one-pending-per-principal check would
+    // otherwise refuse this first, and that check is not the guarantee: it
+    // matches on owner and device, so an overwrite that changes either slips
+    // straight past it. This is the case the review gate named.
+    let mut reset = approved(&id);
+    reset.owner = "someone-else".to_owned();
+    reset.state = ChangeSetState::Approved;
+    let error = coord
+        .insert_change_set(reset)
+        .await
+        .expect_err("insert must not overwrite an existing record");
+    assert!(
+        error.to_string().contains("already exists"),
+        "the id guard must be what refuses this, not the pending-principal \
+         check, which an overwrite can sidestep by changing owner: {error}"
+    );
+    assert_eq!(
+        coord.change_set(&id, "vsrx-ci").await.unwrap().state,
+        ChangeSetState::Applying
+    );
+}
+
+/// A write decided against a stale snapshot must not land.
+///
+/// Every lifecycle method reads, decides, then writes with the lock released in
+/// between. A cancellation that decided a record was cancellable would
+/// otherwise erase a claim that happened in that gap.
+#[tokio::test]
+async fn a_write_decided_against_a_stale_read_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = coordinator(dir.path()).await;
+    let id = "3".repeat(64);
+    coord.insert_change_set(approved(&id)).await.unwrap();
+
+    // What a canceller read before deciding.
+    let stale = coord.change_set(&id, "vsrx-ci").await.unwrap();
+    // ...and the claim that beat it to the record.
+    coord
+        .claim_change_set_for_apply(&id, "vsrx-ci", ApplyHandle::Expected)
+        .await
+        .unwrap();
+
+    let mut cancelled = stale.clone();
+    cancelled.state = ChangeSetState::Cancelled;
+    let error = coord
+        .update_change_set_from(stale.state, cancelled)
+        .await
+        .expect_err("a decision made against Approved must not apply to Applying");
+    assert!(error.to_string().contains("moved to"), "got: {error}");
+    assert_eq!(
+        coord.change_set(&id, "vsrx-ci").await.unwrap().state,
+        ChangeSetState::Applying,
+        "the claim must survive a stale cancellation"
     );
 }
