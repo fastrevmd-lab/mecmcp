@@ -256,9 +256,32 @@ fn an_insert_carries_a_dedup_token_for_its_segment() {
 
     let token = dedup_token("junos-950", "run-7", 42);
 
+    // Exact value, not a `contains` check. The token's byte-for-byte layout is
+    // normative -- ssdf's audit-evidence-contract-v1.md pins it, and ssdf's
+    // Python `audit_chain.dedup_token` asserts these same two vectors. A
+    // `contains` assertion passes for any layout carrying these substrings, so
+    // it cannot catch a divergence, and a divergent token means ClickHouse sees
+    // a retry as a NEW block and lands the duplicate this exists to prevent.
+    assert_eq!(
+        token, "9:junos-950:5:run-7:42",
+        "the token layout is fixed by the SSDF evidence contract"
+    );
     assert!(
         token.contains("junos-950") && token.contains("run-7") && token.contains("42"),
         "the token should stay legible for debugging: {token}"
+    );
+
+    // The length prefix counts UTF-8 BYTES, not characters. `str::len()` is
+    // already bytes, so this holds today -- it is pinned because the mistake is
+    // invisible in ASCII and has been made before: ssdf's Python copy counted
+    // code points (`len(str)`) and had to be corrected to
+    // `len(s.encode("utf-8"))`. Nothing else in this suite uses a non-ASCII
+    // identifier, so without this vector a `chars().count()` "simplification"
+    // would pass every test here while silently diverging from the contract.
+    assert_eq!(
+        dedup_token("café", "run-7", 0),
+        "5:café:5:run-7:0",
+        "café is 4 chars but 5 bytes; the prefix must be the byte length"
     );
     assert_ne!(
         dedup_token("junos-950", "run-7", 42),
