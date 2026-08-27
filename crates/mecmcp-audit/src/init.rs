@@ -257,6 +257,22 @@ pub fn init_tracing(cfg: &AuditConfig) -> io::Result<Option<AuditFileSink>> {
             .with_writer(std::io::stderr)
             .boxed(),
     };
+    // The environment filter is attached to the console layer, **not** to the
+    // registry (#330).
+    //
+    // As a registry layer it decided whether an event existed at all, so it
+    // gated the audit sinks too — and a `RUST_LOG` that names a target, which
+    // is the ordinary way to turn up logging for one crate, produces a filter
+    // that does not enable the `audit` target. Every `target: "audit"` event
+    // was then discarded while the operation it described still happened:
+    // measured on rust-proxmoxmcp, widening a token's scope wrote zero audit
+    // lines under `RUST_LOG=rust_proxmoxmcp=debug` and applied the mutation.
+    //
+    // Per-layer, it controls console verbosity only. The audit file and
+    // journald layers keep their own `is_audit` filters and are reachable
+    // regardless of what the environment says, so `RUST_LOG` can still make
+    // logging noisier and can no longer make the security trail disappear.
+    let stderr = stderr.with_filter(env);
     // `?`, not `.ok()`. See the note on this function.
     let file_handle = cfg
         .audit_log_file
@@ -268,7 +284,6 @@ pub fn init_tracing(cfg: &AuditConfig) -> io::Result<Option<AuditFileSink>> {
         make_journald_layer_with(cfg.journald, tracing_journald::layer)?.map(audit_journald_layer);
 
     let subscriber = tracing_subscriber::registry()
-        .with(env)
         .with(stderr)
         .with(file_layer)
         .with(journald_layer);
