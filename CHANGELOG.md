@@ -29,6 +29,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-27
+
+First hand-written entry, as the header below asks for.
+
+### Security
+
+- **audit** — `RUST_LOG` can no longer switch the audit trail off (#330).
+  `init_tracing` attached the environment filter to the tracing *registry*,
+  where it decides whether an event exists at all, so it gated the audit file
+  and journald sinks as well as the console. A `RUST_LOG` value that names a
+  target — the ordinary way to turn up logging for one crate — produces a
+  filter that does not enable the `audit` target, and every `target: "audit"`
+  event was discarded while the operation it described still happened.
+
+  Measured on rust-proxmoxmcp: widening a token's scope wrote one audit line
+  with `RUST_LOG` unset and **zero** under `RUST_LOG=rust_proxmoxmcp=debug`.
+  The token store was updated both times and stderr stayed empty.
+
+  This reached every server, since `init_tracing` is the single entry point all
+  five use — tool calls, change-set approvals, applies, evidence emission.
+
+  The filter now sits on the console layer. The audit layers keep their own
+  `is_audit` filters and declare no max-level hint, so registry interest
+  resolves to *sometimes* rather than *never* and audit events reach them
+  whatever the environment says. `RUST_LOG` can still make logging noisier and
+  can no longer make the security trail disappear.
+
+  **Consumers should take this release.** No API changed, so the bump is a
+  dependency update, but until it is taken the trail stays switchable.
+
+
 ## [0.20.0] - 2026-08-25
 
 ### Added
