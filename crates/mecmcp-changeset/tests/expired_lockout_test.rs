@@ -76,7 +76,7 @@ async fn an_expired_change_set_does_not_block_a_new_one() {
         ChangeSetState::Approved,
         now() - 3600,
     );
-    coordinator.insert_change_set(stale).await.unwrap();
+    coordinator.seed_change_set_for_test(stale).await.unwrap();
 
     let fresh = record("b", "alice", "fw-01", ChangeSetState::Planned, now() + 900);
     coordinator
@@ -92,7 +92,7 @@ async fn a_live_change_set_still_blocks() {
     let coordinator = load_coordinator(&dir);
 
     let live = record("a", "alice", "fw-01", ChangeSetState::Approved, now() + 900);
-    coordinator.insert_change_set(live).await.unwrap();
+    coordinator.seed_change_set_for_test(live).await.unwrap();
 
     let second = record("b", "alice", "fw-01", ChangeSetState::Planned, now() + 900);
     let error = coordinator.insert_change_set(second).await.unwrap_err();
@@ -107,7 +107,7 @@ async fn the_refusal_names_the_blocking_change_set() {
 
     let live = record("a", "alice", "fw-01", ChangeSetState::Approved, now() + 900);
     let blocking_id = live.id.clone();
-    coordinator.insert_change_set(live).await.unwrap();
+    coordinator.seed_change_set_for_test(live).await.unwrap();
 
     let second = record("b", "alice", "fw-01", ChangeSetState::Planned, now() + 900);
     let error = coordinator.insert_change_set(second).await.unwrap_err();
@@ -145,7 +145,7 @@ async fn expiring_a_change_set_is_persisted_and_visible() {
         now() - 3600,
     );
     let stale_id = stale.id.clone();
-    coordinator.insert_change_set(stale).await.unwrap();
+    coordinator.seed_change_set_for_test(stale).await.unwrap();
 
     // Any insert triggers the sweep.
     let fresh = record("b", "alice", "fw-01", ChangeSetState::Planned, now() + 900);
@@ -213,7 +213,7 @@ async fn a_different_principal_is_unaffected() {
     let coordinator = load_coordinator(&dir);
 
     coordinator
-        .insert_change_set(record(
+        .seed_change_set_for_test(record(
             "a",
             "alice",
             "fw-01",
@@ -257,7 +257,10 @@ async fn an_applying_change_set_is_not_retired_by_its_deadline() {
         now() - 3600, // past its deadline, but the apply is still running
     );
     let in_flight_id = in_flight.id.clone();
-    coordinator.insert_change_set(in_flight).await.unwrap();
+    coordinator
+        .seed_change_set_for_test(in_flight)
+        .await
+        .unwrap();
 
     // A concurrent create must not free the slot out from under the apply.
     let error = coordinator
@@ -305,7 +308,7 @@ async fn a_sweep_survives_a_refused_insert() {
     // success path, which would hide the bug this test exists for. The refused
     // insert below must be the first one whose sweep touches the stale record.
     let blocker = record("b", "bob", "fw-02", ChangeSetState::Planned, now() + 900);
-    coordinator.insert_change_set(blocker).await.unwrap();
+    coordinator.seed_change_set_for_test(blocker).await.unwrap();
 
     // Retired by the sweep: past its deadline, owned by someone else. Already
     // stale when inserted — the sweep runs over the records already in the store,
@@ -318,7 +321,7 @@ async fn a_sweep_survives_a_refused_insert() {
         now() - 3600,
     );
     let stale_id = stale.id.clone();
-    coordinator.insert_change_set(stale).await.unwrap();
+    coordinator.seed_change_set_for_test(stale).await.unwrap();
 
     coordinator
         .insert_change_set(record(

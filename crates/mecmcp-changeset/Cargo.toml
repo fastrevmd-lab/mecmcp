@@ -25,6 +25,14 @@ rustix       = { workspace = true }
 tracing      = { workspace = true }
 url          = "2"
 
+[features]
+# Test-only seeding of records in states the public API will not create.
+# `insert_change_set` creates `Planned` only, because accepting any other state
+# is a door straight into the lifecycle the transition policy governs. Tests
+# still need records in `Expired`, `Applying` and so on, so they get an explicit
+# door rather than the production one being widened for their benefit.
+test-util = []
+
 [dev-dependencies]
 hex = "0.4"
 # `rt-multi-thread` for tests only. The atomic-claim test has to be able to
@@ -36,3 +44,26 @@ uuid = { workspace = true }
 
 [lints]
 workspace = true
+
+# Seeds records in states the public API will not create, so it needs the
+# test-only door; without this the default `cargo test` fails to compile it
+# rather than skipping it.
+[[test]]
+name = "atomic_apply_claim_test"
+required-features = ["test-util"]
+
+[[test]]
+name = "task5_coordinator_test"
+required-features = ["test-util"]
+
+[[test]]
+name = "waiver_lapse_test"
+required-features = ["test-util"]
+
+[[test]]
+name = "expired_lockout_test"
+required-features = ["test-util"]
+
+[[test]]
+name = "in_flight_recovery_test"
+required-features = ["test-util"]

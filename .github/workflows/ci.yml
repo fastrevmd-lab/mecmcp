@@ -42,7 +42,12 @@ jobs:
         run: cargo build --workspace
 
       - name: Run tests
-        run: cargo test --workspace
+        # `test-util` on both crates, or the tests behind it are silently not
+        # run. They are gated because they reach doors the public API does not
+        # offer -- seeding a change set in a state only the lifecycle can
+        # produce, and installing a tracing subscriber per thread -- and a gate
+        # that CI does not open is a test that does not exist.
+        run: cargo test --workspace --features mecmcp-audit/test-util,mecmcp-changeset/test-util
 
       - name: Build documentation
         run: cargo doc --workspace --no-deps

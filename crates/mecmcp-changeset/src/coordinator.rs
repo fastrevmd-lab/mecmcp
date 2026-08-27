@@ -555,6 +555,40 @@ impl ChangesetCoordinator {
         // caller can seed `Some("")` here either.
         let record = normalise_task_handle(record);
 
+        // A change set is created `Planned`. Every later state is reached by a
+        // transition the policy governs, so accepting one here would be a door
+        // straight into `Applying` with no claim.
+        if record.state != ChangeSetState::Planned {
+            return Err(CoordinatorError::new(
+                "state",
+                format!(
+                    "a change set is created Planned, not {:?}; later states are reached \
+                     through the lifecycle, and accepting one here would bypass the \
+                     transition policy",
+                    record.state
+                ),
+            ));
+        }
+
+        let state = self.state.lock().await;
+
+        // Before anything expires or is evicted. An existing id is refused
+        // whatever state it holds — otherwise, at capacity, an `Applying`
+        // record could be settled to `Failed`, evicted as terminal, and
+        // re-inserted under its own id as `Approved` to be claimed a second
+        // time. The review gate found that sequence.
+        if let Some(existing) = state.change_sets.get(&record.id) {
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                format!(
+                    "change set {} already exists in state {:?}; insert does not \
+                     overwrite, and lifecycle changes go through the update path",
+                    record.id, existing.state
+                ),
+            ));
+        }
+        drop(state);
+
         let mut state = self.state.lock().await;
 
         // Retire anything past its approval deadline before doing anything else.
@@ -652,20 +686,6 @@ impl ChangesetCoordinator {
         }
 
         let id = record.id.clone();
-        // Insert creates; it does not overwrite. Replacing a live record through
-        // this door would skip the transition policy entirely — an `Applying`
-        // record could be written straight back to `Approved` and claimed
-        // again, which is the replay the policy exists to stop.
-        if let Some(existing) = state.change_sets.get(&id) {
-            return Err(CoordinatorError::new(
-                "change_set_id",
-                format!(
-                    "change set {id} already exists in state {:?}; insert does not \
-                     overwrite, and lifecycle changes go through the update path",
-                    existing.state
-                ),
-            ));
-        }
         state.change_sets.insert(id.clone(), record);
 
         // Roll back on persist failure
@@ -700,6 +720,48 @@ impl ChangesetCoordinator {
             ));
         }
         Ok(record.clone())
+    }
+
+    /// Seed a record in any state. **Tests only.**
+    ///
+    /// `insert_change_set` creates `Planned` and nothing else, because any
+    /// other state is a door into the lifecycle the transition policy governs.
+    /// Tests still need records sitting in `Expired`, `Applying`, `Failed` and
+    /// so on to exercise sweeps and refusals, and walking each one through the
+    /// full lifecycle would obscure what they are actually asserting.
+    ///
+    /// Behind a feature so a server cannot reach it by accident: the point of
+    /// the policy is that production has exactly one creation door.
+    ///
+    /// Still refuses to overwrite an existing id — seeding is creation too.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the id already exists or if persistence fails.
+    #[cfg(feature = "test-util")]
+    pub async fn seed_change_set_for_test(
+        &self,
+        record: ChangeSetRecord,
+    ) -> Result<(), CoordinatorError> {
+        let mut state = self.state.lock().await;
+        let id = record.id.clone();
+        if let Some(existing) = state.change_sets.get(&id) {
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                format!(
+                    "change set {id} already exists in state {:?}",
+                    existing.state
+                ),
+            ));
+        }
+        state
+            .change_sets
+            .insert(id.clone(), normalise_task_handle(record));
+        if let Err(error) = self.persist_locked(&state) {
+            state.change_sets.remove(&id);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Atomically claim an approved change set for apply.
@@ -953,9 +1015,15 @@ fn check_change_set_write(
     via: WriteVia,
 ) -> Result<(), CoordinatorError> {
     let Some(current) = current else {
-        // No prior record, so there is no approval to replay and nothing to
-        // launder. A record that does not exist cannot be moved anywhere.
-        return Ok(());
+        // An update naming an unknown id used to insert it, which made this an
+        // unguarded creation door: a record could arrive already `Applying`, or
+        // arrive `Approved` and be claimed, skipping the capacity and
+        // one-pending-per-principal checks on the way.
+        return Err(CoordinatorError::new(
+            "change_set_id",
+            "unknown change set; update does not create, and a change set is created \
+             Planned through insert_change_set",
+        ));
     };
 
     if current.state == ChangeSetState::Approved && next.state == ChangeSetState::Applying {

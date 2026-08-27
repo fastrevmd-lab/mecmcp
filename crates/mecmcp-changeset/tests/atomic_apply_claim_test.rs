@@ -16,7 +16,7 @@ use mecmcp_changeset::{
 use std::sync::Arc;
 use std::time::Duration;
 
-fn approved(id: &str) -> ChangeSetRecord {
+fn planned(id: &str) -> ChangeSetRecord {
     // A real digest, not a placeholder: the state file is digest-bound and
     // reload refuses a record whose digest does not match its own contents, so
     // a synthetic one never survives the restart these tests are about.
@@ -32,10 +32,10 @@ fn approved(id: &str) -> ChangeSetRecord {
         digest,
         expected_candidate_fingerprint: fingerprint,
         actions,
-        state: ChangeSetState::Approved,
+        state: ChangeSetState::Planned,
         expires_at_unix: u64::MAX,
         operation_id: None,
-        approver: Some("approver".to_owned()),
+        approver: None,
         approval: None,
         policy_signature: String::new(),
         targets: Vec::new(),
@@ -43,6 +43,26 @@ fn approved(id: &str) -> ChangeSetRecord {
         task_id: None,
         apply_without_handle: false,
     }
+}
+
+/// Seed an `Approved` change set the way the server reaches one.
+///
+/// Insert now refuses anything but `Planned` — writing `Approved` straight in
+/// was a creation door into the very states the policy governs, so the fixtures
+/// have to walk the lifecycle like everything else.
+async fn seed_approved(coord: &ChangesetCoordinator, id: &str) {
+    let record = planned(id);
+    let digest = record.digest.clone();
+    coord.seed_change_set_for_test(record).await.unwrap();
+    coord
+        .approve_change_set(
+            id.to_owned(),
+            "vsrx-ci".to_owned(),
+            "approver".to_owned(),
+            digest,
+        )
+        .await
+        .expect("approve");
 }
 
 async fn coordinator(dir: &std::path::Path) -> Arc<ChangesetCoordinator> {
@@ -77,7 +97,7 @@ async fn only_one_concurrent_claim_can_win() {
         let dir = tempfile::tempdir().unwrap();
         let coord = coordinator(dir.path()).await;
         let id = "a".repeat(64);
-        coord.insert_change_set(approved(&id)).await.unwrap();
+        seed_approved(&coord, &id).await;
 
         // Every claimant waits here, so they hit the claim together rather
         // than in the order they were spawned.
@@ -117,10 +137,7 @@ async fn only_one_concurrent_claim_can_win() {
 async fn a_losing_claim_is_told_which_state_it_lost_to() {
     let dir = tempfile::tempdir().unwrap();
     let coord = coordinator(dir.path()).await;
-    coord
-        .insert_change_set(approved(&"b".repeat(64)))
-        .await
-        .unwrap();
+    seed_approved(&coord, &"b".repeat(64)).await;
 
     coord
         .claim_change_set_for_apply(&"b".repeat(64), "vsrx-ci", ApplyHandle::Expected)
@@ -143,10 +160,7 @@ async fn a_losing_claim_is_told_which_state_it_lost_to() {
 async fn a_claim_for_another_device_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let coord = coordinator(dir.path()).await;
-    coord
-        .insert_change_set(approved(&"c".repeat(64)))
-        .await
-        .unwrap();
+    seed_approved(&coord, &"c".repeat(64)).await;
 
     assert!(
         coord
@@ -174,10 +188,7 @@ async fn a_handleless_apply_survives_a_restart_as_applying() {
     let dir = tempfile::tempdir().unwrap();
     {
         let coord = coordinator(dir.path()).await;
-        coord
-            .insert_change_set(approved(&"d".repeat(64)))
-            .await
-            .unwrap();
+        seed_approved(&coord, &"d".repeat(64)).await;
         coord
             .claim_change_set_for_apply(&"d".repeat(64), "vsrx-ci", ApplyHandle::None)
             .await
@@ -206,10 +217,7 @@ async fn a_handle_expecting_apply_without_one_is_still_failed() {
     let dir = tempfile::tempdir().unwrap();
     {
         let coord = coordinator(dir.path()).await;
-        coord
-            .insert_change_set(approved(&"e".repeat(64)))
-            .await
-            .unwrap();
+        seed_approved(&coord, &"e".repeat(64)).await;
         coord
             .claim_change_set_for_apply(&"e".repeat(64), "vsrx-ci", ApplyHandle::Expected)
             .await
@@ -240,7 +248,7 @@ async fn update_change_set_cannot_perform_the_apply_transition() {
     let dir = tempfile::tempdir().unwrap();
     let coord = coordinator(dir.path()).await;
     let id = "f".repeat(64);
-    coord.insert_change_set(approved(&id)).await.unwrap();
+    seed_approved(&coord, &id).await;
 
     let mut sneaky = coord.change_set(&id, "vsrx-ci").await.unwrap();
     sneaky.state = ChangeSetState::Applying;
@@ -267,7 +275,7 @@ async fn a_handleless_applying_record_cannot_be_returned_to_approved() {
     let dir = tempfile::tempdir().unwrap();
     let coord = coordinator(dir.path()).await;
     let id = "9".repeat(64);
-    coord.insert_change_set(approved(&id)).await.unwrap();
+    seed_approved(&coord, &id).await;
     coord
         .claim_change_set_for_apply(&id, "vsrx-ci", ApplyHandle::None)
         .await
@@ -354,7 +362,7 @@ async fn the_handleless_marker_cannot_be_cleared_while_in_flight() {
     let dir = tempfile::tempdir().unwrap();
     let coord = coordinator(dir.path()).await;
     let id = "1".repeat(64);
-    coord.insert_change_set(approved(&id)).await.unwrap();
+    seed_approved(&coord, &id).await;
     coord
         .claim_change_set_for_apply(&id, "vsrx-ci", ApplyHandle::None)
         .await
@@ -386,7 +394,7 @@ async fn insert_cannot_overwrite_a_live_record() {
     let dir = tempfile::tempdir().unwrap();
     let coord = coordinator(dir.path()).await;
     let id = "2".repeat(64);
-    coord.insert_change_set(approved(&id)).await.unwrap();
+    seed_approved(&coord, &id).await;
     coord
         .claim_change_set_for_apply(&id, "vsrx-ci", ApplyHandle::None)
         .await
@@ -396,11 +404,10 @@ async fn insert_cannot_overwrite_a_live_record() {
     // otherwise refuse this first, and that check is not the guarantee: it
     // matches on owner and device, so an overwrite that changes either slips
     // straight past it. This is the case the review gate named.
-    let mut reset = approved(&id);
+    let mut reset = planned(&id);
     reset.owner = "someone-else".to_owned();
-    reset.state = ChangeSetState::Approved;
     let error = coord
-        .insert_change_set(reset)
+        .seed_change_set_for_test(reset)
         .await
         .expect_err("insert must not overwrite an existing record");
     assert!(
@@ -424,7 +431,7 @@ async fn a_write_decided_against_a_stale_read_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let coord = coordinator(dir.path()).await;
     let id = "3".repeat(64);
-    coord.insert_change_set(approved(&id)).await.unwrap();
+    seed_approved(&coord, &id).await;
 
     // What a canceller read before deciding.
     let stale = coord.change_set(&id, "vsrx-ci").await.unwrap();

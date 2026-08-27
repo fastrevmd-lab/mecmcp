@@ -196,7 +196,10 @@ async fn test_restart_recovery_marks_applying_failed() {
             "0000000000000000000000000000000000000000000000000000000000000001",
             ChangeSetState::Applying,
         );
-        coordinator.insert_change_set(change_set).await.unwrap();
+        coordinator
+            .seed_change_set_for_test(change_set)
+            .await
+            .unwrap();
     }
 
     // Reload - should trigger recovery

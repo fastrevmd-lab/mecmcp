@@ -103,7 +103,7 @@ async fn lapsed_waiver_reports_expired_rather_than_approved() {
 
     let record = waived_record("a", OWNER, Some(now() - 60), now() - 600);
     let id = record.id.clone();
-    coordinator.insert_change_set(record).await.unwrap();
+    coordinator.seed_change_set_for_test(record).await.unwrap();
 
     let status = coordinator
         .change_set_status(id, DEVICE.to_owned())
@@ -125,7 +125,7 @@ async fn waiver_without_expiry_is_never_retired() {
 
     let record = waived_record("b", OWNER, None, now() - 600);
     let id = record.id.clone();
-    coordinator.insert_change_set(record).await.unwrap();
+    coordinator.seed_change_set_for_test(record).await.unwrap();
 
     let status = coordinator
         .change_set_status(id, DEVICE.to_owned())
@@ -149,12 +149,12 @@ async fn lapsed_waiver_frees_the_owners_pending_slot() {
     let coordinator = load_coordinator(&dir);
 
     coordinator
-        .insert_change_set(waived_record("c", OWNER, Some(now() - 60), now() - 600))
+        .seed_change_set_for_test(waived_record("c", OWNER, Some(now() - 60), now() - 600))
         .await
         .unwrap();
 
     coordinator
-        .insert_change_set(waived_record("d", OWNER, Some(now() + 600), now()))
+        .seed_change_set_for_test(waived_record("d", OWNER, Some(now() + 600), now()))
         .await
         .expect("a lapsed waiver must not block a replacement change set");
 }
@@ -174,7 +174,7 @@ async fn lapse_boundary_matches_the_apply_gate() {
     let expires_now = now();
     let record = waived_record("e", OWNER, Some(expires_now), expires_now - 600);
     let id = record.id.clone();
-    coordinator.insert_change_set(record).await.unwrap();
+    coordinator.seed_change_set_for_test(record).await.unwrap();
 
     let status = coordinator
         .change_set_status(id, DEVICE.to_owned())
