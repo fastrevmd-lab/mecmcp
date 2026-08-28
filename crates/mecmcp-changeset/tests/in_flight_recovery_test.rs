@@ -40,6 +40,7 @@ fn applying_record(task_id: Option<&str>) -> ChangeSetRecord {
         targets: Vec::new(),
         preview: None,
         task_id: task_id.map(ToOwned::to_owned),
+        apply_without_handle: false,
     }
 }
 
@@ -209,7 +210,7 @@ async fn the_coordinator_and_the_file_agree_after_an_empty_handle() {
     .expect("load");
 
     coordinator
-        .insert_change_set(applying_record(Some("")))
+        .seed_change_set_for_test(applying_record(Some("")))
         .await
         .expect("insert");
 

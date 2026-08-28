@@ -251,6 +251,7 @@ fn v3_waiver_round_trip_and_version_dependence() {
         targets: vec![],
         preview: None,
         task_id: None,
+        apply_without_handle: false,
     };
 
     let mut state = ChangesetState {

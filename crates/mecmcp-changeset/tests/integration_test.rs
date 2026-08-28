@@ -103,7 +103,7 @@ fn test_version_rejection() {
     // test is that an *unknown future* version is refused rather than guessed
     // at, so it tracks the top of the supported range.
     let invalid_version = serde_json::json!({
-        "version": 5,
+        "version": 6,
         "state": {
             "operations": {},
             "change_sets": {}
@@ -126,7 +126,7 @@ fn test_version_rejection() {
     assert!(result.is_err());
     let error_message = result.unwrap_err().to_string();
     assert!(
-        error_message.contains("unsupported changeset state version 5"),
+        error_message.contains("unsupported changeset state version 6"),
         "Expected version error, got: {error_message}"
     );
 }

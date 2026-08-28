@@ -91,6 +91,7 @@ fn defect_4_edited_reason_is_rejected_on_load() {
         targets: Vec::new(),
         preview: None,
         task_id: None,
+        apply_without_handle: false,
     };
 
     let mut state = ChangesetState {
@@ -187,6 +188,7 @@ fn defect_5_both_approver_and_waived_is_rejected() {
         targets: Vec::new(),
         preview: None,
         task_id: None,
+        apply_without_handle: false,
     };
 
     let mut state = ChangesetState {

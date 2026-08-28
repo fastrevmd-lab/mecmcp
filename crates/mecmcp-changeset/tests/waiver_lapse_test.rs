@@ -87,6 +87,7 @@ fn waived_record(
         targets: Vec::new(),
         preview: None,
         task_id: None,
+        apply_without_handle: false,
     }
 }
 
@@ -102,7 +103,7 @@ async fn lapsed_waiver_reports_expired_rather_than_approved() {
 
     let record = waived_record("a", OWNER, Some(now() - 60), now() - 600);
     let id = record.id.clone();
-    coordinator.insert_change_set(record).await.unwrap();
+    coordinator.seed_change_set_for_test(record).await.unwrap();
 
     let status = coordinator
         .change_set_status(id, DEVICE.to_owned())
@@ -124,7 +125,7 @@ async fn waiver_without_expiry_is_never_retired() {
 
     let record = waived_record("b", OWNER, None, now() - 600);
     let id = record.id.clone();
-    coordinator.insert_change_set(record).await.unwrap();
+    coordinator.seed_change_set_for_test(record).await.unwrap();
 
     let status = coordinator
         .change_set_status(id, DEVICE.to_owned())
@@ -148,12 +149,19 @@ async fn lapsed_waiver_frees_the_owners_pending_slot() {
     let coordinator = load_coordinator(&dir);
 
     coordinator
-        .insert_change_set(waived_record("c", OWNER, Some(now() - 60), now() - 600))
+        .seed_change_set_for_test(waived_record("c", OWNER, Some(now() - 60), now() - 600))
         .await
         .unwrap();
 
+    // The replacement goes through the production door on purpose. Seeding it
+    // skips the expiry sweep and the pending-slot check, which are exactly what
+    // this test asserts about — it passed either way, which made it vacuous.
+    let mut replacement = waived_record("d", OWNER, Some(now() + 600), now());
+    replacement.state = ChangeSetState::Planned;
+    replacement.approval = None;
+    replacement.approver = None;
     coordinator
-        .insert_change_set(waived_record("d", OWNER, Some(now() + 600), now()))
+        .insert_change_set(replacement)
         .await
         .expect("a lapsed waiver must not block a replacement change set");
 }
@@ -173,7 +181,7 @@ async fn lapse_boundary_matches_the_apply_gate() {
     let expires_now = now();
     let record = waived_record("e", OWNER, Some(expires_now), expires_now - 600);
     let id = record.id.clone();
-    coordinator.insert_change_set(record).await.unwrap();
+    coordinator.seed_change_set_for_test(record).await.unwrap();
 
     let status = coordinator
         .change_set_status(id, DEVICE.to_owned())

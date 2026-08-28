@@ -12,7 +12,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use mecmcp_changeset::{ChangeSetState, ChangesetCoordinator, OperationLimits};
+use mecmcp_changeset::{ApplyHandle, ChangeSetState, ChangesetCoordinator, OperationLimits};
 use std::time::Duration;
 
 /// Action type for test change sets.
@@ -46,6 +46,48 @@ fn setup_coordinator() -> (tempfile::TempDir, ChangesetCoordinator) {
 /// Generates a test fingerprint.
 fn test_fingerprint() -> String {
     "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string()
+}
+
+/// Walk a freshly created change set to `target` through the real lifecycle.
+///
+/// These tests used to write the state directly, which the transition policy
+/// now refuses — and refusing it is the point: `Planned -> Applied` was exactly
+/// the shortcut that let an in-flight record be laundered back into a claimable
+/// one. Reaching the state the way the server reaches it costs three lines and
+/// keeps the setup honest.
+async fn drive_to(
+    coordinator: &ChangesetCoordinator,
+    id: &str,
+    device: &str,
+    digest: &str,
+    target: ChangeSetState,
+) {
+    coordinator
+        .approve_change_set(
+            id.to_owned(),
+            device.to_owned(),
+            "bob".to_owned(),
+            digest.to_owned(),
+        )
+        .await
+        .expect("approve");
+    if target == ChangeSetState::Approved {
+        return;
+    }
+    let claimed = coordinator
+        .claim_change_set_for_apply(id, device, ApplyHandle::Expected)
+        .await
+        .expect("claim");
+    if target == ChangeSetState::Applying {
+        return;
+    }
+    let mut record = claimed;
+    let observed = record.state;
+    record.state = target;
+    coordinator
+        .update_change_set_from(observed, record)
+        .await
+        .expect("settle");
 }
 
 #[tokio::test]
@@ -191,12 +233,14 @@ async fn test_cannot_cancel_applied_change_set() {
         .expect("create");
 
     // Manually transition to Applied state by updating the record
-    let mut record = coordinator
-        .change_set(&created.change_set_id, "device-a")
-        .await
-        .expect("get record");
-    record.state = ChangeSetState::Applied;
-    coordinator.update_change_set(record).await.expect("update");
+    drive_to(
+        &coordinator,
+        &created.change_set_id,
+        "device-a",
+        &created.digest,
+        ChangeSetState::Applied,
+    )
+    .await;
 
     // Attempt to cancel Applied change set
     let result = coordinator
@@ -236,12 +280,14 @@ async fn test_cannot_cancel_applying_change_set() {
         .expect("create");
 
     // Manually transition to Applying state
-    let mut record = coordinator
-        .change_set(&created.change_set_id, "device-a")
-        .await
-        .expect("get record");
-    record.state = ChangeSetState::Applying;
-    coordinator.update_change_set(record).await.expect("update");
+    drive_to(
+        &coordinator,
+        &created.change_set_id,
+        "device-a",
+        &created.digest,
+        ChangeSetState::Applying,
+    )
+    .await;
 
     // Attempt to cancel Applying change set
     let result = coordinator
@@ -511,12 +557,14 @@ async fn test_owner_can_cancel_failed_change_set() {
         .expect("create");
 
     // Manually transition to Failed state
-    let mut record = coordinator
-        .change_set(&created.change_set_id, "device-a")
-        .await
-        .expect("get record");
-    record.state = ChangeSetState::Failed;
-    coordinator.update_change_set(record).await.expect("update");
+    drive_to(
+        &coordinator,
+        &created.change_set_id,
+        "device-a",
+        &created.digest,
+        ChangeSetState::Failed,
+    )
+    .await;
 
     // Cancel the Failed change set - should succeed
     let cancelled = coordinator

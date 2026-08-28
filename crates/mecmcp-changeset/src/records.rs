@@ -268,6 +268,29 @@ pub struct ChangeSetRecord {
     /// binary predating this field rejects the whole state file if it appears.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// Set when the apply holding this record produces no vendor task handle.
+    ///
+    /// Most applies end in one — a Proxmox UPID, a Junos commit token — and an
+    /// `Applying` record without one means the process died before it could be
+    /// written. That is recorded as `Failed` at load, because the operation was
+    /// never started as far as anything can tell.
+    ///
+    /// Some applies never have a handle to write. `guest_exec` runs a command
+    /// through a guest agent and gets back a PID inside the guest; Proxmox's
+    /// task system never sees it. For those, `Applying` with no handle means
+    /// the opposite thing — the operation may well have run, and only the
+    /// device knows. Calling that `Failed` would assert an outcome nobody
+    /// observed, on an operation that is usually not idempotent.
+    ///
+    /// This flag is what tells the two apart. Set it and the record stays
+    /// `Applying` across a restart: detectable, not recoverable, and a human
+    /// has to go and look. That is the honest state, and it is also what keeps
+    /// the approval from being spent twice.
+    ///
+    /// `false` is never serialised, so a state file written by a binary that
+    /// sets it stays readable by one that predates it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub apply_without_handle: bool,
 }
 
 /// A preview of what a change set will do, bound to a digest.

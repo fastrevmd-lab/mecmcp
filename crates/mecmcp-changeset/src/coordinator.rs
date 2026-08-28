@@ -1,5 +1,6 @@
 //! Changeset coordinator for managing in-memory state and endpoint locking.
 
+use crate::lifecycle::{ApplyHandle, change_set_transition_allowed};
 use crate::{
     lifecycle::{ChangeSetState, LifecycleState},
     persistence::{ChangesetState, PersistenceError, read_state, write_state},
@@ -296,7 +297,16 @@ impl ChangesetCoordinator {
                 record.task_id = None;
                 recovered = true;
             }
-            if record.state == ChangeSetState::Applying && record.task_id.is_none() {
+            // ...unless the apply never had a handle to write. Then `Applying`
+            // with none is not evidence that nothing started; it is the state
+            // that says only the device knows, and settling it as `Failed`
+            // would assert an outcome nobody observed on an operation that is
+            // usually not idempotent. It also keeps the approval spent, which
+            // is the point: a record left `Approved` could run again.
+            if record.state == ChangeSetState::Applying
+                && record.task_id.is_none()
+                && !record.apply_without_handle
+            {
                 record.state = ChangeSetState::Failed;
                 recovered = true;
             }
@@ -543,9 +553,46 @@ impl ChangesetCoordinator {
 
         // Every boundary the record crosses into the store normalises, so no
         // caller can seed `Some("")` here either.
-        let record = normalise_task_handle(record);
+        let record = normalise_apply_marker(normalise_task_handle(record));
+
+        // A change set is created `Planned`. Every later state is reached by a
+        // transition the policy governs, so accepting one here would be a door
+        // straight into `Applying` with no claim.
+        if record.state != ChangeSetState::Planned {
+            return Err(CoordinatorError::new(
+                "state",
+                format!(
+                    "a change set is created Planned, not {:?}; later states are reached \
+                     through the lifecycle, and accepting one here would bypass the \
+                     transition policy",
+                    record.state
+                ),
+            ));
+        }
 
         let mut state = self.state.lock().await;
+
+        // Before anything expires or is evicted, and under the same lock that
+        // performs the insert.
+        //
+        // Both halves matter. Before eviction, because at capacity an
+        // `Applying` record could otherwise be settled to `Failed`, evicted as
+        // terminal, and re-inserted under its own id to be claimed a second
+        // time. Under one lock, because checking absence and then releasing
+        // before inserting lets two concurrent inserts of the same id both find
+        // nothing and the later one overwrite the earlier — which is the same
+        // check-then-act race this whole change exists to remove, and the first
+        // version of this guard reintroduced it by taking its own lock.
+        if let Some(existing) = state.change_sets.get(&record.id) {
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                format!(
+                    "change set {} already exists in state {:?}; insert does not \
+                     overwrite, and lifecycle changes go through the update path",
+                    record.id, existing.state
+                ),
+            ));
+        }
 
         // Retire anything past its approval deadline before doing anything else.
         //
@@ -678,6 +725,186 @@ impl ChangesetCoordinator {
         Ok(record.clone())
     }
 
+    /// Seed a record in any state. **Tests only.**
+    ///
+    /// `insert_change_set` creates `Planned` and nothing else, because any
+    /// other state is a door into the lifecycle the transition policy governs.
+    /// Tests still need records sitting in `Expired`, `Applying`, `Failed` and
+    /// so on to exercise sweeps and refusals, and walking each one through the
+    /// full lifecycle would obscure what they are actually asserting.
+    ///
+    /// Behind a feature to keep it out of an ordinary build — but a feature is
+    /// **not** a security boundary, and this must not be read as one. Cargo
+    /// features are additive: if any crate in a build enables
+    /// `mecmcp-changeset/test-util`, this becomes available to every user of
+    /// the package in that build. It is a signpost, not a lock. The boundary
+    /// that does hold is `insert_change_set` accepting only `Planned`.
+    ///
+    /// Still refuses to overwrite an existing id — seeding is creation too.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the id already exists or if persistence fails.
+    #[cfg(feature = "test-util")]
+    pub async fn seed_change_set_for_test(
+        &self,
+        record: ChangeSetRecord,
+    ) -> Result<(), CoordinatorError> {
+        let mut state = self.state.lock().await;
+        let id = record.id.clone();
+        if let Some(existing) = state.change_sets.get(&id) {
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                format!(
+                    "change set {id} already exists in state {:?}",
+                    existing.state
+                ),
+            ));
+        }
+        state
+            .change_sets
+            .insert(id.clone(), normalise_task_handle(record));
+        if let Err(error) = self.persist_locked(&state) {
+            state.change_sets.remove(&id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Atomically claim an approved change set for apply.
+    ///
+    /// Checking `Approved` with `change_set()` and then writing `Applying` with
+    /// `update_change_set()` is two operations, and the lock is released
+    /// between them. Two applies could therefore both read `Approved`, both
+    /// pass the check, and both execute — one approval, two executions. The
+    /// second write could also land on top of an `Applied` written by the
+    /// first, erasing the outcome.
+    ///
+    /// For a destroy that is close to harmless, because a second destroy of an
+    /// absent guest fails. For an operation that runs an arbitrary command it
+    /// is not harmless at all, which is why this exists.
+    ///
+    /// The check and the transition happen under one lock here, so exactly one
+    /// caller can move a record out of `Approved`. Everyone else is refused and
+    /// told which state they lost to.
+    ///
+    /// Pass [`ApplyHandle::None`] when the operation produces no vendor task
+    /// handle; see [`ChangeSetRecord::apply_without_handle`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the change set is unknown, belongs to another
+    /// device, is not `Approved`, or if persistence fails. A claim whose
+    /// persistence fails is deliberately **not** rolled back; see the comment
+    /// at that branch for why keeping it is the fail-closed choice.
+    pub async fn claim_change_set_for_apply(
+        &self,
+        id: &str,
+        device: &str,
+        handle: ApplyHandle,
+    ) -> Result<ChangeSetRecord, CoordinatorError> {
+        validate_operation_id(id)?;
+        let mut state = self.state.lock().await;
+        let record = state
+            .change_sets
+            .get(id)
+            .ok_or_else(|| CoordinatorError::new("change_set_id", "unknown change set"))?;
+        if record.device != device {
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                "change set belongs to another device",
+            ));
+        }
+        if record.state != ChangeSetState::Approved {
+            // Naming the state it is in matters: "already applying" and
+            // "expired" send the caller to different places, and a caller that
+            // lost a race needs to know it was a race.
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                format!(
+                    "change set is {:?}, not Approved; it cannot be claimed for apply",
+                    record.state
+                ),
+            ));
+        }
+
+        let previous = record.clone();
+        let mut claimed = previous.clone();
+        claimed.state = ChangeSetState::Applying;
+        claimed.apply_without_handle = matches!(handle, ApplyHandle::None);
+        check_change_set_write(Some(&previous), &claimed, WriteVia::ApplyClaim)?;
+        state.change_sets.insert(id.to_owned(), claimed.clone());
+
+        if let Err(error) = self.persist_locked(&state) {
+            // Deliberately no rollback here, unlike `update_change_set`.
+            //
+            // `write_state` renames the new file into place before it fsyncs
+            // the directory, so a failure can mean either "nothing was written"
+            // or "it was written and we cannot prove it is durable". Rolling
+            // memory back to `Approved` on the second of those would leave disk
+            // saying `Applying` and memory saying `Approved` — and this process
+            // would then let a *second* apply claim it.
+            //
+            // Keeping the claim is the fail-closed choice: the caller gets an
+            // error and does not execute, nobody else can claim, and a human
+            // resolves a record that is at worst stuck. A replayed approval is
+            // the outcome worth spending a stuck record to avoid.
+            let _ = previous;
+            return Err(error);
+        }
+        Ok(claimed)
+    }
+
+    /// Updates an existing record, refusing the write if the state moved.
+    ///
+    /// Every lifecycle method reads a record, decides from that snapshot, and
+    /// writes it back — with the lock released in between. A claim landing in
+    /// that gap used to be erased by a stale cancellation that had already
+    /// decided the record was cancellable. Passing the state the caller
+    /// actually saw makes the write conditional on nothing having moved since.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the change set is unknown, if its state is no longer
+    /// `observed`, if the transition is not permitted, or if persistence fails.
+    pub async fn update_change_set_from(
+        &self,
+        observed: ChangeSetState,
+        record: ChangeSetRecord,
+    ) -> Result<(), CoordinatorError> {
+        let mut state = self.state.lock().await;
+        let id = record.id.clone();
+        let current = state
+            .change_sets
+            .get(&id)
+            .ok_or_else(|| CoordinatorError::new("change_set_id", "unknown change set"))?;
+        if current.state != observed {
+            return Err(CoordinatorError::new(
+                "state",
+                format!(
+                    "change set moved to {:?} since it was read as {observed:?}; \
+                     the update was decided against a state that no longer holds",
+                    current.state
+                ),
+            ));
+        }
+        let record = normalise_apply_marker(normalise_task_handle(record));
+        check_change_set_write(state.change_sets.get(&id), &record, WriteVia::Update)?;
+        let previous = state.change_sets.insert(id.clone(), record);
+        if let Err(error) = self.persist_locked(&state) {
+            match previous {
+                Some(previous) => {
+                    state.change_sets.insert(id, previous);
+                }
+                None => {
+                    state.change_sets.remove(&id);
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Updates an existing change-set record.
     ///
     /// On persistence failure, the in-memory update is rolled back to the previous value.
@@ -694,7 +921,10 @@ impl ChangesetCoordinator {
         // `Some("")` from `change_set()` while the file holds `None` — and a
         // restart would then observe a different record than the running
         // process reports. Memory and file must agree.
-        let record = normalise_task_handle(record);
+        let record = normalise_apply_marker(normalise_task_handle(record));
+
+        check_change_set_write(state.change_sets.get(&id), &record, WriteVia::Update)?;
+
         let previous = state.change_sets.insert(id.clone(), record);
 
         // Roll back on persist failure
@@ -772,6 +1002,91 @@ fn validate_operation_id(value: &str) -> Result<(), CoordinatorError> {
 /// Applied at every boundary the record crosses — into the coordinator's map
 /// here, and onto disk in `write_state` — because normalising only one of them
 /// makes the API and the file disagree about the same change set.
+/// Which door a write is coming through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteVia {
+    /// Any ordinary update. `Approved -> Applying` is not available here.
+    Update,
+    /// `claim_change_set_for_apply`, the only holder of that transition.
+    ApplyClaim,
+}
+
+/// The single point every change-set write passes through.
+///
+/// One place, because the previous attempt guarded two edges and left the rest
+/// of the graph open — an intermediate state reached `Applying` just as well as
+/// a direct write did.
+fn check_change_set_write(
+    current: Option<&ChangeSetRecord>,
+    next: &ChangeSetRecord,
+    via: WriteVia,
+) -> Result<(), CoordinatorError> {
+    let Some(current) = current else {
+        // An update naming an unknown id used to insert it, which made this an
+        // unguarded creation door: a record could arrive already `Applying`, or
+        // arrive `Approved` and be claimed, skipping the capacity and
+        // one-pending-per-principal checks on the way.
+        return Err(CoordinatorError::new(
+            "change_set_id",
+            "unknown change set; update does not create, and a change set is created \
+             Planned through insert_change_set",
+        ));
+    };
+
+    if current.state == ChangeSetState::Approved && next.state == ChangeSetState::Applying {
+        if via == WriteVia::ApplyClaim {
+            return Ok(());
+        }
+        return Err(CoordinatorError::new(
+            "state",
+            "Approved -> Applying must go through claim_change_set_for_apply; writing it \
+             here reintroduces the race where two applies both read Approved and both execute",
+        ));
+    }
+
+    if !change_set_transition_allowed(current.state, next.state) {
+        return Err(CoordinatorError::new(
+            "state",
+            format!(
+                "{:?} -> {:?} is not a permitted change-set transition",
+                current.state, next.state
+            ),
+        ));
+    }
+
+    // The flag is what keeps an in-flight handleless apply out of reach.
+    // Clearing it while still `Applying` would let the next write walk the
+    // record back to `Approved` through an edge the table does allow.
+    if current.state == ChangeSetState::Applying
+        && next.state == ChangeSetState::Applying
+        && current.apply_without_handle
+        && !next.apply_without_handle
+    {
+        return Err(CoordinatorError::new(
+            "state",
+            "an in-flight apply with no vendor handle cannot have that marker cleared: \
+             whether the operation ran is unknown, and clearing it would permit a \
+             second execution",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Clear the handleless marker once the record is no longer in flight.
+///
+/// It answers one question — "is this `Applying` record's outcome unknown?" —
+/// so on a settled record it is noise, and expensive noise: the field forces a
+/// version-5 state file, which a binary predating it cannot read. A caller that
+/// settles a record by writing `state` alone would otherwise leave it set
+/// forever and pin the whole file to v5 for nothing.
+fn normalise_apply_marker(mut record: ChangeSetRecord) -> ChangeSetRecord {
+    if record.state != ChangeSetState::Applying {
+        record.apply_without_handle = false;
+    }
+    record
+}
+
 fn normalise_task_handle(mut record: ChangeSetRecord) -> ChangeSetRecord {
     if record.task_id.as_deref().is_some_and(str::is_empty) {
         record.task_id = None;

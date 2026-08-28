@@ -7,7 +7,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use mecmcp_changeset::{ChangeSetState, ChangesetCoordinator, OperationLimits};
+use mecmcp_changeset::{ApplyHandle, ChangeSetState, ChangesetCoordinator, OperationLimits};
 use std::time::Duration;
 
 /// Action type for test change sets.
@@ -220,13 +220,28 @@ async fn test_applied_change_set_with_actions() {
         .await
         .expect("create");
 
-    // Manually transition to Applied state
-    let mut record = coordinator
-        .change_set(&created.change_set_id, "device-a")
+    // Reach `Applied` the way the server does. Writing the state directly is
+    // refused by the transition policy, and refusing it is the point: a record
+    // that can be moved anywhere can be moved back into a claimable state.
+    coordinator
+        .approve_change_set(
+            created.change_set_id.clone(),
+            "device-a".to_string(),
+            "bob".to_string(),
+            created.digest.clone(),
+        )
         .await
-        .expect("get record");
+        .expect("approve");
+    let mut record = coordinator
+        .claim_change_set_for_apply(&created.change_set_id, "device-a", ApplyHandle::Expected)
+        .await
+        .expect("claim");
+    let observed = record.state;
     record.state = ChangeSetState::Applied;
-    coordinator.update_change_set(record).await.expect("update");
+    coordinator
+        .update_change_set_from(observed, record)
+        .await
+        .expect("settle");
 
     // Get status with actions for the applied set (audit review)
     let status = coordinator

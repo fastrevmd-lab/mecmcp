@@ -83,7 +83,7 @@ pub fn read_state(path: &Path, max_state_bytes: u64) -> Result<ChangesetState, P
     let on_disk: OnDiskChangesetState = serde_json::from_slice(bytes)
         .map_err(|error| PersistenceError::new(format!("invalid changeset state JSON: {error}")))?;
 
-    if !(1..=4).contains(&on_disk.version) {
+    if !(1..=5).contains(&on_disk.version) {
         return Err(PersistenceError::new(format!(
             "unsupported changeset state version {}",
             on_disk.version
@@ -459,6 +459,19 @@ pub fn write_state(
             || cs.preview.is_some()
             || cs.task_id.is_some()
     });
+    // Version 5 is required by `apply_without_handle`, and it needs a generation
+    // of its own rather than a place in the v2 list: version selection takes the
+    // highest match, so a file with a real approval is v4 whatever v2 says, and
+    // 0.21.0 accepts 1..=4. It would read such a file as a supported schema and
+    // then reject the record on the unknown field, which is the failure the
+    // version gate exists to prevent.
+    //
+    // The sharpest case of the same reason `task_id` is gated. This field is
+    // only ever true while a handleless apply is in flight, and unlike a task
+    // handle that record cannot be settled by re-probing — so an unreadable
+    // state file is the difference between "a human checks the guest" and
+    // "nothing can read the state at all".
+    let handleless_applies_need_v5 = state.change_sets.values().any(|cs| cs.apply_without_handle);
     // A non-HTTPS endpoint is a version-2 record too. It is not a new *field*,
     // but the version-1 reader validated `starts_with("https://")` and would
     // reject the whole file over it — which is the same practical consequence
@@ -488,7 +501,9 @@ pub fn write_state(
         .change_sets
         .values()
         .any(|cs| cs.approval.as_ref().is_some_and(|a| a.approver.is_some()));
-    let version = if approvals_need_v4 {
+    let version = if handleless_applies_need_v5 {
+        5
+    } else if approvals_need_v4 {
         4
     } else if waivers_need_v3 {
         3
