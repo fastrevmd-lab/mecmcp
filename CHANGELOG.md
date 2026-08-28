@@ -29,6 +29,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-08-27
+
+### Security
+
+- **One approval now permits at most one apply**, as a property of this crate
+  rather than of whoever remembered the right method (#339). Reading `Approved`
+  with `change_set()` and then writing `Applying` with `update_change_set()` was
+  two operations with the lock released between them, so two applies could both
+  pass the check and both execute — and the second write could land on top of an
+  `Applied` from the first, erasing the outcome.
+
+  `claim_change_set_for_apply` does the check and the transition under one lock
+  and is the only route into `Applying`. `change_set_transition_allowed` is a
+  closed table: anything unnamed is refused, so intermediate states no longer
+  reach `Applying` the long way round. `insert_change_set` creates `Planned`
+  only and refuses an existing id. `update_change_set_from` refuses a write
+  whose observed state has moved, so a stale cancellation cannot erase a claim.
+
+  For a destroy this was close to harmless — a second destroy of an absent guest
+  fails. It matters for operations that are not idempotent, which is what
+  unblocks rustproxmoxmcp#57.
+
+### Added
+
+- **`ApplyHandle` and `ChangeSetRecord::apply_without_handle`.** `Applying` with
+  no task handle meant two opposite things: usually the process died before
+  writing one, so nothing started and `Failed` at load is right — but some
+  applies never have a handle to write, and there the same state means the
+  command may well have run and only the device knows. Calling that `Failed`
+  asserts an outcome nobody observed, on an operation that is not idempotent.
+  Such a record now stays `Applying` across a restart: detectable, not
+  recoverable, and a human looks. That also keeps the approval spent.
+
+### Changed — **state-file schema version 5**
+
+- A file carrying `apply_without_handle` declares version 5, which 0.21.0 and
+  earlier refuse outright. That is deliberate: `ChangeSetRecord` is
+  `deny_unknown_fields`, so an older binary would otherwise read the file as a
+  supported schema and then reject the record on the unknown field. **A rollback
+  below 0.22.0 cannot read a state file written while a handleless apply was in
+  flight.** The marker is cleared once the record settles, so a file only carries
+  it for the duration of such an apply.
+
+### Upgrade note for consumers
+
+- `Approved -> Applying` through `update_change_set` is now refused. Any server
+  doing that must call `claim_change_set_for_apply`; this crate's own
+  `apply_change_set` was migrated in the same change.
+- `insert_change_set` accepts `Planned` only.
+- `Applied -> Failed` remains permitted — rustjunosmcp's `settle_change_set`
+  depends on it, since `Applied` is written before diff, validation and commit.
+
+
 ## [0.21.0] - 2026-08-27
 
 First hand-written entry, as the header below asks for.
