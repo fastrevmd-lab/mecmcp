@@ -94,11 +94,12 @@ fn defect_4_edited_reason_is_rejected_on_load() {
         apply_without_handle: false,
     };
 
-    let mut state = ChangesetState {
+    let mut change_sets = BTreeMap::new();
+    change_sets.insert(change_set_id.clone(), record);
+    let state = ChangesetState {
         operations: BTreeMap::new(),
-        change_sets: BTreeMap::new(),
+        change_sets,
     };
-    state.change_sets.insert(change_set_id.clone(), record);
 
     // Write as version 2 (legacy)
     let on_disk = serde_json::json!({
@@ -191,11 +192,12 @@ fn defect_5_both_approver_and_waived_is_rejected() {
         apply_without_handle: false,
     };
 
-    let mut state = ChangesetState {
+    let mut change_sets = BTreeMap::new();
+    change_sets.insert(change_set_id.clone(), record);
+    let state = ChangesetState {
         operations: BTreeMap::new(),
-        change_sets: BTreeMap::new(),
+        change_sets,
     };
-    state.change_sets.insert(change_set_id.clone(), record);
 
     // Write as version 2
     let on_disk = serde_json::json!({

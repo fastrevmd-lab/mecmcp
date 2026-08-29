@@ -10,7 +10,7 @@
 use mecmcp_changeset::{
     ChangeSetRecord, ChangesetState, OperationLimits, PreviewRecord, TargetError,
     change_set_digest, change_set_digest_with_targets, preview_digest, read_state,
-    validate_targets, write_state,
+    validate_targets, write_state_for_test,
 };
 
 fn record(device: &str, targets: Vec<String>) -> ChangeSetRecord {
@@ -164,7 +164,7 @@ fn a_single_target_deployment_still_writes_version_one() {
         .change_sets
         .insert("a".repeat(64), record("fw-01", Vec::new()));
 
-    write_state(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
+    write_state_for_test(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
 
     let on_disk: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -188,7 +188,7 @@ fn a_multi_target_record_forces_version_two() {
         record("fw-01", vec!["fw-01".into(), "fw-02".into()]),
     );
 
-    write_state(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
+    write_state_for_test(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
     let on_disk: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(on_disk["version"], 2, "multi-target must gate to v2");
@@ -212,7 +212,7 @@ fn a_preview_record_forces_version_two_and_round_trips() {
 
     let mut state = ChangesetState::default();
     state.change_sets.insert("a".repeat(64), changeset);
-    write_state(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
+    write_state_for_test(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
 
     let on_disk: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -300,7 +300,7 @@ fn a_multi_target_record_survives_a_reload() {
 
     let mut state = ChangesetState::default();
     state.change_sets.insert("a".repeat(64), changeset);
-    write_state(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
+    write_state_for_test(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
 
     let reloaded = read_state(&path, OperationLimits::default().max_state_bytes)
         .expect("a multi-target record must reload");
@@ -326,7 +326,7 @@ fn a_single_target_record_still_validates_against_the_old_digest() {
 
     let mut state = ChangesetState::default();
     state.change_sets.insert("a".repeat(64), changeset);
-    write_state(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
+    write_state_for_test(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
 
     read_state(&path, OperationLimits::default().max_state_bytes)
         .expect("a record written by the old digest function must still load");
@@ -349,7 +349,7 @@ fn an_edited_preview_artifact_is_rejected_on_load() {
 
     let mut state = ChangesetState::default();
     state.change_sets.insert("a".repeat(64), changeset);
-    write_state(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
+    write_state_for_test(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
 
     // Edit the artifact on disk, leaving the digest alone — the tamper this
     // digest exists to catch.
@@ -389,7 +389,7 @@ fn an_unsorted_target_set_is_rejected_on_load() {
 
     let mut state = ChangesetState::default();
     state.change_sets.insert("a".repeat(64), changeset);
-    write_state(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
+    write_state_for_test(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
 
     let error = read_state(&path, OperationLimits::default().max_state_bytes)
         .expect_err("an unsorted target set must not reload");
@@ -531,7 +531,7 @@ fn a_task_id_forces_version_two_and_round_trips() {
 
     let mut state = ChangesetState::default();
     state.change_sets.insert("a".repeat(64), changeset);
-    write_state(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
+    write_state_for_test(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
 
     let on_disk: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -560,7 +560,7 @@ fn no_task_id_is_serialised_when_none() {
     state
         .change_sets
         .insert("a".repeat(64), record("fw-01", Vec::new()));
-    write_state(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
+    write_state_for_test(&path, &state, OperationLimits::default().max_state_bytes).unwrap();
 
     let on_disk: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();

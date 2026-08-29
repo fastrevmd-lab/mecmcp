@@ -28,7 +28,9 @@ pub use commit_metadata::{
 pub use coordinator::{ChangesetCoordinator, CoordinatorError, StagedRecovery};
 pub use lifecycle::{ApplyHandle, ChangeSetState, LifecycleState, change_set_transition_allowed};
 pub use operation::StageOutput;
-pub use persistence::{ChangesetState, PersistenceError, read_state, validate_state, write_state};
+#[cfg(feature = "test-util")]
+pub use persistence::write_state_for_test;
+pub use persistence::{ChangesetState, PersistenceError, read_state, validate_state};
 pub use records::{
     ApprovalRecord, ChangeSetRecord, OperationRecord, PreviewError, PreviewRecord, RecordError,
     TargetError, WaiverKind, WaiverRecord, change_set_digest, change_set_digest_with_targets,

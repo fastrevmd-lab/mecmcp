@@ -4,7 +4,7 @@
 
 use mecmcp_changeset::{
     lifecycle::LifecycleState,
-    persistence::{ChangesetState, read_state, write_state},
+    persistence::{ChangesetState, read_state, write_state_for_test},
     records::OperationRecord,
     recovery::{RecoveryDisposition, resolve_persisted_operation},
     types::OperationLimits,
@@ -49,7 +49,7 @@ fn setup_state_file(operation_id: &str, state: LifecycleState) -> (tempfile::Tem
     };
 
     let limits = OperationLimits::default();
-    write_state(&state_path, &changeset_state, limits.max_state_bytes).unwrap();
+    write_state_for_test(&state_path, &changeset_state, limits.max_state_bytes).unwrap();
 
     #[cfg(unix)]
     {

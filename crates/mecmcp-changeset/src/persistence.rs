@@ -387,7 +387,7 @@ pub fn validate_state(state: &ChangesetState, version: u32) -> Result<(), Persis
 /// # Errors
 ///
 /// Returns an error if serialization fails, the file is too large, or the write operation fails.
-pub fn write_state(
+pub(crate) fn write_state(
     path: &Path,
     state: &ChangesetState,
     max_state_bytes: u64,
@@ -605,4 +605,69 @@ fn validate_operation_id(value: &str) -> Result<(), PersistenceError> {
             "value must contain exactly 64 hexadecimal characters",
         ))
     }
+}
+
+/// Write changeset state directly to disk. **Tests only.**
+///
+/// `write_state` is crate-private because a consumer constructing a record in
+/// `Applying` (with `apply_without_handle` set, or a `task_id`) and writing it
+/// bypasses the coordinator's transition policy. `ChangesetCoordinator::load`
+/// would accept it, breaking the invariant "one approval permits at most one
+/// apply" by construction.
+///
+/// Severity is API misuse, not privilege escalation: writing the state file
+/// directly already requires the same authority the service runs with. The
+/// value of closing it is that a consumer crate cannot reach `Applying` in
+/// production code without the claim — a compile-time guarantee rather than a
+/// convention.
+///
+/// Tests still need to construct state files with records in arbitrary
+/// lifecycle states to exercise recovery, sweeps, and refusals, and walking
+/// each one through the full lifecycle would obscure what they are actually
+/// asserting.
+///
+/// Behind a feature to keep it out of an ordinary build — but a feature is
+/// **not** a security boundary, and this must not be read as one. Cargo
+/// features are additive: if any crate in a build enables
+/// `mecmcp-changeset/test-util`, this becomes available to every user of the
+/// package in that build. It is a signpost, not a lock. The boundary that does
+/// hold is that production paths cannot write state without going through the
+/// coordinator.
+///
+/// # Compile-time guarantee
+///
+/// The private `write_state` function is not accessible from outside this crate:
+///
+/// ```compile_fail,E0603
+/// # use mecmcp_changeset::ChangesetState;
+/// let state = ChangesetState::default();
+/// mecmcp_changeset::write_state(
+///     std::path::Path::new("/tmp/test.json"),
+///     &state,
+///     1024,
+/// );
+/// ```
+///
+/// Nor via the persistence module path:
+///
+/// ```compile_fail,E0603
+/// # use mecmcp_changeset::ChangesetState;
+/// let state = ChangesetState::default();
+/// mecmcp_changeset::persistence::write_state(
+///     std::path::Path::new("/tmp/test.json"),
+///     &state,
+///     1024,
+/// );
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if serialization fails, the file is too large, or the write operation fails.
+#[cfg(feature = "test-util")]
+pub fn write_state_for_test(
+    path: &Path,
+    state: &ChangesetState,
+    max_state_bytes: u64,
+) -> Result<(), PersistenceError> {
+    write_state(path, state, max_state_bytes)
 }

@@ -273,7 +273,7 @@ async fn a_held_lock_is_released_when_the_candidate_has_already_moved() {
 async fn staged_recovery_policy_decides_whether_a_restart_demotes_an_operation() {
     use mecmcp_changeset::{
         StagedRecovery,
-        persistence::{read_state, write_state},
+        persistence::{read_state, write_state_for_test},
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -323,7 +323,7 @@ async fn staged_recovery_policy_decides_whether_a_restart_demotes_an_operation()
     // Put it back to Staged and reload with Retain.
     let mut state = read_state(&path, limits.max_state_bytes).unwrap();
     state.operations.get_mut(&out.operation_id).unwrap().state = LifecycleState::Staged;
-    write_state(&path, &state, limits.max_state_bytes).unwrap();
+    write_state_for_test(&path, &state, limits.max_state_bytes).unwrap();
 
     let retained = ChangesetCoordinator::load_with_recovery(
         Some(&path),

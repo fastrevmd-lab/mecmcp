@@ -5,7 +5,7 @@
 use mecmcp_changeset::{
     digest::{validate_digest, validate_fingerprint},
     lifecycle::{ChangeSetState, LifecycleState},
-    persistence::{read_state, validate_state, write_state},
+    persistence::{read_state, validate_state, write_state_for_test},
 };
 use std::path::PathBuf;
 
@@ -328,7 +328,7 @@ fn test_round_trip_write_read() {
     };
 
     // Write it
-    write_state(&state_path, &state, 8 * 1024 * 1024).expect("write must succeed");
+    write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write must succeed");
 
     // Read it back
     let loaded = read_state(&state_path, 8 * 1024 * 1024).expect("read must succeed");
@@ -372,7 +372,8 @@ fn test_tamper_detection_rejects_modified_actions() {
     }
 
     // Write the tampered state
-    write_state(&tampered_path, &tampered_state, 8 * 1024 * 1024).expect("write tampered state");
+    write_state_for_test(&tampered_path, &tampered_state, 8 * 1024 * 1024)
+        .expect("write tampered state");
 
     // Attempt to read it - should fail with digest mismatch
     let result = read_state(&tampered_path, 8 * 1024 * 1024);
@@ -416,7 +417,7 @@ fn test_action_key_order_preserved() {
     // Round-trip through write and read
     let temp_dir = tempfile::tempdir().unwrap();
     let roundtrip_path = temp_dir.path().join("roundtrip.json");
-    write_state(&roundtrip_path, &state, 8 * 1024 * 1024).expect("write must succeed");
+    write_state_for_test(&roundtrip_path, &state, 8 * 1024 * 1024).expect("write must succeed");
     let reloaded = read_state(&roundtrip_path, 8 * 1024 * 1024).expect("read must succeed");
 
     // Get the same change set after round-trip
