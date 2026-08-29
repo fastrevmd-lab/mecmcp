@@ -145,6 +145,7 @@ where
 
 /// Canonical envelope: `{ "version": 1, "devices": {...}, "policy": {...} }`.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CanonicalEnvelope<D, P> {
     version: u32,
     policy: Option<P>,
@@ -153,6 +154,7 @@ struct CanonicalEnvelope<D, P> {
 
 /// Legacy PAN-OS envelope: `{ "version": 1, "devices": [...] }`.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PanosEnvelope<D> {
     version: u32,
     devices: Vec<D>,
