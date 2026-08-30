@@ -18,7 +18,8 @@
 use mecmcp_changeset::{
     ChangeSetState, ChangesetCoordinator, ChangesetState as StateFile, OperationLimits,
     digest::{
-        compute_approval_digest, compute_approval_digest_legacy, validate_principal_for_digest,
+        compute_approval_digest_legacy, compute_approval_digest_v4 as compute_approval_digest,
+        validate_principal_for_digest,
     },
     persistence::{read_state, write_state_for_test},
     records::{ApprovalRecord, ChangeSetRecord},
@@ -268,6 +269,7 @@ fn load_rejects_separator_in_approver() {
         approver: Some("bad|approver".into()),
         approved_at_unix: 1234567890,
         digest,
+        digest_version: 4,
         waived: None,
     });
 
@@ -337,6 +339,7 @@ fn load_rejects_separator_in_owner() {
         approver: Some("clean-approver".into()),
         approved_at_unix: 1234567890,
         digest,
+        digest_version: 4,
         waived: None,
     });
 
@@ -465,6 +468,7 @@ fn load_accepts_clean_approval() {
         approver: Some("demo-approver".into()),
         approved_at_unix: 1234567890,
         digest,
+        digest_version: 4,
         waived: None,
     });
 
@@ -604,6 +608,7 @@ fn a_legacy_approval_migrates_to_v4_and_still_verifies() {
             approver: Some("demo-approver".into()),
             approved_at_unix: 1234567890,
             digest: legacy_digest.clone(),
+            digest_version: 4,
             waived: None,
         }),
         operation_id: None,

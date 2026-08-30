@@ -3,7 +3,7 @@
 use crate::{
     coordinator::{ChangesetCoordinator, CoordinatorError},
     digest::{
-        change_set_digest, compute_approval_digest, compute_waiver_digest_v3, validate_digest,
+        change_set_digest, compute_approval_digest_v5, compute_waiver_digest_v3, validate_digest,
         validate_principal_for_digest,
     },
     lifecycle::ChangeSetState,
@@ -259,13 +259,25 @@ impl ChangesetCoordinator {
         validate_principal_for_digest("approver", &approver)
             .map_err(|msg| CoordinatorError::new("approver", msg))?;
 
-        // v4: a serialized tuple over
-        // (marker, change_set_id, plan_digest, owner, approver, approved_at).
-        // Digests held in memory are always the current version; the legacy
-        // encoding survives only on disk, and `read_state` migrates it.
-        let approval_digest = compute_approval_digest(
+        // v5: the v4 tuple plus the digest of the preview this approver read.
+        //
+        // The plan digest covers the actions; the preview is rendered from them
+        // and stored beside them, and until now nothing tied the two together —
+        // so consent was evidenced against the actions while what was read was
+        // the text (rustproxmoxmcp#56). Signing both means a rendering that
+        // disagreed with its action cannot carry a valid approval.
+        //
+        // Taken from the record as it stands at this moment, which is the point:
+        // the approver signs the text that is there when they approve, not
+        // whatever was attached at plan time.
+        let preview_digest = record
+            .preview
+            .as_ref()
+            .map(|preview| preview.digest.clone());
+        let approval_digest = compute_approval_digest_v5(
             &change_set_id,
             &record.digest,
+            preview_digest.as_deref(),
             &record.owner,
             &approver,
             now,
@@ -278,6 +290,7 @@ impl ChangesetCoordinator {
             approver: Some(approver.clone()),
             approved_at_unix: now,
             digest: approval_digest,
+            digest_version: 5,
             waived: None,
         });
 
@@ -386,6 +399,10 @@ impl ChangesetCoordinator {
             approver: None,
             approved_at_unix: now,
             digest: waiver_digest,
+            // A waived record's digest is a waiver digest, not an approval one,
+            // so this field is never read for it. Set rather than defaulted so
+            // it does not read as an approval version that was chosen.
+            digest_version: 4,
             waived: Some(waiver),
         });
 
@@ -516,6 +533,10 @@ impl ChangesetCoordinator {
             approver: None,
             approved_at_unix: now,
             digest: waiver_digest,
+            // A waived record's digest is a waiver digest, not an approval one,
+            // so this field is never read for it. Set rather than defaulted so
+            // it does not read as an approval version that was chosen.
+            digest_version: 4,
             waived: Some(waiver),
         });
 
@@ -699,7 +720,7 @@ impl ChangesetCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use crate::digest::compute_approval_digest;
+    use crate::digest::compute_approval_digest_v4 as compute_approval_digest;
 
     #[test]
     fn test_approval_digest_is_deterministic() {

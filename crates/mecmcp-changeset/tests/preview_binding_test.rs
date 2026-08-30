@@ -1,0 +1,240 @@
+//! The approval digest binds the preview the approver read (rustproxmoxmcp#56).
+//!
+//! Before v5, approval was evidenced against `(change_set_id, plan_digest,
+//! owner, approver, approved_at)`. The plan digest covers the *actions*; the
+//! preview is rendered from those actions and stored beside them, and nothing
+//! joined the two. An approver's consent therefore attested to the actions,
+//! while what they actually read was the preview.
+//!
+//! v5 adds the preview digest to that tuple. These tests pin the two properties
+//! that makes true — the text is bound, and a v4 record is never promoted to
+//! claim it was.
+
+#![allow(clippy::unwrap_used)]
+
+use mecmcp_changeset::{
+    ChangeSetState, ChangesetState as StateFile,
+    digest::{change_set_digest, compute_approval_digest_v4, compute_approval_digest_v5},
+    persistence::{read_state, write_state_for_test},
+    records::{ApprovalRecord, ChangeSetRecord, PreviewRecord},
+};
+use serde_json::json;
+
+const LIMIT: u64 = 1024 * 1024;
+
+fn record_with_preview(preview: Option<&str>) -> ChangeSetRecord {
+    let owner = "alice";
+    let device = "pve3";
+    let fingerprint = format!("sha256:{}", "a".repeat(64));
+    let actions = vec![json!({"op": "destroy_guest", "vmid": 617})];
+    let digest = change_set_digest(owner, device, &fingerprint, &actions).unwrap();
+    ChangeSetRecord {
+        id: "b".repeat(64),
+        owner: owner.to_owned(),
+        device: device.to_owned(),
+        expected_candidate_fingerprint: fingerprint,
+        actions,
+        digest,
+        state: ChangeSetState::Approved,
+        approver: Some("bob".to_owned()),
+        approval: None,
+        expires_at_unix: 4_102_444_800,
+        operation_id: None,
+        policy_signature: "test".to_owned(),
+        targets: Vec::new(),
+        preview: preview.map(|text| PreviewRecord {
+            digest: mecmcp_changeset::digest::preview_digest(text),
+            artifact: text.to_owned(),
+            job_id: None,
+        }),
+        task_id: None,
+        apply_without_handle: false,
+    }
+}
+
+fn round_trip(record: ChangeSetRecord) -> Result<StateFile, String> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+    let mut change_sets = std::collections::BTreeMap::new();
+    change_sets.insert(record.id.clone(), record);
+    let state = StateFile {
+        operations: std::collections::BTreeMap::new(),
+        change_sets,
+    };
+    write_state_for_test(&path, &state, LIMIT).map_err(|e| e.to_string())?;
+    read_state(&path, LIMIT).map_err(|e| e.to_string())
+}
+
+/// A v5 approval survives a write/read cycle with its preview intact.
+#[test]
+fn a_v5_approval_round_trips() {
+    let mut record = record_with_preview(Some("DESTROY lxc/617 on pve3"));
+    let preview_digest = record.preview.as_ref().map(|p| p.digest.clone());
+    record.approval = Some(ApprovalRecord {
+        approver: Some("bob".to_owned()),
+        approved_at_unix: 1_700_000_000,
+        digest: compute_approval_digest_v5(
+            &record.id,
+            &record.digest,
+            preview_digest.as_deref(),
+            &record.owner,
+            "bob",
+            1_700_000_000,
+        ),
+        digest_version: 5,
+        waived: None,
+    });
+    let state = round_trip(record).expect("a v5 approval must load");
+    let loaded = state.change_sets.values().next().unwrap();
+    assert_eq!(loaded.approval.as_ref().unwrap().digest_version, 5);
+}
+
+/// **The property this whole change exists for.** Editing the preview after
+/// approval must invalidate the approval, not merely the preview's own digest.
+#[test]
+fn editing_the_preview_invalidates_the_approval() {
+    let mut record = record_with_preview(Some("DESTROY lxc/617 on pve3"));
+    let preview_digest = record.preview.as_ref().map(|p| p.digest.clone());
+    record.approval = Some(ApprovalRecord {
+        approver: Some("bob".to_owned()),
+        approved_at_unix: 1_700_000_000,
+        digest: compute_approval_digest_v5(
+            &record.id,
+            &record.digest,
+            preview_digest.as_deref(),
+            &record.owner,
+            "bob",
+            1_700_000_000,
+        ),
+        digest_version: 5,
+        waived: None,
+    });
+
+    // Swap the preview for different text, keeping its own digest self-consistent
+    // so `validate_preview` is satisfied. Before v5 this passed every check.
+    let replacement = "RESIZE lxc/617 disk on pve3";
+    record.preview = Some(PreviewRecord {
+        digest: mecmcp_changeset::digest::preview_digest(replacement),
+        artifact: replacement.to_owned(),
+        job_id: None,
+    });
+
+    let error = round_trip(record).expect_err("a swapped preview must break the approval");
+    assert!(
+        error.contains("approval digest mismatch"),
+        "expected an approval mismatch, got: {error}"
+    );
+}
+
+/// A v4 approval keeps verifying under v4 forever. It must not be promoted:
+/// its approver never saw a preview binding, and re-signing it as v5 would
+/// assert consent that was never given.
+#[test]
+fn a_v4_approval_is_never_promoted() {
+    let mut record = record_with_preview(Some("DESTROY lxc/617 on pve3"));
+    record.approval = Some(ApprovalRecord {
+        approver: Some("bob".to_owned()),
+        approved_at_unix: 1_700_000_000,
+        digest: compute_approval_digest_v4(
+            &record.id,
+            &record.digest,
+            &record.owner,
+            "bob",
+            1_700_000_000,
+        ),
+        digest_version: 4,
+        waived: None,
+    });
+    let state = round_trip(record).expect("a v4 approval must still load");
+    let loaded = state.change_sets.values().next().unwrap();
+    assert_eq!(
+        loaded.approval.as_ref().unwrap().digest_version,
+        4,
+        "a v4 approval was promoted, which would claim consent that was not given"
+    );
+}
+
+/// The corollary: a v4 approval is *not* protected against a preview swap, and
+/// that is correct rather than a gap. It never bound the preview, and pretending
+/// otherwise is exactly what promoting it would do.
+#[test]
+fn a_v4_approval_still_tolerates_a_preview_swap() {
+    let mut record = record_with_preview(Some("DESTROY lxc/617 on pve3"));
+    record.approval = Some(ApprovalRecord {
+        approver: Some("bob".to_owned()),
+        approved_at_unix: 1_700_000_000,
+        digest: compute_approval_digest_v4(
+            &record.id,
+            &record.digest,
+            &record.owner,
+            "bob",
+            1_700_000_000,
+        ),
+        digest_version: 4,
+        waived: None,
+    });
+    let replacement = "RESIZE lxc/617 disk on pve3";
+    record.preview = Some(PreviewRecord {
+        digest: mecmcp_changeset::digest::preview_digest(replacement),
+        artifact: replacement.to_owned(),
+        job_id: None,
+    });
+    round_trip(record).expect("a v4 approval does not bind the preview, by construction");
+}
+
+/// A v5 approval on a record with no preview is legal, and the absence is signed.
+#[test]
+fn a_previewless_v5_approval_binds_the_absence() {
+    let mut record = record_with_preview(None);
+    record.approval = Some(ApprovalRecord {
+        approver: Some("bob".to_owned()),
+        approved_at_unix: 1_700_000_000,
+        digest: compute_approval_digest_v5(
+            &record.id,
+            &record.digest,
+            None,
+            &record.owner,
+            "bob",
+            1_700_000_000,
+        ),
+        digest_version: 5,
+        waived: None,
+    });
+    round_trip(record.clone()).expect("a previewless v5 approval must load");
+
+    // Attaching a preview to a record approved without one must not verify.
+    let mut with_preview = record;
+    with_preview.preview = Some(PreviewRecord {
+        digest: mecmcp_changeset::digest::preview_digest("injected"),
+        artifact: "injected".to_owned(),
+        job_id: None,
+    });
+    let error = round_trip(with_preview)
+        .expect_err("adding a preview after a previewless approval must break it");
+    assert!(error.contains("approval digest mismatch"), "{error}");
+}
+
+/// An unknown digest version is refused rather than silently treated as one of
+/// the known rules.
+#[test]
+fn an_unknown_digest_version_is_refused() {
+    let mut record = record_with_preview(Some("DESTROY lxc/617 on pve3"));
+    record.approval = Some(ApprovalRecord {
+        approver: Some("bob".to_owned()),
+        approved_at_unix: 1_700_000_000,
+        digest: compute_approval_digest_v4(
+            &record.id,
+            &record.digest,
+            &record.owner,
+            "bob",
+            1_700_000_000,
+        ),
+        digest_version: 99,
+        waived: None,
+    });
+    let error = round_trip(record).expect_err("an unknown version must be refused");
+    assert!(
+        error.contains("unsupported digest version"),
+        "expected an explicit refusal, got: {error}"
+    );
+}

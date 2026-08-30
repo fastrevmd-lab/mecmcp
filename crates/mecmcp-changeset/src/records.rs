@@ -524,10 +524,41 @@ pub struct ApprovalRecord {
     /// [`crate::digest::compute_waiver_digest`] instead, and are still verified
     /// with it when the file declares version 1 or 2.
     pub digest: String,
+    /// Which rule [`digest`](Self::digest) was computed under.
+    ///
+    /// Per-record rather than per-file, and deliberately so. The waiver and
+    /// approval migrations before this one re-signed old records under the new
+    /// rule on load, which was safe because the old digest already covered every
+    /// field the new one bound — promoting it authenticated nothing new.
+    ///
+    /// v5 breaks that property: it binds the preview digest, which v4 did not
+    /// cover. Re-signing a v4 approval as v5 would assert that its approver
+    /// consented to the preview, when at the time they approved nothing tied the
+    /// two together. So v4 records stay v4, are verified under v4 forever, and
+    /// are never promoted — which needs the version to travel with the record
+    /// rather than with the file.
+    ///
+    /// Defaults to 4: a file at schema version 4 or above has already had any
+    /// legacy approval migrated to v4 by `read_state`, so an absent field means
+    /// v4. Records below that are handled by the file-version branch instead.
+    #[serde(default = "approval_digest_v4", skip_serializing_if = "is_v4")]
+    pub digest_version: u8,
     /// Waiver record, present when approval was waived — whether by lab mode or
     /// by an operator-granted exception. See [`WaiverKind`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waived: Option<WaiverRecord>,
+}
+
+/// The default [`ApprovalRecord::digest_version`] — see that field.
+const fn approval_digest_v4() -> u8 {
+    4
+}
+
+/// Keeps a v4 record byte-identical on disk to what it was before this field
+/// existed, so a deployment with no v5 approvals writes exactly what it wrote
+/// before and keeps selecting its old schema version.
+fn is_v4(version: &u8) -> bool {
+    *version == 4
 }
 
 /// How an approval came to be waived.

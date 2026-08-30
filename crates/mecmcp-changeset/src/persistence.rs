@@ -3,8 +3,9 @@
 use crate::{
     ChangeSetRecord, OperationRecord,
     digest::{
-        compute_approval_digest, compute_approval_digest_legacy, compute_waiver_digest,
-        compute_waiver_digest_v3, validate_fingerprint, validate_principal_for_digest,
+        compute_approval_digest_legacy, compute_approval_digest_v4, compute_approval_digest_v5,
+        compute_waiver_digest, compute_waiver_digest_v3, validate_fingerprint,
+        validate_principal_for_digest,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -83,7 +84,7 @@ pub fn read_state(path: &Path, max_state_bytes: u64) -> Result<ChangesetState, P
     let on_disk: OnDiskChangesetState = serde_json::from_slice(bytes)
         .map_err(|error| PersistenceError::new(format!("invalid changeset state JSON: {error}")))?;
 
-    if !(1..=5).contains(&on_disk.version) {
+    if !(1..=6).contains(&on_disk.version) {
         return Err(PersistenceError::new(format!(
             "unsupported changeset state version {}",
             on_disk.version
@@ -134,13 +135,18 @@ pub fn read_state(path: &Path, max_state_bytes: u64) -> Result<ChangesetState, P
             if let Some(approval) = record.approval.as_mut()
                 && let Some(approver) = approval.approver.as_ref()
             {
-                approval.digest = crate::digest::compute_approval_digest(
+                approval.digest = crate::digest::compute_approval_digest_v4(
                     &id,
                     &change_set_digest,
                     &owner,
                     approver,
                     approval.approved_at_unix,
                 );
+                // Stamp what it was just re-signed as. The field defaults to 4,
+                // so this is already its value -- set explicitly because the
+                // migration is the thing that makes it true, and a later change
+                // to the default must not silently relabel these records.
+                approval.digest_version = 4;
             }
         }
     }
@@ -269,15 +275,39 @@ pub fn validate_state(state: &ChangesetState, version: u32) -> Result<(), Persis
 
             let expected_approval_digest = if let Some(approver) = &approval.approver {
                 if version >= 4 {
-                    // The tuple encoding is unambiguous by construction, so the
-                    // separator rule is not needed to make it safe.
-                    compute_approval_digest(
-                        id,
-                        &record.digest,
-                        &record.owner,
-                        approver,
-                        approval.approved_at_unix,
-                    )
+                    // Which rule applies is carried by the record, not the file.
+                    // v5 binds the preview digest and v4 does not, so promoting a
+                    // v4 record would claim its approver consented to a preview
+                    // binding that did not exist. They are verified under the rule
+                    // they were signed with, permanently.
+                    //
+                    // The tuple encoding is unambiguous by construction in both,
+                    // so the separator rule is not needed to make either safe.
+                    match approval.digest_version {
+                        5 => compute_approval_digest_v5(
+                            id,
+                            &record.digest,
+                            record
+                                .preview
+                                .as_ref()
+                                .map(|preview| preview.digest.as_str()),
+                            &record.owner,
+                            approver,
+                            approval.approved_at_unix,
+                        ),
+                        4 => compute_approval_digest_v4(
+                            id,
+                            &record.digest,
+                            &record.owner,
+                            approver,
+                            approval.approved_at_unix,
+                        ),
+                        other => {
+                            return Err(PersistenceError::new(format!(
+                                "changeset state approval carries unsupported digest version {other}"
+                            )));
+                        }
+                    }
                 } else {
                     // Legacy: the `|`-joined encoding, which is only safe for
                     // values that cannot move a field boundary. Version decides
@@ -501,7 +531,18 @@ pub(crate) fn write_state(
         .change_sets
         .values()
         .any(|cs| cs.approval.as_ref().is_some_and(|a| a.approver.is_some()));
-    let version = if handleless_applies_need_v5 {
+    // Version 6 is required once an approval is signed under the v5 rule, which
+    // binds the preview digest (rustproxmoxmcp#56). A v1-v5 reader recomputes the
+    // v4 tuple for any approval it sees and would reject the file. Content-based
+    // like every rule above it: a deployment that has approved nothing since the
+    // upgrade keeps writing the version it wrote before.
+    let preview_bound_approvals_need_v6 = state
+        .change_sets
+        .values()
+        .any(|cs| cs.approval.as_ref().is_some_and(|a| a.digest_version >= 5));
+    let version = if preview_bound_approvals_need_v6 {
+        6
+    } else if handleless_applies_need_v5 {
         5
     } else if approvals_need_v4 {
         4

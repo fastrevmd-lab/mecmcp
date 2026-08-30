@@ -79,6 +79,7 @@ fn waived_record(
             approver: None,
             approved_at_unix: approved_at,
             digest: approval_digest,
+            digest_version: 4,
             waived: Some(waiver),
         }),
         expires_at_unix: now() + 86_400,
