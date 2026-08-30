@@ -29,6 +29,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `packaging/lxc/build-minimal-rootfs.sh` and `MINIMAL-LXC-ROOTFS.md`, the result
+  of the #347 spike. Builds a Debian rootfs for an LXC running one
+  mecmcp-family service under systemd, keeping glibc and systemd deliberately.
+  Measured against a real deployed guest: **257 -> 146 packages, 911 -> 260 MB**,
+  and one fewer listening network service. Verified on hardware -- the service
+  starts, every directive that was enforced before is still enforced (read from
+  `/proc`, not from `systemctl show`), hostname resolution is unchanged, a real
+  NETCONF call reaches a vSRX on Junos 24.4R1.9, and the `pct exec` operator path
+  of editing `devices.json` and sending `SIGHUP` still works. `IPAddressDeny` is
+  the one exception and is called out in the document: it is reported by
+  `systemctl show` and is not enforced in an unprivileged LXC, which is true of
+  the stock guests too and is not changed by this image. The template carries no
+  SSH host keys: they are stripped at build time and regenerated once on first
+  boot, so guests built from it do not share a server identity.
+
 ## [0.23.0] - 2026-08-30
 
 ### Security
