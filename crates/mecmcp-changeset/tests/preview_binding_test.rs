@@ -238,3 +238,68 @@ fn an_unknown_digest_version_is_refused() {
         "expected an explicit refusal, got: {error}"
     );
 }
+
+/// The digest check in `read_state` only runs on a *reload*. Between an
+/// in-process preview swap and the next restart, the record still applies and
+/// carries an approval for text that is no longer there. The write is refused
+/// so the window never opens.
+#[tokio::test]
+async fn a_bound_preview_cannot_be_changed_in_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = mecmcp_changeset::ChangesetCoordinator::load(
+        Some(&dir.path().join("state.json")),
+        mecmcp_changeset::OperationLimits::default(),
+        std::time::Duration::from_secs(3600),
+        true,
+    )
+    .unwrap();
+
+    let mut record = record_with_preview(Some("DESTROY lxc/617 on pve3"));
+    record.state = ChangeSetState::Planned;
+    record.approver = None;
+    record.approval = None;
+    coord.insert_change_set(record.clone()).await.unwrap();
+
+    let preview_digest = record.preview.as_ref().map(|p| p.digest.clone());
+    let mut approved = record.clone();
+    approved.state = ChangeSetState::Approved;
+    approved.approver = Some("bob".to_owned());
+    approved.approval = Some(ApprovalRecord {
+        approver: Some("bob".to_owned()),
+        approved_at_unix: 1_700_000_000,
+        digest: compute_approval_digest_v5(
+            &record.id,
+            &record.digest,
+            preview_digest.as_deref(),
+            &record.owner,
+            "bob",
+            1_700_000_000,
+        ),
+        digest_version: 5,
+        waived: None,
+    });
+    coord.update_change_set(approved.clone()).await.unwrap();
+
+    // Swap the text, keeping the preview record self-consistent.
+    let mut swapped = approved.clone();
+    let replacement = "RESIZE lxc/617 disk on pve3";
+    swapped.preview = Some(PreviewRecord {
+        digest: mecmcp_changeset::digest::preview_digest(replacement),
+        artifact: replacement.to_owned(),
+        job_id: None,
+    });
+    let error = coord
+        .update_change_set(swapped)
+        .await
+        .expect_err("rewriting a bound preview must be refused");
+    assert!(
+        error.to_string().contains("bound by an approval"),
+        "expected the immutability refusal, got: {error}"
+    );
+
+    // A write that leaves the preview alone is still fine.
+    coord
+        .update_change_set(approved)
+        .await
+        .expect("an unrelated update must still be allowed");
+}

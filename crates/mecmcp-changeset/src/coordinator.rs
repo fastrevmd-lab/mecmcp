@@ -1044,6 +1044,32 @@ fn check_change_set_write(
         ));
     }
 
+    // A v5 approval binds the preview digest, so changing the preview after
+    // approval makes the approval unverifiable — but only on the next load,
+    // because nothing recomputes it in-process. Between the swap and a restart
+    // the record still applies, carrying an approval for text that is no longer
+    // there. Refusing the write closes that window at its source rather than
+    // detecting it afterwards, and there is no legitimate reason to rewrite the
+    // text an approver already signed.
+    if current
+        .approval
+        .as_ref()
+        .is_some_and(|approval| approval.digest_version >= 5)
+    {
+        let current_preview = current
+            .preview
+            .as_ref()
+            .map(|preview| preview.digest.as_str());
+        let next_preview = next.preview.as_ref().map(|preview| preview.digest.as_str());
+        if current_preview != next_preview {
+            return Err(CoordinatorError::new(
+                "preview",
+                "the preview is bound by an approval and cannot be changed; \
+                 plan the operation again to produce a new one",
+            ));
+        }
+    }
+
     if !change_set_transition_allowed(current.state, next.state) {
         return Err(CoordinatorError::new(
             "state",

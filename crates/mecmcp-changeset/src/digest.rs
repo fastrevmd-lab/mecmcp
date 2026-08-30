@@ -375,7 +375,7 @@ pub fn compute_approval_digest_v5(
 /// closing the ambiguity at the input.
 ///
 /// Since #283 the encoding itself is unambiguous —
-/// [`compute_approval_digest`] serializes a tuple — so this is no longer the
+/// [`compute_approval_digest_v4`] serializes a tuple — so this is no longer the
 /// only thing standing between a `|` and a forged pairing. It stays because the
 /// **legacy** verification path still computes the `|`-joined digest for records
 /// written before v4, and that path must never be handed an ambiguous value.
@@ -456,12 +456,15 @@ mod preview_binding_tests {
             compute_approval_digest_v4("cs1", "sha256:plan", "alice", "bob", 1_700_000_000),
             compute_approval_digest_v4("cs1", "sha256:plan", "alice", "bob", 1_700_000_000),
         );
-        // The marker is part of the encoding; if it ever changes, every stored
-        // approval stops verifying, so pin the actual value.
-        let digest =
-            compute_approval_digest_v4("cs1", "sha256:plan", "alice", "bob", 1_700_000_000);
-        assert!(digest.starts_with("sha256:"), "{digest}");
-        assert_eq!(digest.len(), "sha256:".len() + 64);
+        // Pinned to a literal, not to another call of the same function. Ten
+        // approvals across the fleet were signed with this encoding; if the
+        // marker or the serialization changes they all stop verifying, and a
+        // test that compares the function to itself cannot notice.
+        assert_eq!(
+            compute_approval_digest_v4("cs1", "sha256:plan", "alice", "bob", 1_700_000_000),
+            "sha256:1bb4ce2e69d14289e1f7a76992b1545f2d081fe1abe03b3d12467a47664cbd24",
+            "the v4 encoding changed; every stored v4 approval is now unverifiable"
+        );
     }
 
     /// Every field still moves the digest — the preview is an addition, not a
