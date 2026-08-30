@@ -287,7 +287,7 @@ pub fn compute_waiver_digest_v3(
 /// The leading marker keeps this digest distinguishable from every other tuple
 /// digest here, so a value can never be replayed across kinds.
 #[must_use]
-pub fn compute_approval_digest(
+pub fn compute_approval_digest_v4(
     change_set_id: &str,
     plan_digest: &str,
     owner: &str,
@@ -298,6 +298,60 @@ pub fn compute_approval_digest(
         "mecmcp-approval-v4",
         change_set_id,
         plan_digest,
+        owner,
+        approver,
+        approved_at_unix,
+    ))
+    .expect("approval digest inputs are primitives and cannot fail to serialize");
+    format!("sha256:{}", digest_hex(&canonical))
+}
+
+/// The approval digest, binding the preview the approver actually read.
+///
+/// v4 bound `(change_set_id, plan_digest, owner, approver, approved_at)`. The
+/// plan digest covers the *actions*; the preview is rendered from those actions
+/// and stored beside them, and nothing tied the two together. An approver's
+/// consent was therefore evidenced against the actions alone, while what they
+/// read was the preview — so a rendering bug could have produced text that did
+/// not describe what would run, and the approval would still have verified.
+///
+/// v5 adds `preview_digest`, which closes that: the signature now covers both
+/// the actions and the exact text presented for them.
+///
+/// # Why here and not in the plan digest
+///
+/// rustproxmoxmcp#56 proposes making the preview an input to
+/// [`change_set_digest`]. That would work, and it costs more than it needs to.
+/// The plan digest is created before the preview exists — consumers attach the
+/// preview in a second write — so binding it there means recomputing the plan
+/// digest after creation. Every stored approval binds the plan digest, so
+/// recomputing it invalidates them, and re-signing them would assert that those
+/// approvers consented to a preview binding that did not exist when they
+/// approved. That is laundering, and it is the same hazard #275 refused for
+/// waivers.
+///
+/// Binding it in the approval instead reaches the actual goal — approval covers
+/// the preview — and does it more precisely: the approver signs the text *they*
+/// saw, at the moment they saw it, rather than whatever was attached at plan
+/// time.
+///
+/// `preview_digest` is `Option` because a record can genuinely lack a preview.
+/// `None` and `Some` serialize distinguishably in the tuple, so the absence is
+/// itself signed and cannot be swapped for a presence.
+#[must_use]
+pub fn compute_approval_digest_v5(
+    change_set_id: &str,
+    plan_digest: &str,
+    preview_digest: Option<&str>,
+    owner: &str,
+    approver: &str,
+    approved_at_unix: u64,
+) -> String {
+    let canonical = serde_json::to_vec(&(
+        "mecmcp-approval-v5",
+        change_set_id,
+        plan_digest,
+        preview_digest,
         owner,
         approver,
         approved_at_unix,
@@ -321,7 +375,7 @@ pub fn compute_approval_digest(
 /// closing the ambiguity at the input.
 ///
 /// Since #283 the encoding itself is unambiguous —
-/// [`compute_approval_digest`] serializes a tuple — so this is no longer the
+/// [`compute_approval_digest_v4`] serializes a tuple — so this is no longer the
 /// only thing standing between a `|` and a forged pairing. It stays because the
 /// **legacy** verification path still computes the `|`-joined digest for records
 /// written before v4, and that path must never be handed an ambiguous value.
@@ -337,4 +391,145 @@ pub fn validate_principal_for_digest(field_name: &'static str, value: &str) -> R
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod preview_binding_tests {
+    use super::*;
+
+    /// The point of v5: the same plan, approver and moment, with a different
+    /// preview, must not produce the same signature. Without this the approval
+    /// says nothing about the text the approver read.
+    #[test]
+    fn a_different_preview_is_a_different_approval() {
+        let a = compute_approval_digest_v5(
+            "cs1",
+            "sha256:plan",
+            Some("sha256:preview-a"),
+            "alice",
+            "bob",
+            1_700_000_000,
+        );
+        let b = compute_approval_digest_v5(
+            "cs1",
+            "sha256:plan",
+            Some("sha256:preview-b"),
+            "alice",
+            "bob",
+            1_700_000_000,
+        );
+        assert_ne!(a, b, "the preview is not bound");
+    }
+
+    /// Absence is signed too. A record with no preview must not collide with one
+    /// whose preview was removed, or removal becomes undetectable.
+    #[test]
+    fn no_preview_is_distinct_from_any_preview() {
+        let none =
+            compute_approval_digest_v5("cs1", "sha256:plan", None, "alice", "bob", 1_700_000_000);
+        let some = compute_approval_digest_v5(
+            "cs1",
+            "sha256:plan",
+            Some(""),
+            "alice",
+            "bob",
+            1_700_000_000,
+        );
+        assert_ne!(none, some, "None and Some(\"\") collide");
+    }
+
+    /// v4 and v5 must never agree, even on the inputs they share. The domain
+    /// marker is what stops a v4 digest being presented as a v5 one.
+    #[test]
+    fn v4_and_v5_do_not_collide() {
+        let v4 = compute_approval_digest_v4("cs1", "sha256:plan", "alice", "bob", 1_700_000_000);
+        let v5 =
+            compute_approval_digest_v5("cs1", "sha256:plan", None, "alice", "bob", 1_700_000_000);
+        assert_ne!(v4, v5);
+    }
+
+    /// v4 is unchanged by this work. Ten approvals on the fleet were signed
+    /// with it and must keep verifying byte for byte.
+    #[test]
+    fn v4_is_byte_stable() {
+        assert_eq!(
+            compute_approval_digest_v4("cs1", "sha256:plan", "alice", "bob", 1_700_000_000),
+            compute_approval_digest_v4("cs1", "sha256:plan", "alice", "bob", 1_700_000_000),
+        );
+        // Pinned to a literal, not to another call of the same function. Ten
+        // approvals across the fleet were signed with this encoding; if the
+        // marker or the serialization changes they all stop verifying, and a
+        // test that compares the function to itself cannot notice.
+        assert_eq!(
+            compute_approval_digest_v4("cs1", "sha256:plan", "alice", "bob", 1_700_000_000),
+            "sha256:1bb4ce2e69d14289e1f7a76992b1545f2d081fe1abe03b3d12467a47664cbd24",
+            "the v4 encoding changed; every stored v4 approval is now unverifiable"
+        );
+    }
+
+    /// Every field still moves the digest — the preview is an addition, not a
+    /// replacement.
+    #[test]
+    fn every_v5_field_is_bound() {
+        let base = compute_approval_digest_v5(
+            "cs1",
+            "sha256:plan",
+            Some("sha256:p"),
+            "alice",
+            "bob",
+            1_700_000_000,
+        );
+        for other in [
+            compute_approval_digest_v5(
+                "cs2",
+                "sha256:plan",
+                Some("sha256:p"),
+                "alice",
+                "bob",
+                1_700_000_000,
+            ),
+            compute_approval_digest_v5(
+                "cs1",
+                "sha256:other",
+                Some("sha256:p"),
+                "alice",
+                "bob",
+                1_700_000_000,
+            ),
+            compute_approval_digest_v5(
+                "cs1",
+                "sha256:plan",
+                Some("sha256:q"),
+                "alice",
+                "bob",
+                1_700_000_000,
+            ),
+            compute_approval_digest_v5(
+                "cs1",
+                "sha256:plan",
+                Some("sha256:p"),
+                "eve",
+                "bob",
+                1_700_000_000,
+            ),
+            compute_approval_digest_v5(
+                "cs1",
+                "sha256:plan",
+                Some("sha256:p"),
+                "alice",
+                "eve",
+                1_700_000_000,
+            ),
+            compute_approval_digest_v5(
+                "cs1",
+                "sha256:plan",
+                Some("sha256:p"),
+                "alice",
+                "bob",
+                1_700_000_001,
+            ),
+        ] {
+            assert_ne!(base, other, "a field is not bound");
+        }
+    }
 }

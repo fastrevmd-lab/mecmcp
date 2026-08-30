@@ -49,6 +49,10 @@ workspace = true
 # test-only door; without this the default `cargo test` fails to compile it
 # rather than skipping it.
 [[test]]
+name = "preview_binding_test"
+required-features = ["test-util"]
+
+[[test]]
 name = "atomic_apply_claim_test"
 required-features = ["test-util"]
 

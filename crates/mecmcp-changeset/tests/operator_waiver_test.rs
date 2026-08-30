@@ -7,7 +7,8 @@
 use async_trait::async_trait;
 use mecmcp_audit::{ActorType, AgentIdentity, Attribution, Principal};
 use mecmcp_changeset::digest::{
-    change_set_digest, compute_approval_digest, compute_waiver_digest, compute_waiver_digest_v3,
+    change_set_digest, compute_approval_digest_v4 as compute_approval_digest,
+    compute_waiver_digest, compute_waiver_digest_v3,
 };
 use mecmcp_changeset::persistence::{read_state, write_state_for_test};
 use mecmcp_changeset::{
@@ -243,6 +244,7 @@ fn v3_waiver_round_trip_and_version_dependence() {
             approver: None,
             approved_at_unix: approved_at,
             digest: waiver_digest.clone(),
+            digest_version: 4,
             waived: Some(waiver_record.clone()),
         }),
         expires_at_unix: approved_at + 900,
@@ -593,6 +595,7 @@ async fn an_expired_waiver_does_not_authorize_apply() {
         approver: None,
         approved_at_unix: now,
         digest: waiver_digest,
+        digest_version: 4,
         waived: Some(waiver),
     });
 
@@ -684,6 +687,7 @@ async fn pre_guard_waiver_expiry_check_fails_without_blocking() {
         approver: None,
         approved_at_unix: now,
         digest: waiver_digest,
+        digest_version: 4,
         waived: Some(waiver),
     });
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
@@ -784,6 +788,7 @@ async fn post_guard_waiver_expiry_check_detects_toctou_rewrite() {
         approver: None,
         approved_at_unix: now,
         digest: waiver_digest,
+        digest_version: 4,
         waived: Some(waiver.clone()),
     });
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
@@ -881,6 +886,7 @@ async fn post_guard_waiver_expiry_check_detects_toctou_rewrite() {
         approver: None,
         approved_at_unix: now,
         digest: expired_digest,
+        digest_version: 4,
         waived: Some(expired_waiver),
     });
     coordinator
@@ -943,6 +949,7 @@ async fn waiver_at_exact_expiry_instant_is_expired() {
         approver: None,
         approved_at_unix: now,
         digest: waiver_digest,
+        digest_version: 4,
         waived: Some(waiver),
     });
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");

@@ -1044,6 +1044,80 @@ fn check_change_set_write(
         ));
     }
 
+    // Three invariants, stated as invariants rather than as guards on the paths
+    // that happened to be found. Each earlier version of this block was scoped
+    // to one route and was bypassed by another.
+    //
+    // 1. A preview that is written must be self-consistent.
+    //
+    // Unconditional, not only for approved records. `approve_change_set` signs
+    // the stored preview digest, so a `Planned` record whose artifact and digest
+    // already disagree yields a valid approval over an inconsistent preview --
+    // claimable in-process, and rejected by `read_state` only at the next
+    // restart, taking the whole file with it. Refusing it at the write is the
+    // only point where the two values are both present and comparable.
+    if next.preview.is_some() {
+        next.validate_preview(usize::MAX).map_err(|error| {
+            CoordinatorError::new("preview", format!("the preview is invalid: {error}"))
+        })?;
+    }
+
+    if let Some(current_approval) = current.approval.as_ref() {
+        // 2. A granted two-person approval's digest and version are immutable.
+        //
+        // Without this, invariant 3 is bypassed in two steps: replace the v5
+        // approval with a valid v4 one, at which point the record no longer
+        // reports v5, then change the preview freely on the next write. The
+        // downgraded record stays claimable and reloadable throughout. An
+        // approval is evidence of an act that already happened; nothing later
+        // has cause to rewrite it.
+        //
+        // Scoped to a genuine approval (`approver` present) rather than to any
+        // approval record. A waiver carries no approver and never binds a
+        // preview, so it cannot be the start of that downgrade -- and the
+        // expiry TOCTOU that `post_guard_waiver_expiry_check_detects_toctou_rewrite`
+        // exercises is a real attack whose detection lives in the apply path,
+        // not here. Freezing waivers would remove that test's ability to stage
+        // the scenario without removing the attack.
+        // Whole-record equality, and removal counts. A previous version compared
+        // only the digest and version, which an update setting `approval` to
+        // `None` skipped entirely -- and because the top-level `approver` field
+        // survives, `apply_change_set` then accepted the record through its
+        // legacy-approval path while the preview, no longer bound by anything,
+        // was free to be replaced on the next write. Nothing legitimate clears a
+        // granted approval: `approval: None` is written once, at creation.
+        if current_approval.approver.is_some() && next.approval.as_ref() != Some(current_approval) {
+            return Err(CoordinatorError::new(
+                "approval",
+                "an approval cannot be rewritten or removed once granted; \
+                 plan the operation again to produce a new one",
+            ));
+        }
+
+        // 3. A v5 approval binds the preview digest, so the preview is frozen.
+        //
+        // The digest check in `read_state` only fires on a reload, so between an
+        // in-process swap and the next restart the record still applies while
+        // carrying an approval for text that is no longer there. Refusing the
+        // write closes that window at its source. Invariant 1 above is what
+        // makes this comparison mean anything -- the digest is a field of the
+        // record being written, so on its own it proves nothing about the text.
+        if current_approval.digest_version >= 5 {
+            let current_preview = current
+                .preview
+                .as_ref()
+                .map(|preview| preview.digest.as_str());
+            let next_preview = next.preview.as_ref().map(|preview| preview.digest.as_str());
+            if current_preview != next_preview {
+                return Err(CoordinatorError::new(
+                    "preview",
+                    "the preview is bound by an approval and cannot be changed; \
+                     plan the operation again to produce a new one",
+                ));
+            }
+        }
+    }
+
     if !change_set_transition_allowed(current.state, next.state) {
         return Err(CoordinatorError::new(
             "state",

@@ -574,7 +574,8 @@ async fn the_handleless_marker_does_not_outlive_the_apply() {
     );
 }
 
-/// A file carrying the handleless marker must declare version 5.
+/// A file carrying the handleless marker must declare a version older readers
+/// refuse.
 ///
 /// `ChangeSetRecord` is `deny_unknown_fields`, so a binary that predates the
 /// field rejects the whole file over it. 0.21.0 accepts versions 1..=4, and
@@ -583,6 +584,14 @@ async fn the_handleless_marker_does_not_outlive_the_apply() {
 /// version 4 regardless, and 0.21.0 would read that as a supported schema and
 /// then fail on the unknown field. The gate is only a gate if the version moves
 /// past what the old reader accepts.
+///
+/// The specific number moved from 5 to 6 when approvals began binding the
+/// preview digest (rustproxmoxmcp#56): a v5 approval is itself unreadable to
+/// anything below schema 6, so an approved record now carries that version
+/// before the marker is applied at all. The guarantee under test is unchanged —
+/// the file must declare something a pre-marker binary refuses — and it is
+/// asserted as that rather than as a literal, so the next version rule added
+/// above it does not silently turn this test into a tautology.
 #[tokio::test]
 async fn a_handleless_apply_forces_a_state_file_version_older_readers_refuse() {
     let dir = tempfile::tempdir().unwrap();
@@ -594,10 +603,10 @@ async fn a_handleless_apply_forces_a_state_file_version_older_readers_refuse() {
     let before: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let before_version = before["version"].as_u64().unwrap();
-    assert!(
-        before_version <= 4,
-        "an ordinary approved record should still write a version an older \
-         binary reads, got {before_version}"
+    assert_eq!(
+        before_version, 6,
+        "an approved record binds its preview (v5 approval digest), which is \
+         itself unreadable below schema 6"
     );
 
     coord
@@ -607,10 +616,15 @@ async fn a_handleless_apply_forces_a_state_file_version_older_readers_refuse() {
 
     let after: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(
-        after["version"].as_u64().unwrap(),
-        5,
-        "a file carrying apply_without_handle must declare version 5, or a \
-         0.21.0 binary reads it as supported and then rejects the record"
+    let after_version = after["version"].as_u64().unwrap();
+    assert!(
+        after_version >= 5,
+        "a file carrying apply_without_handle must declare at least version 5, \
+         or a 0.21.0 binary reads it as supported and then rejects the record; \
+         got {after_version}"
+    );
+    assert!(
+        after_version >= before_version,
+        "applying the marker must not lower the declared version"
     );
 }

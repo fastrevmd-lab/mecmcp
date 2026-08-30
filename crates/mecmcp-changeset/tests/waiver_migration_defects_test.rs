@@ -13,7 +13,10 @@
 
 use mecmcp_changeset::{
     ApprovalRecord, ChangeSetRecord, ChangeSetState, WaiverKind, WaiverRecord,
-    digest::{change_set_digest, compute_approval_digest, compute_waiver_digest},
+    digest::{
+        change_set_digest, compute_approval_digest_v4 as compute_approval_digest,
+        compute_waiver_digest,
+    },
     persistence::{ChangesetState, read_state},
 };
 use std::collections::BTreeMap;
@@ -83,6 +86,7 @@ fn defect_4_edited_reason_is_rejected_on_load() {
             approver: None,
             approved_at_unix: approved_at,
             digest: waiver_digest,
+            digest_version: 4,
             waived: Some(waiver),
         }),
         expires_at_unix: approved_at + 3600,
@@ -181,7 +185,8 @@ fn defect_5_both_approver_and_waived_is_rejected() {
             approver: Some(approver), // ← valid approver
             approved_at_unix: approved_at,
             digest: approval_digest, // ← valid approver digest
-            waived: Some(waiver),    // ← INJECTED waiver
+            digest_version: 4,
+            waived: Some(waiver), // ← INJECTED waiver
         }),
         expires_at_unix: approved_at + 3600,
         operation_id: None,

@@ -707,6 +707,7 @@ mod tests {
                 approver: None,
                 approved_at_unix: expires_at - 3600,
                 digest: "c".repeat(64),
+                digest_version: 4,
                 waived: Some(waiver),
             }),
             policy_signature: "test".to_owned(),
