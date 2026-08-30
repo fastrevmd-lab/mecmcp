@@ -145,6 +145,7 @@ where
 
 /// Canonical envelope: `{ "version": 1, "devices": {...}, "policy": {...} }`.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CanonicalEnvelope<D, P> {
     version: u32,
     policy: Option<P>,
@@ -153,6 +154,7 @@ struct CanonicalEnvelope<D, P> {
 
 /// Legacy PAN-OS envelope: `{ "version": 1, "devices": [...] }`.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PanosEnvelope<D> {
     version: u32,
     devices: Vec<D>,
@@ -231,6 +233,21 @@ fn detect_shape(value: &serde_json::Value) -> Result<InventoryShape, InventoryEr
     }
 }
 
+/// The `version` value when it names a schema this build does not support.
+///
+/// Read from the parsed `Value` *before* the closed envelopes deserialize.
+/// The envelopes carry `deny_unknown_fields`, so a document on a future schema
+/// that added a top-level field would otherwise be reported as an unknown-field
+/// `ParseError` -- which tells the operator to delete a field their schema
+/// legitimately requires, instead of to upgrade this binary.
+///
+/// A `version` that is not a `u32` yields `None` and falls through to the
+/// envelope, whose typed error names the field properly.
+fn unsupported_version(value: &serde_json::Value) -> Option<u32> {
+    let version = u32::try_from(value.get("version")?.as_u64()?).ok()?;
+    (version != 1).then_some(version)
+}
+
 /// Parse all three schemas and return (devices_map, global_policy).
 ///
 /// Discrimination happens in two phases:
@@ -249,6 +266,10 @@ where
     // Phase 2: Deserialize into the chosen concrete type
     match shape {
         InventoryShape::Canonical => {
+            if let Some(version) = unsupported_version(&value) {
+                return Err(InventoryError::UnsupportedVersion(version));
+            }
+
             let envelope: CanonicalEnvelope<D, P> = serde_json::from_value(value)
                 .map_err(|e| InventoryError::ParseError(format!("canonical envelope: {e}")))?;
 
@@ -265,6 +286,10 @@ where
             Ok((envelope.devices, envelope.policy))
         }
         InventoryShape::LegacyPanos => {
+            if let Some(version) = unsupported_version(&value) {
+                return Err(InventoryError::UnsupportedVersion(version));
+            }
+
             let envelope: PanosEnvelope<serde_json::Value> = serde_json::from_value(value)
                 .map_err(|e| InventoryError::ParseError(format!("legacy PAN-OS envelope: {e}")))?;
 
