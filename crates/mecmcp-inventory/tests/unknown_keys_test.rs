@@ -37,7 +37,7 @@ fn canonical_envelope_rejects_unknown_top_level_key() {
     write_mode_600(&path);
 
     let result: Result<FileInventory<TestDevice, TestPolicy>, _> = FileInventory::load(&path);
-    match result {
+    match result.map(|_| ()) {
         Err(InventoryError::ParseError(msg)) => {
             assert!(
                 msg.contains("unknown field") || msg.contains("api_key"),
@@ -64,7 +64,7 @@ fn panos_envelope_rejects_unknown_top_level_key() {
     write_mode_600(&path);
 
     let result: Result<FileInventory<TestDevice, TestPolicy>, _> = FileInventory::load(&path);
-    match result {
+    match result.map(|_| ()) {
         Err(InventoryError::ParseError(msg)) => {
             assert!(
                 msg.contains("unknown field") || msg.contains("api_secret"),
@@ -118,4 +118,79 @@ fn junos_flat_map_accepts_device_named_api_key() {
 
     let names = inventory.names();
     assert_eq!(names, vec!["api_key"]);
+}
+
+/// A document on a future schema version must report the version, not the
+/// unknown field that schema added.
+///
+/// Codex review of the #340 fix caught this: `deny_unknown_fields` on the
+/// closed envelopes fires during deserialization, which runs before the
+/// version check. Without the pre-check, an operator on a version-2 inventory
+/// is told to delete a field their schema requires, rather than to upgrade.
+#[test]
+fn a_future_version_reports_the_version_not_its_new_field() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("future_canonical.json");
+    std::fs::write(
+        &path,
+        r#"{"version": 2, "devices": {"r1": {"name": "r1"}}, "field_added_in_v2": true}"#,
+    )
+    .expect("write");
+
+    #[cfg(unix)]
+    write_mode_600(&path);
+
+    let result: Result<FileInventory<TestDevice, TestPolicy>, _> = FileInventory::load(&path);
+    match result.map(|_| ()) {
+        Err(InventoryError::UnsupportedVersion(2)) => {}
+        other => panic!("expected UnsupportedVersion(2), got: {other:?}"),
+    }
+}
+
+/// The same, for the legacy PAN-OS array shape.
+#[test]
+fn a_future_panos_version_reports_the_version_not_its_new_field() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("future_panos.json");
+    std::fs::write(
+        &path,
+        r#"{"version": 2, "devices": [{"name": "fw"}], "field_added_in_v2": true}"#,
+    )
+    .expect("write");
+
+    #[cfg(unix)]
+    write_mode_600(&path);
+
+    let result: Result<FileInventory<TestDevice, TestPolicy>, _> = FileInventory::load(&path);
+    match result.map(|_| ()) {
+        Err(InventoryError::UnsupportedVersion(2)) => {}
+        other => panic!("expected UnsupportedVersion(2), got: {other:?}"),
+    }
+}
+
+/// A `version` that is not a number must still produce the typed field error,
+/// not be swallowed by the pre-check.
+#[test]
+fn a_non_numeric_version_still_produces_a_parse_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("bad_version.json");
+    std::fs::write(
+        &path,
+        r#"{"version": "two", "devices": {"r1": {"name": "r1"}}}"#,
+    )
+    .expect("write");
+
+    #[cfg(unix)]
+    write_mode_600(&path);
+
+    let result: Result<FileInventory<TestDevice, TestPolicy>, _> = FileInventory::load(&path);
+    match result.map(|_| ()) {
+        Err(InventoryError::ParseError(msg)) => {
+            assert!(
+                msg.contains("canonical envelope") && msg.contains("expected u32"),
+                "message should name the shape and the expected type, got: {msg}"
+            );
+        }
+        other => panic!("expected a ParseError, got: {other:?}"),
+    }
 }
