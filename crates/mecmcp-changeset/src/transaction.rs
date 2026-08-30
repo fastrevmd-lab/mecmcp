@@ -24,7 +24,10 @@ use std::time::Duration;
 /// - **Stage atomicity:** [`stage()`](Self::stage) applies all actions or none.
 ///   A partial failure (e.g., second action fails) must revert the first action
 ///   before returning an error. The returned `Staged` handle represents a
-///   consistent snapshot.
+///   consistent snapshot. This holds for every implementation, including one
+///   reporting [`Atomicity::atomic_apply`] `= false` -- the coordinator's apply
+///   path depends on it. See [`stage()`](Self::stage) for why that declaration
+///   does not yet relax this.
 ///
 /// - **Indeterminate honesty:** [`commit()`](Self::commit) returns
 ///   [`CommitOutcome::Indeterminate`] on timeout or cancellation rather than
@@ -35,9 +38,11 @@ use std::time::Duration;
 /// - **Fingerprint scope:** What the fingerprint covers is vendor-specific.
 ///   PAN-OS fingerprints the operator-authorized candidate subtrees listed in
 ///   inventory policy. Junos fingerprints the entire candidate configuration
-///   database. Both are stable (same input → same hash) and binding (any change
-///   to the in-scope content changes the hash). An implementation documents its
-///   scope and guarantees the hash detects all mutations within that scope.
+///   database. A vendor with no candidate database fingerprints the running
+///   state of the resources it will touch. All are stable (same input → same
+///   hash) and binding (any change to the in-scope content changes the hash).
+///   An implementation documents its scope and guarantees the hash detects all
+///   mutations within that scope.
 #[async_trait]
 pub trait DeviceTransaction: Send + Sync {
     /// Vendor-specific action type.
@@ -83,7 +88,24 @@ pub trait DeviceTransaction: Send + Sync {
     /// # Fingerprint contract
     ///
     /// The fingerprint is a `sha256:<64 lowercase hex>` string computed over
-    /// the device's candidate configuration (or the in-scope subset thereof).
+    /// the configuration this transaction will mutate -- the device's candidate
+    /// database, or the in-scope subset of it.
+    ///
+    /// **A vendor with no candidate database hashes its running state instead** --
+    /// the resources this transaction will touch, before it touches them.
+    ///
+    /// That is a weaker guarantee, and worth naming rather than glossing: it
+    /// detects that the target moved, but it cannot detect that someone staged
+    /// something else alongside this change, because nothing can be staged.
+    /// What it binds is drift, not exclusivity. Such a vendor is the one
+    /// declaring [`Atomicity::live_writes`] from
+    /// [`atomicity()`](Self::atomicity), and that declaration -- not this
+    /// fingerprint -- is what tells shared code the whole shape is weaker.
+    ///
+    /// The stability and binding requirements below still apply in full over
+    /// whatever scope is chosen. A running-state hash is a different scope, not
+    /// a licence to be unstable.
+    ///
     /// It must be:
     ///
     /// - **Stable:** Two consecutive calls with no intervening mutation return
@@ -94,8 +116,9 @@ pub trait DeviceTransaction: Send + Sync {
     /// - **Scoped:** What the fingerprint covers is implementation-defined.
     ///   PAN-OS hashes the candidate subtrees listed in inventory policy (not
     ///   the entire running config). Junos would hash the entire candidate
-    ///   database via `<get-configuration database="candidate"/>`. Both are
-    ///   valid; the scope must be documented and stable.
+    ///   database via `<get-configuration database="candidate"/>`. A live-write
+    ///   vendor hashes the running state of the resources it will touch. All
+    ///   are valid; the scope must be documented and stable.
     ///
     /// # Device changes underneath
     ///
@@ -118,6 +141,23 @@ pub trait DeviceTransaction: Send + Sync {
     /// All actions succeed or all fail. A partial failure (e.g., the second
     /// action fails after the first succeeds) must revert the first action
     /// before returning an error.
+    ///
+    /// **This is still required of every implementation, including one that
+    /// reports [`atomicity()`](Self::atomicity) `atomic_apply: false`.** The
+    /// coordinator's apply path depends on it: `apply_change_set` treats a
+    /// `stage()` error as all-or-none, marks the change set `Failed`, and
+    /// removes the operation record, on the stated grounds that "nothing is on
+    /// the device". A vendor that left earlier writes applied would strand
+    /// those changes with no operation record and no reconciliation detail.
+    ///
+    /// So `atomic_apply: false` is, for now, a statement *about* a vendor and
+    /// not yet a licence to behave differently here. It exists so shared code
+    /// can describe what an operator is consenting to. Driving a genuinely
+    /// non-atomic vendor through `apply_change_set` needs the coordinator to
+    /// retain a reconcilable record for a partial failure first; until that
+    /// exists, such a vendor must confine its live writes to
+    /// [`commit()`](Self::commit), where an indeterminate outcome is already
+    /// modelled by [`CommitOutcome::Indeterminate`].
     ///
     /// Returns a vendor-specific `Staged` handle that the coordinator passes
     /// back opaque to [`diff()`](Self::diff), [`validate()`](Self::validate),
@@ -258,6 +298,30 @@ pub trait DeviceTransaction: Send + Sync {
     ///   `Archive(N)` on PAN-OS).
     async fn rollback(&self, to: RollbackRef) -> Result<RollbackOutcome, Self::Error>;
 
+    /// What this implementation can guarantee about applying a change set.
+    ///
+    /// **The default guarantees nothing, and that is deliberate.** An earlier
+    /// draft defaulted to the candidate-configuration answer so that Junos and
+    /// PAN-OS needed no edit. That is the wrong direction for a safety signal:
+    /// it hands every implementation that has not thought about the question a
+    /// claim of atomicity, dry-run validation and guaranteed rollback.
+    ///
+    /// It was also immediately untrue. `rustsdcmcp` has five implementations of
+    /// this trait -- firewall, NAT, object, device-sync and license -- and SDC
+    /// has no candidate store at all; `SdcFirewallTransaction::stage` only
+    /// validates a prepared plan locally and its rollback says "no remote
+    /// candidate exists". An optimistic default would have had all five report
+    /// dry-run validation and reliable rollback they do not have, in the exact
+    /// approval prompt this method exists to make honest.
+    ///
+    /// So: a vendor that genuinely has candidate configuration says so, with
+    /// [`Atomicity::candidate_configuration`]. Everything else under-claims
+    /// until someone checks, which is the direction that cannot mislead an
+    /// approver.
+    fn atomicity(&self) -> Atomicity {
+        Atomicity::nothing_guaranteed()
+    }
+
     /// Whether this implementation wants a device configuration lock held
     /// across a coordinator operation.
     ///
@@ -359,6 +423,107 @@ pub trait DeviceTransaction: Send + Sync {
     ) -> Result<CommitOutcome, Self::Error>;
 }
 
+/// What a vendor's transaction implementation can actually guarantee.
+///
+/// [`DeviceTransaction`] was derived from two vendors that both have candidate
+/// configuration -- Junos NETCONF and PAN-OS candidate/commit. Both can stage
+/// an arbitrary set of changes off to the side, diff it against running,
+/// validate it on-box, and apply it atomically. The trait's guarantees were
+/// written as that answer, for every vendor.
+///
+/// A vendor whose API writes directly to live configuration has none of the
+/// three. Every write is an immediate, independent request; there is no
+/// candidate to hash, nothing to validate before applying, and no checkpoint to
+/// return to. Such an implementation is not defective -- the promise was simply
+/// never true for it.
+///
+/// This exists so shared code can *say so*. The value lands in the approval
+/// prompt: an operator approving a change set against a live-write API is not
+/// getting commit-confirmed semantics, and a renderer that assumes the
+/// candidate-configuration answer tells them otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Atomicity {
+    /// Applying the change set lands all of its mutations, or none.
+    ///
+    /// `false` means the vendor's API cannot offer that: the mutations reach
+    /// the device one request at a time during [`DeviceTransaction::commit`],
+    /// so a failure part-way leaves earlier ones applied.
+    ///
+    /// **This says nothing about [`DeviceTransaction::stage`],** which is
+    /// all-or-none for every implementation regardless of this field -- the
+    /// coordinator removes the operation record on a stage error and would
+    /// strand anything left behind. A vendor that cannot stage without writing
+    /// does not write in `stage()`; it defers to `commit()`, where
+    /// [`CommitOutcome::Indeterminate`] already models an outcome the process
+    /// cannot resolve.
+    pub atomic_apply: bool,
+
+    /// The device can validate the change before it is applied.
+    ///
+    /// `false` means [`DeviceTransaction::validate`] cannot consult the device
+    /// and any check it performs is local.
+    pub dry_run_validation: bool,
+
+    /// A failed apply can be returned to the pre-change state reliably.
+    ///
+    /// `false` means [`DeviceTransaction::rollback`] is best-effort
+    /// compensation: the revert is itself a live write that can fail.
+    pub guaranteed_rollback: bool,
+}
+
+impl Atomicity {
+    /// The candidate-configuration answer: all three guaranteed.
+    ///
+    /// Junos and PAN-OS. This is the default, so neither changes.
+    #[must_use]
+    pub const fn candidate_configuration() -> Self {
+        Self {
+            atomic_apply: true,
+            dry_run_validation: true,
+            guaranteed_rollback: true,
+        }
+    }
+
+    /// None of the three guaranteed. The default.
+    ///
+    /// Both the honest answer for a live-write API and the safe answer for an
+    /// implementation that has not declared one: an approval prompt keyed on
+    /// this describes no guarantee it cannot demonstrate.
+    #[must_use]
+    pub const fn nothing_guaranteed() -> Self {
+        Self {
+            atomic_apply: false,
+            dry_run_validation: false,
+            guaranteed_rollback: false,
+        }
+    }
+
+    /// The live-write answer, which is the same as guaranteeing nothing.
+    ///
+    /// Spelled separately because a vendor declaring it means something the
+    /// default does not: someone looked, and the answer is no.
+    #[must_use]
+    pub const fn live_writes() -> Self {
+        Self::nothing_guaranteed()
+    }
+
+    /// Whether every guarantee holds.
+    ///
+    /// The one question a renderer usually needs: if this is false, the prompt
+    /// must not describe the change as all-or-nothing.
+    #[must_use]
+    pub const fn is_fully_guaranteed(&self) -> bool {
+        self.atomic_apply && self.dry_run_validation && self.guaranteed_rollback
+    }
+}
+
+impl Default for Atomicity {
+    /// Guarantees nothing, matching [`DeviceTransaction::atomicity`]'s default.
+    fn default() -> Self {
+        Self::nothing_guaranteed()
+    }
+}
+
 /// Rollback target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -380,6 +545,12 @@ pub enum RollbackRef {
     /// The string is opaque to the shared crate and interpreted by the
     /// implementation. Use this for vendor-specific rollback mechanisms
     /// that do not fit `Archive` or `CandidateRevert`.
+    ///
+    /// This is also where best-effort compensation belongs. A vendor reporting
+    /// [`Atomicity::guaranteed_rollback`] `= false` has no checkpoint to name,
+    /// so it describes its own pre-image here -- there is deliberately no
+    /// dedicated variant, because adding one would break every exhaustive match
+    /// in the consuming servers to express something `Custom` already carries.
     Custom(String),
 }
 
@@ -505,4 +676,154 @@ pub struct RollbackOutcome {
     /// Human-readable details (warnings, errors).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
+}
+
+#[cfg(test)]
+mod atomicity_tests {
+    use super::*;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("unused in these tests")]
+    struct NoError;
+
+    /// Does not override `atomicity()`, so it takes the trait default.
+    struct UndeclaredVendor;
+    /// Declares the candidate-configuration answer, like Junos and PAN-OS.
+    struct CandidateVendor;
+    /// Declares the live-write answer, like SDC or UniFi.
+    struct LiveWriteVendor;
+
+    macro_rules! stub_transaction {
+        ($name:ident $(, $atomicity:expr)?) => {
+            #[async_trait]
+            impl DeviceTransaction for $name {
+                type Action = String;
+                type Staged = ();
+                type Diff = String;
+                type Validation = String;
+                type Error = NoError;
+
+                $( fn atomicity(&self) -> Atomicity { $atomicity } )?
+
+                async fn fingerprint(&self) -> Result<String, Self::Error> {
+                    unimplemented!("these tests only read atomicity()")
+                }
+                async fn stage(&self, _: &[Self::Action]) -> Result<Self::Staged, Self::Error> {
+                    unimplemented!("these tests only read atomicity()")
+                }
+                async fn diff(&self, _: &Self::Staged) -> Result<Self::Diff, Self::Error> {
+                    unimplemented!("these tests only read atomicity()")
+                }
+                async fn validate(
+                    &self,
+                    _: &Self::Staged,
+                ) -> Result<Self::Validation, Self::Error> {
+                    unimplemented!("these tests only read atomicity()")
+                }
+                async fn commit(
+                    &self,
+                    _: &Self::Staged,
+                    _: &Attribution,
+                    _: &CommitOptions,
+                ) -> Result<CommitOutcome, Self::Error> {
+                    unimplemented!("these tests only read atomicity()")
+                }
+                async fn rollback(&self, _: RollbackRef) -> Result<RollbackOutcome, Self::Error> {
+                    unimplemented!("these tests only read atomicity()")
+                }
+                async fn confirm_commit(
+                    &self,
+                    _: &str,
+                    _: &Attribution,
+                ) -> Result<CommitOutcome, Self::Error> {
+                    unimplemented!("these tests only read atomicity()")
+                }
+            }
+        };
+    }
+
+    stub_transaction!(UndeclaredVendor);
+    stub_transaction!(CandidateVendor, Atomicity::candidate_configuration());
+    stub_transaction!(LiveWriteVendor, Atomicity::live_writes());
+
+    /// The default must guarantee nothing.
+    ///
+    /// An optimistic default would hand a claim of atomicity, dry-run
+    /// validation and reliable rollback to every implementation that has not
+    /// considered the question -- including rustsdcmcp's five, where SDC has no
+    /// candidate store at all. This is the assertion that stops that.
+    ///
+    /// Exercised through a real `DeviceTransaction` that does **not** override
+    /// `atomicity()`, so it reads the trait's own default body. Asserting
+    /// `Atomicity::nothing_guaranteed()` directly would only prove that
+    /// constructor and would pass with the default body changed to anything.
+    #[test]
+    fn an_implementation_that_does_not_override_guarantees_nothing() {
+        let got = <UndeclaredVendor as DeviceTransaction>::atomicity(&UndeclaredVendor);
+        assert!(!got.atomic_apply);
+        assert!(!got.dry_run_validation);
+        assert!(!got.guaranteed_rollback);
+        assert!(
+            !got.is_fully_guaranteed(),
+            "an undeclared vendor must not be described to an approver as guaranteed"
+        );
+        assert_eq!(got, Atomicity::default());
+    }
+
+    /// A vendor that does have candidate configuration says so explicitly, and
+    /// that is what shared code sees.
+    #[test]
+    fn a_candidate_vendor_declares_its_guarantees() {
+        let got = <CandidateVendor as DeviceTransaction>::atomicity(&CandidateVendor);
+        assert!(got.is_fully_guaranteed());
+        assert_eq!(got, Atomicity::candidate_configuration());
+    }
+
+    /// A live-write vendor declaring `live_writes()` and an undeclared one land
+    /// on the same value -- but the declaration means someone looked.
+    #[test]
+    fn a_live_write_vendor_matches_the_default() {
+        let got = <LiveWriteVendor as DeviceTransaction>::atomicity(&LiveWriteVendor);
+        assert!(!got.is_fully_guaranteed());
+        assert_eq!(got, Atomicity::nothing_guaranteed());
+    }
+
+    /// A live-write vendor answers no to all three, and a renderer can tell.
+    #[test]
+    fn the_live_write_constructor_guarantees_nothing() {
+        let got = Atomicity::live_writes();
+        assert!(!got.atomic_apply);
+        assert!(!got.dry_run_validation);
+        assert!(!got.guaranteed_rollback);
+        assert!(
+            !got.is_fully_guaranteed(),
+            "a prompt keyed on this would have described the change as all-or-nothing"
+        );
+    }
+
+    /// Partial answers are representable: a vendor may validate but not apply
+    /// atomically. The type must not collapse to a single boolean.
+    #[test]
+    fn the_three_guarantees_are_independent() {
+        let partial = Atomicity {
+            atomic_apply: false,
+            dry_run_validation: true,
+            guaranteed_rollback: false,
+        };
+        assert!(!partial.is_fully_guaranteed());
+        assert!(partial.dry_run_validation);
+    }
+
+    /// It crosses the wire with the change-set record, so the field names are
+    /// part of the on-disk shape.
+    #[test]
+    fn it_round_trips_through_serde_with_stable_field_names() {
+        let json = serde_json::to_string(&Atomicity::live_writes()).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"atomic_apply":false,"dry_run_validation":false,"guaranteed_rollback":false}"#
+        );
+        let back: Atomicity = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, Atomicity::live_writes());
+    }
 }
