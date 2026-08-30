@@ -270,6 +270,15 @@ impl ChangesetCoordinator {
         // Taken from the record as it stands at this moment, which is the point:
         // the approver signs the text that is there when they approve, not
         // whatever was attached at plan time.
+        // Signing a digest that does not match its own text would produce a
+        // valid approval over an inconsistent preview: claimable here, and
+        // rejected by `read_state` only at the next restart, taking the whole
+        // state file with it. `check_change_set_write` refuses such a record on
+        // the way in, and this is the second door -- a record already in the
+        // store from before that check existed must not be signed either.
+        record.validate_preview(usize::MAX).map_err(|error| {
+            CoordinatorError::new("preview", format!("the preview is invalid: {error}"))
+        })?;
         let preview_digest = record
             .preview
             .as_ref()

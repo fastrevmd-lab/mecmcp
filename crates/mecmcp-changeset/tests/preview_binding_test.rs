@@ -358,7 +358,110 @@ async fn a_bound_preview_cannot_have_its_text_rewritten_under_its_own_digest() {
         .await
         .expect_err("rewriting the text under its own digest must be refused");
     assert!(
-        error.to_string().contains("bound preview is invalid"),
+        error.to_string().contains("preview is invalid"),
         "expected the content check to fire, got: {error}"
+    );
+}
+
+/// Invariant 2. Without it invariant 3 falls in two steps: swap the v5 approval
+/// for a valid v4 one, at which point the record no longer reports v5, then
+/// change the preview freely on the next write.
+#[tokio::test]
+async fn a_granted_approval_cannot_be_downgraded_to_free_the_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = mecmcp_changeset::ChangesetCoordinator::load(
+        Some(&dir.path().join("state.json")),
+        mecmcp_changeset::OperationLimits::default(),
+        std::time::Duration::from_secs(3600),
+        true,
+    )
+    .unwrap();
+
+    let mut record = record_with_preview(Some("DESTROY lxc/617 on pve3"));
+    record.state = ChangeSetState::Planned;
+    record.approver = None;
+    record.approval = None;
+    coord.insert_change_set(record.clone()).await.unwrap();
+
+    let preview_digest = record.preview.as_ref().map(|p| p.digest.clone());
+    let mut approved = record.clone();
+    approved.state = ChangeSetState::Approved;
+    approved.approver = Some("bob".to_owned());
+    approved.approval = Some(ApprovalRecord {
+        approver: Some("bob".to_owned()),
+        approved_at_unix: 1_700_000_000,
+        digest: compute_approval_digest_v5(
+            &record.id,
+            &record.digest,
+            preview_digest.as_deref(),
+            &record.owner,
+            "bob",
+            1_700_000_000,
+        ),
+        digest_version: 5,
+        waived: None,
+    });
+    coord.update_change_set(approved.clone()).await.unwrap();
+
+    // Step one of the bypass: a perfectly valid v4 approval over the same plan.
+    let mut downgraded = approved;
+    downgraded.approval = Some(ApprovalRecord {
+        approver: Some("bob".to_owned()),
+        approved_at_unix: 1_700_000_000,
+        digest: compute_approval_digest_v4(
+            &record.id,
+            &record.digest,
+            &record.owner,
+            "bob",
+            1_700_000_000,
+        ),
+        digest_version: 4,
+        waived: None,
+    });
+    let error = coord
+        .update_change_set(downgraded)
+        .await
+        .expect_err("downgrading a granted approval must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be rewritten once granted"),
+        "expected the approval-immutability refusal, got: {error}"
+    );
+}
+
+/// Invariant 1. An inconsistent preview must never reach a signature — the
+/// resulting approval is valid, and the state file it produces is not.
+#[tokio::test]
+async fn an_inconsistent_preview_cannot_be_written_or_signed() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = mecmcp_changeset::ChangesetCoordinator::load(
+        Some(&dir.path().join("state.json")),
+        mecmcp_changeset::OperationLimits::default(),
+        std::time::Duration::from_secs(3600),
+        true,
+    )
+    .unwrap();
+
+    let mut record = record_with_preview(Some("DESTROY lxc/617 on pve3"));
+    record.state = ChangeSetState::Planned;
+    record.approver = None;
+    record.approval = None;
+    coord.insert_change_set(record.clone()).await.unwrap();
+
+    // A planned record whose artifact and digest disagree.
+    let mut inconsistent = record;
+    inconsistent.preview = Some(PreviewRecord {
+        digest: mecmcp_changeset::digest::preview_digest("what the approver is shown"),
+        artifact: "what would actually run".to_owned(),
+        job_id: None,
+    });
+    let error = coord
+        .update_change_set(inconsistent)
+        .await
+        .expect_err("an inconsistent preview must not be written at all");
+    assert!(
+        error.to_string().contains("preview is invalid"),
+        "expected the consistency refusal, got: {error}"
     );
 }

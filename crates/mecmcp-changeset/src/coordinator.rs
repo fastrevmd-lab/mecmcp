@@ -1044,39 +1044,75 @@ fn check_change_set_write(
         ));
     }
 
-    // A v5 approval binds the preview digest, so changing the preview after
-    // approval makes the approval unverifiable — but only on the next load,
-    // because nothing recomputes it in-process. Between the swap and a restart
-    // the record still applies, carrying an approval for text that is no longer
-    // there. Refusing the write closes that window at its source rather than
-    // detecting it afterwards, and there is no legitimate reason to rewrite the
-    // text an approver already signed.
-    if current
-        .approval
-        .as_ref()
-        .is_some_and(|approval| approval.digest_version >= 5)
-    {
-        let current_preview = current
-            .preview
-            .as_ref()
-            .map(|preview| preview.digest.as_str());
-        let next_preview = next.preview.as_ref().map(|preview| preview.digest.as_str());
-        if current_preview != next_preview {
+    // Three invariants, stated as invariants rather than as guards on the paths
+    // that happened to be found. Each earlier version of this block was scoped
+    // to one route and was bypassed by another.
+    //
+    // 1. A preview that is written must be self-consistent.
+    //
+    // Unconditional, not only for approved records. `approve_change_set` signs
+    // the stored preview digest, so a `Planned` record whose artifact and digest
+    // already disagree yields a valid approval over an inconsistent preview --
+    // claimable in-process, and rejected by `read_state` only at the next
+    // restart, taking the whole file with it. Refusing it at the write is the
+    // only point where the two values are both present and comparable.
+    if next.preview.is_some() {
+        next.validate_preview(usize::MAX).map_err(|error| {
+            CoordinatorError::new("preview", format!("the preview is invalid: {error}"))
+        })?;
+    }
+
+    if let Some(current_approval) = current.approval.as_ref() {
+        // 2. A granted two-person approval's digest and version are immutable.
+        //
+        // Without this, invariant 3 is bypassed in two steps: replace the v5
+        // approval with a valid v4 one, at which point the record no longer
+        // reports v5, then change the preview freely on the next write. The
+        // downgraded record stays claimable and reloadable throughout. An
+        // approval is evidence of an act that already happened; nothing later
+        // has cause to rewrite it.
+        //
+        // Scoped to a genuine approval (`approver` present) rather than to any
+        // approval record. A waiver carries no approver and never binds a
+        // preview, so it cannot be the start of that downgrade -- and the
+        // expiry TOCTOU that `post_guard_waiver_expiry_check_detects_toctou_rewrite`
+        // exercises is a real attack whose detection lives in the apply path,
+        // not here. Freezing waivers would remove that test's ability to stage
+        // the scenario without removing the attack.
+        if current_approval.approver.is_some()
+            && let Some(next_approval) = next.approval.as_ref()
+            && (next_approval.digest != current_approval.digest
+                || next_approval.digest_version != current_approval.digest_version)
+        {
             return Err(CoordinatorError::new(
-                "preview",
-                "the preview is bound by an approval and cannot be changed; \
+                "approval",
+                "an approval cannot be rewritten once granted; \
                  plan the operation again to produce a new one",
             ));
         }
-        // Comparing digests alone is not enough. The digest is a field of the
-        // record being written, so an update that rewrites `artifact` and leaves
-        // `digest` untouched passes the check above and puts altered text in
-        // front of the next reader under an approval that was given for
-        // different text. `validate_preview` recomputes the digest from the
-        // artifact, which is what makes the comparison mean anything.
-        next.validate_preview(usize::MAX).map_err(|error| {
-            CoordinatorError::new("preview", format!("the bound preview is invalid: {error}"))
-        })?;
+
+        // 3. A v5 approval binds the preview digest, so the preview is frozen.
+        //
+        // The digest check in `read_state` only fires on a reload, so between an
+        // in-process swap and the next restart the record still applies while
+        // carrying an approval for text that is no longer there. Refusing the
+        // write closes that window at its source. Invariant 1 above is what
+        // makes this comparison mean anything -- the digest is a field of the
+        // record being written, so on its own it proves nothing about the text.
+        if current_approval.digest_version >= 5 {
+            let current_preview = current
+                .preview
+                .as_ref()
+                .map(|preview| preview.digest.as_str());
+            let next_preview = next.preview.as_ref().map(|preview| preview.digest.as_str());
+            if current_preview != next_preview {
+                return Err(CoordinatorError::new(
+                    "preview",
+                    "the preview is bound by an approval and cannot be changed; \
+                     plan the operation again to produce a new one",
+                ));
+            }
+        }
     }
 
     if !change_set_transition_allowed(current.state, next.state) {
