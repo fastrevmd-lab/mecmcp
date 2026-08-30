@@ -29,6 +29,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-08-30
+
+### Security
+
+- **An approval now binds the preview the approver was shown**
+  (rustproxmoxmcp#56). Consent was evidenced against the *actions*; what an
+  approver read was the *preview*, rendered from those actions and stored beside
+  them with its own digest. Nothing joined the two, so the stored text could be
+  replaced — text *and* digest together — and every check still passed.
+  `compute_approval_digest_v5` adds the preview digest to the signed tuple.
+
+  Bound in the approval rather than in the plan digest, which is what the issue
+  proposes. The plan digest is created before the preview exists, and every
+  stored approval binds it, so recomputing it would invalidate them all — and
+  re-signing would assert that those approvers consented to a binding that did
+  not exist when they approved. That is the laundering #275 refused for waivers.
+
+  What it does **not** do, stated because the distinction matters: it does not
+  verify the preview is a faithful *rendering* of the actions, and it does not
+  prove the bound preview is the one the approver read (`approve_change_set`
+  signs whatever is stored when it is called). Both are recorded on the issue.
+
+- **A granted two-person approval is now immutable, and so is the preview it
+  binds.** Five separate write paths could previously reach the same end: swap
+  the preview in-process, rewrite the artifact under its own digest, downgrade
+  the v5 approval to v4 and then swap, sign an inconsistent preview at approve,
+  or remove the approval entirely and let `apply` accept the record through its
+  legacy `approver` field. Stated now as three invariants in
+  `check_change_set_write` rather than as guards on the paths that were found.
+
+- **The raw persistence surface no longer reaches `Applying`** (#341).
+  `write_state` was re-exported from the crate root, so a consumer could build a
+  record already in `Applying` — with `apply_without_handle` set, or a `task_id`
+  — write it, and have `ChangesetCoordinator::load` accept it. `load` validates
+  structure, not lifecycle provenance, so "one approval permits at most one
+  apply" stopped holding by construction. `write_state` is `pub(crate)`;
+  `write_state_for_test` sits behind the existing `test-util` feature.
+
+- **Unknown top-level keys in an inventory file are refused** (#340). A
+  credential placed at the top level was neither used nor rejected — it sat
+  there while the operator believed it was configured.
+
+### Added
+
+- **`Atomicity`, so a vendor can declare what its transactions guarantee**
+  (#335). `DeviceTransaction` was derived from two vendors that both have
+  candidate configuration and promised all three guarantees on every vendor's
+  behalf. The default guarantees **nothing**: an optimistic default would hand a
+  claim of atomicity, dry-run validation and reliable rollback to every
+  implementation that has not considered the question — including rustsdcmcp's
+  five, where SDC has no candidate store at all.
+
+### Changed
+
+- **`compute_approval_digest` is now `compute_approval_digest_v4`**, and
+  `ApprovalRecord` carries `digest_version`. The version travels with the record
+  rather than the file, because v4 approvals must never be promoted to v5: doing
+  so would claim their approvers consented to a preview binding that did not
+  exist. State-file schema 6 gates a file containing any v5 approval.
+
+- **An unsupported version is reported as one.** `deny_unknown_fields` on the
+  inventory envelopes fired before the version check, so a document on a future
+  schema was told to delete a field its schema requires — an error naming an
+  action that is destructive and wrong.
+
+- **The MSRV job pins `aes`.** `Cargo.lock` is gitignored, so the job resolves
+  fresh every run; `aes` 0.9.3 declared `rust-version = 1.89` and made the 1.88
+  floor unsatisfiable on every open PR, with no commit behind it.
+
+### Upgrading
+
+Breaking for consumers. `ApprovalRecord` gains a public field, so struct
+literals need `digest_version` — 4 for anything hand-built, and the `Default`
+is 4. `compute_approval_digest` is renamed; `write_state` moves behind
+`test-util` as `write_state_for_test`.
+
+**Records approved after the upgrade write schema 6, which binaries below it
+refuse.** Deliberate, and the same gate v4 used: a v1-v5 reader would recompute
+the v4 tuple for a v5 approval and reject the file. A deployment that has
+approved nothing since upgrading keeps writing the version it wrote before.
+
 ## [0.22.0] - 2026-08-27
 
 ### Security
