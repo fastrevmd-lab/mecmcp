@@ -9,7 +9,7 @@ use mecmcp_audit::{ActorType, AgentIdentity, Attribution, Principal};
 use mecmcp_changeset::digest::{
     change_set_digest, compute_approval_digest, compute_waiver_digest, compute_waiver_digest_v3,
 };
-use mecmcp_changeset::persistence::{read_state, write_state};
+use mecmcp_changeset::persistence::{read_state, write_state_for_test};
 use mecmcp_changeset::{
     ApprovalRecord, ChangeSetRecord, ChangeSetState, ChangesetCoordinator, ChangesetState,
     CommitOptions, CommitOutcome, DeviceTransaction, OperationLimits, RollbackOutcome, RollbackRef,
@@ -263,7 +263,7 @@ fn v3_waiver_round_trip_and_version_dependence() {
         .insert(change_set_id.to_owned(), change_set);
 
     // Write the state
-    write_state(&state_path, &state, 8 * 1024 * 1024).expect("write state with v3 waiver");
+    write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state with v3 waiver");
 
     // Assert the written file has version 3
     let raw_json = std::fs::read_to_string(&state_path).expect("read written state");
@@ -596,7 +596,7 @@ async fn an_expired_waiver_does_not_authorize_apply() {
         waived: Some(waiver),
     });
 
-    write_state(&state_path, &state, 8 * 1024 * 1024).expect("write state");
+    write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
 
     // Reload coordinator to pick up the modified state
     let limits = OperationLimits {
@@ -686,7 +686,7 @@ async fn pre_guard_waiver_expiry_check_fails_without_blocking() {
         digest: waiver_digest,
         waived: Some(waiver),
     });
-    write_state(&state_path, &state, 8 * 1024 * 1024).expect("write state");
+    write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
 
     // Reload coordinator
     let limits = OperationLimits {
@@ -786,7 +786,7 @@ async fn post_guard_waiver_expiry_check_detects_toctou_rewrite() {
         digest: waiver_digest,
         waived: Some(waiver.clone()),
     });
-    write_state(&state_path, &state, 8 * 1024 * 1024).expect("write state");
+    write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
 
     // Reload coordinator and wrap in Arc for sharing between tasks
     let limits = OperationLimits {
@@ -945,7 +945,7 @@ async fn waiver_at_exact_expiry_instant_is_expired() {
         digest: waiver_digest,
         waived: Some(waiver),
     });
-    write_state(&state_path, &state, 8 * 1024 * 1024).expect("write state");
+    write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
 
     // Reload coordinator
     let limits = OperationLimits {
@@ -1147,7 +1147,7 @@ fn sabotage_defect_1_load_save_cycle_without_migration() {
     let state = read_state(&state_path, 128 * 1024).expect("load v1 file");
 
     // Write it back (triggers v3 due to waivers_need_v3)
-    write_state(&state_path, &state, 128 * 1024).expect("write state");
+    write_state_for_test(&state_path, &state, 128 * 1024).expect("write state");
 
     // Load again — must succeed because migration happened
     read_state(&state_path, 128 * 1024).expect("second load must succeed after migration");

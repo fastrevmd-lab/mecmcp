@@ -20,7 +20,7 @@ use mecmcp_changeset::{
     digest::{
         compute_approval_digest, compute_approval_digest_legacy, validate_principal_for_digest,
     },
-    persistence::{read_state, write_state},
+    persistence::{read_state, write_state_for_test},
     records::{ApprovalRecord, ChangeSetRecord},
 };
 use serde_json::json;
@@ -28,7 +28,7 @@ use std::{collections::BTreeMap, time::Duration};
 
 /// Write a state file at an explicit legacy schema version.
 ///
-/// `write_state` stamps version 4 for any record carrying a real approval
+/// `write_state_for_test` stamps version 4 for any record carrying a real approval
 /// (mecmcp#283), so it cannot produce the legacy shape these tests are about.
 /// The separator rule now guards exactly one thing: verification of a record
 /// written *before* v4, whose digest is the ambiguous `|`-joined encoding.
@@ -452,7 +452,7 @@ fn load_accepts_clean_approval() {
         task_id: None,
         apply_without_handle: false,
     };
-    // What a current writer produces. `write_state` stamps version 4 for any
+    // What a current writer produces. `write_state_for_test` stamps version 4 for any
     // real approval, and v4 files verify under the tuple encoding.
     let digest = compute_approval_digest(
         &change_set_id,
@@ -474,7 +474,7 @@ fn load_accepts_clean_approval() {
         operations: BTreeMap::new(),
         change_sets,
     };
-    write_state(&path, &state, LIMIT).unwrap();
+    write_state_for_test(&path, &state, LIMIT).unwrap();
 
     let result = read_state(&path, LIMIT);
     assert!(
@@ -646,6 +646,6 @@ fn a_legacy_approval_migrates_to_v4_and_still_verifies() {
 
     // The round trip a running server performs: write what was loaded, read it
     // back. This is what fails if the migration is missing.
-    write_state(&path, &loaded, LIMIT).unwrap();
+    write_state_for_test(&path, &loaded, LIMIT).unwrap();
     read_state(&path, LIMIT).expect("the migrated file must verify under v4");
 }

@@ -13,7 +13,7 @@
 
 use mecmcp_changeset::{
     ChangeSetState, ChangesetCoordinator, OperationLimits,
-    persistence::{read_state, write_state},
+    persistence::{read_state, write_state_for_test},
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -340,7 +340,7 @@ async fn test_approval_digest_tamper_detection_swap_approver() {
     }
 
     // Write the tampered state back
-    write_state(&state_path, &state, 8 * 1024 * 1024).expect("write tampered state");
+    write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write tampered state");
 
     // Attempt to reload — must fail with approval digest mismatch
     let result = read_state(&state_path, 8 * 1024 * 1024);

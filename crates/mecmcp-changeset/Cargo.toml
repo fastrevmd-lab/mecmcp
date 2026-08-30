@@ -67,3 +67,44 @@ required-features = ["test-util"]
 [[test]]
 name = "in_flight_recovery_test"
 required-features = ["test-util"]
+
+[[test]]
+name = "device_lock_test"
+required-features = ["test-util"]
+
+[[test]]
+name = "state_hardening_test"
+required-features = ["test-util"]
+
+[[test]]
+name = "task9_recovery_test"
+required-features = ["test-util"]
+
+[[test]]
+name = "lab_mode_test"
+required-features = ["test-util"]
+
+[[test]]
+name = "operator_waiver_test"
+required-features = ["test-util"]
+
+[[test]]
+name = "task6_approval_gate_test"
+required-features = ["test-util"]
+
+[[test]]
+name = "integration_test"
+required-features = ["test-util"]
+
+[[test]]
+name = "digest_separator_test"
+required-features = ["test-util"]
+
+[[test]]
+name = "multi_target_test"
+required-features = ["test-util"]
+
+[[test]]
+name = "waiver_migration_defects_test"
+required-features = ["test-util"]
+

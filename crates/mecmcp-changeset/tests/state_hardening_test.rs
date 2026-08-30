@@ -13,12 +13,12 @@
 #![allow(clippy::unwrap_used)]
 
 use mecmcp_changeset::ChangesetState;
-use mecmcp_changeset::persistence::{read_state, write_state};
+use mecmcp_changeset::persistence::{read_state, write_state_for_test};
 use std::io::Write;
 
 const LIMIT: u64 = 1024 * 1024;
 
-fn write_state_file(
+fn write_state_for_test_file(
     dir: &tempfile::TempDir,
     name: &str,
     body: &str,
@@ -32,18 +32,18 @@ fn write_state_file(
     path
 }
 
-/// A state document written by `write_state` itself, so any rejection in these
+/// A state document written by `write_state_for_test` itself, so any rejection in these
 /// tests must come from the hardening rather than from the JSON shape.
 fn valid_state(dir: &tempfile::TempDir) -> String {
     let seed = dir.path().join("seed.json");
-    write_state(&seed, &ChangesetState::default(), LIMIT).expect("seed state");
+    write_state_for_test(&seed, &ChangesetState::default(), LIMIT).expect("seed state");
     std::fs::read_to_string(&seed).expect("read seed")
 }
 
 #[test]
 fn accepts_a_correctly_owned_private_state_file() {
     let dir = tempfile::tempdir().unwrap();
-    let path = write_state_file(&dir, "state.json", &valid_state(&dir), 0o600);
+    let path = write_state_for_test_file(&dir, "state.json", &valid_state(&dir), 0o600);
     assert!(
         read_state(&path, LIMIT).is_ok(),
         "a 0600 state file must load"
@@ -54,7 +54,8 @@ fn accepts_a_correctly_owned_private_state_file() {
 fn refuses_a_group_or_world_accessible_state_file() {
     let dir = tempfile::tempdir().unwrap();
     for mode in [0o640, 0o604, 0o666] {
-        let path = write_state_file(&dir, &format!("s{mode:o}.json"), &valid_state(&dir), mode);
+        let path =
+            write_state_for_test_file(&dir, &format!("s{mode:o}.json"), &valid_state(&dir), mode);
         let error = read_state(&path, LIMIT).unwrap_err();
         assert!(
             error.to_string().contains("group- or world-accessible"),
@@ -66,7 +67,7 @@ fn refuses_a_group_or_world_accessible_state_file() {
 #[test]
 fn refuses_a_symlinked_state_file() {
     let dir = tempfile::tempdir().unwrap();
-    let real = write_state_file(&dir, "real.json", &valid_state(&dir), 0o600);
+    let real = write_state_for_test_file(&dir, "real.json", &valid_state(&dir), 0o600);
     let link = dir.path().join("link.json");
     std::os::unix::fs::symlink(&real, &link).unwrap();
 
@@ -80,7 +81,7 @@ fn refuses_a_state_file_over_the_callers_limit() {
     // The caller's budget is honoured, not `FileLimits::default()` — 608's live
     // state file is already 26 KB and grows with change-set history.
     let padded = format!("{}{}", valid_state(&dir), " ".repeat(4096));
-    let path = write_state_file(&dir, "big.json", &padded, 0o600);
+    let path = write_state_for_test_file(&dir, "big.json", &padded, 0o600);
 
     let error = read_state(&path, 128).unwrap_err();
     assert!(error.to_string().contains("limit is 128"), "got: {error}");
@@ -113,12 +114,12 @@ fn replacing_the_state_preserves_its_owner() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.json");
-    write_state(&path, &ChangesetState::default(), LIMIT).expect("seed");
+    write_state_for_test(&path, &ChangesetState::default(), LIMIT).expect("seed");
 
     let before = std::fs::metadata(&path).unwrap();
     let (uid_before, gid_before) = (before.uid(), before.gid());
 
-    write_state(&path, &ChangesetState::default(), LIMIT).expect("replace");
+    write_state_for_test(&path, &ChangesetState::default(), LIMIT).expect("replace");
 
     let after = std::fs::metadata(&path).unwrap();
     assert_eq!(after.uid(), uid_before, "owner uid changed on replace");

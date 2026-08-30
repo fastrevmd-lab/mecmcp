@@ -8,7 +8,7 @@
 use mecmcp_changeset::{
     ChangeSetRecord, ChangeSetState, ChangesetCoordinator, ChangesetState, OperationLimits,
     change_set_digest,
-    persistence::{read_state, write_state},
+    persistence::{read_state, write_state_for_test},
 };
 use std::time::Duration;
 
@@ -49,7 +49,7 @@ fn write_applying(path: &std::path::Path, task_id: Option<&str>) {
     state
         .change_sets
         .insert(ID.to_owned(), applying_record(task_id));
-    write_state(path, &state, OperationLimits::default().max_state_bytes).expect("write");
+    write_state_for_test(path, &state, OperationLimits::default().max_state_bytes).expect("write");
 }
 
 /// The case the field exists for. A handle means the vendor operation is still
@@ -120,7 +120,7 @@ async fn an_apply_without_a_handle_is_still_settled() {
 /// An empty handle is dropped at the write boundary, not rejected at the read
 /// boundary.
 ///
-/// The distinction is the whole point. `write_state` does not validate, so
+/// The distinction is the whole point. `write_state_for_test` does not validate, so
 /// rejecting an empty handle on load would fire only on the *next* start and
 /// would refuse the whole file — turning one bad handle into a server that
 /// will not boot. Dropping it loses nothing, because an empty handle names no
@@ -192,7 +192,7 @@ async fn recovery_settles_a_pre_existing_empty_handle() {
 
 /// The API and the file must report the same record.
 ///
-/// `write_state` normalises its own copy on the way to disk, so normalising
+/// `write_state_for_test` normalises its own copy on the way to disk, so normalising
 /// only there would leave the coordinator returning `Some("")` while the file
 /// held `None` — and a restart would then observe a different record than the
 /// running process reports.
@@ -232,7 +232,7 @@ async fn the_coordinator_and_the_file_agree_after_an_empty_handle() {
 ///
 /// A legacy record that is *not* `Applying` is never rewritten by the settling
 /// loop, so without normalising on load it would keep its empty handle
-/// indefinitely while `write_state` dropped it from the file — the same
+/// indefinitely while `write_state_for_test` dropped it from the file — the same
 /// memory/disk disagreement, on a record nothing else touches.
 #[tokio::test]
 async fn a_legacy_empty_handle_is_normalised_on_load_even_when_settled() {
