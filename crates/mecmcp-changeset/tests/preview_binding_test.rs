@@ -303,3 +303,62 @@ async fn a_bound_preview_cannot_be_changed_in_process() {
         .await
         .expect("an unrelated update must still be allowed");
 }
+
+/// The digest is a field of the record being written, so an update that
+/// rewrites the text and leaves the digest alone passes a digest-only
+/// comparison. That put altered text in front of the next reader under an
+/// approval given for different text.
+#[tokio::test]
+async fn a_bound_preview_cannot_have_its_text_rewritten_under_its_own_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = mecmcp_changeset::ChangesetCoordinator::load(
+        Some(&dir.path().join("state.json")),
+        mecmcp_changeset::OperationLimits::default(),
+        std::time::Duration::from_secs(3600),
+        true,
+    )
+    .unwrap();
+
+    let mut record = record_with_preview(Some("DESTROY lxc/617 on pve3"));
+    record.state = ChangeSetState::Planned;
+    record.approver = None;
+    record.approval = None;
+    coord.insert_change_set(record.clone()).await.unwrap();
+
+    let preview_digest = record.preview.as_ref().map(|p| p.digest.clone());
+    let mut approved = record.clone();
+    approved.state = ChangeSetState::Approved;
+    approved.approver = Some("bob".to_owned());
+    approved.approval = Some(ApprovalRecord {
+        approver: Some("bob".to_owned()),
+        approved_at_unix: 1_700_000_000,
+        digest: compute_approval_digest_v5(
+            &record.id,
+            &record.digest,
+            preview_digest.as_deref(),
+            &record.owner,
+            "bob",
+            1_700_000_000,
+        ),
+        digest_version: 5,
+        waived: None,
+    });
+    coord.update_change_set(approved.clone()).await.unwrap();
+
+    // Rewrite only the text. The digest still says what it said, so a
+    // digest-to-digest comparison sees no change at all.
+    let mut tampered = approved;
+    tampered.preview = Some(PreviewRecord {
+        digest: preview_digest.clone().unwrap(),
+        artifact: "RESIZE lxc/617 disk on pve3".to_owned(),
+        job_id: None,
+    });
+    let error = coord
+        .update_change_set(tampered)
+        .await
+        .expect_err("rewriting the text under its own digest must be refused");
+    assert!(
+        error.to_string().contains("bound preview is invalid"),
+        "expected the content check to fire, got: {error}"
+    );
+}

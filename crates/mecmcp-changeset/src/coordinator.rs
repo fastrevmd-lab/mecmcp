@@ -1068,6 +1068,15 @@ fn check_change_set_write(
                  plan the operation again to produce a new one",
             ));
         }
+        // Comparing digests alone is not enough. The digest is a field of the
+        // record being written, so an update that rewrites `artifact` and leaves
+        // `digest` untouched passes the check above and puts altered text in
+        // front of the next reader under an approval that was given for
+        // different text. `validate_preview` recomputes the digest from the
+        // artifact, which is what makes the comparison mean anything.
+        next.validate_preview(usize::MAX).map_err(|error| {
+            CoordinatorError::new("preview", format!("the bound preview is invalid: {error}"))
+        })?;
     }
 
     if !change_set_transition_allowed(current.state, next.state) {
