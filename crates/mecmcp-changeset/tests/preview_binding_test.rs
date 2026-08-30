@@ -425,7 +425,7 @@ async fn a_granted_approval_cannot_be_downgraded_to_free_the_preview() {
     assert!(
         error
             .to_string()
-            .contains("cannot be rewritten once granted"),
+            .contains("rewritten or removed once granted"),
         "expected the approval-immutability refusal, got: {error}"
     );
 }
@@ -463,5 +463,77 @@ async fn an_inconsistent_preview_cannot_be_written_or_signed() {
     assert!(
         error.to_string().contains("preview is invalid"),
         "expected the consistency refusal, got: {error}"
+    );
+}
+
+/// Removal is a rewrite. Dropping the nested approval leaves the top-level
+/// `approver` populated, so `apply_change_set` still accepts the record through
+/// its legacy-approval path — while the preview, bound by nothing now, is free
+/// to be replaced on the next write.
+#[tokio::test]
+async fn a_granted_approval_cannot_be_removed_to_free_the_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = mecmcp_changeset::ChangesetCoordinator::load(
+        Some(&dir.path().join("state.json")),
+        mecmcp_changeset::OperationLimits::default(),
+        std::time::Duration::from_secs(3600),
+        true,
+    )
+    .unwrap();
+
+    let mut record = record_with_preview(Some("DESTROY lxc/617 on pve3"));
+    record.state = ChangeSetState::Planned;
+    record.approver = None;
+    record.approval = None;
+    coord.insert_change_set(record.clone()).await.unwrap();
+
+    let preview_digest = record.preview.as_ref().map(|p| p.digest.clone());
+    let mut approved = record.clone();
+    approved.state = ChangeSetState::Approved;
+    approved.approver = Some("bob".to_owned());
+    approved.approval = Some(ApprovalRecord {
+        approver: Some("bob".to_owned()),
+        approved_at_unix: 1_700_000_000,
+        digest: compute_approval_digest_v5(
+            &record.id,
+            &record.digest,
+            preview_digest.as_deref(),
+            &record.owner,
+            "bob",
+            1_700_000_000,
+        ),
+        digest_version: 5,
+        waived: None,
+    });
+    coord.update_change_set(approved.clone()).await.unwrap();
+
+    // Step one: drop the nested approval, keeping the top-level approver.
+    let mut stripped = approved.clone();
+    stripped.approval = None;
+    let error = coord
+        .update_change_set(stripped)
+        .await
+        .expect_err("removing a granted approval must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("rewritten or removed once granted"),
+        "expected the removal refusal, got: {error}"
+    );
+
+    // Any other field of the approval is frozen too, not just the digest.
+    let mut retimed = approved;
+    if let Some(approval) = retimed.approval.as_mut() {
+        approval.approved_at_unix = 1_700_000_999;
+    }
+    let error = coord
+        .update_change_set(retimed)
+        .await
+        .expect_err("retiming a granted approval must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("rewritten or removed once granted"),
+        "expected the rewrite refusal, got: {error}"
     );
 }

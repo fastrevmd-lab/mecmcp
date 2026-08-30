@@ -505,7 +505,7 @@ pub fn validate_targets(targets: &[String], maximum: usize) -> Result<(), Target
 /// For waived approvals in lab mode, the `approver` field is absent and `waived`
 /// is present, making the record programmatically distinguishable from genuine
 /// two-person approvals.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalRecord {
     /// Principal who approved this change set (must be distinct from owner).

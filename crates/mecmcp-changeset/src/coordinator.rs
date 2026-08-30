@@ -1079,14 +1079,17 @@ fn check_change_set_write(
         // exercises is a real attack whose detection lives in the apply path,
         // not here. Freezing waivers would remove that test's ability to stage
         // the scenario without removing the attack.
-        if current_approval.approver.is_some()
-            && let Some(next_approval) = next.approval.as_ref()
-            && (next_approval.digest != current_approval.digest
-                || next_approval.digest_version != current_approval.digest_version)
-        {
+        // Whole-record equality, and removal counts. A previous version compared
+        // only the digest and version, which an update setting `approval` to
+        // `None` skipped entirely -- and because the top-level `approver` field
+        // survives, `apply_change_set` then accepted the record through its
+        // legacy-approval path while the preview, no longer bound by anything,
+        // was free to be replaced on the next write. Nothing legitimate clears a
+        // granted approval: `approval: None` is written once, at creation.
+        if current_approval.approver.is_some() && next.approval.as_ref() != Some(current_approval) {
             return Err(CoordinatorError::new(
                 "approval",
-                "an approval cannot be rewritten once granted; \
+                "an approval cannot be rewritten or removed once granted; \
                  plan the operation again to produce a new one",
             ));
         }
