@@ -738,10 +738,29 @@ pub fn write_atomic<G: Grant + serde::Serialize>(
     // Best-effort by design: if the destination does not exist there is nothing
     // to preserve, and if we lack the privilege to chown we are almost certainly
     // already running as the owning user, so the file is correct anyway.
+    //
+    // Only call chown when it would change something: under a systemd unit with
+    // SystemCallFilter=~@privileged, the call is fatal with SIGSYS rather than
+    // refused with EPERM, and `let _ =` cannot catch a signal.
     #[cfg(unix)]
-    if let Ok(existing) = std::fs::metadata(path) {
+    if let Ok(destination_meta) = std::fs::metadata(path) {
         use std::os::unix::fs::MetadataExt;
-        let _ = std::os::unix::fs::chown(temp.path(), Some(existing.uid()), Some(existing.gid()));
+        let (destination_uid, destination_gid) = (destination_meta.uid(), destination_meta.gid());
+
+        // Stat the temp file to get its actual ownership. In a setgid parent
+        // directory, the kernel may give the temp a GID that differs from the
+        // process's effective GID.
+        if let Ok(temp_meta) = std::fs::metadata(temp.path()) {
+            let (temp_uid, temp_gid) = (temp_meta.uid(), temp_meta.gid());
+
+            if needs_ownership_change(temp_uid, temp_gid, destination_uid, destination_gid) {
+                let _ = std::os::unix::fs::chown(
+                    temp.path(),
+                    Some(destination_uid),
+                    Some(destination_gid),
+                );
+            }
+        }
     }
 
     temp.persist(path).map_err(|error| FileError::Io {
@@ -978,6 +997,27 @@ pub fn resolve_token_path(primary: &Path, fallback: &Path) -> std::io::Result<Re
             Err(e)
         }
     }
+}
+
+/// Returns whether a chown syscall is needed to align the replacement file's
+/// ownership with the destination file.
+///
+/// Compares the replacement inode's actual (uid, gid) against the destination's
+/// (uid, gid). In a setgid parent directory the kernel may give a newly created
+/// file the directory's GID rather than the process's effective GID, so comparing
+/// against `getegid()` would be wrong.
+///
+/// A service writing its own state file needs no chown, and under a systemd
+/// `SystemCallFilter=~@privileged` the call is fatal with SIGSYS, not refused
+/// with EPERM. Only call chown when it would change something.
+#[cfg(unix)]
+fn needs_ownership_change(
+    replacement_uid: u32,
+    replacement_gid: u32,
+    destination_uid: u32,
+    destination_gid: u32,
+) -> bool {
+    replacement_uid != destination_uid || replacement_gid != destination_gid
 }
 
 #[cfg(test)]
@@ -2951,5 +2991,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn needs_ownership_change_matches_both() {
+        // When both uid and gid match, no chown needed
+        assert!(!needs_ownership_change(1000, 1000, 1000, 1000));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn needs_ownership_change_uid_differs() {
+        // When uid differs, chown needed
+        assert!(needs_ownership_change(1000, 1000, 0, 1000));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn needs_ownership_change_gid_differs() {
+        // When gid differs, chown needed
+        assert!(needs_ownership_change(1000, 1000, 1000, 0));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn needs_ownership_change_both_differ() {
+        // When both differ, chown needed
+        assert!(needs_ownership_change(1000, 1000, 0, 0));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn needs_ownership_change_setgid_directory() {
+        // Setgid case: replacement and destination both owned by service:shared (1000:50),
+        // even though the process gid is 1000. The kernel gave the temp file gid 50
+        // in a setgid parent. Since they match, no chown needed.
+        //
+        // This would fail if we compared against getegid() (1000) instead of the
+        // replacement file's actual gid (50).
+        let replacement_uid = 1000;
+        let replacement_gid = 50; // From setgid directory
+        let destination_uid = 1000;
+        let destination_gid = 50; // Same group
+        assert!(!needs_ownership_change(
+            replacement_uid,
+            replacement_gid,
+            destination_uid,
+            destination_gid
+        ));
     }
 }

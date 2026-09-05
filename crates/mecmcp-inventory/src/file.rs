@@ -497,13 +497,36 @@ where
     // service cannot read — an outage at its next restart, not here. Restoring
     // the owner fails closed: the file is unreadable to anyone but root until
     // this succeeds.
-    if let Some((uid, gid)) = owner {
-        std::os::unix::fs::chown(path, Some(uid), Some(gid)).map_err(|e| {
+    //
+    // Only call chown when it would change something: under a systemd unit with
+    // SystemCallFilter=~@privileged, the call is fatal with SIGSYS rather than
+    // refused with EPERM, and even map_err cannot catch a signal.
+    if let Some((desired_uid, desired_gid)) = owner {
+        // Stat the file to get its current ownership after write_atomic. In a
+        // setgid parent directory, the kernel may have given it a GID that
+        // differs from the process's effective GID.
+        //
+        // Propagate the metadata failure rather than treating it as "ownership
+        // already matches" — a concurrent removal or filesystem error during a
+        // sudo migration could leave the replacement root-owned and unreadable
+        // by the service, reported as a successful migration.
+        let current_meta = std::fs::metadata(path).map_err(|e| {
             InventoryError::ParseError(format!(
-                "migrated {} but could not restore its owner: {e}",
+                "migrated {} but could not stat it to restore owner: {e}",
                 path.display()
             ))
         })?;
+        use std::os::unix::fs::MetadataExt;
+        let (current_uid, current_gid) = (current_meta.uid(), current_meta.gid());
+
+        if needs_ownership_change(current_uid, current_gid, desired_uid, desired_gid) {
+            std::os::unix::fs::chown(path, Some(desired_uid), Some(desired_gid)).map_err(|e| {
+                InventoryError::ParseError(format!(
+                    "migrated {} but could not restore its owner: {e}",
+                    path.display()
+                ))
+            })?;
+        }
     }
 
     Ok(MigrationReport {
@@ -635,6 +658,27 @@ pub fn write_atomic(path: &Path, value: &serde_json::Value) -> std::io::Result<(
 
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
+}
+
+/// Returns whether a chown syscall is needed to align the replacement file's
+/// ownership with the destination file.
+///
+/// Compares the replacement inode's actual (uid, gid) against the destination's
+/// (uid, gid). In a setgid parent directory the kernel may give a newly created
+/// file the directory's GID rather than the process's effective GID, so comparing
+/// against `getegid()` would be wrong.
+///
+/// A service writing its own state file needs no chown, and under a systemd
+/// `SystemCallFilter=~@privileged` the call is fatal with SIGSYS, not refused
+/// with EPERM. Only call chown when it would change something.
+#[cfg(unix)]
+fn needs_ownership_change(
+    replacement_uid: u32,
+    replacement_gid: u32,
+    destination_uid: u32,
+    destination_gid: u32,
+) -> bool {
+    replacement_uid != destination_uid || replacement_gid != destination_gid
 }
 
 #[cfg(test)]
@@ -922,5 +966,72 @@ mod tests {
             let hash = hash_file(f.path()).unwrap();
             assert_ne!(hash, [0u8; 32]);
         }
+    }
+
+    #[cfg(unix)]
+    mod ownership_tests {
+        use super::*;
+
+        #[test]
+        fn needs_ownership_change_matches_both() {
+            // When both uid and gid match, no chown needed
+            assert!(!needs_ownership_change(1000, 1000, 1000, 1000));
+        }
+
+        #[test]
+        fn needs_ownership_change_uid_differs() {
+            // When uid differs, chown needed
+            assert!(needs_ownership_change(1000, 1000, 0, 1000));
+        }
+
+        #[test]
+        fn needs_ownership_change_gid_differs() {
+            // When gid differs, chown needed
+            assert!(needs_ownership_change(1000, 1000, 1000, 0));
+        }
+
+        #[test]
+        fn needs_ownership_change_both_differ() {
+            // When both differ, chown needed
+            assert!(needs_ownership_change(1000, 1000, 0, 0));
+        }
+
+        #[test]
+        fn needs_ownership_change_setgid_directory() {
+            // Setgid case: replacement and destination both owned by service:shared (1000:50),
+            // even though the process gid is 1000. The kernel gave the temp file gid 50
+            // in a setgid parent. Since they match, no chown needed.
+            //
+            // This would fail if we compared against getegid() (1000) instead of the
+            // replacement file's actual gid (50).
+            let replacement_uid = 1000;
+            let replacement_gid = 50; // From setgid directory
+            let destination_uid = 1000;
+            let destination_gid = 50; // Same group
+            assert!(!needs_ownership_change(
+                replacement_uid,
+                replacement_gid,
+                destination_uid,
+                destination_gid
+            ));
+        }
+
+        // COVERAGE GAP: A migration whose post-write metadata stat fails
+        // (concurrent removal/rename, or filesystem error) must return an error,
+        // not `converted: true`. This path is not reachable without fault
+        // injection — a file that write_atomic just created and sync'd cannot
+        // disappear or become unreadable in the normal case, and simulating
+        // filesystem errors requires root or special tooling. The error mapping
+        // at ~line 513 is the contract enforcement:
+        //
+        //   std::fs::metadata(path).map_err(|e| {
+        //       InventoryError::ParseError(format!(
+        //           "migrated {} but could not stat it to restore owner: {e}",
+        //           path.display()
+        //       ))
+        //   })?;
+        //
+        // Without this propagation, a sudo migration could leave the replacement
+        // root-owned and unreadable by the service, reported as success.
     }
 }
