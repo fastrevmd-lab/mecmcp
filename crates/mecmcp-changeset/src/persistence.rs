@@ -611,11 +611,21 @@ pub(crate) fn write_state(
     // comment describes the same failure; this is the same fix for the same
     // reason. Best-effort by design: no destination means nothing to preserve,
     // and failing to chown means we are almost certainly already the owner.
+    //
+    // Only call chown when it would change something: under a systemd unit with
+    // SystemCallFilter=~@privileged, the call is fatal with SIGSYS rather than
+    // refused with EPERM, and `let _ =` cannot catch a signal.
     #[cfg(unix)]
     if let Ok(existing) = fs::metadata(path) {
         use std::os::unix::fs::MetadataExt;
-        let _ =
-            std::os::unix::fs::chown(temporary.path(), Some(existing.uid()), Some(existing.gid()));
+        let (existing_uid, existing_gid) = (existing.uid(), existing.gid());
+        let effective_uid = rustix::process::geteuid().as_raw();
+        let effective_gid = rustix::process::getegid().as_raw();
+
+        if needs_ownership_change(existing_uid, existing_gid, effective_uid, effective_gid) {
+            let _ =
+                std::os::unix::fs::chown(temporary.path(), Some(existing_uid), Some(existing_gid));
+        }
     }
 
     temporary.persist(path).map_err(|error| {
@@ -711,4 +721,49 @@ pub fn write_state_for_test(
     max_state_bytes: u64,
 ) -> Result<(), PersistenceError> {
     write_state(path, state, max_state_bytes)
+}
+
+/// Returns whether a chown syscall is needed to change ownership from
+/// (existing_uid, existing_gid) to (target_uid, target_gid).
+///
+/// A service writing its own state file needs no chown, and under a systemd
+/// `SystemCallFilter=~@privileged` the call is fatal with SIGSYS, not refused
+/// with EPERM. Only call chown when it would change something.
+#[cfg(unix)]
+fn needs_ownership_change(
+    existing_uid: u32,
+    existing_gid: u32,
+    target_uid: u32,
+    target_gid: u32,
+) -> bool {
+    existing_uid != target_uid || existing_gid != target_gid
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needs_ownership_change_matches_both() {
+        // When both uid and gid match, no chown needed
+        assert!(!needs_ownership_change(1000, 1000, 1000, 1000));
+    }
+
+    #[test]
+    fn needs_ownership_change_uid_differs() {
+        // When uid differs, chown needed
+        assert!(needs_ownership_change(1000, 1000, 0, 1000));
+    }
+
+    #[test]
+    fn needs_ownership_change_gid_differs() {
+        // When gid differs, chown needed
+        assert!(needs_ownership_change(1000, 1000, 1000, 0));
+    }
+
+    #[test]
+    fn needs_ownership_change_both_differ() {
+        // When both differ, chown needed
+        assert!(needs_ownership_change(1000, 1000, 0, 0));
+    }
 }

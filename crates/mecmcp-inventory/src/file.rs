@@ -497,13 +497,22 @@ where
     // service cannot read — an outage at its next restart, not here. Restoring
     // the owner fails closed: the file is unreadable to anyone but root until
     // this succeeds.
+    //
+    // Only call chown when it would change something: under a systemd unit with
+    // SystemCallFilter=~@privileged, the call is fatal with SIGSYS rather than
+    // refused with EPERM, and even map_err cannot catch a signal.
     if let Some((uid, gid)) = owner {
-        std::os::unix::fs::chown(path, Some(uid), Some(gid)).map_err(|e| {
-            InventoryError::ParseError(format!(
-                "migrated {} but could not restore its owner: {e}",
-                path.display()
-            ))
-        })?;
+        let effective_uid = rustix::process::geteuid().as_raw();
+        let effective_gid = rustix::process::getegid().as_raw();
+
+        if needs_ownership_change(uid, gid, effective_uid, effective_gid) {
+            std::os::unix::fs::chown(path, Some(uid), Some(gid)).map_err(|e| {
+                InventoryError::ParseError(format!(
+                    "migrated {} but could not restore its owner: {e}",
+                    path.display()
+                ))
+            })?;
+        }
     }
 
     Ok(MigrationReport {
@@ -635,6 +644,22 @@ pub fn write_atomic(path: &Path, value: &serde_json::Value) -> std::io::Result<(
 
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
+}
+
+/// Returns whether a chown syscall is needed to change ownership from
+/// (existing_uid, existing_gid) to (target_uid, target_gid).
+///
+/// A service writing its own state file needs no chown, and under a systemd
+/// `SystemCallFilter=~@privileged` the call is fatal with SIGSYS, not refused
+/// with EPERM. Only call chown when it would change something.
+#[cfg(unix)]
+fn needs_ownership_change(
+    existing_uid: u32,
+    existing_gid: u32,
+    target_uid: u32,
+    target_gid: u32,
+) -> bool {
+    existing_uid != target_uid || existing_gid != target_gid
 }
 
 #[cfg(test)]
@@ -921,6 +946,35 @@ mod tests {
             f.flush().unwrap();
             let hash = hash_file(f.path()).unwrap();
             assert_ne!(hash, [0u8; 32]);
+        }
+    }
+
+    #[cfg(unix)]
+    mod ownership_tests {
+        use super::*;
+
+        #[test]
+        fn needs_ownership_change_matches_both() {
+            // When both uid and gid match, no chown needed
+            assert!(!needs_ownership_change(1000, 1000, 1000, 1000));
+        }
+
+        #[test]
+        fn needs_ownership_change_uid_differs() {
+            // When uid differs, chown needed
+            assert!(needs_ownership_change(1000, 1000, 0, 1000));
+        }
+
+        #[test]
+        fn needs_ownership_change_gid_differs() {
+            // When gid differs, chown needed
+            assert!(needs_ownership_change(1000, 1000, 1000, 0));
+        }
+
+        #[test]
+        fn needs_ownership_change_both_differ() {
+            // When both differ, chown needed
+            assert!(needs_ownership_change(1000, 1000, 0, 0));
         }
     }
 }

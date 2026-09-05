@@ -16,5 +16,8 @@ tempfile   = { workspace = true }
 thiserror  = { workspace = true }
 tokio      = { version = "1", features = ["sync"] }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [lints]
 workspace = true
