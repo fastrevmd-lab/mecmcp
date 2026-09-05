@@ -26,3 +26,4 @@ uuid       = { workspace = true }
 zeroize    = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
