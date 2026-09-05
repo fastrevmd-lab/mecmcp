@@ -29,22 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **changeset, auth, inventory: conditional chown to survive systemd's
-  `SystemCallFilter=~@privileged`** (#351). The ownership-preserving `chown` in
-  `write_state`, `write_atomic` (tokens), and `migrate` (inventory) was
-  unconditional: it ran even when the effective uid and gid already matched the
-  destination file's owner. Under a systemd unit carrying
-  `SystemCallFilter=~@privileged`, the kernel does not return `EPERM` — it kills
-  the process with **SIGSYS**, which neither `let _ =` nor `map_err` can catch.
-  Observed on rustunifimcp 0.3.0: the second change-set state write killed the
-  server mid-request (`status=31/SYS`, kernel audit `syscall=92` = chown), systemd
-  restarted it, and the approval was lost. LXC 951 (`prod-sdcmcp`) carries the
-  same filter and was exposed. Now only calls `chown` when the ownership would
-  actually change: a service writing its own state file makes no syscall, while
-  the offline-recovery case (sudo over a service-owned file, where the uids differ
-  and no seccomp filter applies) still works.
+## [0.23.1] - 2026-09-05
 
 ### Added
 
@@ -62,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the stock guests too and is not changed by this image. The template carries no
   SSH host keys: they are stripped at build time and regenerated once on first
   boot, so guests built from it do not share a server identity.
+
+### Fixed
+
+- **changeset, auth, inventory: conditional chown to survive systemd's
+  `SystemCallFilter=~@privileged`** (#351). The ownership-preserving `chown` in
+  `write_state`, `write_atomic` (tokens), and `migrate` (inventory) was
+  unconditional: it ran even when the effective uid and gid already matched the
+  destination file's owner. Under a systemd unit carrying
+  `SystemCallFilter=~@privileged`, the kernel does not return `EPERM` — it kills
+  the process with **SIGSYS**, which neither `let _ =` nor `map_err` can catch.
+  Observed on rustunifimcp 0.3.0: the second change-set state write killed the
+  server mid-request (`status=31/SYS`, kernel audit `syscall=92` = chown), systemd
+  restarted it, and the approval was lost. LXC 951 (`prod-sdcmcp`) carries the
+  same filter and was exposed. Now only calls `chown` when the ownership would
+  actually change: a service writing its own state file makes no syscall, while
+  the offline-recovery case (sudo over a service-owned file, where the uids differ
+  and no seccomp filter applies) still works.
 
 ## [0.23.0] - 2026-08-30
 
