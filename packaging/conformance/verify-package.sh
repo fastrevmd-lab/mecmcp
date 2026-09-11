@@ -75,6 +75,12 @@ else
      && [[ "$recorded_rustc" != unknown* ]]; then
     r3 "BUILD-INFO names rustc '$recorded_rustc' but the binary was supplied prebuilt via $CONF_SKIP_BUILD_ENV; it must record 'unknown (binary supplied prebuilt; not compiled by this script)'"
   fi
+  # Clause 3 is armed by the CALLER passing --prebuilt, which no rule can infer.
+  # When the repo has a skip-build path and provenance is fatal, silence here
+  # means "not asked", not "checked and clean" -- and those must not look alike.
+  if [[ "$CONF_BUILD_INFO" == "true" && -n "$CONF_SKIP_BUILD_ENV" && "$PREBUILT" != "1" ]]; then
+    warn R3 "clause 3 (BUILD-INFO must not name a toolchain that did not compile the binary) did not run: $CONF_SKIP_BUILD_ENV is declared but --prebuilt was not passed. Pass it from whichever CI path stages a binary it did not compile."
+  fi
 fi
 
 # R4: the installer should create its own drop-in directory. 0 of 6 repos do
