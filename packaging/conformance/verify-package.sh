@@ -80,8 +80,13 @@ fi
 # R4: the installer should create its own drop-in directory. 0 of 6 repos do
 # today, so every install needs a manual mkdir -p before site config can be
 # placed. WARN until the repos are fixed, then promoted to fail in one PR.
-if [[ -f "$installer_path" ]] && ! grep -q "${CONF_SERVICE}\.service\.d" "$installer_path"; then
-  warn R4 "installer never creates /etc/systemd/system/${CONF_SERVICE}.service.d; every install needs a manual mkdir -p first"
+#
+# Comment lines are stripped first. A bare grep matched a mention ANYWHERE, so
+# `# TODO: mkdir /etc/systemd/system/svc.service.d by hand` silenced the rule --
+# harmless while this is a warn, a false green the day it is promoted to fatal.
+if [[ -f "$installer_path" ]] \
+   && ! grep -vE '^[[:space:]]*#' "$installer_path" | grep -q "${CONF_SERVICE}\.service\.d"; then
+  warn R4 "installer never creates /etc/systemd/system/${CONF_SERVICE}.service.d (mentions in comments do not count); every install needs a manual mkdir -p first"
 fi
 
 # R5: shipped units are TEMPLATES carrying @PLACEHOLDER@ tokens. Render them
