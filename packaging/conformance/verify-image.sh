@@ -50,7 +50,23 @@ while IFS= read -r flag; do
     fi
   done <<< "$argv"
   if [[ $present -eq 0 ]]; then
-    echo "FAIL[R6] '$flag' is absent from argv after override '${OVERRIDES[*]}'; move it from CMD into ENTRYPOINT"
+    # What R6 can see is argv and nothing else, so the message reports that and
+    # lists the ways it happens rather than asserting one remedy. "Move it from
+    # CMD into ENTRYPOINT" was wrong whenever the flag already WAS in the
+    # entrypoint: a shell-form ENTRYPOINT yields .Path=/bin/sh with
+    # .Args=["-c", "..."], and an entrypoint shim that adds the flag internally
+    # cannot show up in argv at all.
+    echo "FAIL[R6] '$flag' is absent from the container's argv after override '${OVERRIDES[*]}'"
+    echo "         observed argv: $(tr '\n' ' ' <<<"$argv")"
+    echo "         Docker APPENDS caller arguments to ENTRYPOINT but REPLACES CMD wholesale, so a flag"
+    echo "         reachable only through CMD disappears the moment an operator passes anything. Check,"
+    echo "         in this order:"
+    echo "           1. the flag is in CMD and belongs in ENTRYPOINT;"
+    echo "           2. ENTRYPOINT is shell-form, so argv is /bin/sh -c '<one string>' and the flag is"
+    echo "              inside that string where an appended override cannot reach it -- use exec form;"
+    echo "           3. an entrypoint shim supplies the flag at runtime, which argv cannot show. Then R6"
+    echo "              cannot confirm it and the shim itself must be shown to keep the flag when the"
+    echo "              caller passes arguments."
     FAILED=1
   fi
 done <<< "$must_survive"
