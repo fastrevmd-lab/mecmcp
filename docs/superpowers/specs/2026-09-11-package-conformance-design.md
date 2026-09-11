@@ -31,7 +31,7 @@ with `git ls-files -s` and `git grep` across all six repos:
 |---|---|
 | junos's installer is at the repo root | **All six** are `packaging/lxc/install.sh`. This has already converged. |
 | panos ships a 0644 installer | **panos and proxmox** both ship 0644. |
-| provenance file mandatory | junos, proxmox and unifi reference `BUILD-INFO` zero times. Only sdc recomputes a sha256. |
+| provenance file mandatory | Not yet true anywhere. junos, proxmox and unifi reference `BUILD-INFO` zero times; only sdc recomputes a sha256. Mandatory remains the destination — see **Provenance ordering** for why the order matters. |
 
 Confirmed unchanged: **no repo creates its own `.service.d` directory**
 (0 of 6), so every install needs a manual `mkdir -p` before site config can
@@ -118,13 +118,24 @@ service    = "rust-proxmoxmcp"
 config_dir = "/etc/proxmoxmcp"
 tokens     = "/var/lib/proxmoxmcp/tokens.json"
 
-# Provenance. junos, proxmox and unifi ship none today; this records that
-# truthfully rather than asserting an aspiration.
-build_info = false
+# Provenance is MANDATORY. This key does not opt out of rule 3; it records
+# whether the repo has reached it yet, and rule 3 reports warn instead of
+# fatal while false. There is no configuration that makes a package legitimately
+# provenance-free.
+build_info = false        # -> true once the packager emits one honestly
 
-# Set when the repo's packager can package a CI-built binary, with the flag
-# name it uses. The three names already disagree, which is #355 in miniature.
-skip_build_env = "PROXMOXMCP_PACKAGE_SKIP_BUILD"   # or false
+# The packager's supported path for packaging a CI-built binary. Required
+# before build_info can become true -- see "Provenance ordering" below.
+# The three existing names already disagree, which is #355 in miniature.
+skip_build_env = false    # panos, proxmox, unifi have none today
+
+# Flags that MUST survive an operator override (rule 6). Per-server knowledge:
+# a generic rule cannot know that mist's audit keying is security-relevant and
+# its --port is not. The mechanism is central; this list is what differs.
+must_survive_override = [
+  "--clusters-file",
+  "--tokens-file",
+]
 ```
 
 Unknown keys are an error, so a typo cannot silently disable a check.
@@ -148,14 +159,66 @@ No rule is introduced red in a repo that cannot go green in the same change.
 |---|---|---|---|
 | 1 | The installer is executable | **fatal** | panos and proxmox fail today; this is the whole reason rollout starts at proxmox |
 | 2 | The declared binary exists at the declared path and is executable | **fatal** | three payload layouts; the manifest makes each one checkable |
-| 3 | If `build_info = true`, its sha256 equals the real bytes and `rustc` does not name a toolchain that did not compile the binary | **fatal where declared** | a `BUILD-INFO` was hand-written to satisfy validation and installed on two rigs |
+| 3 | A `BUILD-INFO` is present, its recorded sha256 equals the real bytes, and `rustc` does not name a toolchain that did not compile the binary | **fatal where `build_info = true`, warn elsewhere** | a `BUILD-INFO` was hand-written to satisfy validation and installed on two rigs. All three clauses from day one: mandatory-but-unverified is worse than absent, because it launders a fabrication through a green check |
 | 4 | The installer creates its own `.service.d` directory | **warn** | 0 of 6 today; becomes fatal once fixed |
 | 5 | Shipped units resolve under `systemd-analyze verify` after placeholder substitution | **fatal** | codifies the manual check already run by hand during the 2026-09-06/07 seccomp wave, which rendered the `@PLACEHOLDER@` tokens and confirmed `EPERM=1 denylist=1 SystemCallLog=0` on all six. Doing it by hand is why it was only done once |
-| 6 | No security-relevant flag appears only in Docker `CMD` | **fatal** | rustmistmcp#78: any `--host` override silently dropped audit keying and redaction |
+| 6 | Every flag in `must_survive_override` is still present in the container's argv after a typical operator override | **fatal** | rustmistmcp#78: any `--host` override silently dropped audit keying and redaction. Central mechanism, manifest-declared flag list |
 
-Rule 6 generalises the per-repo assertions added to rustmistmcp and
-rustproxmoxmcp on 2026-09-11. Those stay where they are; this does not remove
-them.
+Rule 6 replaces the per-repo assertions added to rustmistmcp and
+rustproxmoxmcp on 2026-09-11. Standardising is the point of #355, and two
+hand-written copies are two things that drift.
+
+**They are removed only after the central rule is proven to bite in that
+repo**, in the adopting PR: delete the flag from the Dockerfile, watch the
+central rule fail, restore it, then delete the local assertion. Trading a
+guard known to work for one merely known to be present is the failure mode
+this project keeps finding.
+
+## Provenance ordering
+
+Provenance is mandatory. The order in which it becomes mandatory is the part
+that matters, because getting it wrong recreates the bug the rule exists to
+prevent.
+
+Measured 2026-09-11:
+
+| repo | supported skip-build path | ships `BUILD-INFO` |
+|---|---|---|
+| rustjunosmcp | `JMCP_PACKAGE_SKIP_BUILD` | **none** |
+| rustpanosmcp | **none** | 1 file |
+| rustsdcmcp | `SDCMCP_PACKAGE_SKIP_BUILD` | 4 files, **recomputes sha256** |
+| rustmistmcp | `RUSTMISTMCP_SKIP_BUILD` | 5 files |
+| rustproxmoxmcp | **none** | **none** |
+| rustunifimcp | **none** | **none** |
+
+Three repos cannot package a CI-built binary at all. Repackaging on a
+workstation is not an alternative: glibc is forward-incompatible, so a binary
+linked against the workstation's 2.44 will not start on the containers' 2.41,
+and it fails at service start *after* the old binary has been replaced.
+
+So a check that demands a `BUILD-INFO` those packagers cannot honestly produce
+leaves the operator two options: do not ship, or hand-write one. That is
+exactly how the forged `BUILD-INFO` of 2026-09-07 came about — #355's own
+diagnosis is that "the pressure to fabricate it came directly from there being
+no supported path". Making provenance mandatory before the supported path
+exists would rebuild that pressure and put a passing check's name on the
+result.
+
+Therefore:
+
+1. **A supported skip-build path lands first** in rustpanosmcp,
+   rustproxmoxmcp and rustunifimcp, emitting an honest provenance file — one
+   that records `rustc=unknown (binary supplied prebuilt; not compiled by this
+   script)` rather than naming a local toolchain, as rustmistmcp already does.
+2. **Then that repo flips `build_info = true`**, and rule 3 goes fatal for it.
+3. Rule 3's three clauses — present, sha256 matches the real bytes, `rustc`
+   honest — apply from day one wherever it is fatal. Mandatory-but-unverified
+   is strictly worse than absent: it launders a fabrication through a green
+   check, which is the precise failure #355 reports.
+
+`build_info = false` is therefore a statement about *progress*, not an opt-out.
+No value of it makes a package legitimately provenance-free, and the rule
+reports on every run either way.
 
 ## Rollout
 
@@ -164,8 +227,11 @@ them.
    proves the check is live rather than vacuous, and the fix is one `chmod`.
 3. rustpanosmcp next, the other rule 1 failure.
 4. The remaining four, one PR each.
-5. Once rule 4 passes everywhere, flip it to fatal in mecmcp. One PR, and
-   every repo that has bumped the pin inherits it.
+5. Separately, give rustpanosmcp, rustproxmoxmcp and rustunifimcp a
+   supported skip-build path, then flip each to `build_info = true`.
+6. Once rule 4 passes everywhere, flip it to fatal in mecmcp. One PR, and
+   every repo that has bumped the pin inherits it. Same for rule 3 once all
+   six declare `build_info = true`, at which point the key can be deleted.
 
 ## What this does not prove
 
