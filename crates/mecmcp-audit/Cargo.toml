@@ -20,7 +20,6 @@ getrandom   = { workspace = true }
 hex         = "0.4"
 hmac        = { workspace = true }
 metrics     = { workspace = true }
-rand_core   = { version = "0.6", features = ["getrandom"] }
 rustix      = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }

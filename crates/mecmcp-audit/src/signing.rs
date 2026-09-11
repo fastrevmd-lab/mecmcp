@@ -255,9 +255,16 @@ pub fn decode_signature(encoded: &str) -> Result<DetachedSignature, SigningError
 ///
 /// Returns (signing_key, verifying_key).
 pub fn generate_keypair() -> (SigningKey, VerifyingKey) {
-    use rand_core::OsRng;
+    // An Ed25519 signing key is 32 uniformly random bytes. ed25519-dalek's own
+    // `generate` is exactly `fill_bytes` into those 32 bytes followed by
+    // `from_bytes`, so this is the same construction without taking a
+    // dependency on whichever `rand_core` generation the crate happens to
+    // expose -- the coupling that broke this call when ed25519-dalek moved to
+    // rand_core 0.10. `getrandom::fill` is what the rest of the workspace uses.
+    let mut secret = [0u8; 32];
+    getrandom::fill(&mut secret).expect("the OS RNG is required to generate a signing key");
 
-    let dalek_signing_key = DalekSigningKey::generate(&mut OsRng);
+    let dalek_signing_key = DalekSigningKey::from_bytes(&secret);
     let dalek_verifying_key = dalek_signing_key.verifying_key();
 
     (
@@ -318,6 +325,84 @@ mod tests {
         );
         append(&mut seg, EvidenceRecord::Proposal(proposal_fixture())).unwrap();
         close(seg).unwrap()
+    }
+
+    /// Cross-implementation known-answer test for the audit signature.
+    ///
+    /// Audit signatures are **persisted**. A record signed by an older build
+    /// must still verify under a newer one, so the key derivation, the
+    /// signature bytes and the base64 encoding are all a storage-format
+    /// constant rather than an implementation detail.
+    ///
+    /// Nothing pinned them before this. `signature_encoding_stable` is
+    /// labelled a golden fixture but generates a *random* keypair and
+    /// round-trips sign -> encode -> decode -> verify, so it agrees with
+    /// itself after any change to the algorithm or encoding.
+    ///
+    /// The expectations here come from outside this crate:
+    ///
+    /// - The signing key is RFC 8032 section 7.1 TEST 1
+    ///   (`9d61b19d...7f60`). OpenSSL derives the public key
+    ///   `d75a9801...511a` from it, matching the RFC exactly.
+    /// - The signature is OpenSSL's, over the 32 bytes `00 01 02 ... 1f`:
+    ///
+    /// ```text
+    /// $ printf '302e020100300506032b657004220420<seed>' | xxd -r -p > k.der
+    /// $ openssl pkey -inform DER -in k.der -out k.pem
+    /// $ printf '0001...1f' | xxd -r -p > msg32.bin
+    /// $ openssl pkeyutl -sign -inkey k.pem -rawin -in msg32.bin | base64
+    /// AMHbmIuxL9c1GmBUrj+skPq35PxWsWUccYH19V+Jb2Y5M9OpBgXZBY6dCsRZUO4tPJybFIV0FVhxef4MysNfCQ==
+    /// ```
+    ///
+    /// It drives the real path: `load_signing_key` (including its permission
+    /// checks), `encode_verifying_key`, `sign_head` and `encode_signature`.
+    #[test]
+    fn signature_matches_openssl_known_answer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // RFC 8032 section 7.1 TEST 1 secret key, base64 as this crate stores it.
+        const RFC8032_SECRET_B64: &str = "nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A=";
+        const RFC8032_PUBLIC_B64: &str = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+        const HEAD_HASH_00_TO_1F: &str =
+            "sha256:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        const OPENSSL_SIGNATURE_B64: &str = "AMHbmIuxL9c1GmBUrj+skPq35PxWsWUccYH19V+Jb2Y5M9OpBgXZBY6dCsRZUO4tPJybFIV0FVhxef4MysNfCQ==";
+
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("audit_signing_key");
+        fs::write(&key_path, RFC8032_SECRET_B64).unwrap();
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let signing_key = load_signing_key(&key_path).expect("RFC 8032 key should load");
+
+        // No public accessor derives a VerifyingKey from a SigningKey; this test
+        // lives in the same module, so it reaches the wrapped key directly.
+        let verifying_key = VerifyingKey {
+            inner: signing_key.inner.verifying_key(),
+        };
+
+        assert_eq!(
+            encode_verifying_key(&verifying_key),
+            RFC8032_PUBLIC_B64,
+            "public-key derivation changed; previously distributed verifying keys \
+             would no longer correspond to their signing keys"
+        );
+
+        let mut closed = make_closed_segment();
+        closed.head_hash = HEAD_HASH_00_TO_1F.to_string();
+
+        let signature = sign_head(&closed, &signing_key).expect("signing should succeed");
+
+        assert_eq!(
+            encode_signature(&signature),
+            OPENSSL_SIGNATURE_B64,
+            "audit signature bytes changed; audit records signed by earlier \
+             builds would no longer verify"
+        );
+
+        // And the verify half of the real path agrees with the pinned bytes.
+        let decoded = decode_signature(OPENSSL_SIGNATURE_B64).expect("pinned signature decodes");
+        verify_head(&closed, &decoded, &verifying_key)
+            .expect("pinned signature must verify against the pinned key");
     }
 
     #[test]
