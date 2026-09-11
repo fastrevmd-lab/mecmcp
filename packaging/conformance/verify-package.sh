@@ -88,6 +88,27 @@ fi
 # with the manifest's test values, then check systemd can resolve the result.
 # Installing an unrendered template killed rig 623 with
 # "Fatal: invalid socket address syntax".
+#
+# The reader's exit status is captured before the loop rather than discarded by
+# a process substitution: a reader failure there made R5 a silent no-op, which
+# is the one failure mode a conformance rule must not have.
+reader_ok=1
+if ! units_list="$(python3 "$READER" "$MANIFEST" --list units 2>&1)"; then
+  fail R5 "could not read 'units' from the manifest, so R5 did not run: $(head -2 <<<"$units_list" | tr '\n' ' ')"
+  reader_ok=0; units_list=""
+fi
+if ! placeholder_list="$(python3 "$READER" "$MANIFEST" --list placeholders 2>&1)"; then
+  fail R5 "could not read 'placeholders' from the manifest, so R5 did not run: $(head -2 <<<"$placeholder_list" | tr '\n' ' ')"
+  reader_ok=0; placeholder_list=""
+fi
+
+# An empty `units` is legitimate -- a repo may ship no unit -- but silence is
+# indistinguishable from the rule having been deleted. verify-image.sh already
+# announces its empty-list case; R5 now does the same.
+if [[ $reader_ok -eq 1 && -z "${units_list//[[:space:]]/}" ]]; then
+  echo "note: units is empty; R5 has nothing to check"
+fi
+
 render_dir="$(mktemp -d)"; trap 'rm -rf "$render_dir"' EXIT
 while IFS= read -r unit; do
   [[ -n "$unit" ]] || continue
@@ -99,15 +120,35 @@ while IFS= read -r unit; do
   cp "$STAGING/$unit" "$rendered"
   while IFS=$'\t' read -r token value; do
     [[ -n "$token" ]] && sed -i "s|${token}|${value}|g" "$rendered"
-  done < <(python3 "$READER" "$MANIFEST" --list placeholders)
+  done <<< "$placeholder_list"
   if grep -qE '@[A-Z0-9_]+@' "$rendered"; then
     fail R5 "$unit still contains unrendered placeholders: $(grep -oE '@[A-Z0-9_]+@' "$rendered" | sort -u | tr '\n' ' ')"
     continue
   fi
-  if ! analyze_output="$(systemd-analyze verify "$rendered" 2>&1)"; then
-    fail R5 "$unit does not resolve: $(head -2 <<<"$analyze_output" | tr '\n' ' ')"
+
+  # `systemd-analyze verify` resolves ExecStart= and friends against the local
+  # filesystem. Every family unit names the INSTALLED path
+  # (/usr/local/bin/<binary>), which by definition is not there when a package
+  # is checked BEFORE installation, so all six repos measured exit 1 on a clean
+  # runner with nothing wrong with the unit. R5 asks whether the unit parses and
+  # its directives are valid, which is answerable statically; whether the binary
+  # is installed is not. Exactly that one diagnostic class is dropped, and the
+  # count is printed so a suppressed line is visible rather than silent.
+  #
+  # Nothing else is filtered. Note also that systemd-analyze exits 0 for some
+  # genuine defects (a bad `Restart=` value is reported and still exits 0), so
+  # the verdict is taken from the surviving OUTPUT, not from the exit status.
+  analyze_output="$(systemd-analyze verify "$rendered" 2>&1)"
+  uninstalled_re=': Command .+ is not executable: '
+  suppressed="$(grep -cE "$uninstalled_re" <<<"$analyze_output")"
+  residual="$(grep -vE "$uninstalled_re" <<<"$analyze_output" | grep -vE '^[[:space:]]*$')"
+  if [[ "$suppressed" != "0" ]]; then
+    echo "note: R5 ignored $suppressed unresolvable-command diagnostic(s) for $unit; a package check cannot verify a binary that is not installed yet"
   fi
-done < <(python3 "$READER" "$MANIFEST" --list units)
+  if [[ -n "$residual" ]]; then
+    fail R5 "$unit does not resolve: $(head -2 <<<"$residual" | tr '\n' ' ')"
+  fi
+done <<< "$units_list"
 
 echo "note: static package check only; runtime enforcement is NOT verified here"
 exit "$FAILED"
