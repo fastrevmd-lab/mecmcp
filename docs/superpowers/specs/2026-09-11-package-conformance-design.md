@@ -110,11 +110,18 @@ package tarball rather than linking Rust code.
 
 `packaging/conformance.toml`, one per repo:
 
+This example parses. `packaging/conformance/README.md` is the schema reference;
+every key below is required unless marked optional.
+
 ```toml
-# Paths are relative to the assembled package root unless absolute.
+# binary, installer and units are paths INSIDE the staging directory passed as
+# --staging. An absolute value is rejected, because it would be joined onto the
+# staging path anyway and report "not found" for a file that exists.
 binary     = "bin/rust-proxmoxmcp"
 installer  = "packaging/lxc/install.sh"
-service    = "rust-proxmoxmcp"
+service    = "rust-proxmoxmcp"          # service name, no ".service"
+
+# config_dir and tokens are absolute ON THE TARGET, and stay absolute.
 config_dir = "/etc/proxmoxmcp"
 tokens     = "/var/lib/proxmoxmcp/tokens.json"
 
@@ -127,7 +134,16 @@ build_info = false        # -> true once the packager emits one honestly
 # The packager's supported path for packaging a CI-built binary. Required
 # before build_info can become true -- see "Provenance ordering" below.
 # The three existing names already disagree, which is #355 in miniature.
+# Optional. Either false, or a string NAMING the variable. `true` is rejected:
+# it satisfies the ordering guard while naming nothing, which is what silently
+# disabled rule 3's third clause.
 skip_build_env = false    # panos, proxmox, unifi have none today
+
+# Required, and the one key the earlier version of this example omitted. The
+# units rule renders each of these and checks systemd can resolve the result.
+# An empty list is legal and is announced, so it cannot be mistaken for the
+# rule having been deleted.
+units = ["packaging/systemd/rust-proxmoxmcp.service"]
 
 # Flags that MUST survive an operator override (rule 6). Per-server knowledge:
 # a generic rule cannot know that mist's audit keying is security-relevant and
@@ -136,6 +152,13 @@ must_survive_override = [
   "--clusters-file",
   "--tokens-file",
 ]
+
+# Optional. Test values for the @TOKEN@ placeholders the shipped units carry,
+# used only to render a unit before checking it. Omit the table when the units
+# carry no placeholders; an unrendered placeholder that survives rendering is a
+# failure, because installing one killed rig 623.
+[placeholders]
+"@BIND_ADDRESS@" = "127.0.0.1:30031"
 ```
 
 Unknown keys are an error, so a typo cannot silently disable a check.
