@@ -38,7 +38,18 @@ docker rm "$container" >/dev/null
 FAILED=0
 while IFS= read -r flag; do
   [[ -n "$flag" ]] || continue
-  if ! grep -Fqx -- "$flag" <<<"$argv"; then
+  present=0
+  while IFS= read -r line; do
+    # A declared flag counts as present as its own argv token, or as the
+    # "--flag=value" form -- both are valid CLI shapes for these binaries.
+    # Compared literally (never as a regex) so a flag containing
+    # regex/glob metacharacters cannot misbehave.
+    if [[ "$line" == "$flag" || "$line" == "$flag"'='* ]]; then
+      present=1
+      break
+    fi
+  done <<< "$argv"
+  if [[ $present -eq 0 ]]; then
     echo "FAIL[R6] '$flag' is absent from argv after override '${OVERRIDES[*]}'; move it from CMD into ENTRYPOINT"
     FAILED=1
   fi
