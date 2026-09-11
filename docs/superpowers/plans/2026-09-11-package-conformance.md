@@ -1028,11 +1028,18 @@ mecmcp commit that merged Task 7:
           cp target/release/rust-proxmoxmcp staging/bin/
           cp -r packaging staging/packaging
           cp packaging/conformance.toml staging/
+      - name: Build the image
+        # R6 needs a built image. Omitting `image:` ships R6 dark: the action's
+        # argv step is skipped and the log cannot tell "R6 passed" from "R6
+        # never ran". The action now prints a note in that case, but the first
+        # adopter should not need the note.
+        run: docker build -t rust-proxmoxmcp:conformance .
       - name: Conformance
         uses: fastrevmd-lab/mecmcp/packaging/conformance@<SHA>
         with:
           staging: staging
           manifest: staging/conformance.toml
+          image: rust-proxmoxmcp:conformance
 ```
 
 - [ ] **Step 4: Push and confirm the first run FAILS on R1**

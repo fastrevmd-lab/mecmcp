@@ -50,9 +50,23 @@ runs:
         CONF_MANIFEST: ${{ inputs.manifest }}
         CONF_OVERRIDES: ${{ inputs.overrides }}
       run: |
+        # `set -f` so a `*` in overrides cannot pathname-expand against the
+        # runner's working directory before it reaches the script.
+        set -f
         args=()
         for token in $CONF_OVERRIDES; do args+=(--override "$token"); done
+        set +f
         bash "$GITHUB_ACTION_PATH/verify-image.sh" \
           --image "$CONF_IMAGE" \
           --manifest "$CONF_MANIFEST" \
           "${args[@]}"
+
+    # An `if:`-skipped step produces no output, so a log could not distinguish
+    # "R6 passed" from "R6 never ran" -- and the first adopter omitted `image`.
+    - name: Note that R6 did not run
+      if: inputs.image == ''
+      shell: bash
+      run: |
+        echo "note: R6 (image argv) did NOT run: no 'image' input was given, so"
+        echo "note: nothing checked that must_survive_override flags survive an"
+        echo "note: operator override. Pass image: <tag> to enable it."
