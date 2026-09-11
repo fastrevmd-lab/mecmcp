@@ -13,7 +13,10 @@ for fixture in "$HERE"/../fixtures/*/; do
   [[ -f "$expect_file" ]] || { echo "FAIL - $name has no EXPECT file"; fails=$((fails+1)); continue; }
   want="$(grep -vE '^\s*(#|$)' "$expect_file" | sort -u || true)"
 
-  output="$(bash "$VERIFY" --staging "$fixture" --manifest "$fixture/conformance.toml" 2>&1)"
+  flags=""
+  [[ -f "$fixture/FLAGS" ]] && flags="$(cat "$fixture/FLAGS")"
+
+  output="$(bash "$VERIFY" --staging "$fixture" --manifest "$fixture/conformance.toml" $flags 2>&1)"
   got="$(grep -oE '^FAIL\[R[0-9]+\]' <<<"$output" | tr -d 'FAIL[]' | sort -u || true)"
 
   if [[ "$want" == "$got" ]]; then

@@ -9,11 +9,12 @@
 # be read as "the seccomp posture works".
 set -uo pipefail
 
-STAGING=""; MANIFEST=""
+STAGING=""; MANIFEST=""; PREBUILT=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --staging)  STAGING="$2"; shift 2 ;;
     --manifest) MANIFEST="$2"; shift 2 ;;
+    --prebuilt) PREBUILT=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -70,7 +71,7 @@ else
       r3 "BUILD-INFO binary_sha256 does not match the shipped binary (recorded ${recorded_sha:0:12}..., actual ${actual_sha:0:12}...)"
   fi
   recorded_rustc="$(sed -n 's/^rustc=//p' "$build_info_path" | head -1)"
-  if [[ -n "$CONF_SKIP_BUILD_ENV" && "${!CONF_SKIP_BUILD_ENV:-0}" == "1" ]] \
+  if [[ "$PREBUILT" == "1" && -n "$CONF_SKIP_BUILD_ENV" ]] \
      && [[ "$recorded_rustc" != unknown* ]]; then
     r3 "BUILD-INFO names rustc '$recorded_rustc' but the binary was supplied prebuilt via $CONF_SKIP_BUILD_ENV; it must record 'unknown (binary supplied prebuilt; not compiled by this script)'"
   fi
