@@ -341,7 +341,7 @@ fn line_matches_host(line: &str, host: &str, port: u16) -> Result<bool, ScpError
             format!("[{}]:{}", host, port)
         };
 
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         type HmacSha1 = Hmac<sha1::Sha1>;
 
         let mut hmac = HmacSha1::new_from_slice(&salt)
@@ -2028,6 +2028,46 @@ fn check_cancellation(ct: &CancellationToken) -> Result<(), ScpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Known-answer test for the hashed `known_hosts` HMAC-SHA1.
+    ///
+    /// OpenSSH stores hashed hosts as `|1|<base64 salt>|<base64 HMAC-SHA1(salt, host)>`,
+    /// so the digest output is a **file-format constant**, not an implementation
+    /// detail: if these bytes change, every hashed `known_hosts` entry in the fleet
+    /// stops matching and host-key verification silently falls through to "unknown
+    /// host". SHA-1 is required by the format and must not be "upgraded".
+    ///
+    /// The existing round-trip coverage cannot catch that, because it hashes with
+    /// the same code it verifies against and would agree with itself after any
+    /// change. This vector is computed independently:
+    ///
+    /// ```text
+    /// salt = 0x0b x20   (RFC 2202 case 1 key)
+    /// $ printf 'example.com' | openssl dgst -sha1 -mac HMAC \
+    ///       -macopt hexkey:0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b -binary | base64
+    /// XXrb7jid9VkSGZLgs5kDvEexdLc=
+    /// ```
+    ///
+    /// That same OpenSSL invocation reproduces RFC 2202 case 1
+    /// (`HMAC-SHA1(0x0b x20, "Hi There") = b617318655057264e28bc0b6fb378c8ef146be00`),
+    /// which is what makes the vector trustworthy rather than self-referential.
+    #[test]
+    fn hashed_known_hosts_matches_openssl_known_answer() {
+        let line = "|1|CwsLCwsLCwsLCwsLCwsLCwsLCws=|XXrb7jid9VkSGZLgs5kDvEexdLc= \
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            .replace('\n', "");
+
+        assert!(
+            line_matches_host(&line, "example.com", 22).expect("well-formed hashed line"),
+            "HMAC-SHA1 of the hashed known_hosts entry no longer matches the \
+             OpenSSL-computed vector; hashed known_hosts entries would stop matching"
+        );
+
+        assert!(
+            !line_matches_host(&line, "other.example.com", 22).expect("well-formed hashed line"),
+            "a different host must not match this hash"
+        );
+    }
 
     #[test]
     fn parse_c_header_success() {
@@ -6104,7 +6144,7 @@ mod e2e_tests {
         // For simplicity in this test, we'll manually create a hashed entry.
         // The hash format is: |1|salt|hash where hash = HMAC-SHA1(salt, host)
         use base64::Engine;
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         type HmacSha1 = Hmac<sha1::Sha1>;
 
         let host_to_hash = format!("[127.0.0.1]:{}", addr.port());
