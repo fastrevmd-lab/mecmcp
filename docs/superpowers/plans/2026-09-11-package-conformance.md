@@ -304,7 +304,7 @@ cat > packaging/systemd/svc.service <<'EOF'
 [Unit]
 Description=svc
 [Service]
-ExecStart=/usr/local/bin/svc --host @BIND_ADDRESS@
+ExecStart=/bin/true --host @BIND_ADDRESS@
 SystemCallErrorNumber=EPERM
 [Install]
 WantedBy=multi-user.target
@@ -668,10 +668,10 @@ done < <(python3 "$READER" "$MANIFEST" --list units)
 Run: `bash packaging/conformance/tests/run-fixtures.sh`
 Expected: `all fixtures passed`.
 
-If `systemd-analyze verify` warns about the missing `ExecStart` binary on the
-conformant fixture, point `ExecStart` at `/bin/true` in
-`fixtures/conformant/packaging/systemd/svc.service` and re-run. Do not weaken
-the check to accommodate the fixture.
+The conformant fixture already uses `ExecStart=/bin/true` so `systemd-analyze
+verify` can resolve it on the runner while still carrying a placeholder in its
+arguments. If R5 still reports something on the conformant fixture, fix the
+fixture — never weaken the check to accommodate it.
 
 - [ ] **Step 4: Commit**
 
@@ -830,81 +830,74 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 7: The reusable workflow and mecmcp's own CI job
+### Task 7: The composite action and mecmcp's own CI job
 
 **Files:**
-- Create: `.github/workflows/package-conformance.yml`
+- Create: `packaging/conformance/action.yml`
 - Modify: `.github/workflows/ci.yml`
 
 **Interfaces:**
 - Consumes: all scripts from Tasks 1-6.
-- Produces: a `workflow_call` workflow with inputs `staging` (required
-  string), `manifest` (required string), `image` (optional string, default
-  `''`), `overrides` (optional string, default `--host 0.0.0.0`).
+- Produces: a composite action at `fastrevmd-lab/mecmcp/packaging/conformance@<sha>`
+  with inputs `staging` (required), `manifest` (required), `image` (optional,
+  default `''`), `overrides` (optional, default `--host 0.0.0.0`).
 
-- [ ] **Step 1: Write the reusable workflow**
+**Why a composite action and not a `workflow_call` workflow:** a reusable
+workflow is invoked at job level, and such a job cannot contain `steps:`. The
+consumer must stage the package in the same job that built the binary, so it
+needs something callable as a *step*. A composite action keeps every property
+this was chosen for — central, SHA-pinned, unable to drift silently.
+
+- [ ] **Step 1: Write the composite action**
 
 ```yaml
-# .github/workflows/package-conformance.yml
-name: Package conformance
+# packaging/conformance/action.yml
+name: mecmcp package conformance
+description: >
+  Check an assembled mecmcp-family package against the shared contract.
+  Static inspection only -- this proves nothing about runtime enforcement.
 
-on:
-  workflow_call:
-    inputs:
-      staging:
-        description: Directory the caller populated with the assembled package
-        required: true
-        type: string
-      manifest:
-        description: Path to packaging/conformance.toml
-        required: true
-        type: string
-      image:
-        description: Built image tag for R6. Empty skips R6.
-        required: false
-        type: string
-        default: ''
-      overrides:
-        description: Operator arguments R6 passes to the container
-        required: false
-        type: string
-        default: '--host 0.0.0.0'
+inputs:
+  staging:
+    description: Directory the caller populated with the assembled package
+    required: true
+  manifest:
+    description: Path to packaging/conformance.toml
+    required: true
+  image:
+    description: Built image tag for R6. Empty skips R6.
+    required: false
+    default: ''
+  overrides:
+    description: Operator arguments R6 passes to the container
+    required: false
+    default: '--host 0.0.0.0'
 
-permissions:
-  contents: read
+runs:
+  using: composite
+  steps:
+    - name: Verify the package
+      shell: bash
+      run: |
+        bash "${{ github.action_path }}/verify-package.sh" \
+          --staging "${{ inputs.staging }}" \
+          --manifest "${{ inputs.manifest }}"
 
-jobs:
-  conformance:
-    name: Package conformance
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out the consumer
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
-
-      - name: Check out mecmcp's conformance scripts
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
-        with:
-          repository: fastrevmd-lab/mecmcp
-          ref: ${{ github.job_workflow_sha }}
-          path: .mecmcp-conformance
-          sparse-checkout: packaging/conformance
-
-      - name: Verify the package
-        run: |
-          bash .mecmcp-conformance/packaging/conformance/verify-package.sh \
-            --staging "${{ inputs.staging }}" \
-            --manifest "${{ inputs.manifest }}"
-
-      - name: Verify the image argv
-        if: inputs.image != ''
-        run: |
-          args=()
-          for token in ${{ inputs.overrides }}; do args+=(--override "$token"); done
-          bash .mecmcp-conformance/packaging/conformance/verify-image.sh \
-            --image "${{ inputs.image }}" \
-            --manifest "${{ inputs.manifest }}" \
-            "${args[@]}"
+    - name: Verify the image argv
+      if: inputs.image != ''
+      shell: bash
+      run: |
+        args=()
+        for token in ${{ inputs.overrides }}; do args+=(--override "$token"); done
+        bash "${{ github.action_path }}/verify-image.sh" \
+          --image "${{ inputs.image }}" \
+          --manifest "${{ inputs.manifest }}" \
+          "${args[@]}"
 ```
+
+`github.action_path` resolves to the checked-out action directory, so the
+scripts always come from the same SHA the consumer pinned. There is no second
+checkout and no way for the action and its scripts to disagree.
 
 - [ ] **Step 2: Add mecmcp's own fixture job**
 
@@ -925,16 +918,17 @@ Append to the `jobs:` block of `.github/workflows/ci.yml`:
         run: bash packaging/conformance/tests/test-verify-image.sh
 ```
 
-- [ ] **Step 3: Verify the checkout SHA is real before pushing**
+- [ ] **Step 3: Use the checkout SHA this repo already pins**
+
+Do not invent one. Take the value already in use and reuse it verbatim:
 
 ```bash
-gh api repos/actions/checkout/commits/08c6903cd8c0fde910a37f88322edcfb5dd907a8 --jq .sha
+grep -rhoE 'actions/checkout@[0-9a-f]{40}' .github/workflows/ | sort -u
 ```
 
-Expected: the same SHA echoed back. If it 404s, take the SHA the other family
-repos already pin — `grep -rh 'actions/checkout@' ../RustJunosMCP/.github/workflows/`
-— and use that instead. Do not switch to a floating tag; every action in
-these repos is SHA-pinned.
+Use that SHA in the new job. If more than one appears, use the one in
+`ci.yml`. Every action in these repos is SHA-pinned; never substitute a
+floating tag.
 
 - [ ] **Step 4: Run the three suites locally, then commit**
 
@@ -943,15 +937,17 @@ bash packaging/conformance/tests/test-read-manifest.sh
 bash packaging/conformance/tests/run-fixtures.sh
 bash packaging/conformance/tests/test-verify-image.sh
 git add .github/workflows/
-git commit -m "feat(conformance): reusable workflow and mecmcp fixture job
+git commit -m "feat(conformance): composite action and mecmcp fixture job
 
-A workflow_call workflow consumers invoke SHA-pinned, matching the house
-habit -- every action in these repos is already pinned by SHA. A repo cannot
-silently drift: it is on the pinned SHA or it visibly is not.
+A composite action consumers invoke SHA-pinned, matching the house habit --
+every action in these repos is already pinned by SHA. A repo cannot silently
+drift: it is on the pinned SHA or it visibly is not.
 
-The scripts are fetched from the same SHA the caller pinned, via
-github.job_workflow_sha, so the workflow and the scripts it runs can never
-disagree.
+A composite action rather than a workflow_call workflow because a reusable
+workflow is invoked at job level and such a job cannot contain steps, while
+the consumer must stage the package in the same job that built the binary.
+github.action_path means the scripts always come from the SHA the consumer
+pinned, so the action and its scripts cannot disagree.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
@@ -966,7 +962,8 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 - Modify: `/home/mharman/Projects/rustproxmoxmcp/packaging/lxc/install.sh` (mode only)
 
 **Interfaces:**
-- Consumes: the workflow from Task 7, pinned at its merge SHA on mecmcp `main`.
+- Consumes: the composite action from Task 7, pinned at its merge SHA on
+  mecmcp `main`.
 - Produces: nothing other repos consume.
 
 This task is in a **different repository**. Do not run it in the mecmcp
@@ -1032,7 +1029,7 @@ mecmcp commit that merged Task 7:
           cp -r packaging staging/packaging
           cp packaging/conformance.toml staging/
       - name: Conformance
-        uses: fastrevmd-lab/mecmcp/.github/workflows/package-conformance.yml@<SHA>
+        uses: fastrevmd-lab/mecmcp/packaging/conformance@<SHA>
         with:
           staging: staging
           manifest: staging/conformance.toml
