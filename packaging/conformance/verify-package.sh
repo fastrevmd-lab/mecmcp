@@ -77,5 +77,37 @@ else
   fi
 fi
 
+# R4: the installer should create its own drop-in directory. 0 of 6 repos do
+# today, so every install needs a manual mkdir -p before site config can be
+# placed. WARN until the repos are fixed, then promoted to fail in one PR.
+if [[ -f "$installer_path" ]] && ! grep -q "${CONF_SERVICE}\.service\.d" "$installer_path"; then
+  warn R4 "installer never creates /etc/systemd/system/${CONF_SERVICE}.service.d; every install needs a manual mkdir -p first"
+fi
+
+# R5: shipped units are TEMPLATES carrying @PLACEHOLDER@ tokens. Render them
+# with the manifest's test values, then check systemd can resolve the result.
+# Installing an unrendered template killed rig 623 with
+# "Fatal: invalid socket address syntax".
+render_dir="$(mktemp -d)"; trap 'rm -rf "$render_dir"' EXIT
+while IFS= read -r unit; do
+  [[ -n "$unit" ]] || continue
+  if [[ ! -f "$STAGING/$unit" ]]; then
+    fail R5 "declared unit not found: $unit"
+    continue
+  fi
+  rendered="$render_dir/$(basename "$unit")"
+  cp "$STAGING/$unit" "$rendered"
+  while IFS=$'\t' read -r token value; do
+    [[ -n "$token" ]] && sed -i "s|${token}|${value}|g" "$rendered"
+  done < <(python3 "$READER" "$MANIFEST" --list placeholders)
+  if grep -qE '@[A-Z0-9_]+@' "$rendered"; then
+    fail R5 "$unit still contains unrendered placeholders: $(grep -oE '@[A-Z0-9_]+@' "$rendered" | sort -u | tr '\n' ' ')"
+    continue
+  fi
+  if ! analyze_output="$(systemd-analyze verify "$rendered" 2>&1)"; then
+    fail R5 "$unit does not resolve: $(head -2 <<<"$analyze_output" | tr '\n' ' ')"
+  fi
+done < <(python3 "$READER" "$MANIFEST" --list units)
+
 echo "note: static package check only; runtime enforcement is NOT verified here"
 exit "$FAILED"
