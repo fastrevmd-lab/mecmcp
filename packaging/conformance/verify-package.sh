@@ -51,5 +51,30 @@ elif [[ ! -x "$binary_path" ]]; then
   fail R2 "binary is not executable ($(stat -c '%a' "$binary_path")): $CONF_BINARY"
 fi
 
+# R3: provenance is mandatory as a destination. build_info records whether
+# this repo has reached it, not whether it is exempt -- the rule reports
+# either way. All three clauses apply wherever it is fatal, because a
+# mandatory-but-unverified file launders a fabrication through a green check.
+build_info_path="$STAGING/BUILD-INFO"
+r3() { if [[ "$CONF_BUILD_INFO" == "true" ]]; then fail R3 "$1"; else warn R3 "$1"; fi; }
+
+if [[ ! -f "$build_info_path" ]]; then
+  r3 "no BUILD-INFO in the package (provenance is mandatory; see the spec's Provenance ordering)"
+else
+  recorded_sha="$(sed -n 's/^binary_sha256=//p' "$build_info_path" | head -1)"
+  if [[ -z "$recorded_sha" ]]; then
+    r3 "BUILD-INFO records no binary_sha256"
+  elif [[ -f "$binary_path" ]]; then
+    actual_sha="$(sha256sum "$binary_path" | cut -d' ' -f1)"
+    [[ "$recorded_sha" == "$actual_sha" ]] || \
+      r3 "BUILD-INFO binary_sha256 does not match the shipped binary (recorded ${recorded_sha:0:12}..., actual ${actual_sha:0:12}...)"
+  fi
+  recorded_rustc="$(sed -n 's/^rustc=//p' "$build_info_path" | head -1)"
+  if [[ -n "$CONF_SKIP_BUILD_ENV" && "${!CONF_SKIP_BUILD_ENV:-0}" == "1" ]] \
+     && [[ "$recorded_rustc" != unknown* ]]; then
+    r3 "BUILD-INFO names rustc '$recorded_rustc' but the binary was supplied prebuilt via $CONF_SKIP_BUILD_ENV; it must record 'unknown (binary supplied prebuilt; not compiled by this script)'"
+  fi
+fi
+
 echo "note: static package check only; runtime enforcement is NOT verified here"
 exit "$FAILED"
