@@ -1,0 +1,50 @@
+name: mecmcp package conformance
+description: >
+  Check an assembled mecmcp-family package against the shared contract.
+  Static inspection only -- this proves nothing about runtime enforcement.
+
+inputs:
+  staging:
+    description: Directory the caller populated with the assembled package
+    required: true
+  manifest:
+    description: Path to packaging/conformance.toml
+    required: true
+  prebuilt:
+    description: >
+      Set to 'true' when the staged binary was supplied prebuilt rather than
+      compiled by the packager. Enables R3's check that BUILD-INFO does not
+      name a toolchain that did not compile the binary.
+    required: false
+    default: 'false'
+  image:
+    description: Built image tag for R6. Empty skips R6.
+    required: false
+    default: ''
+  overrides:
+    description: Operator arguments R6 passes to the container
+    required: false
+    default: '--host 0.0.0.0'
+
+runs:
+  using: composite
+  steps:
+    - name: Verify the package
+      shell: bash
+      run: |
+        args=(--staging "${{ inputs.staging }}" --manifest "${{ inputs.manifest }}")
+        if [[ "${{ inputs.prebuilt }}" == "true" ]]; then
+          args+=(--prebuilt)
+        fi
+        bash "${{ github.action_path }}/verify-package.sh" "${args[@]}"
+
+    - name: Verify the image argv
+      if: inputs.image != ''
+      shell: bash
+      run: |
+        args=()
+        for token in ${{ inputs.overrides }}; do args+=(--override "$token"); done
+        bash "${{ github.action_path }}/verify-image.sh" \
+          --image "${{ inputs.image }}" \
+          --manifest "${{ inputs.manifest }}" \
+          "${args[@]}"
