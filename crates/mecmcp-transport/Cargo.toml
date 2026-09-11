@@ -28,7 +28,7 @@ metrics     = { workspace = true }
 # here for emphasis.
 metrics-exporter-prometheus = { workspace = true }
 rmcp        = { version = "3", features = ["transport-streamable-http-server", "transport-streamable-http-server-session", "transport-worker"] }
-rustix      = { version = "1.1", features = ["process", "fs"] }
+rustix      = { workspace = true }
 # "std" is required for the ServerConfig builder API. "tls12" because
 # rustpanosmcp terminates TLS 1.2 as well as 1.3 in production, and this
 # crate must not silently drop a protocol version its consumer offers.
