@@ -31,20 +31,28 @@ runs:
   steps:
     - name: Verify the package
       shell: bash
+      env:
+        CONF_STAGING: ${{ inputs.staging }}
+        CONF_MANIFEST: ${{ inputs.manifest }}
+        CONF_PREBUILT: ${{ inputs.prebuilt }}
       run: |
-        args=(--staging "${{ inputs.staging }}" --manifest "${{ inputs.manifest }}")
-        if [[ "${{ inputs.prebuilt }}" == "true" ]]; then
+        args=(--staging "$CONF_STAGING" --manifest "$CONF_MANIFEST")
+        if [[ "$CONF_PREBUILT" == "true" ]]; then
           args+=(--prebuilt)
         fi
-        bash "${{ github.action_path }}/verify-package.sh" "${args[@]}"
+        bash "$GITHUB_ACTION_PATH/verify-package.sh" "${args[@]}"
 
     - name: Verify the image argv
       if: inputs.image != ''
       shell: bash
+      env:
+        CONF_IMAGE: ${{ inputs.image }}
+        CONF_MANIFEST: ${{ inputs.manifest }}
+        CONF_OVERRIDES: ${{ inputs.overrides }}
       run: |
         args=()
-        for token in ${{ inputs.overrides }}; do args+=(--override "$token"); done
-        bash "${{ github.action_path }}/verify-image.sh" \
-          --image "${{ inputs.image }}" \
-          --manifest "${{ inputs.manifest }}" \
+        for token in $CONF_OVERRIDES; do args+=(--override "$token"); done
+        bash "$GITHUB_ACTION_PATH/verify-image.sh" \
+          --image "$CONF_IMAGE" \
+          --manifest "$CONF_MANIFEST" \
           "${args[@]}"
