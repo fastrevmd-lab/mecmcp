@@ -8,6 +8,15 @@ fails=0
 check() { # name expected_exit actual_exit
   if [[ "$2" == "$3" ]]; then echo "ok   - $1"; else echo "FAIL - $1 (want exit $2, got $3)"; fails=$((fails+1)); fi
 }
+check_err() { # name expected_exit expected_substring cmd...
+  local name="$1" want="$2" want_msg="$3"; shift 3
+  local err; err="$("$@" 2>&1 >/dev/null)"; local got=$?
+  if [[ "$got" == "$want" ]] && grep -qF -- "$want_msg" <<<"$err"; then
+    echo "ok   - $name"
+  else
+    echo "FAIL - $name (exit want $want got $got; stderr: $err)"; fails=$((fails+1))
+  fi
+}
 
 cat > "$tmp/good.toml" <<'EOF'
 binary = "bin/svc"
@@ -30,7 +39,7 @@ grep -q '^CONF_UNITS' <<<"$out" && { echo "FAIL - lists must not appear in scala
   || { echo "FAIL - --list units wrong"; fails=$((fails+1)); }
 [[ "$(python3 "$READER" "$tmp/good.toml" --list placeholders)" == $'@BIND@\t127.0.0.1:1' ]] \
   || { echo "FAIL - --list placeholders wrong"; fails=$((fails+1)); }
-python3 "$READER" "$tmp/good.toml" --list nope >/dev/null 2>&1; check "unknown --list rejected" 2 $?
+check_err "unknown --list rejected" 2 "unknown list" python3 "$READER" "$tmp/good.toml" --list nope
 
 cat > "$tmp/typo.toml" <<'EOF'
 binary = "bin/svc"
@@ -44,12 +53,12 @@ units = []
 must_survive_override = []
 buidl_info = true
 EOF
-python3 "$READER" "$tmp/typo.toml" >/dev/null 2>&1; check "unknown key rejected" 2 $?
+check_err "unknown key rejected" 2 "unknown key" python3 "$READER" "$tmp/typo.toml"
 
 cat > "$tmp/missing.toml" <<'EOF'
 binary = "bin/svc"
 EOF
-python3 "$READER" "$tmp/missing.toml" >/dev/null 2>&1; check "missing required key rejected" 2 $?
+check_err "missing required key rejected" 2 "missing required key" python3 "$READER" "$tmp/missing.toml"
 
 cat > "$tmp/badprov.toml" <<'EOF'
 binary = "bin/svc"
@@ -62,6 +71,6 @@ skip_build_env = false
 units = []
 must_survive_override = []
 EOF
-python3 "$READER" "$tmp/badprov.toml" >/dev/null 2>&1; check "build_info=true without skip_build_env rejected" 2 $?
+check_err "build_info=true without skip_build_env rejected" 2 "build_info = true requires skip_build_env" python3 "$READER" "$tmp/badprov.toml"
 
 [[ $fails -eq 0 ]] && { echo "all passed"; exit 0; } || { echo "$fails failed"; exit 1; }
