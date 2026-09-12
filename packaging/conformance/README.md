@@ -125,6 +125,13 @@ these announces itself.
 - **`build_info = false`** — R3 still reports, as a warning rather than a
   failure. There is no value that makes a package legitimately
   provenance-free.
+- **An earlier rule already failed** — R1-R5 run in one step and R6 in another,
+  and a failing step would normally skip everything after it. Both R6 steps
+  therefore carry `!cancelled()`, so a package with a non-executable installer
+  *and* a security flag stranded in `CMD` reports both in the same run. This is
+  not cosmetic: before it was fixed, the implicit `success()` GitHub adds to a
+  custom step `if:` skipped R6 **and** the note announcing that R6 had not run,
+  so losing argv coverage looked exactly like passing.
 
 ### R5 and the uninstalled binary
 
