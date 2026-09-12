@@ -43,7 +43,11 @@ runs:
         bash "$GITHUB_ACTION_PATH/verify-package.sh" "${args[@]}"
 
     - name: Verify the image argv
-      if: inputs.image != ''
+      # !cancelled() defeats the implicit success() GitHub adds to a custom
+      # step if:. Without it, a fatal R1-R5 failure in the previous step skips
+      # R6 AND the note below, so an adopter with an installer-mode defect
+      # silently loses argv coverage and nothing says so.
+      if: ${{ !cancelled() && inputs.image != '' }}
       shell: bash
       env:
         CONF_IMAGE: ${{ inputs.image }}
@@ -64,7 +68,7 @@ runs:
     # An `if:`-skipped step produces no output, so a log could not distinguish
     # "R6 passed" from "R6 never ran" -- and the first adopter omitted `image`.
     - name: Note that R6 did not run
-      if: inputs.image == ''
+      if: ${{ !cancelled() && inputs.image == '' }}
       shell: bash
       run: |
         echo "note: R6 (image argv) did NOT run: no 'image' input was given, so"
