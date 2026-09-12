@@ -1,0 +1,7 @@
+[Unit]
+Description=svc
+[Service]
+ExecStart=
+SystemCallErrorNumber=
+[Install]
+WantedBy=multi-user.target

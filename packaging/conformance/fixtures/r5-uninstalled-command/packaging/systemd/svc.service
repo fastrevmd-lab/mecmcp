@@ -1,0 +1,9 @@
+[Unit]
+Description=svc
+[Service]
+# The INSTALLED path, which is what every family unit ships and what no CI
+# runner has. Nothing else here is wrong, so R5 must pass.
+ExecStart=/usr/local/bin/svc --host @BIND_ADDRESS@
+SystemCallErrorNumber=EPERM
+[Install]
+WantedBy=multi-user.target

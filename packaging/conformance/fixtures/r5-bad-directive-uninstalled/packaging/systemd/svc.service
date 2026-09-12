@@ -1,0 +1,12 @@
+[Unit]
+Description=svc
+[Service]
+# Same uninstalled ExecStart as r5-uninstalled-command, PLUS a genuine
+# directive error. Filtering the unresolvable-command diagnostic must not
+# swallow this one -- without this fixture the C1 filter would be
+# indistinguishable from deleting R5.
+ExecStart=/usr/local/bin/svc --host @BIND_ADDRESS@
+Restart=bogusvalue
+SystemCallErrorNumber=EPERM
+[Install]
+WantedBy=multi-user.target

@@ -88,3 +88,18 @@ jobs:
 
       - name: Check workspace at MSRV
         run: cargo check --workspace --all-targets
+
+  conformance:
+    name: Conformance fixtures
+    runs-on: ubuntu-24.04
+    # Matches its neighbours, and this job shells out to `docker build`.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Manifest reader
+        run: bash packaging/conformance/tests/test-read-manifest.sh
+      - name: Package fixtures
+        run: bash packaging/conformance/tests/run-fixtures.sh
+      - name: Image fixtures
+        run: bash packaging/conformance/tests/test-verify-image.sh
