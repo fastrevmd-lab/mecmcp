@@ -150,11 +150,16 @@ while IFS= read -r unit; do
   # genuine defects (a bad `Restart=` value is reported and still exits 0), so
   # the verdict is taken from the surviving OUTPUT, not from the exit status.
   analyze_output="$(systemd-analyze verify "$rendered" 2>&1)"
-  uninstalled_re=': Command .+ is not executable: '
+  # Anchored to a bare unit id (no '/') so a parse-error line -- prefixed by a
+  # PATH:LINE: from the rendered tmp file -- can never match even when its
+  # echoed-back offending value happens to contain this same phrase.
+  uninstalled_re='^[^[:space:]/]+\.[a-z]+: Command [^ ]+ is not executable: '
+  suppressed_lines="$(grep -E "$uninstalled_re" <<<"$analyze_output")"
   suppressed="$(grep -cE "$uninstalled_re" <<<"$analyze_output")"
   residual="$(grep -vE "$uninstalled_re" <<<"$analyze_output" | grep -vE '^[[:space:]]*$')"
   if [[ "$suppressed" != "0" ]]; then
     echo "note: R5 ignored $suppressed unresolvable-command diagnostic(s) for $unit; a package check cannot verify a binary that is not installed yet"
+    echo "$suppressed_lines" | sed 's/^/note:   /'
   fi
   if [[ -n "$residual" ]]; then
     fail R5 "$unit does not resolve: $(head -2 <<<"$residual" | tr '\n' ' ')"

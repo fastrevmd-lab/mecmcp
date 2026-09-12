@@ -1,0 +1,8 @@
+[Unit]
+Description=svc
+[Service]
+ExecStart=/usr/local/bin/svc
+Restart=x: Command /a is not executable: y
+SystemCallErrorNumber=EPERM
+[Install]
+WantedBy=multi-user.target
