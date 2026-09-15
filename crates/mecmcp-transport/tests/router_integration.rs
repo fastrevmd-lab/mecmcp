@@ -10,7 +10,7 @@ use mecmcp_transport::{
     build_streamable_http_router, serve_router, test_client::McpClient,
 };
 use rmcp::ServerHandler;
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use tokio_util::sync::CancellationToken;
 
 /// Minimal test server that implements ServerHandler.
@@ -18,8 +18,8 @@ use tokio_util::sync::CancellationToken;
 struct TestServer;
 
 impl ServerHandler for TestServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("test-server", "0.1"))
     }
 }
