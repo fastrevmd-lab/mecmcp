@@ -367,14 +367,14 @@ pub fn streamable_http_server_config(
 /// ```
 /// use mecmcp_auth::NoGrant;
 /// use mecmcp_transport::{HttpTransportConfig, HostOriginPolicy, LimitsConfig, NoAuthAcknowledgement, TransportIdentity, build_streamable_http_router};
-/// use rmcp::{ServerHandler, model::{Implementation, ServerCapabilities, ServerInfo}};
+/// use rmcp::{ServerHandler, model::{Implementation, ServerCapabilities, ServerConfig}};
 /// use tokio_util::sync::CancellationToken;
 ///
 /// # #[derive(Clone)]
 /// # struct EmptyServer;
 /// # impl ServerHandler for EmptyServer {
-/// #     fn get_info(&self) -> ServerInfo {
-/// #         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+/// #     fn get_info(&self) -> ServerConfig {
+/// #         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
 /// #             .with_server_info(Implementation::new("empty", "1"))
 /// #     }
 /// # }
@@ -794,13 +794,13 @@ impl ServePlan {
 /// use std::time::Duration;
 /// use mecmcp_transport::{build_streamable_http_router, serve_router, HttpTransportConfig, HostOriginPolicy, LimitsConfig, NoAuthAcknowledgement, TransportIdentity};
 /// use mecmcp_auth::NoGrant;
-/// use rmcp::{ServerHandler, model::{Implementation, ServerCapabilities, ServerInfo}};
+/// use rmcp::{ServerHandler, model::{Implementation, ServerCapabilities, ServerConfig}};
 ///
 /// # #[derive(Clone)]
 /// # struct EmptyServer;
 /// # impl ServerHandler for EmptyServer {
-/// #     fn get_info(&self) -> ServerInfo {
-/// #         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+/// #     fn get_info(&self) -> ServerConfig {
+/// #         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
 /// #             .with_server_info(Implementation::new("empty", "1"))
 /// #     }
 /// # }
@@ -982,7 +982,7 @@ mod tests {
     use mecmcp_auth::{ActorType, BearerSyntax, CallerCtx, NoGrant, ScopeSet};
     use rmcp::{
         ServerHandler,
-        model::{Implementation, ServerCapabilities, ServerInfo},
+        model::{Implementation, ServerCapabilities, ServerConfig},
     };
     use std::time::Duration;
     use tokio::net::TcpStream;
@@ -992,8 +992,8 @@ mod tests {
     struct EmptyServer;
 
     impl ServerHandler for EmptyServer {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
                 .with_server_info(Implementation::new("empty", "1"))
         }
     }
