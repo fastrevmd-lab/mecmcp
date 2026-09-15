@@ -2,7 +2,7 @@
 //! dedicated JSON audit file, and an optional native journald target.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal as _, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::filter::filter_fn;
@@ -249,7 +249,22 @@ impl AuditFileSink {
 /// catch this error itself and decide.
 pub fn init_tracing(cfg: &AuditConfig) -> io::Result<Option<AuditFileSink>> {
     let env = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let stderr = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    // Colour only when something can render it.
+    //
+    // `fmt::layer()` turns ANSI on whenever the feature is compiled in, without
+    // asking whether the writer is a terminal. Piping stderr to a file, to
+    // journald, or to a parent process therefore embedded escape sequences
+    // between every field name and its value, so an audit line reads
+    // `tool\x1b[0m\x1b[2m=\x1b[0mexecute` on the wire while looking like
+    // `tool=execute` on a screen. Any consumer matching a plain `tool=` finds
+    // nothing, and the failure is invisible to whoever wrote the pattern.
+    //
+    // Only the Text layer is affected; `.json()` never emitted ANSI, which is
+    // why deployments running `--audit-format json` were always clean.
+    let ansi = std::io::stderr().is_terminal();
+    let stderr = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(ansi);
     let stderr = match cfg.format {
         AuditFormat::Text => stderr.boxed(),
         AuditFormat::Json => tracing_subscriber::fmt::layer()
