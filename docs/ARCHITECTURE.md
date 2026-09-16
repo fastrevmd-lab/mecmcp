@@ -2,9 +2,12 @@
 
 How `mecmcp` is put together and how a vendor server sits on top of it.
 
-`mecmcp` is a **library workspace, not a server.** It ships no binary and opens
-no socket. Everything in it is consumed by the per-vendor MCP servers, which are
-the things that actually run.
+`mecmcp` is a **library workspace, not a server.** It serves no MCP endpoint and
+opens no socket. The one exception to "library" is `mecmcp-audit`, which ships
+two operator binaries — `mecmcp-verify` and `mecmcp-audit-keygen` — and neither
+listens on anything; both only read and write local files. Everything else here
+is consumed by the per-vendor MCP servers, which are the things that actually
+run.
 
 The organising rule: *everything that is not NETCONF or a vendor's XML/REST API
 lives here once.* Authentication, attribution, audit, transport hardening,
@@ -55,20 +58,48 @@ a consumer pins one tag and gets a coherent set.
 
 ### Dependency shape
 
-```
-mecmcp-secret ─┬─> mecmcp-auth ─┬─> mecmcp-audit ──> mecmcp-transport ──> mecmcp-server
-               │                └────────────────────────────────────────>┘
-               ├─> mecmcp-inventory
-               ├─> mecmcp-http
-               ├─> mecmcp-scp
-               └─> mecmcp-changeset (also depends on mecmcp-audit)
+Throughout this section `──>` and `->` read **depends on**. (An earlier revision
+of this diagram used the arrows the other way round, which is part of how the
+errors below went unnoticed.)
 
-mecmcp-device ──> mecmcp-job
-mecmcp-policy, mecmcp-openapi, mecmcp-runtime  — near-standalone
+Three crates form a spine:
+
+```
+mecmcp-audit ──> mecmcp-auth ──> mecmcp-secret
 ```
 
-`mecmcp-secret` is the floor and `mecmcp-server` is the ceiling. Nothing in the
-tree knows a vendor's names, paths, headers, or status codes.
+Every other crate depends on some subset of those three, and on nothing else in
+the workspace:
+
+```
+mecmcp-transport  -> audit, auth
+mecmcp-server     -> audit, auth            a sibling of transport, not a layer on it
+mecmcp-changeset  -> audit, secret
+mecmcp-runtime    -> audit, auth, secret
+mecmcp-http       -> secret
+mecmcp-inventory  -> secret
+mecmcp-scp        -> secret
+```
+
+Separately, touching none of the above:
+
+```
+mecmcp-job ──> mecmcp-device
+mecmcp-openapi, mecmcp-policy  — no workspace dependencies at all
+```
+
+Fifteen edges, three levels deep. **`mecmcp-server` does not depend on
+`mecmcp-transport`** — an earlier revision of this diagram drew that edge, and it
+has never existed. The two are sibling consumers of the same two foundation
+crates, which is why a consumer can take either without the other: rustjunosmcp
+and rustpanosmcp both link transport and not server.
+
+`mecmcp-secret` is the floor — six crates reach it. There is no single ceiling:
+nothing in the workspace depends on `transport`, `server`, `changeset` or
+`runtime`, so those are linked by consumers rather than by each other. Four
+crates depend on nothing else here at all — `secret`, `device`, `openapi` and
+`policy`. Nothing in the tree knows a vendor's names, paths, headers, or status
+codes.
 
 ---
 
