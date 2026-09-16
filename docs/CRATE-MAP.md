@@ -15,7 +15,7 @@ found.
 | Workspace version | **0.23.1** |
 | Crates | **14**, versioned together |
 | Library code | **54,593** lines in `src/` (84,788 including tests) |
-| Tests | **1,389** test functions |
+| Tests | **1,388** test functions |
 | Internal edges | **15**, three levels deep |
 | Consuming servers | **6** |
 | Toolchain | edition 2024, MSRV 1.88 |
@@ -161,8 +161,10 @@ enforces the order, because each position is load-bearing.
 - **The transport audit event is emitted before dispatch**, not at the end of
   the request — its `duration_ms` is preflight time, and holding the scope
   across the handler would both inflate that and emit it after the handler's own
-  event. It therefore precedes target concurrency, so a 503 from that gate is
-  still recorded.
+  event. It therefore precedes target concurrency — which means the audit trail
+  records the *attempt*, not the outcome of that last gate. A request refused by
+  target concurrency leaves one event saying preflight allowed it, and nothing
+  saying it was then refused. See [#370](https://github.com/fastrevmd-lab/mecmcp/issues/370).
 - **Target concurrency is innermost**, so an unauthorized request never acquires
   a per-device permit.
 
@@ -292,13 +294,15 @@ diverge.
    useful here" but "is this *only* true here".
 2. **Configure, don't reimplement.** Preflight, transport assembly, token
    subcommands and shutdown are parameterised precisely so a consumer passes
-   arguments instead of forking behaviour. Where the scope target is a scalar
-   field, a consumer declares `TargetField`s and writes no preflight of its own
-   — panos (`device`), sdc (`tenant`), proxmox (`cluster`) and unifi
-   (`controller`) all do. Two do not: junos and mist implement `ScopePreflight`
-   directly, because a nested device selector and an org/site subject that needs
-   canonicalising cannot be expressed as a flat field. Reach for a custom
-   preflight only when the target genuinely is not a scalar.
+   arguments instead of forking behaviour. The criterion for `TargetField` is
+   **expressibility, not shape**: it handles a named argument matched directly
+   against the caller's scope, in either `Scalar` or `NonEmptyArray` form — panos
+   (`device`), sdc (`tenant`), proxmox (`cluster`) and unifi (`controller`) all
+   declare one and write no preflight. Reach for `ScopePreflight` when the
+   matching semantics are something `TargetField` cannot express: junos nests its
+   device selector, and mist must canonicalise a scalar `org_id` into
+   `org/<uuid>` before it can be compared. Note that mist's target *is* a scalar
+   — shape is not what decides it.
 3. **Reads are direct; writes go through the change set.** Stage, digest,
    approve as a *distinct* principal, apply — refusing if the target drifted
    since it was planned.

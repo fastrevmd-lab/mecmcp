@@ -122,8 +122,10 @@ inside it: `apply_ip_rate_limit` is attached *last* in
 `build_streamable_http_router` so that it also covers `/metrics`, and in axum the
 last layer applied is the first to run. **The transport audit precedes target
 concurrency**, because `bearer_preflight_middleware` drops its `AuditScope`
-before calling `next.run` — so a 503 from target concurrency is audited, not
-silent.
+before calling `next.run`. The consequence is worth stating plainly: a request
+refused by target concurrency is recorded as a call preflight *allowed*, and no
+event records the refusal. Tracked as
+[#370](https://github.com/fastrevmd-lab/mecmcp/issues/370).
 
 The inner segment is not assembled by hand in each consumer. `apply_bearer_boundary`
 in `crates/mecmcp-transport/src/auth.rs` installs it and **enforces the order**:
@@ -148,17 +150,22 @@ Each position is load-bearing, and the rationale is recorded next to the functio
 
 `ToolScopePreflight` (`crates/mecmcp-transport/src/preflight.rs`) parses the
 JSON-RPC body, extracts the tool name and the configured target fields, and
-denies with 403 before dispatch. It is generic over the argument shape, so a
-consumer whose scope target is a scalar field declares `TargetField`s and writes
-no preflight of its own: PAN-OS `device`, SDC `tenant`, Proxmox `cluster`,
-UniFi `controller`.
+denies with 403 before dispatch. It is generic over the argument shape, and
+handles both `TargetValueShape::Scalar` and `TargetValueShape::NonEmptyArray`.
+A consumer whose target is matched *directly* against the caller's scope
+declares `TargetField`s and writes no preflight of its own: PAN-OS `device`,
+SDC `tenant`, Proxmox `cluster`, UniFi `controller`.
 
 **Two consumers do implement `ScopePreflight` themselves**, and an earlier
-revision of this file wrongly named both as `TargetField` users. Junos takes a
-nested device selector and Mist an org/site subject that has to be canonicalised
-before it can be matched — neither is a flat field, so neither can be expressed
-as a `TargetField`. A custom preflight is the right answer when the target is
-genuinely not a scalar, and the wrong answer otherwise.
+revision of this file wrongly named both as `TargetField` users. Junos nests its
+device selector; Mist must canonicalise `org_id` into `org/<uuid>` before it can
+be compared against a scope subject.
+
+The deciding criterion is **what `TargetField` can express, not the shape of the
+value**. Arrays are expressible (`NonEmptyArray`), and Mist's target is a plain
+scalar string that still needs a custom preflight. Write one when the matching
+needs nesting, normalisation, or any semantics beyond direct comparison —
+not merely because the value is or is not a scalar.
 
 ### Audit by construction
 
