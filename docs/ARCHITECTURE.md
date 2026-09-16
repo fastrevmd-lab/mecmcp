@@ -68,8 +68,8 @@ Three crates form a spine:
 mecmcp-audit ──> mecmcp-auth ──> mecmcp-secret
 ```
 
-Every other crate depends on some subset of those three, and on nothing else in
-the workspace:
+Seven crates depend on some subset of that spine, and on nothing else in the
+workspace:
 
 ```
 mecmcp-transport  -> audit, auth
@@ -94,7 +94,9 @@ has never existed. The two are sibling consumers of the same two foundation
 crates, which is why a consumer can take either without the other: rustjunosmcp
 and rustpanosmcp both link transport and not server.
 
-`mecmcp-secret` is the floor — six crates reach it. There is no single ceiling:
+`mecmcp-secret` is the floor: **six crates depend on it directly**, and nine of
+the fourteen have some path to it — the other three arrive through the spine.
+There is no single ceiling:
 nothing in the workspace depends on `transport`, `server`, `changeset` or
 `runtime`, so those are linked by consumers rather than by each other. Four
 crates depend on nothing else here at all — `secret`, `device`, `openapi` and
