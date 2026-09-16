@@ -21,11 +21,12 @@ wrong.
 | Juniper SRX / Junos devices, directly | **rustjunosmcp** | Production |
 | Palo Alto firewalls | **rustpanosmcp** | Production |
 | Security Director Cloud (SASE portal) | **rustsdcmcp** | **Lab only** |
-| Juniper Mist cloud | **rustmistmcp** | **Scaffold** — no live integration yet |
+| Juniper Mist cloud | **rustmistmcp** | Production |
 
 Only the first two should be pointed at production gear. `rustsdcmcp` is fine
-against a lab tenant. `rustmistmcp` is worth reading, not deploying — its
-mutating tools do not exist yet and its live client is not accepted.
+against a lab tenant. `rustmistmcp` reached its first production tag and is
+deployed; its mutating tools are still deliberately absent, so treat it as
+read-only rather than as a scaffold.
 
 ---
 
@@ -219,7 +220,7 @@ ssh -N -L 30032:127.0.0.1:30032 <host>
 Public release is blocked on replacing its remaining compatibility shims with
 upstream APIs landing in one coherent `mecmcp` release.
 
-### rustmistmcp — 0.1.0, scaffold
+### rustmistmcp — production, read-only tool surface
 
 24 curated read-only tools over a catalog of 1,059 audited Mist operations. No
 mutating tools exist yet.

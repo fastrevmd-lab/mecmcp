@@ -227,18 +227,22 @@ its return type.
 
 ## 3. The consumers
 
-Four servers sit on this foundation. They are at very different maturity, and
-that difference matters more than the feature tables.
+**Six** servers sit on this foundation, not the four this section listed for a
+long time. Per-crate consumption and the full matrix live in
+[`CRATE-MAP.md`](CRATE-MAP.md); this table is the shape and maturity.
 
-| | rustjunosmcp | rustpanosmcp | rustsdcmcp | rustmistmcp |
-|---|---|---|---|---|
-| Target | Juniper Junos / SRX **devices** | Palo Alto **PAN-OS** | Security Director **Cloud** | Juniper **Mist** cloud |
-| Outbound transport | NETCONF over SSH + SCP1 | HTTPS XML-API | HTTPS REST | HTTPS REST |
-| Credential to upstream | SSH key or password | API key | `x-api-key` or `x-oauth2-token` | `Authorization: Token …` |
-| Version | 0.17.0 | 0.8.0 | 0.1.0 | 0.1.0 |
-| Maturity | **production** | **production** | lab only | scaffold |
-| Scope axes | device glob × tool | device × tool | tenant × tool | org/site UUID × operation × capability |
-| mecmcp pin | `v0.7.3` | `v0.7.3` | `v0.8.0` | git rev (0.7.x) |
+| | junos | panos | sdc | mist | proxmox | unifi |
+|---|---|---|---|---|---|---|
+| Target | Junos / SRX **devices** | **PAN-OS** | Security Director **Cloud** | **Mist** cloud | **Proxmox VE** | **UniFi** Network |
+| Outbound transport | NETCONF/SSH + SCP1 | HTTPS XML-API | HTTPS REST | HTTPS REST | HTTPS REST | HTTPS REST |
+| Credential to upstream | SSH key or password | API key | `x-api-key` / `x-oauth2-token` | `Authorization: Token …` | API token | local admin |
+| Maturity | **production** | **production** | lab tenant | **production** | **production** | **production** |
+| Scope axes | device glob × tool | device × tool | tenant × tool | org/site × operation | cluster × tool | controller × tool |
+| mecmcp crates | 10 | 7 | 6 | 10 | 11 | 10 |
+
+Versions move every release wave, so they are deliberately not pinned here —
+`CRATE-MAP.md` carries the current set, and each repo's own README is
+authoritative at its version.
 
 **rustjunosmcp** is the runtime-hardening reference — session pooling, device
 leases, rate limits, audit redaction. Repo layout is flat: `rust-junosmcp`
@@ -255,8 +259,9 @@ upstream APIs shipped in one coherent release.
 
 **rustmistmcp** carries an audited catalog of 1,059 Mist operations derived from
 the upstream OpenAPI spec, classified by capability (ordinary read, privileged
-read, create, update, delete, execute). Mutating tools are deliberately absent
-until the change-set work lands. Treat it as a scaffold.
+read, create, update, delete, execute). It was a scaffold for a long time and is
+described that way in older notes; it is not one now — it cut its first
+production tag and is deployed.
 
 ### Why the pins differ
 
