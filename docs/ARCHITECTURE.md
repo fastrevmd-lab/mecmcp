@@ -112,9 +112,18 @@ This is the architecture. Everything else is support for it.
 A `tools/call` arriving over streamable HTTP passes through, in this order:
 
 ```
-TLS ─> Host/Origin ─> IP rate limit ─> auth ─> token rate ─> token concurrency
-    ─> body limit ─> preflight ─> target concurrency ─> transport audit ─> handler
+TLS ─> IP rate limit ─> Host/Origin ─> auth ─> token rate ─> token concurrency
+    ─> body limit ─> preflight ─> transport audit ─> target concurrency ─> handler
 ```
+
+Two positions in that chain are easy to get backwards, and an earlier revision
+of this file had both wrong. **The IP rate limit is outside Host/Origin**, not
+inside it: `apply_ip_rate_limit` is attached *last* in
+`build_streamable_http_router` so that it also covers `/metrics`, and in axum the
+last layer applied is the first to run. **The transport audit precedes target
+concurrency**, because `bearer_preflight_middleware` drops its `AuditScope`
+before calling `next.run` — so a 503 from target concurrency is audited, not
+silent.
 
 The inner segment is not assembled by hand in each consumer. `apply_bearer_boundary`
 in `crates/mecmcp-transport/src/auth.rs` installs it and **enforces the order**:
@@ -139,10 +148,17 @@ Each position is load-bearing, and the rationale is recorded next to the functio
 
 `ToolScopePreflight` (`crates/mecmcp-transport/src/preflight.rs`) parses the
 JSON-RPC body, extracts the tool name and the configured target fields, and
-denies with 403 before dispatch. It is generic over the argument shape because
-the four consumers differ only in field naming — Junos uses `router`/`routers`,
-PAN-OS `device`, SDC `tenant`, Mist an org/site subject. Each configures
-`TargetField`s rather than writing its own preflight.
+denies with 403 before dispatch. It is generic over the argument shape, so a
+consumer whose scope target is a scalar field declares `TargetField`s and writes
+no preflight of its own: PAN-OS `device`, SDC `tenant`, Proxmox `cluster`,
+UniFi `controller`.
+
+**Two consumers do implement `ScopePreflight` themselves**, and an earlier
+revision of this file wrongly named both as `TargetField` users. Junos takes a
+nested device selector and Mist an org/site subject that has to be canonicalised
+before it can be matched — neither is a flat field, so neither can be expressed
+as a `TargetField`. A custom preflight is the right answer when the target is
+genuinely not a scalar, and the wrong answer otherwise.
 
 ### Audit by construction
 
