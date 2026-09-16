@@ -15,7 +15,7 @@ found.
 | Workspace version | **0.23.1** |
 | Crates | **14**, versioned together |
 | Library code | **54,593** lines in `src/` (84,788 including tests) |
-| Tests | **1,347** test functions |
+| Tests | **1,389** test functions |
 | Internal edges | **15**, three levels deep |
 | Consuming servers | **6** |
 | Toolchain | edition 2024, MSRV 1.88 |
@@ -142,19 +142,36 @@ This is the architecture; the rest is support for it. The inner segment is not
 assembled by hand in each consumer — `apply_bearer_boundary` installs it and
 enforces the order, because each position is load-bearing.
 
-<img src="assets/fig-gate-chain.svg" alt="Eleven stages left to right: TLS termination, Host and Origin, IP rate limit, bearer auth, token rate, token concurrency, body limit, scope preflight, target concurrency, transport audit, vendor handler. Each stage except the last two shows the HTTP status it refuses with." width="100%">
+<img src="assets/fig-gate-chain.svg" alt="Eleven stages left to right: TLS termination, IP rate limit, Host and Origin, bearer auth, token rate, token concurrency, body limit, scope preflight, transport audit, target concurrency, vendor handler. Each refusing stage shows the HTTP status it emits." width="100%">
 
 **The order is the control.**
 
-- **Auth is outermost**, so an anonymous request cannot charge a token's budget.
+- **The IP rate limit is the outermost thing in the process**, applied after all
+  routes are assembled so it covers `/metrics` too. It sits *outside* Host/Origin
+  validation, so a request rejected for a foreign Host has already spent its
+  source IP's budget.
+- **Auth is outermost within the bearer boundary**, so an anonymous request
+  cannot charge a *token's* budget.
 - **Token rate and concurrency are non-buffering**, so they decide before the
   body is read.
 - **The body limit precedes anything that buffers**, so preflight and target
   concurrency cannot be made to allocate without bound.
 - **Preflight runs after token accounting**, so an out-of-scope request still
   consumes budget rather than being a free retry channel.
+- **The transport audit event is emitted before dispatch**, not at the end of
+  the request — its `duration_ms` is preflight time, and holding the scope
+  across the handler would both inflate that and emit it after the handler's own
+  event. It therefore precedes target concurrency, so a 503 from that gate is
+  still recorded.
 - **Target concurrency is innermost**, so an unauthorized request never acquires
   a per-device permit.
+
+Two details the figure compresses. The Host/Origin stage emits **400** for a
+malformed or missing Host and **403** for a disallowed Origin, not only the
+**421** it returns for a disallowed Host. And `apply_ip_rate_limit` is attached
+*last* in `build_streamable_http_router`, which in axum means it runs *first* —
+the layering reads backwards from the runtime order, which is exactly the trap
+that put an earlier version of this diagram in the wrong sequence.
 
 Since 0.8.1 the bearer boundary emits a transport audit event for **every**
 `tools/call` before dispatch. The point is the quantifier: a call is audited
@@ -275,10 +292,13 @@ diverge.
    useful here" but "is this *only* true here".
 2. **Configure, don't reimplement.** Preflight, transport assembly, token
    subcommands and shutdown are parameterised precisely so a consumer passes
-   arguments instead of forking behaviour. Four consumers differ only in field
-   naming — junos `router`, panos `device`, sdc `tenant`, mist an org/site
-   subject — and each configures `TargetField`s rather than writing its own
-   preflight.
+   arguments instead of forking behaviour. Where the scope target is a scalar
+   field, a consumer declares `TargetField`s and writes no preflight of its own
+   — panos (`device`), sdc (`tenant`), proxmox (`cluster`) and unifi
+   (`controller`) all do. Two do not: junos and mist implement `ScopePreflight`
+   directly, because a nested device selector and an org/site subject that needs
+   canonicalising cannot be expressed as a flat field. Reach for a custom
+   preflight only when the target genuinely is not a scalar.
 3. **Reads are direct; writes go through the change set.** Stage, digest,
    approve as a *distinct* principal, apply — refusing if the target drifted
    since it was planned.
