@@ -308,7 +308,7 @@ longer hand-assembles its router: `HostOriginPolicy`, `HttpTransportConfig`,
 to disable the Host allowlist, which is the DNS-rebinding guard
 (RUSTSEC-2026-0189). Note that **Host and Origin treat a portless allowlist entry
 differently, on purpose** — a portless `Host` entry matches any port, because
-`--allowed-host 192.168.1.194` must keep working on `:30031`, while a portless
+`--allowed-host 192.0.2.10` must keep working on `:30031`, while a portless
 `Origin` entry matches only a portless browser Origin, because wildcarding there
 would widen the policy.
 

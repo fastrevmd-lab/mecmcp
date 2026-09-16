@@ -18,7 +18,7 @@
 - All five workspaces set `clippy::todo = "deny"` and `clippy::unwrap_used = "deny"`. Test modules need `#[allow(clippy::unwrap_used)]`.
 - **`RustJunosMCP`'s `russh` pin exists for CVE-2026-68930.** Do not bump it.
 - mecmcp version is currently **0.17.0**; consumers pin it by immutable git tag.
-- Repo→path: `mecmcp`, `RustJunosMCP`, `rustsdcmcp`, `rustproxmoxmcp`, `rustmistmcp`, `rust-panosmcp` all under `/home/mharman/Projects/`.
+- Repo→path: `mecmcp`, `RustJunosMCP`, `rustsdcmcp`, `rustproxmoxmcp`, `rustmistmcp`, `rust-panosmcp` all under `~/Projects/`.
 
 ---
 
@@ -82,7 +82,7 @@ fn many_concurrent_captures_each_see_their_own_event() {
 - [ ] **Step 2: Run it and confirm it fails**
 
 ```bash
-cd /home/mharman/Projects/mecmcp
+cd ~/Projects/mecmcp
 for i in $(seq 10); do
   cargo test -q -p mecmcp-audit --features test-util --test capture_under_concurrency \
     many_concurrent_captures >/dev/null 2>&1 || echo "FAIL run $i"
@@ -140,7 +140,7 @@ pub fn run_with_capture<F: FnOnce()>(f: F) -> String {
 - [ ] **Step 4: Run the loop and confirm it now passes**
 
 ```bash
-cd /home/mharman/Projects/mecmcp
+cd ~/Projects/mecmcp
 fail=0
 for i in $(seq 50); do
   cargo test -q -p mecmcp-audit --features test-util --test capture_under_concurrency >/dev/null 2>&1 || fail=$((fail+1))
@@ -157,7 +157,7 @@ Comment out the `let _guard = ...` line, re-run the 50-run loop, confirm failure
 - [ ] **Step 6: Full gate**
 
 ```bash
-cd /home/mharman/Projects/mecmcp
+cd ~/Projects/mecmcp
 fail=0
 cargo fmt --all -- --check || fail=1
 cargo clippy --workspace --all-targets -- -D warnings >/dev/null 2>&1 || fail=1
@@ -170,7 +170,7 @@ Do not commit unless `gates failed=0`.
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /home/mharman/Projects/mecmcp
+cd ~/Projects/mecmcp
 git checkout -b fix/324-serialise-capture
 git add crates/mecmcp-audit/src/testutil.rs crates/mecmcp-audit/tests/capture_under_concurrency.rs
 git commit -m "fix(testutil): serialise run_with_capture against the global interest cache
@@ -203,12 +203,12 @@ Closes #324"
 
 - [ ] **Step 1: Bump the workspace version**
 
-In `/home/mharman/Projects/mecmcp/Cargo.toml`, change `version      = "0.17.0"` to `version      = "0.18.0"`. All 14 member crates inherit it.
+In `~/Projects/mecmcp/Cargo.toml`, change `version      = "0.17.0"` to `version      = "0.18.0"`. All 14 member crates inherit it.
 
 - [ ] **Step 2: Confirm nothing still says 0.17.0**
 
 ```bash
-cd /home/mharman/Projects/mecmcp
+cd ~/Projects/mecmcp
 rg -n '0\.17\.0' Cargo.toml crates/*/Cargo.toml
 ```
 
@@ -217,7 +217,7 @@ Expected: no output.
 - [ ] **Step 3: Gate**
 
 ```bash
-cd /home/mharman/Projects/mecmcp
+cd ~/Projects/mecmcp
 fail=0
 cargo fmt --all -- --check || fail=1
 cargo clippy --workspace --all-targets -- -D warnings >/dev/null 2>&1 || fail=1
@@ -228,7 +228,7 @@ echo "gates failed=$fail"
 - [ ] **Step 4: Commit, open the PR, and merge once CI is green**
 
 ```bash
-cd /home/mharman/Projects/mecmcp
+cd ~/Projects/mecmcp
 git add Cargo.toml
 git commit -m "chore: release 0.18.0"
 git push -u origin fix/324-serialise-capture
@@ -244,7 +244,7 @@ Wait for all checks to report SUCCESS, then merge with `gh pr merge <n> --merge 
 - [ ] **Step 5: Tag and push**
 
 ```bash
-cd /home/mharman/Projects/mecmcp
+cd ~/Projects/mecmcp
 git checkout main && git pull --ff-only
 git tag -a v0.18.0 -m "mecmcp 0.18.0
 
@@ -259,7 +259,7 @@ git push origin v0.18.0
 ## Task 3: Fix junos's flaky audit tests via the mecmcp bump (junos #339)
 
 **Files:**
-- Modify: `/home/mharman/Projects/RustJunosMCP/Cargo.toml` — every `mecmcp-*` dependency, tag `v0.17.0` → `v0.18.0`
+- Modify: `~/Projects/RustJunosMCP/Cargo.toml` — every `mecmcp-*` dependency, tag `v0.17.0` → `v0.18.0`
 
 **Interfaces:**
 - Consumes: tag `v0.18.0` from Task 2, and the unchanged `run_with_capture` signature from Task 1.
@@ -270,7 +270,7 @@ git push origin v0.18.0
 - [ ] **Step 1: Bump every mecmcp pin**
 
 ```bash
-cd /home/mharman/Projects/RustJunosMCP
+cd ~/Projects/RustJunosMCP
 git checkout main && git pull --ff-only
 git checkout -b fix/339-mecmcp-018
 sed -i 's/tag = "v0\.17\.0"/tag = "v0.18.0"/g; s/version = "0\.17\.0"/version = "0.18.0"/g' Cargo.toml
@@ -282,7 +282,7 @@ Expected from the final `rg`: no output.
 - [ ] **Step 2: Update the lockfile**
 
 ```bash
-cd /home/mharman/Projects/RustJunosMCP
+cd ~/Projects/RustJunosMCP
 cargo update -w
 grep -A1 'name = "mecmcp-audit"' Cargo.lock | head -2
 ```
@@ -292,7 +292,7 @@ Expected: `version = "0.18.0"`.
 - [ ] **Step 3: Prove the flake is gone**
 
 ```bash
-cd /home/mharman/Projects/RustJunosMCP
+cd ~/Projects/RustJunosMCP
 fail=0
 for i in $(seq 50); do
   cargo test -q -p rust-junosmcp --test audit >/dev/null 2>&1 || fail=$((fail+1))
@@ -310,7 +310,7 @@ Expected: `0/50` for both. Before this change the rate was roughly 1 in 10.
 - [ ] **Step 4: Full gate**
 
 ```bash
-cd /home/mharman/Projects/RustJunosMCP
+cd ~/Projects/RustJunosMCP
 fail=0
 cargo fmt --all -- --check || fail=1
 cargo clippy --workspace --all-targets -- -D warnings >/dev/null 2>&1 || fail=1
@@ -324,7 +324,7 @@ Note: `cargo test --workspace` may now be run without `--test-threads=1`, which 
 - [ ] **Step 5: Commit, PR, merge**
 
 ```bash
-cd /home/mharman/Projects/RustJunosMCP
+cd ~/Projects/RustJunosMCP
 git add Cargo.toml Cargo.lock
 git commit -m "chore(deps): mecmcp 0.18.0, fixing the flaky audit captures
 
@@ -350,7 +350,7 @@ Merge once green.
 ## Task 4: Give RustJunosMCP its first Dependabot config (junos #338)
 
 **Files:**
-- Create: `/home/mharman/Projects/RustJunosMCP/.github/dependabot.yml`
+- Create: `~/Projects/RustJunosMCP/.github/dependabot.yml`
 
 **Interfaces:**
 - Consumes: nothing.
@@ -383,7 +383,7 @@ Do **not** add an `ignore:` entry for `rust`. rust-panosmcp carried one and it s
 - [ ] **Step 2: Verify it parses as YAML**
 
 ```bash
-cd /home/mharman/Projects/RustJunosMCP
+cd ~/Projects/RustJunosMCP
 python3 -c "import sys,yaml;yaml.safe_load(open('.github/dependabot.yml'));print('valid YAML')" 2>/dev/null \
   || python3 -c "
 import re,sys
@@ -398,7 +398,7 @@ print('structure OK')"
 - [ ] **Step 3: Commit, PR, merge**
 
 ```bash
-cd /home/mharman/Projects/RustJunosMCP
+cd ~/Projects/RustJunosMCP
 git checkout main && git pull --ff-only
 git checkout -b fix/338-dependabot
 git add .github/dependabot.yml
@@ -443,8 +443,8 @@ Never copy a digest from a sibling repo. Comparing repos to each other rather th
 ## Task 5: Add the docker ecosystem to rustsdcmcp and rustproxmoxmcp
 
 **Files:**
-- Modify: `/home/mharman/Projects/rustsdcmcp/.github/dependabot.yml`
-- Modify: `/home/mharman/Projects/rustproxmoxmcp/.github/dependabot.yml`
+- Modify: `~/Projects/rustsdcmcp/.github/dependabot.yml`
+- Modify: `~/Projects/rustproxmoxmcp/.github/dependabot.yml`
 
 **Interfaces:**
 - Consumes: nothing. Independent of all other tasks.
@@ -468,7 +468,7 @@ Add to the end of `updates:` in each:
 ```bash
 for d in rustsdcmcp rustproxmoxmcp; do
   printf "%-16s " "$d"
-  ls "/home/mharman/Projects/$d/Dockerfile" >/dev/null 2>&1 && echo "Dockerfile present" || echo "MISSING — do not add the ecosystem"
+  ls "~/Projects/$d/Dockerfile" >/dev/null 2>&1 && echo "Dockerfile present" || echo "MISSING — do not add the ecosystem"
 done
 ```
 
@@ -478,7 +478,7 @@ Both must print `Dockerfile present`. If either does not, stop and report — th
 
 ```bash
 for d in rustsdcmcp rustproxmoxmcp; do
-  cd "/home/mharman/Projects/$d"
+  cd "~/Projects/$d"
   git checkout main && git pull --ff-only
   git checkout -b ci/dependabot-docker
   git add .github/dependabot.yml
@@ -500,7 +500,7 @@ Open a PR in each with `gh pr create`, and merge once green.
 ## Task 6: Scheduled digest-drift backstop (panos #133)
 
 **Files:**
-- Create: `/home/mharman/Projects/rust-panosmcp/.github/workflows/digest-drift.yml`
+- Create: `~/Projects/rust-panosmcp/.github/workflows/digest-drift.yml`
 
 **Interfaces:**
 - Consumes: nothing.
@@ -592,7 +592,7 @@ jobs:
 - [ ] **Step 2: Validate the YAML**
 
 ```bash
-cd /home/mharman/Projects/rust-panosmcp
+cd ~/Projects/rust-panosmcp
 python3 -c "import yaml;yaml.safe_load(open('.github/workflows/digest-drift.yml'));print('valid YAML')"
 ```
 
@@ -601,7 +601,7 @@ python3 -c "import yaml;yaml.safe_load(open('.github/workflows/digest-drift.yml'
 Run the resolve-and-compare body locally against the real Dockerfile:
 
 ```bash
-cd /home/mharman/Projects/rust-panosmcp
+cd ~/Projects/rust-panosmcp
 line=$(grep -m1 '^FROM gcr.io/distroless/cc-debian13' Dockerfile)
 pinned=$(printf '%s' "$line" | sed -n 's/.*@\(sha256:[0-9a-f]*\).*/\1/p')
 tag=$(printf '%s' "$line" | sed -n 's|^FROM gcr.io/distroless/cc-debian13:\([^@]*\)@.*|\1|p')
@@ -622,7 +622,7 @@ After merging, run `gh workflow run digest-drift.yml --repo fastrevmd-lab/rust-p
 - [ ] **Step 5: Commit, PR, merge, close #133**
 
 ```bash
-cd /home/mharman/Projects/rust-panosmcp
+cd ~/Projects/rust-panosmcp
 git checkout main && git pull --ff-only
 git checkout -b ci/133-digest-drift
 git add .github/workflows/digest-drift.yml
@@ -647,7 +647,7 @@ gh pr create --repo fastrevmd-lab/rust-panosmcp --base main --head ci/133-digest
 ## Task 7: Port rustsdcmcp's egress-enforcement probe to the other four (mecmcp #322)
 
 **Files:**
-- Read (reference, do not modify): `/home/mharman/Projects/rustsdcmcp/packaging/lxc/install.sh:355-410`, `/home/mharman/Projects/rustsdcmcp/docs/operations.md:100-140`
+- Read (reference, do not modify): `~/Projects/rustsdcmcp/packaging/lxc/install.sh:355-410`, `~/Projects/rustsdcmcp/docs/operations.md:100-140`
 - Modify: `packaging/lxc/install.sh` in `RustJunosMCP`, `rust-panosmcp`, `rustmistmcp`, `rustproxmoxmcp`
 - Modify: the operations doc in each of those four
 - Modify: `packaging/systemd/*.service` in each of those four (comment only)
@@ -668,8 +668,8 @@ gh pr create --repo fastrevmd-lab/rust-panosmcp --base main --head ci/133-digest
 - [ ] **Step 1: Read the reference implementation**
 
 ```bash
-sed -n '350,415p' /home/mharman/Projects/rustsdcmcp/packaging/lxc/install.sh
-sed -n '96,145p' /home/mharman/Projects/rustsdcmcp/docs/operations.md
+sed -n '350,415p' ~/Projects/rustsdcmcp/packaging/lxc/install.sh
+sed -n '96,145p' ~/Projects/rustsdcmcp/docs/operations.md
 ```
 
 Note it is `bash` in sdc. `rustproxmoxmcp`'s installer is **POSIX `sh`** (`#!/bin/sh`, `set -eu`) — `[[ ]]` is invalid there and shellcheck will flag SC3010. Use `[ ]` and POSIX syntax in that repo.
@@ -709,7 +709,7 @@ systemctl show <service>.service -p IPEgressBytes --value
 ```bash
 for d in RustJunosMCP rust-panosmcp rustmistmcp rustproxmoxmcp; do
   printf "%-16s " "$d"
-  f="/home/mharman/Projects/$d/packaging/lxc/install.sh"
+  f="~/Projects/$d/packaging/lxc/install.sh"
   bash -n "$f" 2>/dev/null && shellcheck "$f" >/dev/null 2>&1 && echo "parses + shellcheck clean" || echo "PROBLEM"
 done
 ```
@@ -717,7 +717,7 @@ done
 All four must print `parses + shellcheck clean`. For `rustproxmoxmcp`, also confirm no `[[` was introduced:
 
 ```bash
-grep -c '\[\[' /home/mharman/Projects/rustproxmoxmcp/packaging/lxc/install.sh
+grep -c '\[\[' ~/Projects/rustproxmoxmcp/packaging/lxc/install.sh
 ```
 
 Expected: the same count as before your change (POSIX sh must not gain any).

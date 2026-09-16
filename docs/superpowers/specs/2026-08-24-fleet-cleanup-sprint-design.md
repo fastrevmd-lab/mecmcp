@@ -159,7 +159,7 @@ treated as boilerplate:
   `fetch_file`, and `collect_jtac_support_bundle` exercised against a real
   device before the change is believed.
 - **`IPAddressDeny`** (panos #129, mist #41, junos #332) must not blackhole the
-  SSDF evidence endpoint at `192.168.1.151:8443` or any device subnet. Check the
+  SSDF evidence endpoint at `192.0.2.31:8443` or any device subnet. Check the
   inventory before writing the rule, not after.
 - **proxmox #19** changes the `--host` default from `0.0.0.0` to `127.0.0.1`.
   That will break any registered MCP entry relying on the old default; the
@@ -210,7 +210,7 @@ contending for a checkout. It is roughly a day of work on its own; that cost was
 raised and accepted.
 
 Today `ssdf` is the only private repo of the seven. Its HEAD alone carries ~190
-references to `pve3.mechub.org`, 105 to `192.168.1.150`, plus `panosvm`,
+references to `pve3.mechub.org`, 105 to `192.0.2.30`, plus `panosvm`,
 `prod-junosmcp`, `prod-panosmcp` and ~20 further internal hosts, across 145
 commits.
 

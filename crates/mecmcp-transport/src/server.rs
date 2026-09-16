@@ -563,7 +563,7 @@ async fn host_origin_validation_middleware(
     // Check against loopback defaults (host only, any port) + allowed_hosts.
     //
     // **Host vs Origin port matching differs deliberately:**
-    // - Host: portless allowlist entry matches ANY port (production shape: `--allowed-host 192.168.1.194` on `:30031`)
+    // - Host: portless allowlist entry matches ANY port (production shape: `--allowed-host 192.0.2.10` on `:30031`)
     // - Origin: portless allowlist entry matches ONLY portless browser Origin (no wildcarding)
     //
     // Browsers canonically omit default ports from Origin but include the listener port in Host.
@@ -1699,7 +1699,7 @@ mod tests {
         let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
-            HostOriginPolicy::enforced(vec!["192.168.1.194".to_owned()], Vec::<String>::new()),
+            HostOriginPolicy::enforced(vec!["192.0.2.10".to_owned()], Vec::<String>::new()),
             CancellationToken::new(),
             NoAuthAcknowledgement::operator_allowed_no_auth(),
         );
@@ -1714,7 +1714,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/mcp")
-                    .header(header::HOST, "192.168.1.194:30031") // Explicit port
+                    .header(header::HOST, "192.0.2.10:30031") // Explicit port
                     .body(Body::from("{}"))
                     .expect("request"),
             )
@@ -1733,7 +1733,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/mcp")
-                    .header(header::HOST, "192.168.1.194") // No port
+                    .header(header::HOST, "192.0.2.10") // No port
                     .body(Body::from("{}"))
                     .expect("request"),
             )

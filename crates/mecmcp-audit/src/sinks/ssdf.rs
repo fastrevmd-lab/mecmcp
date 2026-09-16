@@ -51,7 +51,7 @@ use thiserror::Error;
 /// Configuration for the SSDF sink.
 #[derive(Debug, Clone)]
 pub struct SsdfSinkConfig {
-    /// ClickHouse HTTP endpoint (e.g., "http://192.168.1.104:8123").
+    /// ClickHouse HTTP endpoint (e.g., "http://192.0.2.40:8123").
     /// HTTPS not supported by StdHttpTransport; use HTTP or a TLS proxy.
     pub endpoint: String,
     /// ClickHouse database name (e.g., "ssdf").

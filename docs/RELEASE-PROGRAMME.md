@@ -158,7 +158,7 @@ Nothing releases until these clear. Independent of each other.
 | # | Action | Repo |
 |---|---|---|
 | 0.1 | **Done.** Merged PR #300 and get off `fix/provenance-request-id`. Without it, `parse_device_log` has no `request.id` to join on. | `rustjunosmcp` |
-| 0.2 | **Done.** Added `--allowed-origin http://192.168.1.127` and `http://192.168.1.108` (this host and `strix`) to LXC 950's drop-in override; snapshot `pre-allowed-origin` taken first; verified by a live MCP call returning all 36 devices. 0.9.0 refuses an off-loopback listener with no Origin allowlist, so the service will not start. Tagged `protected` — snapshot first. | fleet |
+| 0.2 | **Done.** Added `--allowed-origin http://192.0.2.20` and `http://192.0.2.21` (this host and `strix`) to LXC 950's drop-in override; snapshot `pre-allowed-origin` taken first; verified by a live MCP call returning all 36 devices. 0.9.0 refuses an off-loopback listener with no Origin allowlist, so the service will not start. Tagged `protected` — snapshot first. | fleet |
 | 0.3 | **Done.** Tagged `v0.1.0` at 26fbad0 and `v0.1.1` at d5b3e7b retroactively and pushed. It links to release URLs for tags that do not exist. | `rustproxmoxmcp` |
 
 ### Phase 1 — `mecmcp` 0.9.0 — **COMPLETE 2026-08-13**

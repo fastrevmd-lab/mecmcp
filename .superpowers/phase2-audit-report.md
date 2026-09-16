@@ -10,7 +10,7 @@
 ### 1. Crate lift ✓
 
 Created `crates/mecmcp-audit/` with all source lifted from
-`/home/mharman/Projects/RustJunosMCP/rust-junosmcp-audit/src/`:
+`~/Projects/RustJunosMCP/rust-junosmcp-audit/src/`:
 
 - `lib.rs` (public API surface)
 - `attribution.rs` (new — the structured Attribution type)
@@ -97,14 +97,14 @@ report. Consumers are warned before Phase 2 deploys.
 
 ## Verification results
 
-All commands run from `/home/mharman/Projects/mecmcp`:
+All commands run from `~/Projects/mecmcp`:
 
 ### Build
 
 ```
 $ cargo build --workspace
-   Compiling mecmcp-auth v0.1.4 (/home/mharman/Projects/mecmcp/crates/mecmcp-auth)
-   Compiling mecmcp-audit v0.1.4 (/home/mharman/Projects/mecmcp/crates/mecmcp-audit)
+   Compiling mecmcp-auth v0.1.4 (~/Projects/mecmcp/crates/mecmcp-auth)
+   Compiling mecmcp-audit v0.1.4 (~/Projects/mecmcp/crates/mecmcp-audit)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.24s
 ```
 
@@ -175,7 +175,7 @@ test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 ```
 $ cargo clippy --workspace --all-targets --all-features -- -D warnings
-    Checking mecmcp-audit v0.1.4 (/home/mharman/Projects/mecmcp/crates/mecmcp-audit)
+    Checking mecmcp-audit v0.1.4 (~/Projects/mecmcp/crates/mecmcp-audit)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.32s
 ```
 
@@ -193,8 +193,8 @@ $ cargo fmt --all --check
 
 ```
 $ cargo +1.88.0 check --workspace --all-targets
-    Checking mecmcp-auth v0.1.4 (/home/mharman/Projects/mecmcp/crates/mecmcp-auth)
-    Checking mecmcp-audit v0.1.4 (/home/mharman/Projects/mecmcp/crates/mecmcp-audit)
+    Checking mecmcp-auth v0.1.4 (~/Projects/mecmcp/crates/mecmcp-auth)
+    Checking mecmcp-audit v0.1.4 (~/Projects/mecmcp/crates/mecmcp-audit)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.74s
 ```
 
@@ -340,7 +340,7 @@ test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 ```
 $ cargo clippy --workspace --all-targets --all-features -- -D warnings
-    Checking mecmcp-audit v0.1.4 (/home/mharman/Projects/mecmcp/crates/mecmcp-audit)
+    Checking mecmcp-audit v0.1.4 (~/Projects/mecmcp/crates/mecmcp-audit)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.35s
 ```
 
@@ -358,7 +358,7 @@ $ cargo fmt --all --check
 
 ```
 $ cargo +1.88.0 check --workspace --all-targets
-    Checking mecmcp-audit v0.1.4 (/home/mharman/Projects/mecmcp/crates/mecmcp-audit)
+    Checking mecmcp-audit v0.1.4 (~/Projects/mecmcp/crates/mecmcp-audit)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.31s
 ```
 

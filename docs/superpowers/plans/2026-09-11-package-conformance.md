@@ -34,7 +34,7 @@ stopping at the first.
   disclaimer on every run.
 - Commit messages end with:
   `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`
-- Work on branch `feat/package-conformance` in `/home/mharman/Projects/mecmcp`
+- Work on branch `feat/package-conformance` in `~/Projects/mecmcp`
   for Tasks 1-7. Task 8 is a different repo and a different branch.
 
 ## File Structure
@@ -957,9 +957,9 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ### Task 8: Adopt in rustproxmoxmcp — the proof
 
 **Files:**
-- Create: `/home/mharman/Projects/rustproxmoxmcp/packaging/conformance.toml`
-- Modify: `/home/mharman/Projects/rustproxmoxmcp/.github/workflows/ci.yml`
-- Modify: `/home/mharman/Projects/rustproxmoxmcp/packaging/lxc/install.sh` (mode only)
+- Create: `~/Projects/rustproxmoxmcp/packaging/conformance.toml`
+- Modify: `~/Projects/rustproxmoxmcp/.github/workflows/ci.yml`
+- Modify: `~/Projects/rustproxmoxmcp/packaging/lxc/install.sh` (mode only)
 
 **Interfaces:**
 - Consumes: the composite action from Task 7, pinned at its merge SHA on
@@ -973,7 +973,7 @@ consumer pins a real SHA.
 - [ ] **Step 1: Confirm the repo fails R1 today**
 
 ```bash
-cd /home/mharman/Projects/rustproxmoxmcp
+cd ~/Projects/rustproxmoxmcp
 git ls-files -s packaging/lxc/install.sh
 ```
 
@@ -984,7 +984,7 @@ rustpanosmcp as the first adopter instead.
 - [ ] **Step 2: Write the manifest**
 
 ```bash
-cd /home/mharman/Projects/rustproxmoxmcp
+cd ~/Projects/rustproxmoxmcp
 git checkout -b feat/package-conformance
 cat > packaging/conformance.toml <<'EOF'
 binary     = "bin/rust-proxmoxmcp"
