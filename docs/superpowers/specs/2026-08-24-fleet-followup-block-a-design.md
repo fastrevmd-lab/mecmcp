@@ -127,7 +127,7 @@ It is a backstop for the case Dependabot misses, not the primary mechanism.
 
 `IPAddressDeny` / `IPAddressAllow` are accepted by systemd and reported by
 `systemctl show`, and are **not enforced** in an unprivileged LXC — systemd
-cannot attach the cgroup BPF program. Measured on rig 613: a loopback connection
+cannot attach the cgroup BPF program. Measured on a PAN-OS test rig: a loopback connection
 succeeds identically with and without `IPAddressDeny=127.0.0.0/8`.
 
 Every guest in this fleet is an unprivileged LXC.

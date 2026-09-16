@@ -156,7 +156,7 @@ must_survive_override = [
 # Optional. Test values for the @TOKEN@ placeholders the shipped units carry,
 # used only to render a unit before checking it. Omit the table when the units
 # carry no placeholders; an unrendered placeholder that survives rendering is a
-# failure, because installing one killed rig 623.
+# failure, because installing one killed a UniFi test rig.
 [placeholders]
 "@BIND_ADDRESS@" = "127.0.0.1:30031"
 ```

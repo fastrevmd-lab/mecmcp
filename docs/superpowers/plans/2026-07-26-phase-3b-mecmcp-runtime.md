@@ -22,9 +22,9 @@ Inherited from [`PLAN.md`](../../../PLAN.md). Repeated here because a task imple
 - **Workspace lints:** `missing_docs = "warn"`, `unsafe_code = "forbid"`, `clippy::all = "warn"` (priority -1), `dbg_macro = "deny"`, `todo = "deny"`, `unwrap_used = "warn"`.
 - **Raising `unsafe_code` to `forbid` is an exit criterion of this phase.** The two remaining `#[allow(unsafe_code)]` sites guard `libc::kill(pid, SIGHUP)` calls that move into this crate and become safe calls through `rustix::process::kill`. Phase 3a left the lint at `deny` precisely because these unsafe calls were still present.
 - **No breaking change to CLI flags.** They are a public interface consumed by deployed systemd unit files, runbooks, and the operators who type them. New spellings ship as aliases; existing ones keep working.
-- **`max_inflight_requests_per_router` keeps its name** — it is in the deployed config on LXC 609. A serde alias for the new spelling is added; the field name is not renamed.
-- **The SIGHUP hot-reload behaviour must not regress.** It is how `devices.json` and `tokens.json` reload without a restart on deployed containers (LXCs 608, 609, 600, 601), and `rustjunosmcp/tests/http_reload.rs` is its only coverage. The test must pass unmodified after this phase.
-- **Live deployments:** LXC 608, 609 (production), 600, 601 (clean-room reference). LXC 608 carries TLS paths in its unit file rather than a drop-in, so nothing may assume the shipped unit is what is installed.
+- **`max_inflight_requests_per_router` keeps its name** — it is in the deployed config on the Junos production guest. A serde alias for the new spelling is added; the field name is not renamed.
+- **The SIGHUP hot-reload behaviour must not regress.** It is how `devices.json` and `tokens.json` reload without a restart on deployed containers (LXCs the PAN-OS production guest, the Junos production guest, a Junos rehearsal rig, a PAN-OS rehearsal rig), and `rustjunosmcp/tests/http_reload.rs` is its only coverage. The test must pass unmodified after this phase.
+- **Live deployments:** the PAN-OS production guest, the Junos production guest (production), a Junos rehearsal rig, a PAN-OS rehearsal rig (clean-room reference). The PAN-OS production guest carries TLS paths in its unit file rather than a drop-in, so nothing may assume the shipped unit is what is installed.
 - **Licence:** MIT. **Naming:** `mecmcp-` crate prefix.
 
 ### The rule that governs every decision below
@@ -266,6 +266,6 @@ Update `mecmcp/PLAN.md` to mark Phase 3b complete.
 - The workspace lint is `unsafe_code = "forbid"`, and no crate contains unsafe code or an `#[allow(unsafe_code)]` annotation.
 - `--routers` still works in junos as a hidden alias; `--devices` is accepted everywhere.
 - A junos deployment whose TLS key is mode 0644 fails to start with an error naming the file, its mode, and the remedy.
-- `rustpanosmcp` fresh installs default `--tokens-file` to `/var/lib/rust-panosmcp/tokens.json`; existing deployments (608, 609, 600, 601) continue to work with their unit file paths.
+- `rustpanosmcp` fresh installs default `--tokens-file` to `/var/lib/rust-panosmcp/tokens.json`; existing deployments (the PAN-OS production guest, the Junos production guest, a Junos rehearsal rig, a PAN-OS rehearsal rig) continue to work with their unit file paths.
 - Neither deployed unit file needs an edit.
 - `mecmcp/PLAN.md` marks Phase 3b complete, and both servers' CHANGELOGs document the user-facing changes.

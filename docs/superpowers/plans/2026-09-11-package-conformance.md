@@ -639,7 +639,7 @@ fi
 
 # R5: shipped units are TEMPLATES carrying @PLACEHOLDER@ tokens. Render them
 # with the manifest's test values, then check systemd can resolve the result.
-# Installing an unrendered template killed rig 623 with
+# Installing an unrendered template killed a UniFi test rig with
 # "Fatal: invalid socket address syntax".
 render_dir="$(mktemp -d)"; trap 'rm -rf "$render_dir"' EXIT
 while IFS= read -r unit; do
@@ -686,7 +686,7 @@ mecmcp PR once they all do.
 R5 codifies the render-and-verify done by hand during the 2026-09-06/07
 seccomp wave. Doing it by hand is why it happened once. Unrendered
 placeholders are a failure in their own right -- installing a template
-unrendered is what killed rig 623.
+unrendered is what killed a UniFi test rig.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```

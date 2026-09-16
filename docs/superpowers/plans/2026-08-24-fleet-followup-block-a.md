@@ -14,7 +14,7 @@
 
 - **Never claim a gate passed without seeing it pass.** Capture the real exit code; `cmd | tail` reports *tail's* status, not the command's. Use `cmd; echo "exit=$?"`.
 - **Never `git add -A`** — `codex exec review` leaves a `.review-codex/` tree containing a ~23 MB binary. Stage files explicitly.
-- **Do not touch any live guest.** No `ssh`, `pct`, `qm`, or Proxmox API. Guests 950/951/952/960/971 are production; 610–619 are rigs and are out of scope for this block.
+- **Do not touch any live guest.** No `ssh`, `pct`, `qm`, or Proxmox API. Guests the Junos production guest/the SDC guest/the Mist guest/the PAN-OS production guest/the Proxmox guest are production; a test rig–a test rig are rigs and are out of scope for this block.
 - All five workspaces set `clippy::todo = "deny"` and `clippy::unwrap_used = "deny"`. Test modules need `#[allow(clippy::unwrap_used)]`.
 - **`RustJunosMCP`'s `russh` pin exists for CVE-2026-68930.** Do not bump it.
 - mecmcp version is currently **0.17.0**; consumers pin it by immutable git tag.

@@ -33,20 +33,20 @@ blocks that milestone, not its 0.1 or 0.2.
 
 ## What the fleet actually contains
 
-Surveyed 2026-08-14 across LXC 950, 960, 601, 606 and 600:
+Surveyed 2026-08-14 across the Junos production guest, the PAN-OS production guest, a PAN-OS rehearsal rig, the SDC guest and a Junos rehearsal rig:
 
 | Host | State file | Schema | Change sets | Waivers |
 |---|---|---|---|---|
-| 950 | `/var/lib/jmcp/changeset-state.json` | v2 | **28** | **0** |
-| 960 | `/var/lib/rust-panosmcp/mutation-state.json` | v1 | live | **0** |
-| 601 | `/var/lib/rust-panosmcp/mutation-state.json` | v1 | live | **0** |
-| 606 | `/var/lib/rustsdcmcp/changeset-state.json` | v2 | live | **0** |
-| 600 | `/var/lib/jmcp/changeset-state.json` | v2 | live | **0** |
+| the Junos production guest | `/var/lib/jmcp/changeset-state.json` | v2 | **28** | **0** |
+| the PAN-OS production guest | `/var/lib/rust-panosmcp/mutation-state.json` | v1 | live | **0** |
+| a PAN-OS rehearsal rig | `/var/lib/rust-panosmcp/mutation-state.json` | v1 | live | **0** |
+| the SDC guest | `/var/lib/rustsdcmcp/changeset-state.json` | v2 | live | **0** |
+| a Junos rehearsal rig | `/var/lib/jmcp/changeset-state.json` | v2 | live | **0** |
 
 **There is not one waiver record in the estate.** That is the fact that makes
 this change cheap: altering the waiver digest invalidates nothing that exists.
 It is also the reason the neighbouring approval digest is explicitly *not*
-touched here — 950 alone holds 28 change sets whose approval digests are
+touched here — the Junos production guest alone holds 28 change sets whose approval digests are
 verified on every load.
 
 ## Approach

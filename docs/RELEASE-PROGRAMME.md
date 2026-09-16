@@ -37,7 +37,7 @@ variant. The unified server is eventually renamed `rustsdmcp`.
    repository merge.
 3. **Rename to `rustsdmcp` last**, when the second backend actually lands.
    Renaming earlier is churn across the repo, crate names, systemd units, the
-   LXC 606 deployment, token files, docs, and the registry.
+   the SDC guest deployment, token files, docs, and the registry.
 
 ### Why, and what changed
 
@@ -158,7 +158,7 @@ Nothing releases until these clear. Independent of each other.
 | # | Action | Repo |
 |---|---|---|
 | 0.1 | **Done.** Merged PR #300 and get off `fix/provenance-request-id`. Without it, `parse_device_log` has no `request.id` to join on. | `rustjunosmcp` |
-| 0.2 | **Done.** Added `--allowed-origin http://192.0.2.20` and `http://192.0.2.21` (this host and `strix`) to LXC 950's drop-in override; snapshot `pre-allowed-origin` taken first; verified by a live MCP call returning all 36 devices. 0.9.0 refuses an off-loopback listener with no Origin allowlist, so the service will not start. Tagged `protected` — snapshot first. | fleet |
+| 0.2 | **Done.** Added `--allowed-origin http://192.0.2.20` and `http://192.0.2.21` (this host and a second workstation) to the Junos production guest's drop-in override; snapshot `pre-allowed-origin` taken first; verified by a live MCP call returning all 36 devices. 0.9.0 refuses an off-loopback listener with no Origin allowlist, so the service will not start. Tagged `protected` — snapshot first. | fleet |
 | 0.3 | **Done.** Tagged `v0.1.0` at 26fbad0 and `v0.1.1` at d5b3e7b retroactively and pushed. It links to release URLs for tags that do not exist. | `rustproxmoxmcp` |
 
 ### Phase 1 — `mecmcp` 0.9.0 — **COMPLETE 2026-08-13**
@@ -167,7 +167,7 @@ Nothing releases until these clear. Independent of each other.
 
 Ruling on #266's shape: a loud stderr warning on `revoke` and `rotate`, not
 auto-discover-and-SIGHUP. This estate runs the same binary as a
-production/rehearsal pair (950 and 600, 960 and 601), and a revoke that
+production/rehearsal pair for each vendor, and a revoke that
 signalled the wrong process would be worse than one that signalled none. Exit
 stays 0 because the revoke did succeed.
 
@@ -235,22 +235,24 @@ plus whatever repo-local policy script exists.
 
 `rustpanosmcp` **v0.9.0** and `rustjunosmcp` **v0.20.0** are tagged. The change-set
 risk cleared: `ChangesetState`, `OperationRecord` and `ChangeSetRecord` serialize
-identically between mecmcp v0.8.6 and v0.9.1, so LXC 960's `mutation-state.json`
+identically between mecmcp v0.8.6 and v0.9.1, so the PAN-OS production guest's `mutation-state.json`
 survives and in-flight change sets are not orphaned.
 
-**Not yet done: installing these on LXC 950 and 960.** Both are `protected`.
-Snapshot each, rehearse on the disposable rigs 600 and 601, then production.
-950's `--allowed-origin` is already in place and verified by a live MCP call.
+**Not yet done: installing these on the Junos and PAN-OS production guests.**
+Both are `protected`. Snapshot each, rehearse on the disposable rehearsal rigs,
+then production. The Junos guest's `--allowed-origin` is already in place and
+verified by a live MCP call.
 
 
 - **`rustpanosmcp`** — 9 unreleased commits including a breaking fail-closed
-  HTTP change; LXC 960 is 9 behind. **Before upgrading 960:** confirm 0.9.0 does
+  HTTP change; the PAN-OS production guest is 9 behind. **Before upgrading it:** confirm 0.9.0 does
   not orphan in-flight change-sets. `mutation-state.json` is **unversioned** and
   `mecmcp` owns its schema.
 - **`rustjunosmcp`** — 0.20.0 with PR #300 plus 0.9.0 adoption. Note `main` is
   exactly at v0.19.0; there is no hidden unreleased work.
 
-Both hosts are `protected`: snapshot, then rehearse on 601/600 before 960/950.
+Both hosts are `protected`: snapshot, then rehearse on the rehearsal rigs before
+the production guests.
 
 ### Phase 4 — First releases — **PARTIALLY COMPLETE 2026-08-13**
 
@@ -305,7 +307,7 @@ Original plan follows.
 
 ## The deployment finding: a flag present and ignored, three times
 
-**2026-08-14. LXC 950 went down during its 0.20.0 upgrade, and the cause was
+**2026-08-14. The Junos production guest went down during its 0.20.0 upgrade, and the cause was
 this programme's own fix.**
 
 `rustjunosmcp` parsed `--allow-insecure-bind`, listed it in `--help`, forwarded
@@ -318,7 +320,7 @@ back inside a minute from the `pre-0-20-0` snapshot; production restored on
 
 Investigating found **a second one in the same file**: `main.rs` passed
 `Vec::new()` for origins with a comment claiming they were "empty by default",
-while the CLI has always accepted `--allowed-origin` and 950's unit passes two.
+while the CLI has always accepted `--allowed-origin` and the Junos production guest's unit passes two.
 The Origin entries added in Phase 0.2 were never reaching the transport. It had
 not bitten only because the insecure-bind check runs first.
 
@@ -336,9 +338,9 @@ wrong downstream.
 
 | Rig | Shape | Why it passed |
 |---|---|---|
-| 600 | loopback | exempt from all four admission checks |
-| 601 | off-loopback **with TLS** | satisfies the same branch another way |
-| **950** | off-loopback, **no TLS**, `--allow-insecure-bind` | the one combination neither rig covers |
+| a Junos rehearsal rig | loopback | exempt from all four admission checks |
+| a PAN-OS rehearsal rig | off-loopback **with TLS** | satisfies the same branch another way |
+| **the Junos production guest** | off-loopback, **no TLS**, `--allow-insecure-bind` | the one combination neither rig covers |
 
 A rehearsal estate only proves the shapes it contains. Before trusting one,
 enumerate which admission branches each rig actually exercises.

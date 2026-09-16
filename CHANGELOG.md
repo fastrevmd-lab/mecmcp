@@ -59,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the process with **SIGSYS**, which neither `let _ =` nor `map_err` can catch.
   Observed on rustunifimcp 0.3.0: the second change-set state write killed the
   server mid-request (`status=31/SYS`, kernel audit `syscall=92` = chown), systemd
-  restarted it, and the approval was lost. LXC 951 (`prod-sdcmcp`) carries the
+  restarted it, and the approval was lost. The SDC guest (the sdc guest) carries the
   same filter and was exposed. Now only calls `chown` when the ownership would
   actually change: a service writing its own state file makes no syscall, while
   the offline-recovery case (sudo over a service-owned file, where the uids differ
@@ -433,7 +433,7 @@ First hand-written entry, as the header below asks for.
 - Record Phase 2's findings
 - Mark Phase 2 complete — all six consumers on v0.9.1
 - Record phases 3-5 outcomes and two scoping corrections
-- Record the 950 outage and the flag-wiring defect class
+- Record the Junos production outage and the flag-wiring defect class
 - **spec** — Operator waivers with a digest-bound kind (#275)
 - **plan** — Implementation plan for operator waivers (#275)
 - **changeset** — Correct ApprovalRecord digest and waived field docs (#275)

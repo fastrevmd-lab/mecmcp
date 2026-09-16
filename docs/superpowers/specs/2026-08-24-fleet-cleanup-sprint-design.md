@@ -1,7 +1,7 @@
 # Fleet cleanup sprint — design
 
 **Opened 2026-08-24.** A two-day sweep to clear the open backlog across
-`mecmcp` and its six consumer repos, verified on the 610–619 test rigs.
+`mecmcp` and its six consumer repos, verified on the a test rig–a test rig test rigs.
 
 ## Goal and definition of done
 
@@ -40,7 +40,7 @@ than being written five times with five different behaviours.
 
 ### The evidence-writer bug — #319's open question, answered
 
-`mecmcp` #319 §1 asked whether the world-readable evidence files on 971 were a
+`mecmcp` #319 §1 asked whether the world-readable evidence files on the Proxmox guest were a
 proxmox defect or a shared one. They are shared:
 
 - `crates/mecmcp-audit/src/sinks/ssdf.rs:235` — outbox opened
@@ -50,8 +50,8 @@ proxmox defect or a shared one. They are shared:
   `crates/mecmcp-audit/src/bin/mecmcp-audit-keygen.rs:51` **do** set
   `.mode(0o600)`
 
-The evidence files therefore inherit the process umask. On 950/951/952/960 they
-land `0600` only because those units carry `UMask=0077`; 971 has no `UMask`
+The evidence files therefore inherit the process umask. On the Junos production guest/the SDC guest/the Mist guest/the PAN-OS production guest they
+land `0600` only because those units carry `UMask=0077`; the Proxmox guest has no `UMask`
 line, so they landed `0644`. Fixing this in `mecmcp-audit` protects all five
 servers regardless of whether a unit remembers the directive, and closes the
 first task of rustproxmoxmcp#18.
@@ -72,9 +72,9 @@ first task of rustproxmoxmcp#18.
    need `codex exec review --commit <sha>`. Quota exhaustion presents as a
    transient error; if the gate does not produce a verdict it is reported as
    *not run*, never as a pass.
-4. **Test rigs only.** 610–619 are all running and `disposable`-tagged, a
-   matched two-person / lab-mode pair per server. Production (950, 951, 952,
-   960, 971) is out of scope for this sprint.
+4. **Test rigs only.** a test rig–a test rig are all running and `disposable`-tagged, a
+   matched two-person / lab-mode pair per server. Production (the Junos production guest, the SDC guest, the Mist guest,
+   the PAN-OS production guest, the Proxmox guest) is out of scope for this sprint.
 
 ## Wave structure
 
@@ -171,11 +171,11 @@ Prove each change on the matched pair, lab-mode rig first, then two-person.
 
 | Server | Rigs | What must be exercised |
 |---|---|---|
-| junos | 611 → 610 | `transfer_file`, `fetch_file`, `collect_jtac_support_bundle` under the new filter; token fallback read; commit path against vsrx-ci |
-| panos | 613 → 612 | stage → validate → commit; SSDF evidence drain; change-set create/approve/apply |
-| sdc | 615 → 614 | prepare → approve → apply; packaging smoke with the new pin |
-| proxmox | 617 → 616 | bind default, `StateDirectory` mode, evidence file mode now `0600`, change-set plan/approve/apply |
-| mist | 619 → 618 | read path, plan/approve/apply, evidence outbox under the denylist |
+| junos | a test rig → a test rig | `transfer_file`, `fetch_file`, `collect_jtac_support_bundle` under the new filter; token fallback read; commit path against vsrx-ci |
+| panos | a test rig → a test rig | stage → validate → commit; SSDF evidence drain; change-set create/approve/apply |
+| sdc | a test rig → a test rig | prepare → approve → apply; packaging smoke with the new pin |
+| proxmox | a test rig → a test rig | bind default, `StateDirectory` mode, evidence file mode now `0600`, change-set plan/approve/apply |
+| mist | a test rig → a test rig | read path, plan/approve/apply, evidence outbox under the denylist |
 
 Explicit checks, since these are the claims the sprint is making:
 
@@ -210,8 +210,8 @@ contending for a checkout. It is roughly a day of work on its own; that cost was
 raised and accepted.
 
 Today `ssdf` is the only private repo of the seven. Its HEAD alone carries ~190
-references to `pve3.mechub.org`, 105 to `192.0.2.30`, plus `panosvm`,
-`prod-junosmcp`, `prod-panosmcp` and ~20 further internal hosts, across 145
+references to `node.example.internal`, 105 to `192.0.2.30`, plus `panosvm`,
+the junos guest, the panos guest and ~20 further internal hosts, across 145
 commits.
 
 1. **Back up first** — a full mirror clone kept locally. A history rewrite is
@@ -238,7 +238,8 @@ commits.
   not build time. Mitigation: grep for the old tag across the repo before
   opening the PR.
 - **junos syscall denylist breaking file transfer.** Highest blast radius in the
-  sprint. Mitigation: rehearse on 611 before 610, and never on 950.
+  sprint. Mitigation: rehearse on the lab-mode rig before the two-person rig, and never
+  on a production guest.
 - **`IPAddressDeny` blackholing the evidence endpoint or a device subnet.**
   Mitigation: inventory check written into the PR description.
 - **History rewrite invalidating clones.** Mitigation: mirror backup, and the
@@ -246,7 +247,7 @@ commits.
 
 ## Explicitly out of scope
 
-Production guests 950 / 951 / 952 / 960 / 971; LXC 970 (`notmechub`, not ours);
+Production guests the Junos production guest / the SDC guest / the Mist guest / the PAN-OS production guest / the Proxmox guest; a third-party Proxmox guest (`notmechub`, not ours);
 the MCP 2026-07-28 spec adoption beyond #167 and possibly #164; SSDF #26; the
 Security Director unification described in `RELEASE-PROGRAMME.md`.
 
@@ -261,7 +262,7 @@ plan was wrong.
 **Completed 2026-08-24.** Open issues across the seven repos went from **48 to
 13**; `rustsdcmcp` and `rustproxmoxmcp` reached zero. Waves 0–4 all landed:
 `mecmcp v0.17.0` tagged, Tier 1 (14 issues) and Tier 2 (21 issues) merged in
-all five servers, rig rehearsal completed on 610–619, and trackers #318/#319
+all five servers, rig rehearsal completed on a test rig–a test rig, and trackers #318/#319
 closed (#320 stays open — its spikes were deliberately not attempted).
 
 Of the 13 issues still open, five were **filed during this sprint**, four are

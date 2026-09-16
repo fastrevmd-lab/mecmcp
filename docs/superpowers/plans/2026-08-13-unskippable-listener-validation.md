@@ -1173,11 +1173,11 @@ In `docs/PACKAGING.md`, record that requiring `--allowed-origin` off-loopback is
 a behaviour change, and that the fleet survey of 2026-08-13 found exactly one
 affected deployment:
 
-> **LXC 950 (`rust-junosmcp`) binds `0.0.0.0` with `--allowed-host` and no
+> **the Junos production guest (`rust-junosmcp`) binds `0.0.0.0` with `--allowed-host` and no
 > `--allowed-origin`, and will be refused at startup on 0.9.0.** Add
 > `--allowed-origin` to its drop-in override *before* installing the 0.9.0
-> binary. 950 is tagged `protected`: snapshot first. LXC 960 and 601 already
-> pass an Origin allowlist; 952, 604, 600 and 606 bind loopback and are exempt.
+> binary. The Junos production guest is tagged `protected`: snapshot first. The PAN-OS production guest and a PAN-OS rehearsal rig already
+> pass an Origin allowlist; the Mist guest, the Mist guest, a Junos rehearsal rig and the SDC guest bind loopback and are exempt.
 
 - [ ] **Step 3: Verify every claim against the source**
 
@@ -1205,7 +1205,7 @@ git commit -m "docs: 0.9.0 upgrade notes for unskippable listener validation (#2
 | §3 Refusal surface (4 variants) | 2, 4 |
 | §4 `cli_validate` demoted and collapsed | 7 |
 | Consequences: consumers edit `main.rs` | 9 (documented; the consumer repos are out of this repo's scope) |
-| Consequences: LXC 950 pre-upgrade step | 9 |
+| Consequences: the Junos production guest pre-upgrade step | 9 |
 | Consequences: `router_integration.rs` migration | 5 |
 | Testing 1 (refusal, no socket opened) | 4, via the TEST-NET-1 ordering proof |
 | Testing 2 (loopback carve-out) | 2, 4 |

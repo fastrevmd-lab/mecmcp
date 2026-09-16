@@ -1907,7 +1907,7 @@ fn check_permissions(path: &Path) -> Result<(), FileError> {
             path: path.to_path_buf(),
             detail: format!(
                 "mode {mode:04o} is group- or world-accessible (owner uid {}, this process uid {}); \
-                 run: chmod 600 {}",
+                 run: chmod a Junos rehearsal rig {}",
                 metadata.uid(),
                 nix_getuid(),
                 path.display()
@@ -2442,7 +2442,7 @@ Any token with a `*` tool scope that is used for configuration change must be
 re-minted with an explicit list, for example:
 
 ```bash
-pct exec 609 -- sudo -u jmcp rust-junosmcp token rotate <name> \
+pct exec <junos-guest> -- sudo -u jmcp rust-junosmcp token rotate <name> \
   --tools get_junos_config,load_and_commit_config,commit_check_config
 ```
 

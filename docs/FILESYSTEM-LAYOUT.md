@@ -12,14 +12,14 @@ The two shipping servers chose different layouts:
 | **Service user** | `jmcp` | `rust-panosmcp` |
 | **State dir** | `/var/lib/jmcp` | `/var/lib/rust-panosmcp` |
 | **Inventory** | `/etc/jmcp/devices.json` | `/etc/rust-panosmcp/devices.json` |
-| **Tokens (609)** | `/etc/jmcp/tokens.json` | n/a |
-| **Tokens (608)** | n/a | `/var/lib/rust-panosmcp/tokens.json` |
+| **Tokens (junos)** | `/etc/jmcp/tokens.json` | n/a |
+| **Tokens (panos)** | n/a | `/var/lib/rust-panosmcp/tokens.json` |
 
 Neither is wrong in isolation, but an operator managing both types them differently for no technical reason. Any shared tooling — backup scripts, config management, log shipping, monitoring — needs a per-vendor path table.
 
-The placement of `tokens.json` diverges across servers **and within the same server** between deployments. LXC 608 keeps tokens at `/var/lib/rust-panosmcp/tokens.json`; the shipped installer would create them at `/etc/rust-panosmcp/tokens.json`. LXC 609 keeps them at `/etc/jmcp/tokens.json`.
+The placement of `tokens.json` diverges across servers **and within the same server** between deployments. The PAN-OS production guest keeps tokens at `/var/lib/rust-panosmcp/tokens.json`; the shipped installer would create them at `/etc/rust-panosmcp/tokens.json`. The Junos production guest keeps them at `/etc/jmcp/tokens.json`.
 
-This has already caused operational friction: upgrading 601 (the old PAN-OS test rig, now retired) required correcting a systemd drop-in that pointed at the wrong path, because production (608) and the installer disagreed on the canonical location.
+This has already caused operational friction: upgrading the old PAN-OS test rig (now retired) required correcting a systemd drop-in that pointed at the wrong path, because production (the PAN-OS production guest) and the installer disagreed on the canonical location.
 
 ## The config vs state split
 
@@ -61,7 +61,7 @@ The current split puts a server-written file under `/etc`, which is why an atomi
 
 ## The `jmcp` exception
 
-**LXC 609** (the live Junos deployment on pve2) uses `/etc/jmcp`, `/var/lib/jmcp`, and service user `jmcp`. This predates the standard and is **protected from breaking changes** per PLAN.md.
+**the Junos production guest** (the live Junos deployment on the hypervisor node) uses `/etc/jmcp`, `/var/lib/jmcp`, and service user `jmcp`. This predates the standard and is **protected from breaking changes** per PLAN.md.
 
 The standard requires `rust-junosmcp` to honour the existing paths **if present**, and use the standard paths on a fresh install:
 
@@ -80,11 +80,11 @@ let state_dir = if Path::new("/var/lib/jmcp").exists() {
 };
 ```
 
-**No new deployments use the abbreviated form.** A fresh install of `RustJunosMCP` deploys as `rust-junosmcp`, not `jmcp`. The exception exists only to prevent breaking 609.
+**No new deployments use the abbreviated form.** A fresh install of `RustJunosMCP` deploys as `rust-junosmcp`, not `jmcp`. The exception exists only to prevent breaking the existing Junos deployment.
 
-## LXC 608: the tokens.json discrepancy
+## the PAN-OS production guest: the tokens.json discrepancy
 
-**LXC 608** (live PAN-OS on pve2) keeps `tokens.json` at `/var/lib/rust-panosmcp/tokens.json`, which is correct under this standard. However, **the shipped installer as of 0.4.0 would create it at `/etc/rust-panosmcp/tokens.json`**, which is wrong.
+**the PAN-OS production guest** (live PAN-OS on the hypervisor node) keeps `tokens.json` at `/var/lib/rust-panosmcp/tokens.json`, which is correct under this standard. However, **the shipped installer as of 0.4.0 would create it at `/etc/rust-panosmcp/tokens.json`**, which is wrong.
 
 ### Migration for rust-panosmcp
 
@@ -196,23 +196,23 @@ Every `packaging/lxc/install.sh` must:
 
 ## Deployed systems: what changes
 
-### LXC 609 (rust-junosmcp on pve2) — NO CHANGE REQUIRED
+### the Junos production guest (rust-junosmcp on the hypervisor node) — NO CHANGE REQUIRED
 
 The existing `/etc/jmcp` and `/var/lib/jmcp` layout is **locked in** and remains supported. The standard requires new code to detect and honour these paths when present.
 
-### LXC 608 (rust-panosmcp on pve2) — tokens.json already correct
+### the PAN-OS production guest (rust-panosmcp on the hypervisor node) — tokens.json already correct
 
 `tokens.json` is already at `/var/lib/rust-panosmcp/tokens.json`, which is the standard location. **No migration needed.**
 
 The shipped unit file as of 0.5.0+ must reference `/var/lib/rust-panosmcp/tokens.json` by default. If an older deployment has a drop-in pointing elsewhere, that drop-in will continue to work (it overrides the shipped unit).
 
-### LXC 606 (rustsdcmcp on pve2) — verify and document
+### the SDC guest (rustsdcmcp on the hypervisor node) — verify and document
 
-Check the actual layout on 606:
+Check the actual layout on the SDC guest:
 
 ```bash
-ssh root@pve2.mechub.org "pct exec 606 -- ls -la /etc/rustsdcmcp"
-ssh root@pve2.mechub.org "pct exec 606 -- ls -la /var/lib/rustsdcmcp"
+ssh root@node.example.internal "pct exec <sdc-guest> -- ls -la /etc/rustsdcmcp"
+ssh root@node.example.internal "pct exec <sdc-guest> -- ls -la /var/lib/rustsdcmcp"
 ```
 
 If it matches the standard (`/etc/rustsdcmcp`, `/var/lib/rustsdcmcp`, tokens in `/var/lib`), document that it is already compliant. If it diverges, apply the same migration rule as rust-panosmcp.

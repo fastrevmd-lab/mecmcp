@@ -18,7 +18,7 @@
 - Every public item needs a doc comment; doc examples are compiled.
 - **All gates must pass:** `cargo build --workspace --all-targets`, `cargo test --workspace --locked`, `cargo clippy --workspace --all-targets` (zero warnings), `cargo fmt --all --check`, `cargo doc --workspace --no-deps`. Running `test` and `clippy` alone has repeatedly missed `fmt` and `doc` failures in this repo.
 - **`compute_waiver_digest` is never deleted.** It is the only thing that can verify a v1/v2 record.
-- **`compute_approval_digest` is not touched.** Its separator ambiguity is mecmcp#283; LXC 950 holds 28 change sets verified against it.
+- **`compute_approval_digest` is not touched.** Its separator ambiguity is mecmcp#283; the Junos production guest holds 28 change sets verified against it.
 - **Never accept "either digest verifies".** A v3 record must verify only under the v3 rule. Accepting either would let a forged legacy digest pass.
 
 ---

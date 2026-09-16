@@ -232,7 +232,7 @@ exists — an SD On-Prem server, private and parked — which takes the same six
 crates as `sdc` at a much older pin; it is out of scope for family-wide work.
 
 `rustnetconf` is deliberately absent from this table: it is a dependency *of*
-the Junos server, not a consumer of mecmcp, which is the correct layering
+The Junos server, not a consumer of mecmcp, which is the correct layering
 direction.
 
 ### Three consumption shapes, not one

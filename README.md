@@ -58,7 +58,8 @@ no code changes. Bump **both** strings on each entry — a `version = "0.9.x"`
 requirement does not accept `0.10.0`, so changing only `tag = "v0.9.1"` leaves
 the dependency unresolvable.
 
-**No data migration:** a live survey of LXC 950, 960, 601, 606, and 600 found 28
+**No data migration:** a live survey of the Junos and PAN-OS production guests,
+The SDC guest and both rehearsal rigs found 28
 change sets and **zero** waiver records, so changing the waiver digest invalidates
 nothing that exists. The neighbouring approval digest was deliberately left alone
 for that reason and is tracked as #283. Any state file containing a waiver is now
@@ -166,12 +167,12 @@ off-loopback.
 - **Off-loopback listeners now require `--allowed-origin`.** This is a behavior
   change: an empty Origin allowlist is currently valid and disables Origin
   checking by design. Fleet survey (2026-08-13) found exactly one affected
-  deployment. **LXC 950 (`rust-junosmcp`) binds `0.0.0.0` with `--allowed-host`
+  deployment. **The Junos production guest (`rust-junosmcp`) binds `0.0.0.0` with `--allowed-host`
   and no `--allowed-origin`, and will be refused at startup on 0.9.0.** Add
   `--allowed-origin` to its drop-in override before installing the 0.9.0 binary.
-  950 is tagged `protected`: snapshot it first. LXC 960 and 601
-  (`rust-panosmcp`) already pass an Origin allowlist and are unaffected; 952,
-  604, 600, and 606 bind `127.0.0.1` and are exempt.
+  It is tagged `protected`: snapshot it first. The PAN-OS guests
+  (`rust-panosmcp`) already pass an Origin allowlist and are unaffected; the
+  Mist, SDC and rehearsal guests bind `127.0.0.1` and are exempt.
 
 **0.8.3 — 0.8.2's client name never actually reached anyone. Upgrade past 0.8.2.**
 The propagation was correct and unreachable. The middleware reads the captured

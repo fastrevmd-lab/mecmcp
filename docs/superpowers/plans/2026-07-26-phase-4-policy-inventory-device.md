@@ -19,7 +19,7 @@ Inherited from [`PLAN.md`](../../../PLAN.md). Repeated here because a task imple
 
 - **Edition 2024, MSRV 1.88.**
 - **Workspace lints:** `missing_docs = "warn"`, `unsafe_code = "forbid"`, `clippy::all = "warn"` (priority -1), `dbg_macro = "deny"`, `todo = "deny"`, `unwrap_used = "warn"`.
-- **No breaking change to on-disk `devices.json`** in either server. Live deployments exist on LXC 608, 609, 600, 601.
+- **No breaking change to on-disk `devices.json`** in either server. Live deployments exist on both production guests and both rehearsal rigs.
 - **Anything that belongs to the consuming server must be a parameter, not baked into the shared crate.** Four defects shipped by violating this in Phase 3; see PLAN.md's "The rule these phases keep learning the hard way."
 - **Do not hand a consumer something older than it already has.** Check dependency versions in both servers before pinning anything in a shared crate.
 - **One git ref for all `mecmcp-*` deps.** Two refs produce two `CallerCtx` types with different `TypeId`s and per-token limits silently stop enforcing. `grep -c '^name = "mecmcp-auth"' Cargo.lock` must print 1 in each consuming server.
@@ -56,7 +56,7 @@ Measured from `RustJunosMCP` and `rust-panosmcp` on 2026-07-26.
 
 **D1 — Schema convergence (mecmcp #27) is explicitly out of scope for Phase 4.**
 
-`PLAN.md`'s exit criterion says "both servers load their existing `devices.json` unchanged through the trait." This phase delivers the **trait abstraction** over the two existing schemas, not schema convergence. Attempting both at once means a migration against four live deployments (LXC 608, 609, 600, 601) in the same change that introduces the abstraction.
+`PLAN.md`'s exit criterion says "both servers load their existing `devices.json` unchanged through the trait." This phase delivers the **trait abstraction** over the two existing schemas, not schema convergence. Attempting both at once means a migration against four live deployments (the PAN-OS production guest, the Junos production guest, a Junos rehearsal rig, a PAN-OS rehearsal rig) in the same change that introduces the abstraction.
 
 mecmcp #27 documents the problem thoroughly: junos uses a flat map with a magic `_blocklist_defaults` entry sharing the namespace with devices; panos uses a versioned envelope with a device array. They differ in every structural decision available. #27 proposes a converged shape and notes the hard constraint: both servers have live deployments, so this lands as "read both shapes, write the new one, with the legacy reader kept and tested until every deployment has migrated."
 
