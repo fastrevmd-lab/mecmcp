@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1210 250" width="1210" height="250" role="img" aria-label="The ordered gate chain a tools/call passes through, each with the status code it refuses with">
+  <defs>
+    <marker id="a3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" fill="#4DD0C8"/></marker>
+    <marker id="a4" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" fill="#F87171"/></marker>
+    <style>.m { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }</style>
+  </defs>
+  <rect x="0" y="0" width="1210" height="250" rx="8" fill="#0B0D12"/>
+  <g transform="translate(15,14)">
+    <path d="M24,66 L24,54 L330,54 L330,66" fill="none" stroke="#4A5568" stroke-width="1"/>
+    <text class="m" x="177" y="45" text-anchor="middle" font-size="10" fill="#9AA2AD">before any token exists</text>
+    <path d="M336,66 L336,54 L1058,54 L1058,66" fill="none" stroke="#0D9488" stroke-width="1.2"/>
+    <text class="m" x="697" y="45" text-anchor="middle" font-size="10" fill="#4DD0C8">apply_bearer_boundary — order enforced here</text>
+    <rect x="24" y="78" width="92" height="56" rx="4" fill="#171A22" stroke="#0D9488" stroke-width="1"/>
+    <text class="m" x="70" y="102" text-anchor="middle" font-size="10" fill="#B7F5F0">TLS</text>
+    <text class="m" x="70" y="116" text-anchor="middle" font-size="10" fill="#9AA2AD">termination</text>
+    <line x1="70" y1="140" x2="70" y2="158" stroke="#F87171" stroke-width="1" marker-end="url(#a4)"/>
+    <text class="m" x="70" y="174" text-anchor="middle" font-size="10" fill="#F87171">refused</text>
+    <rect x="128" y="78" width="92" height="56" rx="4" fill="#171A22" stroke="#0D9488" stroke-width="1"/>
+    <text class="m" x="174" y="102" text-anchor="middle" font-size="10" fill="#B7F5F0">Host /</text>
+    <text class="m" x="174" y="116" text-anchor="middle" font-size="10" fill="#9AA2AD">Origin</text>
+    <line x1="174" y1="140" x2="174" y2="158" stroke="#F87171" stroke-width="1" marker-end="url(#a4)"/>
+    <text class="m" x="174" y="174" text-anchor="middle" font-size="10" fill="#F87171">421</text>
+    <rect x="232" y="78" width="92" height="56" rx="4" fill="#171A22" stroke="#0D9488" stroke-width="1"/>
+    <text class="m" x="278" y="102" text-anchor="middle" font-size="10" fill="#B7F5F0">IP rate</text>
+    <text class="m" x="278" y="116" text-anchor="middle" font-size="10" fill="#9AA2AD">limit</text>
+    <line x1="278" y1="140" x2="278" y2="158" stroke="#F87171" stroke-width="1" marker-end="url(#a4)"/>
+    <text class="m" x="278" y="174" text-anchor="middle" font-size="10" fill="#F87171">429</text>
+    <rect x="336" y="78" width="92" height="56" rx="4" fill="#0C3A37" stroke="#4DD0C8" stroke-width="1.5"/>
+    <text class="m" x="382" y="102" text-anchor="middle" font-size="10" fill="#B7F5F0">bearer</text>
+    <text class="m" x="382" y="116" text-anchor="middle" font-size="10" fill="#4DD0C8">auth</text>
+    <line x1="382" y1="140" x2="382" y2="158" stroke="#F87171" stroke-width="1" marker-end="url(#a4)"/>
+    <text class="m" x="382" y="174" text-anchor="middle" font-size="10" fill="#F87171">401</text>
+    <rect x="440" y="78" width="92" height="56" rx="4" fill="#171A22" stroke="#0D9488" stroke-width="1"/>
+    <text class="m" x="486" y="102" text-anchor="middle" font-size="10" fill="#B7F5F0">token</text>
+    <text class="m" x="486" y="116" text-anchor="middle" font-size="10" fill="#9AA2AD">rate</text>
+    <line x1="486" y1="140" x2="486" y2="158" stroke="#F87171" stroke-width="1" marker-end="url(#a4)"/>
+    <text class="m" x="486" y="174" text-anchor="middle" font-size="10" fill="#F87171">429</text>
+    <rect x="544" y="78" width="92" height="56" rx="4" fill="#171A22" stroke="#0D9488" stroke-width="1"/>
+    <text class="m" x="590" y="102" text-anchor="middle" font-size="10" fill="#B7F5F0">token</text>
+    <text class="m" x="590" y="116" text-anchor="middle" font-size="10" fill="#9AA2AD">concurrency</text>
+    <line x1="590" y1="140" x2="590" y2="158" stroke="#F87171" stroke-width="1" marker-end="url(#a4)"/>
+    <text class="m" x="590" y="174" text-anchor="middle" font-size="10" fill="#F87171">503</text>
+    <rect x="648" y="78" width="92" height="56" rx="4" fill="#171A22" stroke="#0D9488" stroke-width="1"/>
+    <text class="m" x="694" y="102" text-anchor="middle" font-size="10" fill="#B7F5F0">body</text>
+    <text class="m" x="694" y="116" text-anchor="middle" font-size="10" fill="#9AA2AD">limit</text>
+    <line x1="694" y1="140" x2="694" y2="158" stroke="#F87171" stroke-width="1" marker-end="url(#a4)"/>
+    <text class="m" x="694" y="174" text-anchor="middle" font-size="10" fill="#F87171">413</text>
+    <rect x="752" y="78" width="92" height="56" rx="4" fill="#0C3A37" stroke="#4DD0C8" stroke-width="1.5"/>
+    <text class="m" x="798" y="102" text-anchor="middle" font-size="10" fill="#B7F5F0">scope</text>
+    <text class="m" x="798" y="116" text-anchor="middle" font-size="10" fill="#4DD0C8">preflight</text>
+    <line x1="798" y1="140" x2="798" y2="158" stroke="#F87171" stroke-width="1" marker-end="url(#a4)"/>
+    <text class="m" x="798" y="174" text-anchor="middle" font-size="10" fill="#F87171">403</text>
+    <rect x="856" y="78" width="92" height="56" rx="4" fill="#171A22" stroke="#0D9488" stroke-width="1"/>
+    <text class="m" x="902" y="102" text-anchor="middle" font-size="10" fill="#B7F5F0">target</text>
+    <text class="m" x="902" y="116" text-anchor="middle" font-size="10" fill="#9AA2AD">concurrency</text>
+    <line x1="902" y1="140" x2="902" y2="158" stroke="#F87171" stroke-width="1" marker-end="url(#a4)"/>
+    <text class="m" x="902" y="174" text-anchor="middle" font-size="10" fill="#F87171">503</text>
+    <rect x="960" y="78" width="92" height="56" rx="4" fill="#171A22" stroke="#0D9488" stroke-width="1"/>
+    <text class="m" x="1006" y="102" text-anchor="middle" font-size="10" fill="#B7F5F0">transport</text>
+    <text class="m" x="1006" y="116" text-anchor="middle" font-size="10" fill="#9AA2AD">audit</text>
+    <text class="m" x="1006" y="174" text-anchor="middle" font-size="10" fill="#9AA2AD">emits, never refuses</text>
+    <rect x="1064" y="78" width="92" height="56" rx="4" fill="#2A1B4D" stroke="#7C3AED" stroke-width="1.5"/>
+    <text class="m" x="1110" y="102" text-anchor="middle" font-size="10" fill="#C4B5FD">vendor</text>
+    <text class="m" x="1110" y="116" text-anchor="middle" font-size="10" fill="#C4B5FD">handler</text>
+    <g stroke="#4DD0C8" stroke-width="1.2" marker-end="url(#a3)">
+    <line x1="117" y1="106" x2="125" y2="106"/>
+    <line x1="221" y1="106" x2="229" y2="106"/>
+    <line x1="325" y1="106" x2="333" y2="106"/>
+    <line x1="429" y1="106" x2="437" y2="106"/>
+    <line x1="533" y1="106" x2="541" y2="106"/>
+    <line x1="637" y1="106" x2="645" y2="106"/>
+    <line x1="741" y1="106" x2="749" y2="106"/>
+    <line x1="845" y1="106" x2="853" y2="106"/>
+    <line x1="949" y1="106" x2="957" y2="106"/>
+    <line x1="1053" y1="106" x2="1061" y2="106"/>
+    </g>
+    <text class="m" x="24" y="206" font-size="10" fill="#4A5568">downward arrows are refusals — the request never reaches the next gate</text>
+  </g>
+</svg>

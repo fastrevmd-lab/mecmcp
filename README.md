@@ -638,6 +638,8 @@ refused at startup by 0.3.8.
 | [`ANALYSIS.md`](ANALYSIS.md) | Side-by-side teardown of both repos — what is duplicated, what is asymmetric, what stays vendor-specific |
 | [`PLAN.md`](PLAN.md) | Program-level extraction plan: crate map, phase sequencing, decisions, exit criteria (historical — the plan is delivered) |
 | [`ROADMAP.md`](ROADMAP.md) | What "enterprise grade" means at 150 engineers and 4,000 multi-vendor firewalls |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | How `mecmcp` is put together and how a vendor server sits on top of it — the crate tiers and the request lifecycle |
+| [`docs/CRATE-MAP.md`](docs/CRATE-MAP.md) | **Start here for the whole picture.** What each of the fourteen crates does, the dependency graph, and which crates each vendor server actually consumes — with diagrams |
 | [`docs/PACKAGING.md`](docs/PACKAGING.md) | How a mechub MCP server is delivered and installed — container base, LXC, README requirements |
 | [`docs/AUDIT-FORWARDING-STANDARD.md`](docs/AUDIT-FORWARDING-STANDARD.md) | **Standard.** How every server ships its audit trail off the host: JSON emission rules (normative) and the hash-chained ClickHouse sink (#292) |
 | [`docs/superpowers/plans/`](docs/superpowers/plans/) | Executable per-phase implementation plans |

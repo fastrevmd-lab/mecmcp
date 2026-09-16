@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1030 436" width="1030" height="436" role="img" aria-label="Dependency graph of the fourteen mecmcp crates in four levels, with mecmcp-secret at the base and four crates having no workspace dependencies">
+  <defs>
+    <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0,1 L9,5 L0,9 z" fill="#4DD0C8"/>
+    </marker>
+    <style>.m { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }</style>
+  </defs>
+  <rect x="0" y="0" width="1030" height="436" rx="8" fill="#0B0D12"/>
+  <g transform="translate(15,14)">
+
+    <text class="m" x="12" y="56" font-size="9.5" fill="#4A5568">d3</text>
+    <text class="m" x="12" y="156" font-size="9.5" fill="#4A5568">d2</text>
+    <text class="m" x="12" y="256" font-size="9.5" fill="#4A5568">d1</text>
+    <text class="m" x="12" y="356" font-size="9.5" fill="#4A5568">d0</text>
+
+    <g stroke="#0D9488" stroke-width="1.4" fill="none" marker-end="url(#a2)">
+      <line x1="80"  y1="73"  x2="196" y2="127"/>
+      <line x1="220" y1="73"  x2="220" y2="127"/>
+      <line x1="360" y1="73"  x2="248" y2="127"/>
+      <line x1="500" y1="73"  x2="272" y2="127"/>
+      <line x1="220" y1="173" x2="220" y2="227"/>
+      <line x1="232" y1="273" x2="342" y2="327"/>
+      <line x1="380" y1="273" x2="380" y2="327"/>
+      <line x1="516" y1="273" x2="408" y2="327"/>
+      <line x1="654" y1="273" x2="432" y2="327"/>
+      <line x1="862" y1="73"  x2="862" y2="127"/>
+    </g>
+
+    <rect x="17" y="31" width="126" height="42" rx="5" fill="#171A22" stroke="#0D9488"/>
+    <text class="m" x="80" y="49" text-anchor="middle" font-size="10.5" fill="#4DD0C8">mecmcp-transport</text>
+    <text class="m" x="80" y="63" text-anchor="middle" font-size="9" fill="#9AA2AD">boundary · 12,008</text>
+
+    <rect x="157" y="31" width="126" height="42" rx="5" fill="#171A22" stroke="#0D9488"/>
+    <text class="m" x="220" y="49" text-anchor="middle" font-size="10.5" fill="#4DD0C8">mecmcp-server</text>
+    <text class="m" x="220" y="63" text-anchor="middle" font-size="9" fill="#9AA2AD">boundary · 769</text>
+
+    <rect x="297" y="31" width="126" height="42" rx="5" fill="#171A22" stroke="#0D9488"/>
+    <text class="m" x="360" y="49" text-anchor="middle" font-size="10.5" fill="#4DD0C8">mecmcp-changeset</text>
+    <text class="m" x="360" y="63" text-anchor="middle" font-size="9" fill="#9AA2AD">domain · 7,647</text>
+
+    <rect x="437" y="31" width="126" height="42" rx="5" fill="#171A22" stroke="#0D9488"/>
+    <text class="m" x="500" y="49" text-anchor="middle" font-size="10.5" fill="#4DD0C8">mecmcp-runtime</text>
+    <text class="m" x="500" y="63" text-anchor="middle" font-size="9" fill="#9AA2AD">process · 2,958</text>
+
+    <rect x="157" y="131" width="126" height="42" rx="5" fill="#0C3A37" stroke="#4DD0C8" stroke-width="1.5"/>
+    <text class="m" x="220" y="149" text-anchor="middle" font-size="10.5" fill="#B7F5F0">mecmcp-audit</text>
+    <text class="m" x="220" y="163" text-anchor="middle" font-size="9" fill="#4DD0C8">4 dependents · 9,694</text>
+
+    <rect x="157" y="231" width="126" height="42" rx="5" fill="#0C3A37" stroke="#4DD0C8" stroke-width="1.5"/>
+    <text class="m" x="220" y="249" text-anchor="middle" font-size="10.5" fill="#B7F5F0">mecmcp-auth</text>
+    <text class="m" x="220" y="263" text-anchor="middle" font-size="9" fill="#4DD0C8">4 dependents · 5,475</text>
+
+    <rect x="317" y="231" width="126" height="42" rx="5" fill="#171A22" stroke="#0D9488"/>
+    <text class="m" x="380" y="249" text-anchor="middle" font-size="10.5" fill="#4DD0C8">mecmcp-http</text>
+    <text class="m" x="380" y="263" text-anchor="middle" font-size="9" fill="#9AA2AD">outbound · 3,260</text>
+
+    <rect x="457" y="231" width="126" height="42" rx="5" fill="#171A22" stroke="#0D9488"/>
+    <text class="m" x="520" y="249" text-anchor="middle" font-size="10.5" fill="#4DD0C8">mecmcp-inventory</text>
+    <text class="m" x="520" y="263" text-anchor="middle" font-size="9" fill="#9AA2AD">domain · 1,323</text>
+
+    <rect x="597" y="231" width="126" height="42" rx="5" fill="#171A22" stroke="#0D9488"/>
+    <text class="m" x="660" y="249" text-anchor="middle" font-size="10.5" fill="#4DD0C8">mecmcp-scp</text>
+    <text class="m" x="660" y="263" text-anchor="middle" font-size="9" fill="#9AA2AD">outbound · 6,661</text>
+
+    <rect x="317" y="331" width="126" height="42" rx="5" fill="#0F4A46" stroke="#4DD0C8" stroke-width="2"/>
+    <text class="m" x="380" y="349" text-anchor="middle" font-size="10.5" fill="#B7F5F0">mecmcp-secret</text>
+    <text class="m" x="380" y="363" text-anchor="middle" font-size="9" fill="#4DD0C8">6 dependents · 1,078</text>
+
+    <line x1="756" y1="26" x2="756" y2="390" stroke="#262B38" stroke-width="1" stroke-dasharray="4 5"/>
+    <text class="m" x="862" y="16" text-anchor="middle" font-size="9.5" fill="#4A5568">independent components</text>
+
+    <rect x="799" y="31" width="126" height="42" rx="5" fill="#171A22" stroke="#0D9488"/>
+    <text class="m" x="862" y="49" text-anchor="middle" font-size="10.5" fill="#4DD0C8">mecmcp-job</text>
+    <text class="m" x="862" y="63" text-anchor="middle" font-size="9" fill="#9AA2AD">outbound · 962</text>
+
+    <rect x="799" y="131" width="126" height="42" rx="5" fill="#171A22" stroke="#0D9488"/>
+    <text class="m" x="862" y="149" text-anchor="middle" font-size="10.5" fill="#4DD0C8">mecmcp-device</text>
+    <text class="m" x="862" y="163" text-anchor="middle" font-size="9" fill="#9AA2AD">domain · 908</text>
+
+    <rect x="799" y="231" width="126" height="42" rx="5" fill="#171A22" stroke="#0D9488"/>
+    <text class="m" x="862" y="249" text-anchor="middle" font-size="10.5" fill="#4DD0C8">mecmcp-openapi</text>
+    <text class="m" x="862" y="263" text-anchor="middle" font-size="9" fill="#9AA2AD">outbound · 911</text>
+
+    <rect x="799" y="331" width="126" height="42" rx="5" fill="#171A22" stroke="#0D9488"/>
+    <text class="m" x="862" y="349" text-anchor="middle" font-size="10.5" fill="#4DD0C8">mecmcp-policy</text>
+    <text class="m" x="862" y="363" text-anchor="middle" font-size="9" fill="#9AA2AD">domain · 939</text>
+  </g>
+</svg>
