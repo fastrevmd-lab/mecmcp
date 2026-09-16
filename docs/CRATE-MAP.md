@@ -161,10 +161,14 @@ enforces the order, because each position is load-bearing.
 - **The transport audit event is emitted before dispatch**, not at the end of
   the request — its `duration_ms` is preflight time, and holding the scope
   across the handler would both inflate that and emit it after the handler's own
-  event. It therefore precedes target concurrency — which means the audit trail
-  records the *attempt*, not the outcome of that last gate. A request refused by
-  target concurrency leaves one event saying preflight allowed it, and nothing
-  saying it was then refused. See [#370](https://github.com/fastrevmd-lab/mecmcp/issues/370).
+  event. It therefore precedes target concurrency, so it cannot describe what
+  that last gate did. Until [#370](https://github.com/fastrevmd-lab/mecmcp/issues/370)
+  that was the whole story, and a request shed by target concurrency left one
+  event saying preflight *allowed* it with `result=ok` — a success it never had.
+  The boundary now emits a second, terminal event on any 4xx or 5xx:
+  `deny reason=refused_after_preflight`, `layer=post_dispatch`, carrying the
+  status returned. Refusals only; a successful call is still described by the
+  preflight event plus the handler's own.
 - **Target concurrency is innermost**, so an unauthorized request never acquires
   a per-device permit.
 

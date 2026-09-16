@@ -122,10 +122,13 @@ inside it: `apply_ip_rate_limit` is attached *last* in
 `build_streamable_http_router` so that it also covers `/metrics`, and in axum the
 last layer applied is the first to run. **The transport audit precedes target
 concurrency**, because `bearer_preflight_middleware` drops its `AuditScope`
-before calling `next.run`. The consequence is worth stating plainly: a request
-refused by target concurrency is recorded as a call preflight *allowed*, and no
-event records the refusal. Tracked as
-[#370](https://github.com/fastrevmd-lab/mecmcp/issues/370).
+before calling `next.run`, so it cannot carry the outcome of anything inside it.
+That used to mean a request shed by target concurrency was recorded as a call
+preflight *allowed* with `result=ok`, and nothing recorded the refusal —
+[#370](https://github.com/fastrevmd-lab/mecmcp/issues/370). The boundary now
+emits a second terminal event whenever the response is a 4xx or 5xx
+(`refused_after_preflight`, `layer=post_dispatch`, plus the status), leaving the
+preflight event and its `duration_ms` untouched.
 
 The inner segment is not assembled by hand in each consumer. `apply_bearer_boundary`
 in `crates/mecmcp-transport/src/auth.rs` installs it and **enforces the order**:
