@@ -468,7 +468,7 @@ Add to the end of `updates:` in each:
 ```bash
 for d in rustsdcmcp rustproxmoxmcp; do
   printf "%-16s " "$d"
-  ls "~/Projects/$d/Dockerfile" >/dev/null 2>&1 && echo "Dockerfile present" || echo "MISSING — do not add the ecosystem"
+  ls "$HOME/Projects/$d/Dockerfile" >/dev/null 2>&1 && echo "Dockerfile present" || echo "MISSING — do not add the ecosystem"
 done
 ```
 
@@ -478,7 +478,7 @@ Both must print `Dockerfile present`. If either does not, stop and report — th
 
 ```bash
 for d in rustsdcmcp rustproxmoxmcp; do
-  cd "~/Projects/$d"
+  cd "$HOME/Projects/$d"
   git checkout main && git pull --ff-only
   git checkout -b ci/dependabot-docker
   git add .github/dependabot.yml
@@ -709,7 +709,7 @@ systemctl show <service>.service -p IPEgressBytes --value
 ```bash
 for d in RustJunosMCP rust-panosmcp rustmistmcp rustproxmoxmcp; do
   printf "%-16s " "$d"
-  f="~/Projects/$d/packaging/lxc/install.sh"
+  f="$HOME/Projects/$d/packaging/lxc/install.sh"
   bash -n "$f" 2>/dev/null && shellcheck "$f" >/dev/null 2>&1 && echo "parses + shellcheck clean" || echo "PROBLEM"
 done
 ```
