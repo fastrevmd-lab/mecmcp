@@ -21,12 +21,20 @@ wrong.
 | Juniper SRX / Junos devices, directly | **rustjunosmcp** | Production |
 | Palo Alto firewalls | **rustpanosmcp** | Production |
 | Security Director Cloud (SASE portal) | **rustsdcmcp** | **Lab only** |
-| Juniper Mist cloud | **rustmistmcp** | Production |
+| Juniper Mist cloud | **rustmistmcp** | **Lab only** — packaging pre-release |
 
 Only the first two should be pointed at production gear. `rustsdcmcp` is fine
-against a lab tenant. `rustmistmcp` reached its first production tag and is
-deployed; its mutating tools are still deliberately absent, so treat it as
-read-only rather than as a scaffold.
+against a lab tenant. `rustmistmcp` has cut a production tag and served live
+read-only tenant traffic, so it is no longer the scaffold older notes describe —
+but its packaging is explicitly **pre-release**: the TLS, Host/Origin and
+bad-bearer rows of its own `PACKAGING_ACCEPTANCE.md` are unproven, and the one
+lab run used no TLS and no off-loopback bind. Keep it on a lab tenant until
+those pass.
+
+**It is not read-only.** It registers `plan_mist_change`,
+`approve_mist_change_set` and `apply_mist_change_set`, with mutations scoped to
+batch-1 WAN edge operations. Scope tokens accordingly — a grant written on the
+assumption that Mist cannot write is wrong.
 
 ---
 
@@ -220,9 +228,10 @@ ssh -N -L 30032:127.0.0.1:30032 <host>
 Public release is blocked on replacing its remaining compatibility shims with
 upstream APIs landing in one coherent `mecmcp` release.
 
-### rustmistmcp — production, read-only tool surface
+### rustmistmcp — lab only, mostly-read tool surface with change-set writes
 
-24 curated read-only tools over a catalog of 1,059 audited Mist operations. No
+46 registered tools over a catalog of 1,059 audited Mist operations, of which
+three are the change-set write path. No
 mutating tools exist yet.
 
 Scoping is three-deep: profile `allowed_orgs`, then the token's tool scope, then

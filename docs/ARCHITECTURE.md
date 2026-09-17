@@ -239,7 +239,7 @@ long time. Per-crate consumption and the full matrix live in
 | Target | Junos / SRX **devices** | **PAN-OS** | Security Director **Cloud** | **Mist** cloud | **Proxmox VE** | **UniFi** Network |
 | Outbound transport | NETCONF/SSH + SCP1 | HTTPS XML-API | HTTPS REST | HTTPS REST | HTTPS REST | HTTPS REST |
 | Credential to upstream | SSH key or password | API key | `x-api-key` / `x-oauth2-token` | `Authorization: Token …` | API token | local admin |
-| Maturity | **production** | **production** | lab tenant | **production** | **production** | **production** |
+| Maturity | **production** | **production** | lab tenant | lab tenant | **production** | **production** |
 | Scope axes | device glob × tool | device × tool | tenant × tool | org/site × operation | cluster × tool | controller × tool |
 | mecmcp crates | 10 | 7 | 6 | 10 | 11 | 10 |
 
@@ -263,8 +263,11 @@ upstream APIs shipped in one coherent release.
 **rustmistmcp** carries an audited catalog of 1,059 Mist operations derived from
 the upstream OpenAPI spec, classified by capability (ordinary read, privileged
 read, create, update, delete, execute). It was a scaffold for a long time and is
-described that way in older notes; it is not one now — it cut its first
-production tag and is deployed.
+described that way in older notes; it is not one now — it cut a production tag
+and has served live read-only traffic. Its packaging is still pre-release
+though, and it does carry a change-set write path
+(`plan_mist_change` / `approve_mist_change_set` / `apply_mist_change_set`), so
+it is neither a scaffold nor production-ready nor read-only.
 
 ### Why the pins differ
 
