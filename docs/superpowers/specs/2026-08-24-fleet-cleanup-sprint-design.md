@@ -1,7 +1,7 @@
 # Fleet cleanup sprint — design
 
 **Opened 2026-08-24.** A two-day sweep to clear the open backlog across
-`mecmcp` and its six consumer repos, verified on the a test rig–a test rig test rigs.
+`mecmcp` and its six consumer repos, verified on all ten test rigs.
 
 ## Goal and definition of done
 
@@ -72,7 +72,7 @@ first task of rustproxmoxmcp#18.
    need `codex exec review --commit <sha>`. Quota exhaustion presents as a
    transient error; if the gate does not produce a verdict it is reported as
    *not run*, never as a pass.
-4. **Test rigs only.** a test rig–a test rig are all running and `disposable`-tagged, a
+4. **Test rigs only.** All ten rigs are running and `disposable`-tagged, a
    matched two-person / lab-mode pair per server. Production (the Junos production guest, the SDC guest, the Mist guest,
    the PAN-OS production guest, the Proxmox guest) is out of scope for this sprint.
 
@@ -171,11 +171,11 @@ Prove each change on the matched pair, lab-mode rig first, then two-person.
 
 | Server | Rigs | What must be exercised |
 |---|---|---|
-| junos | a test rig → a test rig | `transfer_file`, `fetch_file`, `collect_jtac_support_bundle` under the new filter; token fallback read; commit path against vsrx-ci |
-| panos | a test rig → a test rig | stage → validate → commit; SSDF evidence drain; change-set create/approve/apply |
-| sdc | a test rig → a test rig | prepare → approve → apply; packaging smoke with the new pin |
-| proxmox | a test rig → a test rig | bind default, `StateDirectory` mode, evidence file mode now `0600`, change-set plan/approve/apply |
-| mist | a test rig → a test rig | read path, plan/approve/apply, evidence outbox under the denylist |
+| junos | lab-mode rig → two-person rig | `transfer_file`, `fetch_file`, `collect_jtac_support_bundle` under the new filter; token fallback read; commit path against vsrx-ci |
+| panos | lab-mode rig → two-person rig | stage → validate → commit; SSDF evidence drain; change-set create/approve/apply |
+| sdc | lab-mode rig → two-person rig | prepare → approve → apply; packaging smoke with the new pin |
+| proxmox | lab-mode rig → two-person rig | bind default, `StateDirectory` mode, evidence file mode now `0600`, change-set plan/approve/apply |
+| mist | lab-mode rig → two-person rig | read path, plan/approve/apply, evidence outbox under the denylist |
 
 Explicit checks, since these are the claims the sprint is making:
 
@@ -262,7 +262,7 @@ plan was wrong.
 **Completed 2026-08-24.** Open issues across the seven repos went from **48 to
 13**; `rustsdcmcp` and `rustproxmoxmcp` reached zero. Waves 0–4 all landed:
 `mecmcp v0.17.0` tagged, Tier 1 (14 issues) and Tier 2 (21 issues) merged in
-all five servers, rig rehearsal completed on a test rig–a test rig, and trackers #318/#319
+all five servers, rig rehearsal completed on all ten rigs, and trackers #318/#319
 closed (#320 stays open — its spikes were deliberately not attempted).
 
 Of the 13 issues still open, five were **filed during this sprint**, four are

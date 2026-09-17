@@ -1907,7 +1907,7 @@ fn check_permissions(path: &Path) -> Result<(), FileError> {
             path: path.to_path_buf(),
             detail: format!(
                 "mode {mode:04o} is group- or world-accessible (owner uid {}, this process uid {}); \
-                 run: chmod a Junos rehearsal rig {}",
+                 run: chmod 600 {}",
                 metadata.uid(),
                 nix_getuid(),
                 path.display()

@@ -1862,4 +1862,16 @@ fn real_target_concurrency_shed_is_audited() {
         captured.contains("http_status=503"),
         "the shed event must carry 503: {captured}"
     );
+    // The refusal happened *after* authorization succeeded. Recording it as a
+    // denial would be false authorization evidence: `AuditOutcome::Denied` is
+    // defined as authorization refusing the call before work began.
+    assert!(
+        !captured.contains("authorization=denied"),
+        "a post-authorization refusal must not claim authorization denied it: {captured}"
+    );
+    assert!(
+        captured.contains("result=failed")
+            || captured.contains("error_kind=refused_after_preflight"),
+        "the shed must record as a failure, not a denial: {captured}"
+    );
 }
