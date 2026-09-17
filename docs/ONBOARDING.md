@@ -230,9 +230,11 @@ upstream APIs landing in one coherent `mecmcp` release.
 
 ### rustmistmcp — lab only, mostly-read tool surface with change-set writes
 
-46 registered tools over a catalog of 1,059 audited Mist operations, of which
-three are the change-set write path. No
-mutating tools exist yet.
+38 registered tools over a catalog of 1,059 audited Mist operations. Three of
+them are the mutating change-set path — `plan_mist_change`,
+`approve_mist_change_set`, `apply_mist_change_set` — with a fourth,
+`get_mist_change_set`, reading its state. Mutations are scoped to batch-1 WAN
+edge operations.
 
 Scoping is three-deep: profile `allowed_orgs`, then the token's tool scope, then
 a grant naming `allowed_operations`, `actions` (capabilities), and `subjects`
