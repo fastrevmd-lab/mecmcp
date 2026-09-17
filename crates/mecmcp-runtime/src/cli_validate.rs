@@ -297,7 +297,7 @@ mod tests {
             "0.0.0.0",
             "--allow-insecure-bind",
             "--allowed-host",
-            "192.168.1.194",
+            "192.0.2.10",
         ]));
         assert!(
             matches!(r, Err(CliRefusal::AllowedOriginRequired { .. })),

@@ -9,7 +9,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use mecmcp_audit::AuditScope;
+use mecmcp_audit::{Attribution, AuditScope};
 use mecmcp_auth::{BearerSyntax, CallerCtx, Grant, parse_bearer_header};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -758,6 +758,8 @@ pub async fn bearer_preflight_middleware<G: Grant>(
         .as_ref()
         .and_then(|p| p.client_call_id.clone());
 
+    let terminal_call_id = audited_call_id.clone();
+
     let mut scope = audited_tool.map(|tool| {
         let mut scope = AuditScope::from_caller(&caller, tool, "transport", Vec::new());
         // `AuditScope` is constructor-only, so this reaches the audit trail
@@ -792,13 +794,51 @@ pub async fn bearer_preflight_middleware<G: Grant>(
         return forbidden(&state.realm, &reason);
     }
 
+    // Retain just enough to audit a refusal that happens *after* this point.
+    // The scope above is dropped before dispatch on purpose, so without this a
+    // 503 from target concurrency left one event saying preflight allowed the
+    // call and it succeeded — a success the request never had (mecmcp#370).
+    // Built before `caller` moves into the request extensions.
+    // Carries the same client provenance the preflight event resolved, so the
+    // two records for one request correlate instead of the refusal arriving
+    // with empty `client_version` / `client_call_id`.
+    let terminal = audited_tool.map(|tool| {
+        (
+            Attribution::from_caller(&caller),
+            tool,
+            client_extras.client_version.clone(),
+            terminal_call_id,
+        )
+    });
+
     // Re-insert the potentially updated CallerCtx with client_name populated.
     // The parts are mutable here, so we can replace the extension.
     let mut request = Request::from_parts(parts, Body::from(body_bytes));
     request.extensions_mut().insert(caller);
     request.extensions_mut().insert(client_extras);
 
-    next.run(request).await
+    let response = next.run(request).await;
+
+    // Only refusals. A successful call is already described by the preflight
+    // event plus the handler's own, richer one; emitting a third for every
+    // success would double the volume and say nothing new.
+    if let Some((attribution, tool, client_version, call_id)) = terminal {
+        let status = response.status();
+        if status.is_client_error() || status.is_server_error() {
+            let mut scope = AuditScope::new(attribution, tool, "transport", Vec::new());
+            scope.set_client_extras(client_version, call_id);
+            scope.meta("layer", "post_dispatch");
+            scope.meta("http_status", u64::from(status.as_u16()));
+            // `fail_kind`, not `deny`. `AuditOutcome::Denied` is defined as
+            // authorization refusing the call *before work began*; everything
+            // reachable here ran after preflight allowed it, and may have begun
+            // work. Recording it as a denial would be false authorization
+            // evidence — the same class of error this event exists to fix.
+            scope.fail_kind("refused_after_preflight", status);
+        }
+    }
+
+    response
 }
 
 /// Cap on distinct tool names ever interned, and on the length of one.

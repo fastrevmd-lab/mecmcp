@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Extract two-person change control from `rustpanosmcp` into a shared crate so both servers get fingerprint-bound planning, independent approval, and indeterminate recovery. The extraction must preserve `/var/lib/rust-panosmcp/mutation-state.json` on LXC 608 without data loss or schema breakage, and it must fit Junos NETCONF candidate/commit as naturally as it fits PAN-OS XPath set/delete + commit.
+**Goal:** Extract two-person change control from `rustpanosmcp` into a shared crate so both servers get fingerprint-bound planning, independent approval, and indeterminate recovery. The extraction must preserve `/var/lib/rust-panosmcp/mutation-state.json` on the PAN-OS production guest without data loss or schema breakage, and it must fit Junos NETCONF candidate/commit as naturally as it fits PAN-OS XPath set/delete + commit.
 
 **Architecture:** Generalize `rust-panosmcp-core/src/mutation.rs` (2,234 lines) behind a `DeviceTransaction` trait. PAN-OS and Junos each implement the trait over their native protocols. The shared crate manages lifecycle state, two-principal enforcement, approval TTLs, indeterminate recovery, and atomic persistence. Every vendor-specific concern — device vocabulary, metric names, commit comment format, admin scope revert — is a trait method or a constructor parameter, never baked into the crate.
 
@@ -22,7 +22,7 @@ Inherited from [`PLAN.md`](../../../PLAN.md):
 
 ### Phase 5 critical constraints
 
-- **The production state file on LXC 608 must not be corrupted, truncated, or replaced with an empty file.** `/var/lib/rust-panosmcp/mutation-state.json` holds approval evidence and indeterminate recovery state. Any migration ships with a compatible read path that accepts both the old and new schema. Field renames use serde aliases; the old spelling keeps working and stays tested.
+- **The production state file on the PAN-OS production guest must not be corrupted, truncated, or replaced with an empty file.** `/var/lib/rust-panosmcp/mutation-state.json` holds approval evidence and indeterminate recovery state. Any migration ships with a compatible read path that accepts both the old and new schema. Field renames use serde aliases; the old spelling keeps working and stays tested.
 - **Approval evidence is the product.** The approve event captures `change_set_id`, `digest`, `owner`, and `approver` as independent principals. A schema change that loses any of these is wrong. The digest binds `(owner, device, pre-fingerprint, ordered-actions)` — that exact tuple must remain the digest input across any refactor.
 - **Two principals must be genuinely distinct.** The approver-is-owner check (`record.owner == approver`) enforces separation of duties. `Principal` is an enum in `mecmcp-audit` specifically to prevent token-name forgery. The changeset crate must compare principals by that type, never by string, and it must document the requirement that the consumer pass typed principals.
 - **Indeterminate outcomes are recoverable but never silently resolved.** A commit RPC that times out mid-flight leaves unknown remote state. The current code marks it `indeterminate`, persists recovery instructions, and exposes `resolve_persisted_operation(confirmation: "RESOLVED {id} AS COMMITTED|DISCARDED")` for manual reconciliation. This must carry forward unchanged — no automatic resolution, no best-effort inference.
@@ -98,7 +98,7 @@ if on_disk.version != 1 {
 }
 ```
 
-So the wrapper exists, `version: 1` is enforced, and the file on LXC 608 is
+So the wrapper exists, `version: 1` is enforced, and the file on the PAN-OS production guest is
 already in this shape. **There is no bare `{"operations": ...}` format in the
 field and no migration to write.** An earlier draft of this decision proposed
 adding the wrapper via `#[serde(alias = "state")]`; that would have been a
@@ -117,7 +117,7 @@ schema strictly closed in both directions:
 
 Any task in this plan that adds a field to the persisted state must say which
 version it lands in and how a v1 file is read. Rollback matters as much as
-upgrade here: 608 has no standby, so the recovery path is a Proxmox snapshot
+upgrade here: the PAN-OS production guest has no standby, so the recovery path is a Proxmox snapshot
 restore, and a state file the previous binary cannot parse defeats it.
 
 **D7 — `rollback()` is a trait method, not a tool-level concern.** Junos `rollback_config` loads archive N and commits it as a single action. PAN-OS has no archive-based rollback; it reverts candidate changes attributed to an admin. Both are vendor-specific, but both are part of the transaction lifecycle. The trait exposes `async fn rollback(&self, to: RollbackRef) -> Result<Outcome, Self::Error>` where `RollbackRef` is an enum: `RollbackRef::Archive(u32)` for Junos, `RollbackRef::CandidateRevert` for PAN-OS. The shared crate does not call it directly; the consuming server's `rollback_*` tool invokes it.
@@ -221,8 +221,8 @@ Each task ends green and independently reviewable.
 
 - [ ] In `rustpanosmcp`, implement `DeviceTransaction` for `PanosClient`. `Action` is the existing `ChangeSetAction`. `fingerprint()` is the existing `candidate_fingerprint()` function. `stage()` wraps the XPath set/delete loop. `diff()` calls `<show><config><list><change-summary/></list></config></show>`. `validate()` runs `<validate>` and polls the job. `commit()` runs the partial commit and polls the job, returns `Indeterminate` on lock-release failure. `rollback()` runs `<revert><config><partial><admin>...</admin></partial></revert>`.
 - [ ] Replace `rust-panosmcp-core/src/mutation.rs` with thin wrappers over `mecmcp-changeset`. The tool handlers (`create_panos_change_set`, `approve_panos_change_set`, `apply_panos_change_set`, `stage_panos_config`, `diff_panos_candidate`, `validate_panos_candidate`, `commit_panos_candidate`, `discard_panos_candidate`, `get_panos_operation`) become 10-50 line functions calling the coordinator.
-- [x] ~~Migrate the state file on first run: if `mutation-state.json` exists and has no `version` key, wrap it in `{"version": 1, "state": <contents>}` atomically before loading. Log the migration.~~ **Not needed — this step was wrong.** Measured against the tree on 2026-07-27: `rust-panosmcp-core/src/mutation.rs` already writes `OnDiskMutationState { version: 1, state }` and `read_mutation_state` already rejects any other version. The file on LXC 608 is versioned today, so there is no unversioned shape to migrate from, and adding a migration would mean rewriting a live state file to the form it is already in. This is the fourth time this plan has specified work that `main` had already done — verify each step against the tree before implementing it.
-- [ ] Exit: all 62 PAN-OS tests pass, the mutation lifecycle test in `mutation_lifecycle.rs` still validates the approval audit event, and `/var/lib/rust-panosmcp/mutation-state.json` on LXC 608 loads successfully after a restart.
+- [x] ~~Migrate the state file on first run: if `mutation-state.json` exists and has no `version` key, wrap it in `{"version": 1, "state": <contents>}` atomically before loading. Log the migration.~~ **Not needed — this step was wrong.** Measured against the tree on 2026-07-27: `rust-panosmcp-core/src/mutation.rs` already writes `OnDiskMutationState { version: 1, state }` and `read_mutation_state` already rejects any other version. The file on the PAN-OS production guest is versioned today, so there is no unversioned shape to migrate from, and adding a migration would mean rewriting a live state file to the form it is already in. This is the fourth time this plan has specified work that `main` had already done — verify each step against the tree before implementing it.
+- [ ] Exit: all 62 PAN-OS tests pass, the mutation lifecycle test in `mutation_lifecycle.rs` still validates the approval audit event, and `/var/lib/rust-panosmcp/mutation-state.json` on the PAN-OS production guest loads successfully after a restart.
 
 ### Task 11 — Junos implementation
 
@@ -360,9 +360,9 @@ Both fit naturally. The trait does not force either into an awkward adapter.
 - `rustpanosmcp` test suite (62 tests) passes. The `mutation_lifecycle.rs` test still validates the approval audit event contains `change_set_id`, `digest`, `owner`, and `action_count`.
 - `rustjunosmcp` test suite (987 tests) passes. Four new tests cover Junos change-set create/approve/apply/status.
 - Lab verification: create a 2-action change set on vSRX `srx-01` as token "writer", approve it as token "reviewer", apply it, run `show system commit`, verify the commit log names the attribution. Verify `discard_junos_candidate` reverts uncommitted changes and releases the lock.
-- PAN-OS lab verification: `/var/lib/rust-panosmcp/mutation-state.json` on LXC 608 loads successfully after the server restarts with the new crate. An existing approved change set created before the migration remains approved and applyable.
+- PAN-OS lab verification: `/var/lib/rust-panosmcp/mutation-state.json` on the PAN-OS production guest loads successfully after the server restarts with the new crate. An existing approved change set created before the migration remains approved and applyable.
 - `cargo deny check` passes in all three repos.
-- Snapshot LXC 608 before deploying the PAN-OS migration. If the migration fails, roll back to the snapshot. Document the rollback procedure in the phase CHANGELOG.
+- Snapshot the PAN-OS production guest before deploying the PAN-OS migration. If the migration fails, roll back to the snapshot. Document the rollback procedure in the phase CHANGELOG.
 
 ---
 
@@ -370,7 +370,7 @@ Both fit naturally. The trait does not force either into an awkward adapter.
 
 | Risk | Mitigation |
 |---|---|
-| Corrupting `/var/lib/rust-panosmcp/mutation-state.json` on LXC 608 | Snapshot 608 before deploying. The format does not change — the shared crate adopts the existing `{"version": 1, "state": {...}}` layout unchanged (D6). Write a property test asserting any valid v1 file round-trips through read+write byte-identically. Because `deny_unknown_fields` makes the schema closed in both directions, a rollback to the previous binary must also be tested: restore the snapshot and confirm the older build still loads a file the newer build wrote. |
+| Corrupting `/var/lib/rust-panosmcp/mutation-state.json` on the PAN-OS production guest | Snapshot the PAN-OS production guest before deploying. The format does not change — the shared crate adopts the existing `{"version": 1, "state": {...}}` layout unchanged (D6). Write a property test asserting any valid v1 file round-trips through read+write byte-identically. Because `deny_unknown_fields` makes the schema closed in both directions, a rollback to the previous binary must also be tested: restore the snapshot and confirm the older build still loads a file the newer build wrote. |
 | Losing approval evidence in the migration | The `ChangeSetRecord` fields `{id, owner, device, digest, approver, actions}` are load-bearing and must survive the migration byte-for-byte. Write a test loading a v1 state file with an approved change set, assert every field matches after deserialization. |
 | The trait does not fit Junos candidate/commit | Task 11 implements the Junos side and validates the fit. If `DeviceTransaction` needs adjustment (e.g., an additional method for Junos-specific ephemeral configuration), adjust the trait in Task 3 and document the rationale. Do not ship a forced adapter. |
 | Breaking the two-principal check | The crate must compare principals by `mecmcp_audit::Principal`, not by string. Write a test where two tokens with the same name but different `Principal` variants (e.g., `Principal::Token("alice")` vs `Principal::Oidc("alice")`) are treated as distinct. |

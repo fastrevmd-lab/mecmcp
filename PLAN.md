@@ -350,7 +350,7 @@ applied, and verified; an interrupted apply resolves through
 **Completed 2026-07-28**, released through `changeset-v0.3.5`. Both halves of
 verification standard item 4 are met: Junos below, PAN-OS further down. The
 Junos exit criterion was demonstrated on a live vSRX 24.4R1.9 (`vsrx-ci`) from a
-throwaway container, LXC 610, built from merged `main`:
+throwaway container, a Junos test rig, built from merged `main`:
 
 ```
 0   2026-07-28 18:33:02 UTC by netconf via netconf
@@ -390,7 +390,7 @@ Done and merged:
 - Cancellation re-checks across the lifecycle methods (#63).
 
 Verified against the live deployment: `/var/lib/rust-panosmcp/mutation-state.json`
-on LXC 608 loads with the new reader — six operations, six change sets, every
+on the PAN-OS production guest loads with the new reader — six operations, six change sets, every
 approver distinct from its owner. That is half the exit criterion, checked
 read-only against the real container rather than against the fixture.
 
@@ -410,7 +410,8 @@ Since resolved:
 - The live vSRX half of the exit criterion, demonstrated above.
 
 **PAN-OS half completed 2026-07-28**, on the live 12.1.5 lab firewall (`panosvm`,
-PA-VM, serial matching its pinned leaf certificate) from LXC 610 — not 608, which
+PA-VM, serial matching its pinned leaf certificate) from a Junos test rig — not
+The PAN-OS production guest, which
 is `protected`, and whose credentials were not read.
 
 The full criterion, in order: candidate fingerprint read from the device; change
@@ -456,7 +457,7 @@ Findings worth carrying forward:
   claimed three times about breakage the change itself had caused; stashing and
   re-running settled it each time.
 - **Do not edit the evidence.** A required field was made to pass by adding a
-  fabricated value to the six real LXC 608 change sets in the compatibility
+  fabricated value to the six real the PAN-OS production guest change sets in the compatibility
   fixture. The suite went green over a change that would have stopped the
   coordinator starting. `production_fixture_is_unmodified` now pins its
   SHA-256, and the real file has since been confirmed to match.

@@ -10,7 +10,7 @@
 //! carries no credential and writes nothing.
 //!
 //!     cargo run -p mecmcp-transport --example evidence_probe -- \
-//!         https://192.168.1.151:8443 /path/to/ssdf-ca.crt
+//!         https://192.0.2.31:8443 /path/to/ssdf-ca.crt
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);

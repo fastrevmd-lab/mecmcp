@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1010 330" width="1010" height="330" role="img" aria-label="Three consumption clusters: the universal core taken by all six servers, the on-box firewall cluster adding policy and device leases, and the cloud REST cluster adding the outbound HTTP client and pagination">
+  <defs><style>.m { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }</style></defs>
+  <rect x="0" y="0" width="1010" height="330" rx="8" fill="#0B0D12"/>
+  <g transform="translate(15,14)">
+
+    <rect x="20" y="24" width="940" height="66" rx="6" fill="#0C3A37" stroke="#4DD0C8" stroke-width="1.5"/>
+    <text class="m" x="40" y="48" font-size="11" fill="#B7F5F0">universal core — all six servers</text>
+    <text class="m" x="40" y="72" font-size="11.5" fill="#4DD0C8">mecmcp-audit · mecmcp-auth · mecmcp-changeset · mecmcp-runtime · mecmcp-transport</text>
+    <text class="m" x="940" y="48" text-anchor="end" font-size="10" fill="#9AA2AD">identity, evidence, change control, process, boundary</text>
+
+    <line x1="270" y1="90" x2="270" y2="126" stroke="#4A5568" stroke-width="1.2"/>
+    <line x1="710" y1="90" x2="710" y2="126" stroke="#4A5568" stroke-width="1.2"/>
+    <line x1="270" y1="108" x2="710" y2="108" stroke="#4A5568" stroke-width="1.2"/>
+
+    <rect x="20" y="126" width="470" height="98" rx="6" fill="#171A22" stroke="#0D9488"/>
+    <text class="m" x="40" y="150" font-size="11" fill="#B7F5F0">on-box firewall — the server holds the device</text>
+    <text class="m" x="40" y="174" font-size="11.5" fill="#4DD0C8">+ mecmcp-policy · mecmcp-inventory</text>
+    <text class="m" x="40" y="192" font-size="11.5" fill="#4DD0C8">+ mecmcp-device · mecmcp-scp  (junos only)</text>
+    <text class="m" x="40" y="212" font-size="10" fill="#9AA2AD">junos · panos — NETCONF/SSH and XML-API</text>
+
+    <rect x="510" y="126" width="450" height="98" rx="6" fill="#171A22" stroke="#0D9488"/>
+    <text class="m" x="530" y="150" font-size="11" fill="#B7F5F0">cloud / management plane — the server calls an API</text>
+    <text class="m" x="530" y="174" font-size="11.5" fill="#4DD0C8">+ mecmcp-http · mecmcp-server</text>
+    <text class="m" x="530" y="192" font-size="11.5" fill="#4DD0C8">+ mecmcp-openapi · mecmcp-job</text>
+    <text class="m" x="530" y="212" font-size="10" fill="#9AA2AD">mist · proxmox · unifi · sdc — HTTPS REST</text>
+
+    <rect x="20" y="244" width="940" height="46" rx="5" fill="#12151C" stroke="#262B38" stroke-dasharray="4 4"/>
+    <text class="m" x="40" y="263" font-size="10.5" fill="#9AA2AD">junos and panos predate mecmcp-server and do not use it · sdc predates mecmcp-http and still calls reqwest directly</text>
+    <text class="m" x="40" y="280" font-size="10.5" fill="#9AA2AD">unifi is the only consumer with no direct HTTP-client dependency at all — every outbound byte goes through mecmcp-http</text>
+  </g>
+</svg>

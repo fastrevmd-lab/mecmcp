@@ -9,9 +9,17 @@ Cargo.lock
 /.superpowers/
 
 # Never commit real authentication material, even hashed.
+# `tokens.json` and `*.tokens.json` do NOT match a hyphenated name such as
+# `prod-tokens.json`, so `*-tokens.json` is listed separately. Without it the
+# ban had a hole, and the old `!crates/*/tests/fixtures/*-tokens.json` negation
+# was inert: it un-ignored files that were never ignored in the first place.
 tokens.json
 *.tokens.json
-!crates/*/tests/fixtures/*-tokens.json
+*-tokens.json
+# The two committed test fixtures are exempted by exact path, so the exemption
+# cannot widen to a real token file dropped into any crate's fixtures directory.
+!crates/mecmcp-auth/tests/fixtures/junos-tokens.json
+!crates/mecmcp-auth/tests/fixtures/panos-tokens.json
 
 .DS_Store
 tem_todo

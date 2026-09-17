@@ -44,7 +44,7 @@ Host/Origin allowlist rule, and a `load_http_token_store` (`main.rs:161`) whose
 `_ => Ok(None)` arm silently yields no token store when neither
 `--tokens-file` nor `--allow-no-auth` is given.
 
-The exposure is **latent, not live**: LXC 952 and 604 both bind `127.0.0.1:30030`
+The exposure is **latent, not live**: the Mist production guest and the Mist rehearsal guest both bind `127.0.0.1:30030`
 with a tokens file and no drop-in override, verified 2026-08-13. It is worth
 fixing because `rustjunosmcp` already carries exactly the kind of drop-in
 override (`0.0.0.0:30031`) that would trip it.
@@ -214,16 +214,16 @@ release.
 
   | LXC | Service | Bind | `allowed-host` | `allowed-origin` | Under 0.9.0 |
   |---|---|---|---|---|---|
-  | **950** | rust-junosmcp | `0.0.0.0` | yes | **no** | **refused to start** |
-  | 960 | rust-panosmcp | `0.0.0.0` | yes | yes | starts |
-  | 601 | rust-panosmcp | `0.0.0.0` | yes | yes | starts |
-  | 952 | rustmistmcp | `127.0.0.1` | — | — | exempt (loopback) |
-  | 604 | rustmistmcp | `127.0.0.1` | — | — | exempt (loopback) |
-  | 600 | rust-junosmcp | `127.0.0.1` | — | — | exempt (loopback) |
-  | 606 | rustsdcmcp | `127.0.0.1` | — | — | exempt (loopback) |
+  | **the Junos production guest** | rust-junosmcp | `0.0.0.0` | yes | **no** | **refused to start** |
+  | the PAN-OS production guest | rust-panosmcp | `0.0.0.0` | yes | yes | starts |
+  | a PAN-OS rehearsal rig | rust-panosmcp | `0.0.0.0` | yes | yes | starts |
+  | Mist (production) | rustmistmcp | `127.0.0.1` | — | — | exempt (loopback) |
+  | Mist (rehearsal) | rustmistmcp | `127.0.0.1` | — | — | exempt (loopback) |
+  | a Junos rehearsal rig | rust-junosmcp | `127.0.0.1` | — | — | exempt (loopback) |
+  | the SDC guest | rustsdcmcp | `127.0.0.1` | — | — | exempt (loopback) |
 
-  **Pre-upgrade step:** add `--allowed-origin` to LXC 950's drop-in override
-  before the 0.9.0 binary is installed. 950 is tagged `protected`; snapshot
+  **Pre-upgrade step:** add `--allowed-origin` to the Junos production guest's drop-in override
+  before the 0.9.0 binary is installed. The Junos production guest is tagged `protected`; snapshot
   first, per the standing rollback rule for that host. No other deployed host is
   affected.
 - **`rustmistmcp`'s latent gap closes without touching that repository.** It

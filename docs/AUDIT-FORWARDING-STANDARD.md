@@ -130,7 +130,7 @@ terminal.
 `--audit-journald` and `--audit-log-file` are additive, not alternatives. A
 server that needs the standalone JSONL — `mecmcp-verify` and the bench read it
 directly — runs **both**, so the same events get FSS coverage without taking the
-file away. That is the resolution of the "609 sink question": no server has to
+file away. That is the resolution of the "per-guest sink question": no server has to
 choose.
 
 ### Redaction

@@ -31,7 +31,7 @@ job is holding credentials for firewalls should not sit next to `sh`, `curl`, an
 `apt` — after an RCE those are the pivot. `debian:12-slim` ships all three.
 
 **`cc` rather than `static`/`scratch`.** These binaries link `ring`/`rustls`, and
-the Junos server also links `russh`. A fully static musl build would allow
+The Junos server also links `russh`. A fully static musl build would allow
 `distroless/static` or even `scratch`, which is strictly better, but musl's
 allocator and DNS resolution differ enough that it must be measured per repo
 before being mandated. See §5.
@@ -473,12 +473,12 @@ an operator setting up before credentials are provisioned.
 **`mecmcp` 0.9.0 requires `--allowed-origin` off-loopback, which is a behavior
 change.** An empty Origin allowlist is currently valid and disables Origin
 checking by design. Fleet survey on 2026-08-13 found exactly one affected
-deployment: **LXC 950 (`rust-junosmcp`) binds `0.0.0.0` with `--allowed-host` and
+deployment: **The Junos production guest (`rust-junosmcp`) binds `0.0.0.0` with `--allowed-host` and
 no `--allowed-origin`, and will be refused at startup on 0.9.0.** Add
 `--allowed-origin` to its drop-in override *before* installing the 0.9.0 binary.
-950 is tagged `protected`: snapshot it first. LXC 960 and 601 (`rust-panosmcp`)
-already pass an Origin allowlist and are unaffected; 952, 604, 600, and 606 bind
-`127.0.0.1` and are exempt.
+It is tagged `protected`: snapshot it first. The PAN-OS guests (`rust-panosmcp`)
+already pass an Origin allowlist and are unaffected; the Mist, SDC and rehearsal
+guests bind `127.0.0.1` and are exempt.
 
 ---
 

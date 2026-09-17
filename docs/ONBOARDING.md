@@ -21,11 +21,20 @@ wrong.
 | Juniper SRX / Junos devices, directly | **rustjunosmcp** | Production |
 | Palo Alto firewalls | **rustpanosmcp** | Production |
 | Security Director Cloud (SASE portal) | **rustsdcmcp** | **Lab only** |
-| Juniper Mist cloud | **rustmistmcp** | **Scaffold** — no live integration yet |
+| Juniper Mist cloud | **rustmistmcp** | **Lab only** — packaging pre-release |
 
 Only the first two should be pointed at production gear. `rustsdcmcp` is fine
-against a lab tenant. `rustmistmcp` is worth reading, not deploying — its
-mutating tools do not exist yet and its live client is not accepted.
+against a lab tenant. `rustmistmcp` has cut a production tag and served live
+read-only tenant traffic, so it is no longer the scaffold older notes describe —
+but its packaging is explicitly **pre-release**: the TLS, Host/Origin and
+bad-bearer rows of its own `PACKAGING_ACCEPTANCE.md` are unproven, and the one
+lab run used no TLS and no off-loopback bind. Keep it on a lab tenant until
+those pass.
+
+**It is not read-only.** It registers `plan_mist_change`,
+`approve_mist_change_set` and `apply_mist_change_set`, with mutations scoped to
+batch-1 WAN edge operations. Scope tokens accordingly — a grant written on the
+assumption that Mist cannot write is wrong.
 
 ---
 
@@ -219,10 +228,13 @@ ssh -N -L 30032:127.0.0.1:30032 <host>
 Public release is blocked on replacing its remaining compatibility shims with
 upstream APIs landing in one coherent `mecmcp` release.
 
-### rustmistmcp — 0.1.0, scaffold
+### rustmistmcp — lab only, mostly-read tool surface with change-set writes
 
-24 curated read-only tools over a catalog of 1,059 audited Mist operations. No
-mutating tools exist yet.
+38 registered tools over a catalog of 1,059 audited Mist operations. Three of
+them are the mutating change-set path — `plan_mist_change`,
+`approve_mist_change_set`, `apply_mist_change_set` — with a fourth,
+`get_mist_change_set`, reading its state. Mutations are scoped to batch-1 WAN
+edge operations.
 
 Scoping is three-deep: profile `allowed_orgs`, then the token's tool scope, then
 a grant naming `allowed_operations`, `actions` (capabilities), and `subjects`

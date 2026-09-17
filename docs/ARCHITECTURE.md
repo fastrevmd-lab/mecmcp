@@ -2,9 +2,12 @@
 
 How `mecmcp` is put together and how a vendor server sits on top of it.
 
-`mecmcp` is a **library workspace, not a server.** It ships no binary and opens
-no socket. Everything in it is consumed by the per-vendor MCP servers, which are
-the things that actually run.
+`mecmcp` is a **library workspace, not a server.** It serves no MCP endpoint and
+opens no socket. The one exception to "library" is `mecmcp-audit`, which ships
+two operator binaries — `mecmcp-verify` and `mecmcp-audit-keygen` — and neither
+listens on anything; both only read and write local files. Everything else here
+is consumed by the per-vendor MCP servers, which are the things that actually
+run.
 
 The organising rule: *everything that is not NETCONF or a vendor's XML/REST API
 lives here once.* Authentication, attribution, audit, transport hardening,
@@ -55,20 +58,50 @@ a consumer pins one tag and gets a coherent set.
 
 ### Dependency shape
 
-```
-mecmcp-secret ─┬─> mecmcp-auth ─┬─> mecmcp-audit ──> mecmcp-transport ──> mecmcp-server
-               │                └────────────────────────────────────────>┘
-               ├─> mecmcp-inventory
-               ├─> mecmcp-http
-               ├─> mecmcp-scp
-               └─> mecmcp-changeset (also depends on mecmcp-audit)
+Throughout this section `──>` and `->` read **depends on**. (An earlier revision
+of this diagram used the arrows the other way round, which is part of how the
+errors below went unnoticed.)
 
-mecmcp-device ──> mecmcp-job
-mecmcp-policy, mecmcp-openapi, mecmcp-runtime  — near-standalone
+Three crates form a spine:
+
+```
+mecmcp-audit ──> mecmcp-auth ──> mecmcp-secret
 ```
 
-`mecmcp-secret` is the floor and `mecmcp-server` is the ceiling. Nothing in the
-tree knows a vendor's names, paths, headers, or status codes.
+Seven crates depend on some subset of that spine, and on nothing else in the
+workspace:
+
+```
+mecmcp-transport  -> audit, auth
+mecmcp-server     -> audit, auth            a sibling of transport, not a layer on it
+mecmcp-changeset  -> audit, secret
+mecmcp-runtime    -> audit, auth, secret
+mecmcp-http       -> secret
+mecmcp-inventory  -> secret
+mecmcp-scp        -> secret
+```
+
+Separately, touching none of the above:
+
+```
+mecmcp-job ──> mecmcp-device
+mecmcp-openapi, mecmcp-policy  — no workspace dependencies at all
+```
+
+Fifteen edges, three levels deep. **`mecmcp-server` does not depend on
+`mecmcp-transport`** — an earlier revision of this diagram drew that edge, and it
+has never existed. The two are sibling consumers of the same two foundation
+crates, which is why a consumer can take either without the other: rustjunosmcp
+and rustpanosmcp both link transport and not server.
+
+`mecmcp-secret` is the floor: **six crates depend on it directly**, and nine of
+the fourteen have some path to it — the other three arrive through the spine.
+There is no single ceiling:
+nothing in the workspace depends on `transport`, `server`, `changeset` or
+`runtime`, so those are linked by consumers rather than by each other. Four
+crates depend on nothing else here at all — `secret`, `device`, `openapi` and
+`policy`. Nothing in the tree knows a vendor's names, paths, headers, or status
+codes.
 
 ---
 
@@ -79,9 +112,23 @@ This is the architecture. Everything else is support for it.
 A `tools/call` arriving over streamable HTTP passes through, in this order:
 
 ```
-TLS ─> Host/Origin ─> IP rate limit ─> auth ─> token rate ─> token concurrency
-    ─> body limit ─> preflight ─> target concurrency ─> transport audit ─> handler
+TLS ─> IP rate limit ─> Host/Origin ─> auth ─> token rate ─> token concurrency
+    ─> body limit ─> preflight ─> transport audit ─> target concurrency ─> handler
 ```
+
+Two positions in that chain are easy to get backwards, and an earlier revision
+of this file had both wrong. **The IP rate limit is outside Host/Origin**, not
+inside it: `apply_ip_rate_limit` is attached *last* in
+`build_streamable_http_router` so that it also covers `/metrics`, and in axum the
+last layer applied is the first to run. **The transport audit precedes target
+concurrency**, because `bearer_preflight_middleware` drops its `AuditScope`
+before calling `next.run`, so it cannot carry the outcome of anything inside it.
+That used to mean a request shed by target concurrency was recorded as a call
+preflight *allowed* with `result=ok`, and nothing recorded the refusal —
+[#370](https://github.com/fastrevmd-lab/mecmcp/issues/370). The boundary now
+emits a second terminal event whenever the response is a 4xx or 5xx
+(`refused_after_preflight`, `layer=post_dispatch`, plus the status), leaving the
+preflight event and its `duration_ms` untouched.
 
 The inner segment is not assembled by hand in each consumer. `apply_bearer_boundary`
 in `crates/mecmcp-transport/src/auth.rs` installs it and **enforces the order**:
@@ -106,10 +153,22 @@ Each position is load-bearing, and the rationale is recorded next to the functio
 
 `ToolScopePreflight` (`crates/mecmcp-transport/src/preflight.rs`) parses the
 JSON-RPC body, extracts the tool name and the configured target fields, and
-denies with 403 before dispatch. It is generic over the argument shape because
-the four consumers differ only in field naming — Junos uses `router`/`routers`,
-PAN-OS `device`, SDC `tenant`, Mist an org/site subject. Each configures
-`TargetField`s rather than writing its own preflight.
+denies with 403 before dispatch. It is generic over the argument shape, and
+handles both `TargetValueShape::Scalar` and `TargetValueShape::NonEmptyArray`.
+A consumer whose target is matched *directly* against the caller's scope
+declares `TargetField`s and writes no preflight of its own: PAN-OS `device`,
+SDC `tenant`, Proxmox `cluster`, UniFi `controller`.
+
+**Two consumers do implement `ScopePreflight` themselves**, and an earlier
+revision of this file wrongly named both as `TargetField` users. Junos nests its
+device selector; Mist must canonicalise `org_id` into `org/<uuid>` before it can
+be compared against a scope subject.
+
+The deciding criterion is **what `TargetField` can express, not the shape of the
+value**. Arrays are expressible (`NonEmptyArray`), and Mist's target is a plain
+scalar string that still needs a custom preflight. Write one when the matching
+needs nesting, normalisation, or any semantics beyond direct comparison —
+not merely because the value is or is not a scalar.
 
 ### Audit by construction
 
@@ -171,18 +230,22 @@ its return type.
 
 ## 3. The consumers
 
-Four servers sit on this foundation. They are at very different maturity, and
-that difference matters more than the feature tables.
+**Six** servers sit on this foundation, not the four this section listed for a
+long time. Per-crate consumption and the full matrix live in
+[`CRATE-MAP.md`](CRATE-MAP.md); this table is the shape and maturity.
 
-| | rustjunosmcp | rustpanosmcp | rustsdcmcp | rustmistmcp |
-|---|---|---|---|---|
-| Target | Juniper Junos / SRX **devices** | Palo Alto **PAN-OS** | Security Director **Cloud** | Juniper **Mist** cloud |
-| Outbound transport | NETCONF over SSH + SCP1 | HTTPS XML-API | HTTPS REST | HTTPS REST |
-| Credential to upstream | SSH key or password | API key | `x-api-key` or `x-oauth2-token` | `Authorization: Token …` |
-| Version | 0.17.0 | 0.8.0 | 0.1.0 | 0.1.0 |
-| Maturity | **production** | **production** | lab only | scaffold |
-| Scope axes | device glob × tool | device × tool | tenant × tool | org/site UUID × operation × capability |
-| mecmcp pin | `v0.7.3` | `v0.7.3` | `v0.8.0` | git rev (0.7.x) |
+| | junos | panos | sdc | mist | proxmox | unifi |
+|---|---|---|---|---|---|---|
+| Target | Junos / SRX **devices** | **PAN-OS** | Security Director **Cloud** | **Mist** cloud | **Proxmox VE** | **UniFi** Network |
+| Outbound transport | NETCONF/SSH + SCP1 | HTTPS XML-API | HTTPS REST | HTTPS REST | HTTPS REST | HTTPS REST |
+| Credential to upstream | SSH key or password | API key | `x-api-key` / `x-oauth2-token` | `Authorization: Token …` | API token | local admin |
+| Maturity | **production** | **production** | lab tenant | lab tenant | **production** | **production** |
+| Scope axes | device glob × tool | device × tool | tenant × tool | org/site × operation | cluster × tool | controller × tool |
+| mecmcp crates | 10 | 7 | 6 | 10 | 11 | 10 |
+
+Versions move every release wave, so they are deliberately not pinned here —
+`CRATE-MAP.md` carries the current set, and each repo's own README is
+authoritative at its version.
 
 **rustjunosmcp** is the runtime-hardening reference — session pooling, device
 leases, rate limits, audit redaction. Repo layout is flat: `rust-junosmcp`
@@ -199,8 +262,12 @@ upstream APIs shipped in one coherent release.
 
 **rustmistmcp** carries an audited catalog of 1,059 Mist operations derived from
 the upstream OpenAPI spec, classified by capability (ordinary read, privileged
-read, create, update, delete, execute). Mutating tools are deliberately absent
-until the change-set work lands. Treat it as a scaffold.
+read, create, update, delete, execute). It was a scaffold for a long time and is
+described that way in older notes; it is not one now — it cut a production tag
+and has served live read-only traffic. Its packaging is still pre-release
+though, and it does carry a change-set write path
+(`plan_mist_change` / `approve_mist_change_set` / `apply_mist_change_set`), so
+it is neither a scaffold nor production-ready nor read-only.
 
 ### Why the pins differ
 

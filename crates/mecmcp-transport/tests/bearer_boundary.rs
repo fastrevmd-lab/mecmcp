@@ -1732,3 +1732,146 @@ fn stateless_request_without_session_header_has_empty_provenance() {
         "session_id must be empty without session header: {captured}"
     );
 }
+
+/// A refusal produced *after* preflight must reach the audit trail (mecmcp#370).
+///
+/// The transport audit event is emitted before dispatch, deliberately, so its
+/// `duration_ms` measures preflight rather than the whole request. The cost is
+/// that anything refusing downstream — target concurrency returning 503 is the
+/// real case — produced no record of its own, so the only event said preflight
+/// *allowed* the call and it *succeeded*. The trail asserted a success that did
+/// not happen, which is worse than a gap.
+///
+/// Fails before the fix: the capture contains the allowed preflight event and
+/// nothing carrying the 503.
+#[test]
+fn refusal_after_preflight_is_audited() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    // Stand in for target concurrency shedding load: the inner service refuses
+    // with the same status `overload_response` returns.
+    let router = Router::new().route(
+        "/",
+        post(|| async { (StatusCode::SERVICE_UNAVAILABLE, "shed") }),
+    );
+    let app = apply_bearer_boundary(
+        router,
+        boundary(BearerResponseProfile::detailed("mecmcp")),
+        BoundaryAccounting {
+            session_tracker: None,
+            concurrency: None,
+            limits: Arc::new(LimitsConfig {
+                max_request_body_bytes: 4096,
+                ..Default::default()
+            }),
+        },
+    );
+
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        runtime.block_on(async {
+            let response = app.oneshot(tools_call(None)).await.expect("response");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        });
+    });
+
+    assert!(
+        captured.contains("refused_after_preflight"),
+        "a downstream refusal must emit its own audit event: {captured}"
+    );
+    assert!(
+        captured.contains("http_status=503"),
+        "the refusal event must carry the status actually returned: {captured}"
+    );
+}
+
+/// The same guarantee, against the real `target_concurrency_middleware`
+/// rather than a stand-in handler (mecmcp#370).
+///
+/// The stand-in test above proves the boundary audits *a* downstream refusal.
+/// This one proves the refusal that actually happens in production does reach
+/// the trail: a second in-flight call to the same target is shed with 503 by
+/// the concurrency layer, which emits no audit event of its own.
+#[test]
+fn real_target_concurrency_shed_is_audited() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    // First request parks in the handler holding the per-target permit; the
+    // second then has nowhere to go.
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (e, r) = (entered.clone(), release.clone());
+    let router = Router::new().route(
+        "/",
+        post(move || {
+            let (e, r) = (e.clone(), r.clone());
+            async move {
+                e.notify_one();
+                r.notified().await;
+                "ok"
+            }
+        }),
+    );
+
+    let cfg = LimitsConfig {
+        max_request_body_bytes: 4096,
+        max_inflight_requests_per_device: 1,
+        ..Default::default()
+    };
+    let app = apply_bearer_boundary(
+        router,
+        boundary(BearerResponseProfile::detailed("mecmcp")),
+        BoundaryAccounting {
+            session_tracker: None,
+            concurrency: Some(ConcurrencyState::new(&cfg, vec!["device".to_owned()], None)),
+            limits: Arc::new(cfg),
+        },
+    );
+
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        runtime.block_on(async {
+            let held = tokio::spawn({
+                let app = app.clone();
+                async move { app.oneshot(tools_call(None)).await.expect("first") }
+            });
+            entered.notified().await;
+
+            let shed = app.clone().oneshot(tools_call(None)).await.expect("second");
+            assert_eq!(
+                shed.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "second concurrent call to the same target must be shed"
+            );
+
+            release.notify_one();
+            let _ = held.await;
+        });
+    });
+
+    assert!(
+        captured.contains("refused_after_preflight"),
+        "the real target-concurrency shed must be audited: {captured}"
+    );
+    assert!(
+        captured.contains("http_status=503"),
+        "the shed event must carry 503: {captured}"
+    );
+    // The refusal happened *after* authorization succeeded. Recording it as a
+    // denial would be false authorization evidence: `AuditOutcome::Denied` is
+    // defined as authorization refusing the call before work began.
+    assert!(
+        !captured.contains("authorization=denied"),
+        "a post-authorization refusal must not claim authorization denied it: {captured}"
+    );
+    assert!(
+        captured.contains("result=failed")
+            || captured.contains("error_kind=refused_after_preflight"),
+        "the shed must record as a failure, not a denial: {captured}"
+    );
+}

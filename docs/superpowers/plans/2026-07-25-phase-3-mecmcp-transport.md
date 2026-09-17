@@ -39,10 +39,10 @@ implementer sees only their task:
   calls that belong to `mecmcp-runtime`. See the handoff at the end.
 - **No breaking change to on-disk `tokens.json` or `devices.json`.**
 - **No breaking change to the MCP tool surface** of either server.
-- **The deployed systemd override on LXC 609 must keep working unchanged:**
+- **The deployed systemd override on the Junos production guest must keep working unchanged:**
   `0.0.0.0:30031`, `--allow-insecure-bind`, `--allowed-host <lan-ip>`, no
   `--inventory-readonly`.
-- **LXC 608 terminates TLS itself** with `--tls-cert`/`--tls-key`, and its unit
+- **the PAN-OS production guest terminates TLS itself** with `--tls-cert`/`--tls-key`, and its unit
   file carries those paths directly rather than in a drop-in. Nothing in this
   phase may change TLS behaviour or the CLI flags that configure it.
 - **Licence:** MIT. **Naming:** `mecmcp-` crate prefix.
@@ -121,7 +121,7 @@ pulled `aws-lc-rs` into this workspace once already and broke TLS.
 | `"router_concurrency"` limit kind (`overload.rs:32`) | `"target_concurrency"`, with the old string kept as a documented alias so existing alert rules keep firing |
 
 **D6 — `max_inflight_requests_per_router` keeps its name in `LimitsConfig`.**
-Renaming it to `_per_device` would break the deployed config on 609. It gets a
+Renaming it to `_per_device` would break the deployed Junos config. It gets a
 serde alias for the new spelling and documentation saying it means "per target
 device"; the rename is not worth an outage.
 
