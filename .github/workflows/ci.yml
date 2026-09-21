@@ -56,7 +56,7 @@ jobs:
     # mecmcp-auth is a library consumed by two binaries, so an accidental MSRV
     # bump breaks them rather than this repo. That makes it exactly the wrong
     # thing to discover downstream.
-    name: Minimum supported Rust 1.89
+    name: Minimum supported Rust
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
