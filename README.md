@@ -474,7 +474,7 @@ Consumer-visible changes:
 | `Mcp-Method` / `Mcp-Name` header validation | Now enforced **by the SDK** for clients declaring `>= 2026-07-28`. No middleware needed |
 | **`StreamableHttpServerConfig::max_request_body_bytes` is new, and defaults to 4 MiB** | **Stop calling `StreamableHttpServerConfig::default()`. Call `mecmcp_transport::streamable_http_server_config(&limits)` instead.** |
 
-Everything else is source-compatible. MSRV stays 1.88 and the edition stays 2024,
+Everything else is source-compatible. MSRV stays 1.89 and the edition stays 2024,
 both of which this workspace already required.
 
 **The body limit is the one that bites silently.** rmcp 3 enforces its own 4 MiB
