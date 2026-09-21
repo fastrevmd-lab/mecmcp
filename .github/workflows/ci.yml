@@ -56,7 +56,7 @@ jobs:
     # mecmcp-auth is a library consumed by two binaries, so an accidental MSRV
     # bump breaks them rather than this repo. That makes it exactly the wrong
     # thing to discover downstream.
-    name: Minimum supported Rust 1.88
+    name: Minimum supported Rust
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -64,27 +64,22 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # rust-toolchain.toml pins the working toolchain; the MSRV floor declared
-      # in Cargo.toml is deliberately lower. Remove the pin so the 1.88
+      # in Cargo.toml is deliberately lower. Remove the pin so the 1.89
       # toolchain below is what actually runs.
       - name: Drop the toolchain pin
         run: rm -f rust-toolchain.toml
 
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@1.89.0
 
       # `Cargo.lock` is gitignored here, so this job resolves fresh on every run
       # and takes whatever the registry currently offers. That is what makes it
       # useful -- it catches a dependency raising its floor -- and also what
       # lets an unrelated release turn every open PR red with no commit behind
-      # it. `aes` 0.9.3 declared `rust-version = 1.89`, reached through
-      # russh -> ssh-key -> aes-gcm -> aes, which made our 1.88 unsatisfiable.
-      #
-      # Pinning the last 1.88-compatible release keeps this job measuring *our*
-      # MSRV rather than the registry's. When a pin here is no longer needed,
-      # drop it; when a new one is needed, the failure names the crate and the
-      # version it wants, which is the whole diagnosis.
-      - name: Pin dependencies that dropped 1.88 support
-        run: cargo update -p aes --precise 0.9.2
+      # it. If a future dependency raises its floor above ours, pin it here
+      # with `cargo update -p <crate> --precise <version>` rather than silently
+      # raising the floor, because the floor is a promise the consumer repos
+      # depend on.
 
       - name: Check workspace at MSRV
         run: cargo check --workspace --all-targets
