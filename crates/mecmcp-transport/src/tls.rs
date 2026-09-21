@@ -145,7 +145,7 @@ mod tests {
         let cert = directory.path().join("cert.pem");
         let key = directory.path().join("key.pem");
         fs::write(&cert, issued.cert.pem()).expect("cert");
-        fs::write(&key, issued.key_pair.serialize_pem()).expect("key");
+        fs::write(&key, issued.signing_key.serialize_pem()).expect("key");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -211,7 +211,7 @@ mod tests {
         let cert = directory.path().join("cert.pem");
         let key = directory.path().join("key.pem");
         fs::write(&cert, issued.cert.pem()).expect("cert");
-        fs::write(&key, issued.key_pair.serialize_pem()).expect("key");
+        fs::write(&key, issued.signing_key.serialize_pem()).expect("key");
         fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("mode");
 
         let provider = Arc::new(rustls::crypto::ring::default_provider());

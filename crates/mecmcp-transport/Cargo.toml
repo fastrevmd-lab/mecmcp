@@ -64,7 +64,7 @@ async-trait = { workspace = true }
 # conflicts with a consumer that pins `ring`. That broke TLS in a downstream
 # server. Keep it here, and keep default-features off.
 metrics-exporter-prometheus = { workspace = true }
-rcgen       = "0.13"
+rcgen       = "0.14"
 # ring is dev-only for tests. The main crate uses the process-global provider
 # that the consuming application installs. Both current consumers use ring.
 rustls      = { version = "0.23", default-features = false, features = ["ring"] }
