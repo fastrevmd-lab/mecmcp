@@ -6529,70 +6529,80 @@ mod e2e_tests {
     }
 
     /// Server presenting an SSH certificate is rejected
-    ///
-    /// This test documents why certificate rejection cannot be tested in a unit test
-    /// and explicitly states the uncovered line.
     #[tokio::test]
     async fn ssh_certificate_rejected() {
-        // This test exists as documentation only - see the comment below explaining
-        // why certificate construction is not feasible in a unit test.
+        use russh::client::Handler;
+        use russh::keys::{Algorithm, PrivateKey, ssh_key};
+        use ssh_key::certificate::{Builder, CertType};
 
-        // Try to construct a minimal Certificate. OpenSSH certificates are complex structures
-        // that include:
-        // - A public key
-        // - A CA signature
-        // - Principals (user/host names the cert is valid for)
-        // - Validity period
-        // - Critical options and extensions
-        //
-        // The ssh_key::Certificate type can be parsed from OpenSSH wire format, but
-        // constructing one from scratch requires:
-        // 1. A CA key to sign with
-        // 2. Proper encoding of all certificate fields
-        // 3. Computing the signature over the certificate body
-        //
-        // This is disproportionate for a unit test. The certificate rejection path
-        // at line ~431 (the Certificate arm in check_server_key) remains uncovered
-        // by automated tests.
-        //
-        // Verification strategy: The rejection logic is fail-closed and consistent
-        // with the @cert-authority rejection in check_known_hosts_markers (line 237-246).
-        // Both reject certificates with the same rationale: this client does not
-        // support certificate authentication. The @cert-authority path IS tested
-        // (see the known_hosts marker tests).
-        //
-        // To verify the certificate rejection manually:
-        // 1. Set up an SSH server with certificate-based host auth
-        // 2. Connect with this client
-        // 3. Confirm it rejects with "certificate authentication is not supported"
-        //
-        // Note: attempting to construct a Certificate here would require either:
-        // - Embedding a pre-generated OpenSSH certificate fixture and parsing it, or
-        // - Implementing the full OpenSSH certificate signing protocol
-        //
-        // Neither is proportionate for this test. The line remains uncovered.
+        // Generate CA signing key and host private key
+        #[allow(clippy::unwrap_used)]
+        let ca_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+            .expect("failed to generate CA key");
+        #[allow(clippy::unwrap_used)]
+        let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+            .expect("failed to generate host key");
 
-        // If we could construct a Certificate, the test would look like this:
-        // let cert = Certificate::...; // construction not feasible in unit test
-        // let key_or_cert = PublicKeyOrCertificate::Certificate(cert);
-        //
-        // let error_slot = Arc::new(Mutex::new(None));
-        // let mut handler = SshHandler {
-        //     host_key_verification: HostKeyVerification::AcceptAll,
-        //     host: "example.com".to_string(),
-        //     port: 22,
-        //     error_slot,
-        // };
-        //
-        // let result = handler.check_server_key(&key_or_cert).await;
-        // assert!(result.is_err(), "Certificate should be rejected");
-        //
-        // let error = handler.error_slot.lock().unwrap().take().expect("error should be set");
-        // match error {
-        //     ScpError::HostKeyVerification(msg) => {
-        //         assert!(msg.contains("certificate authentication is not supported"));
-        //     }
-        //     other => panic!("expected HostKeyVerification error, got: {:?}", other),
-        // }
+        // Build an OpenSSH host certificate signed by the CA
+        #[allow(clippy::unwrap_used)]
+        let mut builder = Builder::new_with_random_nonce(
+            &mut rand::rng(),
+            host_key.public_key().clone(),
+            0,        // valid_after: epoch
+            u64::MAX, // valid_before: far future
+        )
+        .expect("failed to create certificate builder");
+
+        #[allow(clippy::unwrap_used)]
+        builder.serial(42).expect("failed to set serial");
+        #[allow(clippy::unwrap_used)]
+        builder.key_id("test-host").expect("failed to set key_id");
+        #[allow(clippy::unwrap_used)]
+        builder
+            .cert_type(CertType::Host)
+            .expect("failed to set cert_type");
+        #[allow(clippy::unwrap_used)]
+        builder
+            .valid_principal("example.com")
+            .expect("failed to set principal");
+
+        #[allow(clippy::unwrap_used)]
+        let cert = builder.sign(&ca_key).expect("failed to sign certificate");
+
+        let key_or_cert = russh::keys::PublicKeyOrCertificate::Certificate(cert);
+
+        // Create an SshHandler with AcceptAll verification (most permissive mode).
+        // This proves that certificates are rejected even when plain keys would be
+        // blanket-accepted.
+        let error_slot = HostKeyErrorSlot::default();
+        let mut handler = SshHandler {
+            host_key_verification: HostKeyVerification::AcceptAll,
+            host: "example.com".to_string(),
+            port: 22,
+            error_slot: error_slot.clone(),
+        };
+
+        // check_server_key should reject the certificate
+        let result = handler.check_server_key(&key_or_cert).await;
+        assert!(
+            result.is_err(),
+            "check_server_key should reject SSH certificates"
+        );
+
+        // Verify the error slot contains a HostKeyVerification error mentioning
+        // that certificate authentication is not supported
+        let error = error_slot
+            .take()
+            .expect("error_slot should contain an error after certificate rejection");
+        match error {
+            ScpError::HostKeyVerification(msg) => {
+                assert!(
+                    msg.contains("certificate authentication is not supported"),
+                    "error message should explain certificate auth is unsupported, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ScpError::HostKeyVerification, got: {:?}", other),
+        }
     }
 }
