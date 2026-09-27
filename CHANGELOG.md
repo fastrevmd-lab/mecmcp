@@ -36,9 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/healthz` reports the process is up with no dependency check. `/readyz`
   runs the consumer-supplied `ReadinessCheck`s registered with
   `HttpTransportConfig::with_readiness_check` — 200 when all pass (including
-  when none are configured), 503 listing the failed check names otherwise.
-  `mecmcp-transport` ships no checks of its own; each consuming server wires
-  in audit-sink-writable and inventory-loaded checks as a follow-up.
+  when none are configured), 503 listing the failed check names otherwise. A
+  probe's failure reason is `&'static str`, not `String`: since `/readyz` is
+  unauthenticated, the type keeps a probe from formatting a runtime value
+  (a path, an I/O error) into the response body — log that detail
+  server-side instead. `mecmcp-transport` ships no checks of its own; each
+  consuming server wires in audit-sink-writable and inventory-loaded checks
+  as a follow-up.
 
 ### Changed
 
@@ -46,11 +50,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Behaviour change:** a peer that is not `127.0.0.1`/`::1` now gets a 403
   from `/metrics`, regardless of any MCP bearer token it presents — where
   previously any peer that passed the Host/Origin allowlist and IP rate limit
-  could reach it. Call the new `HttpTransportConfig::with_metrics_token`
-  to also admit a non-loopback peer presenting a dedicated metrics bearer
-  token (checked independently of the MCP token store, so an MCP token still
-  never grants `/metrics`). See `docs/METRICS.md` for the Prometheus scrape
-  config migration.
+  could reach it. A loopback peer that also carries a request-forwarding
+  header (`Forwarded`, `X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP`) is
+  treated as non-loopback, since a same-host reverse proxy — the deployment
+  shape this project documents for its own servers — otherwise makes every
+  forwarded caller look loopback at the TCP layer. Loopback detection also
+  now canonicalizes the peer address first, so an IPv4-mapped IPv6 address
+  (`::ffff:127.0.0.1`, seen on a dual-stack listener) is recognized as
+  loopback rather than refused. Call the new
+  `HttpTransportConfig::with_metrics_token` to also admit a non-loopback peer
+  presenting a dedicated metrics bearer token (checked independently of the
+  MCP token store, so an MCP token still never grants `/metrics`). See
+  `docs/METRICS.md` for the Prometheus scrape config migration, including the
+  reverse-proxy caveat.
 - **Raised MSRV to 1.89** and removed the `aes` pin from the CI msrv job that PR #344 added. All six consumer repos are moving to 1.89 in parallel PRs, so the objection that blocked raising the floor in #344 no longer stands.
 
 ## [0.23.1] - 2026-09-05

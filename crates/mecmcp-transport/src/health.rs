@@ -19,20 +19,22 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct ReadinessCheck {
     name: &'static str,
-    probe: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    probe: Arc<dyn Fn() -> Result<(), &'static str> + Send + Sync>,
 }
 
 impl ReadinessCheck {
     /// Build a check from a name and a probe closure.
     ///
     /// `probe` returns `Ok(())` when the dependency is ready, or an `Err`
-    /// reason. `/readyz` is unauthenticated: the reason **must not** contain
-    /// device names, hostnames, tokens, or other customer data — a generic
-    /// cause ("audit sink is not writable") is the right amount of detail.
+    /// reason. `/readyz` is unauthenticated, so the reason is `&'static str`
+    /// rather than `String`: a caller cannot format a filesystem path, an I/O
+    /// error, or any other runtime value into it, only return a fixed literal
+    /// such as `"audit sink is not writable"`. Log the runtime detail
+    /// server-side instead.
     #[must_use]
     pub fn new(
         name: &'static str,
-        probe: impl Fn() -> Result<(), String> + Send + Sync + 'static,
+        probe: impl Fn() -> Result<(), &'static str> + Send + Sync + 'static,
     ) -> Self {
         Self {
             name,
@@ -64,7 +66,7 @@ struct ReadyBody {
 #[derive(serde::Serialize)]
 struct FailedCheck {
     name: &'static str,
-    reason: String,
+    reason: &'static str,
 }
 
 /// `GET /readyz`: runs every configured [`ReadinessCheck`] and reports the
@@ -152,7 +154,7 @@ mod tests {
     #[tokio::test]
     async fn readyz_is_503_when_the_audit_sink_is_unwritable() {
         let checks: Arc<[ReadinessCheck]> = Arc::from([ReadinessCheck::new("audit_sink", || {
-            Err("audit sink is not writable".to_owned())
+            Err("audit sink is not writable")
         })]);
         let response = call(health_router(checks), "/readyz").await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -167,7 +169,7 @@ mod tests {
     async fn readyz_reports_every_failed_check() {
         let checks: Arc<[ReadinessCheck]> = Arc::from([
             ReadinessCheck::new("audit_sink", || Ok(())),
-            ReadinessCheck::new("inventory", || Err("inventory not loaded".to_owned())),
+            ReadinessCheck::new("inventory", || Err("inventory not loaded")),
         ]);
         let response = call(health_router(checks), "/readyz").await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -186,7 +188,7 @@ mod tests {
         // A readiness probe that would fail readyz must not affect healthz —
         // liveness has no dependencies by definition.
         let checks: Arc<[ReadinessCheck]> = Arc::from([ReadinessCheck::new("audit_sink", || {
-            Err("audit sink is not writable".to_owned())
+            Err("audit sink is not writable")
         })]);
         let response = call(health_router(checks), "/healthz").await;
         assert_eq!(response.status(), StatusCode::OK);

@@ -1443,15 +1443,36 @@ mod tests {
         // Both requests carry a loopback ConnectInfo: this test is about the
         // Host/Origin layer, not the loopback-or-token metrics access gate
         // added for MEC-48, which is covered by its own tests in metrics.rs.
+        //
+        // This test also carries the end-to-end proof for MEC-48 review
+        // finding 3 (an MCP bearer token must not grant `/metrics`, and a
+        // metrics token must not grant `/mcp`) rather than living in its own
+        // file under `tests/`. `ServePlan` deliberately has no accessor that
+        // yields its `Router` outside this crate (mecmcp#273) — an external
+        // integration test cannot get at the assembled router at all, and a
+        // synthetic non-loopback peer can only be injected via
+        // `.extension(ConnectInfo(..))` on a request built against that
+        // router directly. Combined with `PrometheusRuntime::install` being a
+        // process-global recorder that panics on a second install in the same
+        // test binary, the property can only be proven here, reusing this
+        // test's one authenticated + metrics-enabled router.
         let peer: std::net::SocketAddr = "127.0.0.1:0".parse().expect("address");
-        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
+        let (mcp_secret, mcp_digest) = mecmcp_auth::TokenSecret::mint().expect("mint mcp token");
+        let (metrics_secret, metrics_digest) =
+            mecmcp_auth::TokenSecret::mint().expect("mint metrics token");
+        let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, move |candidate| {
+            mcp_digest.verify(candidate).then(caller)
+        });
+        let boundary = BearerBoundary::new(authenticator, BearerResponseProfile::detailed("test"));
+        let config = HttpTransportConfig::authenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
             HostOriginPolicy::enforced(["allowed.example.test"], Vec::<String>::new()),
             CancellationToken::new(),
-            NoAuthAcknowledgement::operator_allowed_no_auth(),
+            boundary,
         )
-        .with_metrics(true);
+        .with_metrics(true)
+        .with_metrics_token(metrics_digest);
         let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
             .expect("router build failed");
         let router = plan.router;
@@ -1507,6 +1528,7 @@ mod tests {
         // per-test recorder teardown).
         let non_loopback: std::net::SocketAddr = "203.0.113.7:0".parse().expect("address");
         let non_loopback_response = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -1523,6 +1545,107 @@ mod tests {
             non_loopback_response.status(),
             StatusCode::FORBIDDEN,
             "a non-loopback peer must be refused by default even with an allowed Host"
+        );
+
+        // MEC-48 review finding 3: an MCP bearer token must not grant
+        // /metrics from a non-loopback peer, even though it is a valid,
+        // currently-accepted token.
+        let mcp_token_on_metrics = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .header(header::HOST, "allowed.example.test")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", mcp_secret.expose_secret()),
+                    )
+                    .extension(axum::extract::ConnectInfo(non_loopback))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            mcp_token_on_metrics.status(),
+            StatusCode::FORBIDDEN,
+            "a valid MCP bearer token must not grant /metrics"
+        );
+
+        // The dedicated metrics token grants /metrics from that same non-loopback peer.
+        let metrics_token_on_metrics = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .header(header::HOST, "allowed.example.test")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", metrics_secret.expose_secret()),
+                    )
+                    .extension(axum::extract::ConnectInfo(non_loopback))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            metrics_token_on_metrics.status(),
+            StatusCode::OK,
+            "the configured metrics token must grant /metrics from a non-loopback peer"
+        );
+
+        // ... but that same metrics token must not authenticate /mcp.
+        let metrics_token_on_mcp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "allowed.example.test")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", metrics_secret.expose_secret()),
+                    )
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            metrics_token_on_mcp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a metrics token must not grant /mcp"
+        );
+
+        // And the MCP token does authenticate /mcp (proves the boundary is
+        // still live, so the 403/401 results above are the gate working, not
+        // the boundary being bypassed or dead).
+        let mcp_token_on_mcp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "allowed.example.test")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", mcp_secret.expose_secret()),
+                    )
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_ne!(
+            mcp_token_on_mcp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a valid MCP bearer token must authenticate /mcp"
         );
     }
 
