@@ -294,7 +294,8 @@ fn is_token_prefix(entry: &AllowlistEntry, input_tokens: &[&str]) -> bool {
 
 /// True if any entry in `list` is a whole-token prefix of `input_tokens`.
 fn matches_any_entry(list: &[AllowlistEntry], input_tokens: &[&str]) -> bool {
-    list.iter().any(|entry| is_token_prefix(entry, input_tokens))
+    list.iter()
+        .any(|entry| is_token_prefix(entry, input_tokens))
 }
 
 /// Evaluate `command` against a [`CommandAllowlist`]. See
@@ -339,7 +340,14 @@ fn evaluate_allowlist<'a, A>(command: &str, allowlist: &CommandAllowlist) -> Dec
 }
 
 /// Outcome of a policy check.
+///
+/// There are now two deny shapes (`Deny` and `DenyAllowlist`), so **never**
+/// gate on `if let Decision::Deny { .. } = decision { refuse }` or a partial
+/// match against a single variant — either shape denies, and code that only
+/// recognizes one silently allows the other. Use [`Decision::is_allowed`], or
+/// match all three variants exhaustively.
 #[derive(Debug)]
+#[must_use = "a Decision must be checked with `is_allowed()` (or matched exhaustively) or the policy check has no effect"]
 pub enum Decision<'a, A> {
     /// The input is allowed.
     Allow,
@@ -370,6 +378,19 @@ pub enum Decision<'a, A> {
         /// forged line into a log file.
         normalized: String,
     },
+}
+
+impl<A> Decision<'_, A> {
+    /// True only for [`Decision::Allow`].
+    ///
+    /// Prefer this over matching a single deny variant: `Decision` has two
+    /// deny shapes (`Deny`, `DenyAllowlist`), and a caller that only
+    /// recognizes one — e.g. `if let Decision::Deny { .. } = d { refuse }
+    /// else { allow }` — will silently allow the other. Either gate on
+    /// `is_allowed()`, or match all three variants exhaustively.
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Decision::Allow)
+    }
 }
 
 /// Trim and collapse runs of whitespace to a single space.
@@ -634,9 +655,7 @@ where
         deny_action: A,
     ) -> Decision<'a, A> {
         match self.command_mode {
-            CommandMode::Allowlist => {
-                evaluate_allowlist(pfe_command, &self.pfe_commands.allowlist)
-            }
+            CommandMode::Allowlist => evaluate_allowlist(pfe_command, &self.pfe_commands.allowlist),
             CommandMode::Blocklist => {
                 let normalized = normalize_input(pfe_command);
                 let rules = self.pfe_command_rules_for(device);
@@ -911,7 +930,10 @@ mod tests {
         let entries = vec!["show   version".to_string(), "request".to_string()];
         let compiled =
             compile_allowlist_entries(&entries, "test", test_allowlist_error_builder).unwrap();
-        assert_eq!(compiled[0].tokens(), &["show".to_string(), "version".to_string()]);
+        assert_eq!(
+            compiled[0].tokens(),
+            &["show".to_string(), "version".to_string()]
+        );
         assert_eq!(compiled[1].tokens(), &["request".to_string()]);
     }
 
@@ -1020,9 +1042,11 @@ mod tests {
     #[test]
     fn policy_empty_per_device_blocklist_does_not_inflate_rule_counts() {
         let mut commands = DomainRules::default();
-        commands
-            .defaults
-            .push(make_compiled_rule(TestAction::Deny, "x", RuleSource::Defaults));
+        commands.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "x",
+            RuleSource::Defaults,
+        ));
 
         let p = Policy::new(
             CommandMode::Blocklist,
@@ -1414,11 +1438,31 @@ mod tests {
             )],
         );
 
+        let mut pfe_commands = DomainRules::default();
+        pfe_commands.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "request system *",
+            RuleSource::Defaults,
+        ));
+        pfe_commands.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "delete *",
+            RuleSource::Defaults,
+        ));
+        pfe_commands.device_specific.insert(
+            "r1".to_string(),
+            vec![make_compiled_rule(
+                TestAction::Allow,
+                "request system reboot",
+                RuleSource::Device,
+            )],
+        );
+
         let p = Policy::new(
             CommandMode::Blocklist,
             blocklist_domain(commands),
             DomainRules::default(),
-            CommandDomain::default(),
+            blocklist_domain(pfe_commands),
         );
 
         let cases: &[(&str, &str, bool)] = &[
@@ -1434,20 +1478,23 @@ mod tests {
 
         for (device, command, expect_allow) in cases {
             let decision = p.check_command(device, command, TestAction::Deny);
-            let allowed = matches!(decision, Decision::Allow);
             assert_eq!(
-                allowed, *expect_allow,
-                "device={device:?} command={command:?} expected allow={expect_allow}"
+                decision.is_allowed(),
+                *expect_allow,
+                "check_command device={device:?} command={command:?} expected allow={expect_allow}"
+            );
+            let pfe_decision = p.check_pfe_command(device, command, TestAction::Deny);
+            assert_eq!(
+                pfe_decision.is_allowed(),
+                *expect_allow,
+                "check_pfe_command device={device:?} command={command:?} expected allow={expect_allow}"
             );
         }
     }
 
     // Allowlist-mode regression tests (MEC-92 acceptance criteria).
 
-    fn allowlist_policy(
-        entries: &[&str],
-        allowed_pipes: &[&str],
-    ) -> Policy<TestAction> {
+    fn allowlist_policy(entries: &[&str], allowed_pipes: &[&str]) -> Policy<TestAction> {
         let allowlist = CommandAllowlist {
             entries: allowlist_entries(entries),
             allowed_pipes: allowlist_entries(allowed_pipes),
@@ -1561,11 +1608,7 @@ mod tests {
     fn allowlist_pipe_stage_not_matching_allowed_pipes_is_refused() {
         let p = allowlist_policy(&["show configuration"], &["save"]);
         assert!(matches!(
-            p.check_command(
-                "r1",
-                "show configuration | match secret",
-                TestAction::Deny
-            ),
+            p.check_command("r1", "show configuration | match secret", TestAction::Deny),
             Decision::DenyAllowlist {
                 reason: AllowlistDenyReason::PipeNotAllowlisted,
                 ..
@@ -1577,7 +1620,11 @@ mod tests {
     fn allowlist_semicolon_is_refused() {
         let p = allowlist_policy(&["show version"], &[]);
         assert!(matches!(
-            p.check_command("r1", "show version; request system reboot", TestAction::Deny),
+            p.check_command(
+                "r1",
+                "show version; request system reboot",
+                TestAction::Deny
+            ),
             Decision::DenyAllowlist {
                 reason: AllowlistDenyReason::ForbiddenMetachar,
                 ..
@@ -1630,6 +1677,46 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn is_allowed_is_false_for_deny_allowlist_and_true_for_allow() {
+        let p = allowlist_policy(&["show version"], &[]);
+        assert!(
+            !p.check_command("r1", "request system reboot", TestAction::Deny)
+                .is_allowed()
+        );
+        assert!(
+            p.check_command("r1", "show version", TestAction::Deny)
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    fn is_allowed_is_false_for_blocklist_deny() {
+        let mut commands = DomainRules::default();
+        commands.defaults.push(make_compiled_rule(
+            TestAction::Deny,
+            "request system *",
+            RuleSource::Defaults,
+        ));
+        let p = Policy::new(
+            CommandMode::Blocklist,
+            CommandDomain {
+                blocklist: commands,
+                allowlist: CommandAllowlist::default(),
+            },
+            DomainRules::default(),
+            CommandDomain::default(),
+        );
+        assert!(
+            !p.check_command("r1", "request system reboot", TestAction::Deny)
+                .is_allowed()
+        );
+        assert!(
+            p.check_command("r1", "show version", TestAction::Deny)
+                .is_allowed()
+        );
     }
 
     #[test]
