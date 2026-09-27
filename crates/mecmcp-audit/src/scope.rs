@@ -542,7 +542,7 @@ mod tests {
             grant: None,
             provider: Some("anthropic".into()),
             provider_tier: Some(mecmcp_auth::Tier::Public),
-            on_behalf_of: Some("fastrevmd@gmail.com".into()),
+            on_behalf_of: Some("dev@example.com".into()),
             actor_type: mecmcp_auth::ActorType::Agent,
             client_name: None,
             model_id: None,
@@ -562,7 +562,7 @@ mod tests {
             "actor_type must flow from token entry: {out}"
         );
         assert!(
-            out.contains("on_behalf_of=fastrevmd@gmail.com"),
+            out.contains("on_behalf_of=dev@example.com"),
             "on_behalf_of must flow from token entry: {out}"
         );
     }
