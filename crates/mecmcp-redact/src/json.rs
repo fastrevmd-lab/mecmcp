@@ -8,7 +8,7 @@
 //! guarantee the way an allowlist projection is.
 
 use crate::denylist::is_denylisted_key;
-use crate::shape::looks_like_secret_value;
+use crate::shape::{looks_like_embedded_blob, looks_like_secret_value};
 use serde_json::Value;
 
 const PLACEHOLDER: &str = "[REDACTED]";
@@ -33,6 +33,8 @@ pub fn redact(value: &mut Value) {
         Value::String(s) => {
             if looks_like_secret_value(s) {
                 *s = PLACEHOLDER.to_string();
+            } else if looks_like_embedded_blob(s) {
+                *s = crate::text::redact(s);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -43,15 +45,20 @@ pub fn redact(value: &mut Value) {
 /// string outright (a denylisted key is redacted regardless of shape).
 /// Objects and arrays are walked recursively rather than nuked wholesale, so
 /// a denylisted container key (unlikely, but not impossible for a vendor to
-/// name e.g. `secrets: { ... }`) still preserves any non-secret siblings
-/// inside it instead of destroying structure a caller might depend on.
+/// name e.g. `secrets: { ... }`) still preserves the structure — but every
+/// scalar leaf inside that subtree is force-redacted regardless of its own
+/// key or shape: once a caller has said "this container is secret", a value
+/// two levels down (`secrets.wifi`, `pre_shared_keys[0]`) must not survive
+/// just because its own immediate key or shape is not independently
+/// suspicious.
 fn redact_leaf(v: &Value) -> Value {
     match v {
-        Value::Object(_) | Value::Array(_) => {
-            let mut cloned = v.clone();
-            redact(&mut cloned);
-            cloned
-        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), redact_leaf(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redact_leaf).collect()),
         Value::Null => Value::Null,
         _ => Value::String(PLACEHOLDER.to_string()),
     }
@@ -106,6 +113,52 @@ mod tests {
         let mut v = json!({"password": null});
         redact(&mut v);
         assert_eq!(v["password"], Value::Null);
+    }
+
+    #[test]
+    fn f3_array_under_denylisted_key_has_every_element_redacted() {
+        let mut v = json!({"pre_shared_keys": ["QQ1", "QQ2"]});
+        redact(&mut v);
+        assert_eq!(v["pre_shared_keys"][0], "[REDACTED]");
+        assert_eq!(v["pre_shared_keys"][1], "[REDACTED]");
+    }
+
+    #[test]
+    fn f3_nested_object_under_denylisted_key_has_every_leaf_redacted() {
+        let mut v = json!({"secrets": {"wifi": "QQ3", "count": 2}});
+        redact(&mut v);
+        assert_eq!(v["secrets"]["wifi"], "[REDACTED]");
+        // A non-string leaf still becomes a placeholder string, matching the
+        // existing top-level `numbers_and_booleans_...` contract.
+        assert_eq!(v["secrets"]["count"], "[REDACTED]");
+    }
+
+    #[test]
+    fn f3_combined_repro_from_review_leaks_nothing() {
+        let mut v = json!({
+            "pre_shared_keys": ["QQ1", "QQ2"],
+            "secrets": {"wifi": "QQ3"}
+        });
+        redact(&mut v);
+        let s = v.to_string();
+        assert!(
+            !s.contains("QQ1") && !s.contains("QQ2") && !s.contains("QQ3"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn f4b_embedded_blob_in_an_unlisted_string_field_is_scrubbed() {
+        let mut v = json!({
+            "output": "set interfaces ge-0/0/0 unit 0\nset security ike policy p1 pre-shared-key ascii-text \"$9$fakehashvalue\"; ## SECRET-DATA\n"
+        });
+        redact(&mut v);
+        let s = v["output"].as_str().expect("output is a string");
+        assert!(!s.contains("fakehashvalue"), "got: {s}");
+        assert!(
+            s.contains("set interfaces ge-0/0/0 unit 0"),
+            "unrelated config lines must survive: {s}"
+        );
     }
 
     #[test]

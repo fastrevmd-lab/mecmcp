@@ -80,6 +80,37 @@ fn no_denylisted_key_fixture_secret_survives_any_format() {
     }
 }
 
+/// Render `key` in its hyphenated vendor spelling: `pre_shared_key` ->
+/// `pre-shared-key`. The other property test above renders keys in their
+/// already-normalized form (`presharedkey`), which is exactly the spelling
+/// [`mecmcp_redact::denylist::is_denylisted_key`] normalizes *to*, not the
+/// hyphenated form a real vendor field name typically arrives in — that gap
+/// is why F1 (hyphen/underscore-joined keys defeating the text tokenizer)
+/// went uncaught by the exhaustive property test that was supposed to cover
+/// exactly this.
+fn hyphenate(key: &str) -> String {
+    key.chars()
+        .map(|c| if c == '_' { '-' } else { c })
+        .collect()
+}
+
+#[test]
+fn no_denylisted_key_fixture_secret_survives_any_format_in_its_hyphenated_vendor_spelling() {
+    for (i, key) in DENYLISTED_KEYS.iter().enumerate() {
+        let field = hyphenate(key);
+        for &format in FORMATS {
+            let secret = format!("QQZZH{i:04}{}", format_name(format));
+            let input = render(&field, &secret, format);
+            let got = redact(&input, format);
+            assert!(
+                !got.contains(&secret),
+                "denylisted key '{key}' (hyphenated field '{field}') leaked in {}: {got}",
+                format_name(format)
+            );
+        }
+    }
+}
+
 #[test]
 fn no_value_shape_fixture_secret_survives_any_format_under_an_unlisted_key() {
     for (i, secret) in SHAPE_FIXTURES.iter().enumerate() {

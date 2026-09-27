@@ -69,6 +69,14 @@ fn redact_value_span(line: &str, force: bool) -> String {
     if let Some(redacted) = redact_quoted_spans(line, force) {
         return redacted;
     }
+    // When forced, redact the value token that follows the specific
+    // denylisted key token, not the last `=`/`:`/whitespace on the line — a
+    // line can carry several `k=v` pairs (`user=admin password=X src=...`)
+    // or bare trailing tokens (`community X authorization read-only`) where
+    // the denylisted key is nowhere near the end.
+    if force && let Some(redacted) = redact_after_denylisted_key(line) {
+        return redacted;
+    }
     if let Some(eq) = line.rfind('=') {
         let (head, tail) = line.split_at(eq + 1);
         if force || looks_like_secret_value(tail.trim()) {
@@ -96,29 +104,121 @@ fn redact_value_span(line: &str, force: bool) -> String {
     line.to_string()
 }
 
+/// Byte ranges of every maximal run of non-whitespace characters in `line`,
+/// in order.
+fn whitespace_token_spans(line: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in line.char_indices() {
+        if c.is_whitespace() {
+            if let Some(s) = start.take() {
+                spans.push((s, i));
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        spans.push((s, line.len()));
+    }
+    spans
+}
+
+/// Replace `line[value_start..value_end]` with [`PLACEHOLDER`], but keep any
+/// trailing structural punctuation (`;`, `,`, `{`, `}`) that is attached
+/// directly to the value with no separating whitespace — a Junos statement
+/// terminator or hierarchy brace is not part of the secret.
+fn splice_placeholder(line: &str, value_start: usize, value_end: usize) -> String {
+    let value = &line[value_start..value_end];
+    let core_len = value.trim_end_matches([';', ',', '{', '}']).len();
+    let punct_start = value_start + core_len;
+    format!(
+        "{}{PLACEHOLDER}{}",
+        &line[..value_start],
+        &line[punct_start..]
+    )
+}
+
+/// Find a denylisted key token on `line` and redact the value that follows
+/// it, for `key=value`, `key: value` / `key:value`, and bare `key value`
+/// forms. Quoted values (`key "value"`) are handled earlier by
+/// [`redact_quoted_spans`] and never reach here. Returns `None` when no
+/// denylisted key token is found this way, so the caller can fall back to a
+/// whole-line heuristic.
+fn redact_after_denylisted_key(line: &str) -> Option<String> {
+    let tokens = whitespace_token_spans(line);
+    for (i, &(s, e)) in tokens.iter().enumerate() {
+        let text = &line[s..e];
+        for sep in ['=', ':'] {
+            let Some(rel) = text.find(sep) else {
+                continue;
+            };
+            let key_part = &text[..rel];
+            if !is_denylisted_key(key_part) {
+                continue;
+            }
+            let value_start = s + rel + 1;
+            if value_start < e {
+                return Some(splice_placeholder(line, value_start, e));
+            }
+            // `key=`/`key:` with nothing else in this token: the value is
+            // the next whitespace token, if there is one.
+            if let Some(&(vs, ve)) = tokens.get(i + 1) {
+                return Some(splice_placeholder(line, vs, ve));
+            }
+        }
+        // Bare key token, no `=`/`:` attached to it.
+        let bare_key = text.trim_end_matches([':', ';']);
+        if !bare_key.is_empty()
+            && is_denylisted_key(bare_key)
+            && let Some(&(vs, ve)) = tokens.get(i + 1)
+        {
+            let next_token = &line[vs..ve];
+            // Some vendors put a type keyword directly after the key,
+            // before the actual secret (Junos `pre-shared-key ascii-text
+            // "..."`). A type keyword never carries entropy — no digit —
+            // so when the immediate next token looks like one and a
+            // further token follows, that further token is the value.
+            if !next_token.chars().any(|c| c.is_ascii_digit())
+                && let Some(&(vs2, ve2)) = tokens.get(i + 2)
+            {
+                return Some(splice_placeholder(line, vs2, ve2));
+            }
+            return Some(splice_placeholder(line, vs, ve));
+        }
+    }
+    None
+}
+
 /// Replace the content of every `"..."` or `'...'` span in `line`. Returns
 /// `None` when there are no quoted spans, or when `force` is false and none
 /// of them looks like a secret value (so the caller falls through to the
 /// `=`/`:`/bare-token rules instead).
 fn redact_quoted_spans(line: &str, force: bool) -> Option<String> {
+    // Single left-to-right scan: whichever quote character (`"` or `'`)
+    // opens first is the one that closes the span, and the scan resumes
+    // after that close. Scanning each quote character independently and
+    // merging the results (the previous approach) can produce overlapping
+    // spans whenever the two quote kinds nest — e.g. `"a'b"` opens a `"`
+    // span at 0..end and a `'` span starting *inside* it — and slicing
+    // `line[cursor..=start]` against an out-of-order later span panics.
     let mut spans = Vec::new();
-    for quote in ['"', '\''] {
-        let mut search_from = 0;
-        while let Some(start) = line[search_from..].find(quote) {
-            let start = search_from + start;
-            if let Some(end_rel) = line[start + 1..].find(quote) {
-                let end = start + 1 + end_rel;
-                spans.push((start, end));
-                search_from = end + 1;
-            } else {
-                break;
-            }
+    let mut idx = 0;
+    while let Some(rel) = line[idx..].find(['"', '\'']) {
+        let start = idx + rel;
+        let quote = line[start..].chars().next().expect("find matched a char");
+        if let Some(end_rel) = line[start + quote.len_utf8()..].find(quote) {
+            let end = start + quote.len_utf8() + end_rel;
+            spans.push((start, end));
+            idx = end + quote.len_utf8();
+        } else {
+            // Unterminated quote: nothing further to pair it with.
+            break;
         }
     }
     if spans.is_empty() {
         return None;
     }
-    spans.sort_unstable_by_key(|&(start, _)| start);
     let any_match = force
         || spans
             .iter()
@@ -199,5 +299,95 @@ mod tests {
     fn unrelated_lines_pass_through_unchanged() {
         let text = "hostname: r1.example.net\ndescription: uplink to core";
         assert_eq!(redact(text), text);
+    }
+
+    // --- F1: hyphen/underscore-joined denylist terms must still match. ---
+
+    #[test]
+    fn f1_hyphenated_key_bare_form_is_redacted() {
+        let got = redact("set security ike policy p1 pre-shared-key ascii-text QQvalue1");
+        assert!(!got.contains("QQvalue1"), "got: {got}");
+    }
+
+    #[test]
+    fn f1_underscore_key_equals_form_is_redacted() {
+        let got = redact("api_key=QQvalue2");
+        assert!(!got.contains("QQvalue2"), "got: {got}");
+    }
+
+    #[test]
+    fn f1_hyphenated_key_colon_form_is_redacted() {
+        let got = redact("private-key: QQvalue3");
+        assert!(!got.contains("QQvalue3"), "got: {got}");
+    }
+
+    #[test]
+    fn f1_hyphenated_key_bare_form_with_trailing_semicolon_is_redacted() {
+        let got = redact("authentication-key QQvalue4;");
+        assert!(!got.contains("QQvalue4"), "got: {got}");
+        assert!(got.ends_with(';'), "terminator must survive: {got}");
+    }
+
+    // --- F2: redact the value that follows the key, not the last span. ---
+
+    #[test]
+    fn f2a_equals_form_redacts_the_matching_keys_value_not_the_last_one() {
+        let got = redact("login ok user=admin password=QQvalue8 src=192.0.2.1");
+        assert!(!got.contains("QQvalue8"), "got: {got}");
+        assert!(
+            got.contains("user=admin"),
+            "unrelated field must survive: {got}"
+        );
+        assert!(
+            got.contains("src=192.0.2.1"),
+            "unrelated field must survive: {got}"
+        );
+    }
+
+    #[test]
+    fn f2b_bare_form_redacts_the_token_after_the_key_not_the_last_token() {
+        let got = redact("set snmp community QQvalue6 authorization read-only");
+        assert!(!got.contains("QQvalue6"), "got: {got}");
+        assert!(
+            got.contains("read-only"),
+            "trailing unrelated tokens must survive: {got}"
+        );
+    }
+
+    #[test]
+    fn f2b_junos_hierarchical_form_redacts_the_value_not_the_brace() {
+        let got = redact("community QQvalue5 {");
+        assert!(!got.contains("QQvalue5"), "got: {got}");
+        assert!(got.trim_end().ends_with('{'), "brace must survive: {got}");
+    }
+
+    // --- F6: overlapping/nested quote spans must not panic. ---
+
+    #[test]
+    fn f6_nested_mixed_quotes_do_not_panic() {
+        let got = redact(r#"set password "a'b" 'x'"#);
+        assert!(got.contains(PLACEHOLDER));
+    }
+
+    #[test]
+    fn f6_quote_mix_fuzz_style_no_panic_over_many_shapes() {
+        let bodies = [
+            "", "a", "ab", "a'b", "a\"b", "'", "\"", "''", "\"\"", "'\"'\"",
+        ];
+        let wrappers: &[fn(&str) -> String] = &[
+            |b: &str| format!(r#"set password "{b}""#),
+            |b: &str| format!("set password '{b}'"),
+            |b: &str| format!(r#"set password "{b}" 'x'"#),
+            |b: &str| format!(r#"set password '{b}' "x""#),
+            |b: &str| format!(r#"a "{b}" b '{b}' c"#),
+        ];
+        for wrapper in wrappers {
+            for body in bodies {
+                // Must not panic for any combination; the exact placeholder
+                // count is not asserted since some bodies leave a quote
+                // unterminated (deliberately, to exercise that path too).
+                let _ = redact(&wrapper(body));
+            }
+        }
     }
 }

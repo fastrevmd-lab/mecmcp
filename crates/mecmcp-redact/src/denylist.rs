@@ -31,7 +31,22 @@ pub const DENYLISTED_KEYS: &[&str] = &[
     "bindpw",
     "encryptionkey",
     "privkey",
+    "authorization",
+    "bearer",
+    "cookie",
+    "passwd",
+    "pwd",
+    "session",
 ];
+
+/// Field names that must match the *whole* normalized key, not a substring.
+///
+/// `"key"` is deliberately not in [`DENYLISTED_KEYS`]: as a substring it would
+/// match half of every config (`keys`, `keyword`, `keychain`, an interface
+/// named `key0`, ...). But the bare field name `key` alone is exactly the
+/// PAN-OS keygen response shape (`<result><key>` is the API key itself), so it
+/// still needs to be denylisted — just under exact match instead.
+const DENYLISTED_EXACT_KEYS: &[&str] = &["key"];
 
 /// Lowercase `s` and drop every non-alphanumeric byte, so `pre-shared-key`,
 /// `pre_shared_key`, and `preSharedKey` all normalize to `presharedkey`.
@@ -53,6 +68,9 @@ pub fn is_denylisted_key(key: &str) -> bool {
     let normalized = normalize(key);
     if normalized.is_empty() {
         return false;
+    }
+    if DENYLISTED_EXACT_KEYS.iter().any(|term| normalized == *term) {
+        return true;
     }
     DENYLISTED_KEYS.iter().any(|term| normalized.contains(term))
 }
@@ -98,6 +116,35 @@ mod tests {
     fn unrelated_keys_are_not_denylisted() {
         for key in ["description", "hostname", "interface", "vlan_id", "name"] {
             assert!(!is_denylisted_key(key), "'{key}' must not be denylisted");
+        }
+    }
+
+    #[test]
+    fn f7_new_field_names_are_denylisted() {
+        for key in [
+            "authorization",
+            "Authorization",
+            "bearer",
+            "bearer_token",
+            "cookie",
+            "passwd",
+            "pwd",
+            "session",
+            "session_id",
+        ] {
+            assert!(is_denylisted_key(key), "'{key}' must be denylisted");
+        }
+    }
+
+    #[test]
+    fn bare_key_matches_exactly_but_not_as_a_substring() {
+        assert!(is_denylisted_key("key"));
+        assert!(is_denylisted_key("Key"));
+        for key in ["keys", "keyword", "keychain", "monkey", "key0", "hotkey"] {
+            assert!(
+                !is_denylisted_key(key),
+                "'{key}' must not match the exact-only 'key' entry"
+            );
         }
     }
 

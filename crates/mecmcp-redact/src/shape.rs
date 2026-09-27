@@ -10,7 +10,18 @@
 /// Whether `value` matches a known secret-value shape.
 #[must_use]
 pub fn looks_like_secret_value(value: &str) -> bool {
-    is_crypt_hash(value) || contains_pan_aq_suffix(value) || is_enc_marker(value)
+    is_crypt_hash(value)
+        || contains_pan_aq_suffix(value)
+        || is_enc_marker(value)
+        || contains_pem_marker(value)
+}
+
+/// A PEM block header appearing anywhere in `value`: `-----BEGIN <TYPE>-----`.
+/// Unlike [`is_pem_begin`], this matches mid-string (a PEM embedded in a JSON
+/// string value or an XML text node carries the header inline, not as its own
+/// trimmed line), so a PEM under any key — denylisted or not — is caught.
+fn contains_pem_marker(value: &str) -> bool {
+    value.contains("-----BEGIN ")
 }
 
 /// Juniper/glibc crypt-style hash: `$<id>$<content>`, e.g. `$9$abC1EyKM8`.
@@ -53,6 +64,22 @@ fn is_enc_marker(value: &str) -> bool {
         None => false,
         Some(c) => !c.is_ascii_alphanumeric(),
     }
+}
+
+/// Whether `value` looks like it carries an embedded secret-bearing blob (a
+/// whole Junos `configuration-text` body, a command `<output>`, or a JSON
+/// `"output"` string) rather than being a single secret-shaped scalar itself.
+/// [`looks_like_secret_value`] only matches when the *entire* value has one
+/// of the known shapes, so a multi-line blob with a `$9$` hash or a
+/// `## SECRET-DATA` line buried inside otherwise-ordinary text needs this
+/// separate check to be routed through `crate::text::redact` instead of
+/// being passed through whole.
+#[must_use]
+pub fn looks_like_embedded_blob(value: &str) -> bool {
+    value.contains('\n')
+        || value.contains('$')
+        || value.contains("-----BEGIN")
+        || value.contains("SECRET-DATA")
 }
 
 /// Junos flat-config secret marker: a line carrying `## SECRET-DATA`.
@@ -114,6 +141,14 @@ mod tests {
             "pre-shared-key ascii-text \"$9$abc123\"; ## SECRET-DATA"
         ));
         assert!(!line_has_secret_data_marker("set interfaces ge-0/0/0"));
+    }
+
+    #[test]
+    fn pem_marker_anywhere_in_value_is_a_secret_shape() {
+        assert!(looks_like_secret_value(
+            "-----BEGIN PRIVATE KEY-----\nMIIFAKE==\n-----END PRIVATE KEY-----"
+        )); // gitleaks:allow -- fabricated PEM body, not a real key
+        assert!(!looks_like_secret_value("hello world"));
     }
 
     #[test]

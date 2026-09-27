@@ -36,6 +36,14 @@ impl FieldAllowlist {
     /// entirely and returned as [`Value::Null`] — a projection only knows how
     /// to keep fields of an object, and returning the input unfiltered on a
     /// shape mismatch would defeat the point of an allowlist.
+    ///
+    /// An allowlisted field is meant to name a scalar (`id`, `name`, `ip`).
+    /// If a caller allowlists a field that happens to be a container (object
+    /// or array), that whole container is kept verbatim by field-name alone —
+    /// so as defence in depth, `crate::json::redact` still runs over the
+    /// projected result: a secret nested inside a wholesale-kept container
+    /// field is caught by the denylist-and-shape scan even though the
+    /// allowlist itself does not look inside it.
     #[must_use]
     pub fn project(&self, value: &Value) -> Value {
         let Value::Object(map) = value else {
@@ -47,7 +55,9 @@ impl FieldAllowlist {
                 kept.insert((*field).to_string(), v.clone());
             }
         }
-        Value::Object(kept)
+        let mut projected = Value::Object(kept);
+        crate::json::redact(&mut projected);
+        projected
     }
 
     /// Project a JSON array of objects element-wise, e.g. a `list` result.
@@ -107,6 +117,19 @@ mod tests {
         let arr = projected.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert!(arr.iter().all(|item| item.get("secret").is_none()));
+    }
+
+    #[test]
+    fn f10_allowlisted_container_field_still_has_nested_secrets_redacted() {
+        const CONFIG_FIELDS: FieldAllowlist = FieldAllowlist::new(&["id", "config"]);
+        let resource = json!({
+            "id": "abc123",
+            "config": {"wlan": {"password": "QQwifisecret1"}},
+        });
+        let projected = CONFIG_FIELDS.project(&resource);
+        let s = projected.to_string();
+        assert!(!s.contains("QQwifisecret1"), "got: {s}");
+        assert_eq!(projected["id"], "abc123");
     }
 
     #[test]

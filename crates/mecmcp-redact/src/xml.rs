@@ -11,7 +11,7 @@
 
 use crate::RedactError;
 use crate::denylist::is_denylisted_key;
-use crate::shape::looks_like_secret_value;
+use crate::shape::{looks_like_embedded_blob, looks_like_secret_value};
 use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
@@ -47,13 +47,13 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
             }
             Event::Start(e) => {
                 tag_stack.push(local_name(e.name()).to_vec());
-                let rewritten = redact_attributes(&e)?;
+                let rewritten = redact_attributes(&e, &tag_stack)?;
                 writer
                     .write_event(Event::Start(rewritten))
                     .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
             }
             Event::Empty(e) => {
-                let rewritten = redact_attributes(&e)?;
+                let rewritten = redact_attributes(&e, &tag_stack)?;
                 writer
                     .write_event(Event::Empty(rewritten))
                     .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
@@ -65,11 +65,8 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
                     .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
             }
             Event::Text(e) => {
-                let enclosing_key_is_secret = tag_stack
-                    .last()
-                    .map(|name| is_denylisted_key(&String::from_utf8_lossy(name)))
-                    .unwrap_or(false);
-                let redacted = redact_text_bytes(&e, enclosing_key_is_secret)?;
+                let ancestor_is_secret = any_ancestor_denylisted(&tag_stack);
+                let redacted = redact_text_bytes(&e, ancestor_is_secret)?;
                 writer
                     .write_event(Event::Text(redacted))
                     .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
@@ -77,14 +74,13 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
             Event::CData(e) => {
                 let text = e.into_inner();
                 let decoded = String::from_utf8_lossy(&text).into_owned();
-                let enclosing_key_is_secret = tag_stack
-                    .last()
-                    .map(|name| is_denylisted_key(&String::from_utf8_lossy(name)))
-                    .unwrap_or(false);
-                let out = if enclosing_key_is_secret || looks_like_secret_value(&decoded) {
+                let ancestor_is_secret = any_ancestor_denylisted(&tag_stack);
+                let out = if ancestor_is_secret || looks_like_secret_value(&decoded) {
                     quick_xml::events::BytesCData::new(
                         String::from_utf8_lossy(PLACEHOLDER).into_owned(),
                     )
+                } else if looks_like_embedded_blob(&decoded) {
+                    quick_xml::events::BytesCData::new(crate::text::redact(&decoded))
                 } else {
                     quick_xml::events::BytesCData::new(decoded)
                 };
@@ -115,7 +111,21 @@ fn local_name(name: QName<'_>) -> Vec<u8> {
     name.local_name().as_ref().to_vec()
 }
 
-fn redact_attributes<'a>(start: &BytesStart<'a>) -> Result<BytesStart<'a>, RedactError> {
+/// Whether any element currently open (not just the immediate parent) is a
+/// denylisted key — a Junos SNMP community landing in `<name>` under
+/// `<community>`, or a PSK in `<ascii-text>` under `<pre-shared-key>`, both
+/// have a *grandparent*, not a parent, that names the secret.
+fn any_ancestor_denylisted(tag_stack: &[Vec<u8>]) -> bool {
+    tag_stack
+        .iter()
+        .any(|name| is_denylisted_key(&String::from_utf8_lossy(name)))
+}
+
+fn redact_attributes<'a>(
+    start: &BytesStart<'a>,
+    tag_stack: &[Vec<u8>],
+) -> Result<BytesStart<'a>, RedactError> {
+    let ancestor_is_secret = any_ancestor_denylisted(tag_stack);
     let mut out = BytesStart::new(String::from_utf8_lossy(start.name().as_ref()).into_owned());
     for attr in start.attributes() {
         let attr = attr.map_err(|e| RedactError::InvalidXml(e.to_string()))?;
@@ -124,11 +134,12 @@ fn redact_attributes<'a>(start: &BytesStart<'a>) -> Result<BytesStart<'a>, Redac
             .normalized_value(quick_xml::XmlVersion::Implicit1_0)
             .map_err(|e| RedactError::InvalidXml(e.to_string()))?
             .into_owned();
-        let redacted_value = if is_denylisted_key(&key) || looks_like_secret_value(&value) {
-            String::from_utf8_lossy(PLACEHOLDER).into_owned()
-        } else {
-            value
-        };
+        let redacted_value =
+            if ancestor_is_secret || is_denylisted_key(&key) || looks_like_secret_value(&value) {
+                String::from_utf8_lossy(PLACEHOLDER).into_owned()
+            } else {
+                value
+            };
         out.push_attribute((
             String::from_utf8_lossy(attr.key.as_ref()).as_ref(),
             redacted_value.as_str(),
@@ -139,7 +150,7 @@ fn redact_attributes<'a>(start: &BytesStart<'a>) -> Result<BytesStart<'a>, Redac
 
 fn redact_text_bytes<'a>(
     text: &BytesText<'a>,
-    enclosing_key_is_secret: bool,
+    ancestor_is_secret: bool,
 ) -> Result<BytesText<'static>, RedactError> {
     let raw = text
         .decode()
@@ -147,8 +158,10 @@ fn redact_text_bytes<'a>(
     let decoded = quick_xml::escape::unescape(&raw)
         .map_err(|e| RedactError::InvalidXml(e.to_string()))?
         .into_owned();
-    if enclosing_key_is_secret || looks_like_secret_value(&decoded) {
+    if ancestor_is_secret || looks_like_secret_value(&decoded) {
         Ok(BytesText::new(&String::from_utf8_lossy(PLACEHOLDER)).into_owned())
+    } else if looks_like_embedded_blob(&decoded) {
+        Ok(BytesText::new(&crate::text::redact(&decoded)).into_owned())
     } else {
         Ok(BytesText::new(&decoded).into_owned())
     }
@@ -214,5 +227,41 @@ mod tests {
     fn malformed_xml_is_rejected_not_passed_through() {
         let err = redact("<unclosed><tag>").unwrap_err();
         assert!(matches!(err, RedactError::InvalidXml(_)));
+    }
+
+    #[test]
+    fn f4a_denylisted_grandparent_element_redacts_descendant_text() {
+        let xml = r#"<snmp><community><name>QQcommunity1</name></community></snmp>"#;
+        let got = redact(xml).unwrap();
+        assert!(!got.contains("QQcommunity1"), "got: {got}");
+    }
+
+    #[test]
+    fn f4a_denylisted_grandparent_redacts_nested_ascii_text() {
+        let xml = r#"<pre-shared-key><ascii-text>QQpsk1</ascii-text></pre-shared-key>"#;
+        let got = redact(xml).unwrap();
+        assert!(!got.contains("QQpsk1"), "got: {got}");
+    }
+
+    #[test]
+    fn f4b_configuration_text_blob_is_scrubbed_for_embedded_secrets() {
+        let xml = r#"<rpc-reply><configuration-text>set interfaces ge-0/0/0 unit 0
+set security ike policy p1 pre-shared-key ascii-text "$9$fakehashvalue"; ## SECRET-DATA
+</configuration-text></rpc-reply>"#;
+        let got = redact(xml).unwrap();
+        assert!(!got.contains("fakehashvalue"), "got: {got}");
+        assert!(
+            got.contains("set interfaces ge-0/0/0 unit 0"),
+            "unrelated config lines must survive: {got}"
+        );
+    }
+
+    #[test]
+    fn f4b_command_output_blob_is_scrubbed() {
+        let xml = r#"<output>root:$6$fakesaltfakehash:19000:0:99999:7:::
+another line</output>"#;
+        let got = redact(xml).unwrap();
+        assert!(!got.contains("fakesaltfakehash"), "got: {got}");
+        assert!(got.contains("another line"), "got: {got}");
     }
 }

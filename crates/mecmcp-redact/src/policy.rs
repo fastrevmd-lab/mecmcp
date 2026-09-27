@@ -48,16 +48,37 @@ pub enum RedactionPolicy {
 /// satisfies both "logs loudly at startup" and "recorded in the audit trail"
 /// without this crate depending on `mecmcp-audit` at all.
 pub fn install(policy: RedactionPolicy) {
-    if let RedactionPolicy::DisabledByOperator { flag } = &policy {
-        tracing::warn!(
-            target: "audit",
-            event = "tool_output_redaction_disabled",
-            operator_flag = %flag,
-            "tool-output redaction disabled by operator flag {flag}: device secrets, keys, \
-             and tokens in tool output will reach the model unredacted",
-        );
+    let disabled_flag = match &policy {
+        RedactionPolicy::DisabledByOperator { flag } => Some(*flag),
+        RedactionPolicy::Enabled => None,
+    };
+    match POLICY.set(policy) {
+        Ok(()) => {
+            if let Some(flag) = disabled_flag {
+                tracing::warn!(
+                    target: "audit",
+                    event = "tool_output_redaction_disabled",
+                    operator_flag = %flag,
+                    "tool-output redaction disabled by operator flag {flag}: device secrets, \
+                     keys, and tokens in tool output will reach the model unredacted",
+                );
+            }
+        }
+        Err(_) => {
+            // `active()` already locked in a policy (or a previous `install`
+            // won the race) — this call had no effect. Logging the disable
+            // event here anyway would claim redaction is off when the
+            // already-installed policy, not this one, is what's actually in
+            // force.
+            tracing::warn!(
+                target: "audit",
+                event = "tool_output_redaction_install_ignored",
+                requested_disable_flag = disabled_flag.unwrap_or("<n/a>"),
+                "install() called after the redaction policy was already locked in; \
+                 the already-installed policy remains in effect",
+            );
+        }
     }
-    let _ = POLICY.set(policy);
 }
 
 /// The active redaction policy. Defaults to [`RedactionPolicy::Enabled`] when

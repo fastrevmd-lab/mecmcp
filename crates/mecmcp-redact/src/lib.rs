@@ -33,12 +33,14 @@
 //! their signatures a tool argument could thread through even if a handler
 //! tried.
 //!
-//! # Fingerprints are computed before redaction
+//! # Fingerprints are computed before redaction, and keyed
 //!
-//! [`digest::digest_hex`] must run on the original bytes. See the
-//! [`digest`] module for why change detection breaks otherwise, and
-//! [`redact_and_digest`] for the combinator that makes that the only order a
-//! caller can reach.
+//! [`redact_and_digest`] computes an HMAC-SHA256 fingerprint over the
+//! original bytes, under a per-install key the caller supplies and the model
+//! never sees. See the [`digest`] module for why change detection breaks if
+//! the digest runs on redacted text, why it must be keyed rather than a
+//! plain content hash, and why [`redact_and_digest`] is the only place that
+//! order and that key ever meet.
 
 pub mod denylist;
 pub mod digest;
@@ -141,25 +143,40 @@ pub fn redact_xml_str(input: &str) -> Result<String, RedactError> {
 /// of the *original* body it was computed from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedactedOutput {
-    /// `sha256:<hex>` over the unredacted input.
+    /// `hmac-sha256:<hex>` over the unredacted input, keyed by the
+    /// `digest_key` passed to [`redact_and_digest`].
     pub digest: String,
     /// The redacted body, in the same format it was given in.
     pub redacted: String,
 }
 
-/// Digest the original bytes, then redact them, and hand back both.
+/// Digest the original bytes under `digest_key`, then redact them, and hand
+/// back both.
 ///
 /// This is the recommended entry point for a server wiring redaction into a
 /// tool-output path that also needs a fingerprint: it makes "digest the
-/// unredacted data" the only order reachable through the API, rather than two
-/// separate calls a future edit could accidentally reorder.
+/// unredacted data, keyed" the only order and shape reachable through the
+/// API, rather than two separate calls a future edit could accidentally
+/// reorder or a plain unkeyed hash a future edit could accidentally swap in.
+///
+/// `digest_key` must be a per-install secret the model never sees — see the
+/// [`digest`] module docs for why an unkeyed digest paired with the redacted
+/// body is a guessing oracle for low-entropy secrets. This function has no
+/// opinion on where the key comes from; a typical caller loads it once at
+/// startup the same way `mecmcp_audit::redact`'s own `--audit-hmac-key-file`
+/// does, and passes the same bytes on every call so change detection keeps
+/// working across polls.
 ///
 /// # Errors
 /// Returns [`RedactError::InvalidJson`] or [`RedactError::InvalidXml`] per
 /// `format`, for the same reasons [`redact_json_str`] and [`redact_xml_str`]
 /// do. [`Format::Text`] never fails.
-pub fn redact_and_digest(raw: &str, format: Format) -> Result<RedactedOutput, RedactError> {
-    let digest = digest::digest_hex(raw.as_bytes());
+pub fn redact_and_digest(
+    raw: &str,
+    format: Format,
+    digest_key: &[u8],
+) -> Result<RedactedOutput, RedactError> {
+    let digest = digest::digest_hex(digest_key, raw.as_bytes());
     let redacted = match format {
         Format::Text => redact_text(raw),
         Format::Json => redact_json_str(raw)?,
@@ -173,23 +190,39 @@ pub fn redact_and_digest(raw: &str, format: Format) -> Result<RedactedOutput, Re
 mod tests {
     use super::*;
 
+    const TEST_DIGEST_KEY: &[u8] = b"QQtest-install-digest-key";
+
     #[test]
     fn redact_and_digest_digest_matches_direct_digest_of_raw_input() {
         let raw = r#"{"password": "FAKEsupersecret123", "hostname": "r1.example.net"}"#;
-        let out = redact_and_digest(raw, Format::Json).unwrap();
-        assert_eq!(out.digest, digest::digest_hex(raw.as_bytes()));
+        let out = redact_and_digest(raw, Format::Json, TEST_DIGEST_KEY).unwrap();
+        assert_eq!(
+            out.digest,
+            digest::digest_hex(TEST_DIGEST_KEY, raw.as_bytes())
+        );
         assert!(!out.redacted.contains("FAKEsupersecret123"));
+    }
+
+    /// F8: pairing the redacted body with an *unkeyed* digest of the
+    /// original is a guessing oracle for low-entropy secrets. Different
+    /// install keys over the same raw input must disagree.
+    #[test]
+    fn redact_and_digest_digest_depends_on_the_key() {
+        let raw = r#"{"community": "FAKEcommunity123"}"#;
+        let a = redact_and_digest(raw, Format::Json, b"QQkey-a").unwrap();
+        let b = redact_and_digest(raw, Format::Json, b"QQkey-b").unwrap();
+        assert_ne!(a.digest, b.digest);
     }
 
     #[test]
     fn redact_and_digest_rejects_malformed_json_rather_than_guessing() {
-        let err = redact_and_digest("{not json", Format::Json).unwrap_err();
+        let err = redact_and_digest("{not json", Format::Json, TEST_DIGEST_KEY).unwrap_err();
         assert!(matches!(err, RedactError::InvalidJson(_)));
     }
 
     #[test]
     fn redact_and_digest_rejects_malformed_xml_rather_than_guessing() {
-        let err = redact_and_digest("<unclosed>", Format::Xml).unwrap_err();
+        let err = redact_and_digest("<unclosed>", Format::Xml, TEST_DIGEST_KEY).unwrap_err();
         assert!(matches!(err, RedactError::InvalidXml(_)));
     }
 
