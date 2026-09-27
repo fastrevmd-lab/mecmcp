@@ -84,8 +84,8 @@ fn a_configured_endpoint_produces_a_pipeline_config() {
     // Trailing newline stripped: a password file written with an editor ends
     // in one, and sending it would fail auth in a way that reads like a wrong
     // password rather than a stray byte.
-    assert_eq!(config.sink.password, "write-secret");
-    assert_eq!(config.sink.verify_password, "verify-secret");
+    assert_eq!(config.sink.password.expose(), "write-secret");
+    assert_eq!(config.sink.verify_password.expose(), "verify-secret");
     assert!(
         !config.run_id.is_empty() && config.run_id != config.server_id,
         "each process lifetime needs its own run id: {config:?}"
@@ -275,7 +275,7 @@ fn only_one_line_ending_is_stripped_from_a_password() {
     .unwrap()
     .expect("configured");
 
-    assert_eq!(config.sink.password, "trailing space ");
+    assert_eq!(config.sink.password.expose(), "trailing space ");
 }
 
 /// An empty credential file is a configuration error, not an empty password.

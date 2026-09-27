@@ -515,10 +515,13 @@ pub enum EvidenceArgsError {
 /// UTF-8 conversion would silently substitute replacement characters -- both
 /// surfacing later as an authentication failure that looks like a wrong
 /// password rather than a mangled one.
-fn read_password(path: Option<&Path>, flag: &'static str) -> Result<String, EvidenceArgsError> {
+fn read_password(
+    path: Option<&Path>,
+    flag: &'static str,
+) -> Result<mecmcp_secret::OutboundSecret, EvidenceArgsError> {
     let path = path.ok_or(EvidenceArgsError::MissingPassword { flag })?;
     let secret = mecmcp_secret::load_from_file(path, mecmcp_secret::SecretLimits::default())?;
-    Ok(secret.expose().to_owned())
+    Ok(secret)
 }
 
 /// A fresh run identifier for this process lifetime.
