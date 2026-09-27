@@ -29,8 +29,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **transport: `/healthz` and `/readyz`** (MEC-48, mecmcp#377). Both are
+  unauthenticated, always mounted, and return no device or customer data.
+  `/healthz` reports the process is up with no dependency check. `/readyz`
+  runs the consumer-supplied `ReadinessCheck`s registered with
+  `HttpTransportConfig::with_readiness_check` — 200 when all pass (including
+  when none are configured), 503 listing the failed check names otherwise.
+  `mecmcp-transport` ships no checks of its own; each consuming server wires
+  in audit-sink-writable and inventory-loaded checks as a follow-up.
+
 ### Changed
 
+- **transport: `/metrics` defaults to loopback-only** (MEC-48, mecmcp#377).
+  **Behaviour change:** a peer that is not `127.0.0.1`/`::1` now gets a 403
+  from `/metrics`, regardless of any MCP bearer token it presents — where
+  previously any peer that passed the Host/Origin allowlist and IP rate limit
+  could reach it. Call the new `HttpTransportConfig::with_metrics_token`
+  to also admit a non-loopback peer presenting a dedicated metrics bearer
+  token (checked independently of the MCP token store, so an MCP token still
+  never grants `/metrics`). See `docs/METRICS.md` for the Prometheus scrape
+  config migration.
 - **Raised MSRV to 1.89** and removed the `aes` pin from the CI msrv job that PR #344 added. All six consumer repos are moving to 1.89 in parallel PRs, so the objection that blocked raising the floor in #344 no longer stands.
 
 ## [0.23.1] - 2026-09-05

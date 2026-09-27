@@ -1,11 +1,15 @@
 //! Prometheus metrics runtime with vendor-neutral naming.
 
 use axum::Router;
-use axum::extract::State;
-use axum::http::{HeaderValue, header::CONTENT_TYPE};
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::{HeaderValue, StatusCode, header::CONTENT_TYPE};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use mecmcp_auth::{BearerSyntax, TokenDigest, parse_bearer_header};
 use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::MissedTickBehavior;
 use tokio_util::task::AbortOnDropHandle;
@@ -183,6 +187,94 @@ async fn render_metrics(State(handle): State<PrometheusHandle>) -> Response {
         handle.render(),
     )
         .into_response()
+}
+
+/// Who may reach `/metrics` when the peer is not loopback.
+///
+/// Loopback peers are always admitted without a token — that matches the
+/// pre-existing deployment model (a Prometheus scraper colocated with the
+/// process) and keeps `/metrics` working with zero configuration. A
+/// non-loopback peer must present this exact token, which is **not** an MCP
+/// bearer token: it is checked against its own digest, never against the
+/// `BearerBoundary`'s token store, so an MCP token never grants `/metrics`.
+#[derive(Clone, Default)]
+pub(crate) struct MetricsAccess {
+    token: Option<Arc<TokenDigest>>,
+}
+
+impl MetricsAccess {
+    /// No token configured: `/metrics` is loopback-only.
+    pub(crate) fn loopback_only() -> Self {
+        Self { token: None }
+    }
+
+    /// A non-loopback peer presenting this token's plaintext is admitted.
+    pub(crate) fn loopback_or_token(token: TokenDigest) -> Self {
+        Self {
+            token: Some(Arc::new(token)),
+        }
+    }
+}
+
+/// Gate `/metrics` behind [`MetricsAccess`].
+///
+/// # Fail-closed on a missing `ConnectInfo`
+///
+/// Unlike the IP rate limiter, which treats an absent `ConnectInfo` as "skip
+/// the limit" (an availability control failing open), this treats it as "not
+/// loopback" (a confidentiality control failing closed) — `/metrics` can leak
+/// device names, tool usage, and error rates (data gravity), so an unknown
+/// peer must not be trusted by default. In production `ConnectInfo` is always
+/// present (`serve_router` mounts with `into_make_service_with_connect_info`);
+/// absence only happens in a test harness that did not wire one in.
+async fn metrics_access_middleware(
+    State(access): State<MetricsAccess>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let is_loopback = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .is_some_and(|ConnectInfo(addr)| addr.ip().is_loopback());
+
+    if is_loopback {
+        return next.run(request).await;
+    }
+
+    if let Some(digest) = &access.token
+        && let Some(candidate) = bearer_candidate(&request)
+        && digest.verify(candidate)
+    {
+        return next.run(request).await;
+    }
+
+    (
+        StatusCode::FORBIDDEN,
+        "metrics access requires a loopback peer or a valid metrics token",
+    )
+        .into_response()
+}
+
+/// Extract the bearer credential from `Authorization`, if exactly one is present.
+fn bearer_candidate(request: &Request) -> Option<&str> {
+    let mut values = request
+        .headers()
+        .get_all(axum::http::header::AUTHORIZATION)
+        .iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let value = value.to_str().ok()?;
+    parse_bearer_header(value, BearerSyntax::Strict).ok()
+}
+
+/// Wrap a `/metrics` router with the loopback-or-token gate.
+pub(crate) fn gate_metrics_router(router: Router, access: MetricsAccess) -> Router {
+    router.layer(axum::middleware::from_fn_with_state(
+        access,
+        metrics_access_middleware,
+    ))
 }
 
 // Module-level metric name storage for use by overload responses and other
@@ -469,5 +561,108 @@ mod tests {
             "metric names differ across threads — this is the thread_local \
              regression: middleware on a tokio worker would record nothing"
         );
+    }
+
+    mod access_gate {
+        use super::*;
+        use axum::extract::ConnectInfo;
+
+        fn addr(s: &str) -> SocketAddr {
+            s.parse().expect("address")
+        }
+
+        fn gated_router(access: MetricsAccess) -> Router {
+            let (_recorder, handle) = test_recorder("gate");
+            gate_metrics_router(metrics_router(handle), access)
+        }
+
+        async fn get(router: Router, peer: SocketAddr, bearer: Option<&str>) -> StatusCode {
+            let mut builder = Request::builder().uri("/metrics");
+            if let Some(token) = bearer {
+                builder =
+                    builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let request = builder
+                .extension(ConnectInfo(peer))
+                .body(Body::empty())
+                .unwrap();
+            router.oneshot(request).await.unwrap().status()
+        }
+
+        #[tokio::test]
+        async fn loopback_peer_is_admitted_without_a_token_by_default() {
+            let status = get(
+                gated_router(MetricsAccess::loopback_only()),
+                addr("127.0.0.1:9999"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn non_loopback_peer_is_refused_by_default() {
+            let status = get(
+                gated_router(MetricsAccess::loopback_only()),
+                addr("203.0.113.5:9999"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn non_loopback_peer_with_valid_metrics_token_is_admitted() {
+            let (secret, digest) = mecmcp_auth::TokenSecret::mint().unwrap();
+            let status = get(
+                gated_router(MetricsAccess::loopback_or_token(digest)),
+                addr("203.0.113.5:9999"),
+                Some(secret.expose_secret()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn non_loopback_peer_without_the_token_is_refused_even_when_one_is_configured() {
+            let (_secret, digest) = mecmcp_auth::TokenSecret::mint().unwrap();
+            let status = get(
+                gated_router(MetricsAccess::loopback_or_token(digest)),
+                addr("203.0.113.5:9999"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+
+        /// An MCP bearer token is a different secret than the metrics token —
+        /// presenting it must not grant `/metrics`.
+        #[tokio::test]
+        async fn an_mcp_token_does_not_grant_metrics_access() {
+            let (_mcp_secret, _mcp_digest) = mecmcp_auth::TokenSecret::mint().unwrap();
+            let (_metrics_secret, metrics_digest) = mecmcp_auth::TokenSecret::mint().unwrap();
+            let status = get(
+                gated_router(MetricsAccess::loopback_or_token(metrics_digest)),
+                addr("203.0.113.5:9999"),
+                Some(_mcp_secret.expose_secret()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn missing_connect_info_fails_closed() {
+            // No `.extension(ConnectInfo(..))` at all — simulates a router
+            // mounted without connect-info wiring. Must refuse, not admit.
+            let (_recorder, handle) = test_recorder("gate-noconnect");
+            let router =
+                gate_metrics_router(metrics_router(handle), MetricsAccess::loopback_only());
+            let request = Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap();
+            let status = router.oneshot(request).await.unwrap().status();
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
     }
 }

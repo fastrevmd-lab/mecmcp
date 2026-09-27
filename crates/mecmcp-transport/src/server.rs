@@ -134,6 +134,8 @@ pub struct HttpTransportConfig<G: Grant> {
     host_origin: HostOriginPolicy,
     bearer: Option<BearerBoundary<G>>,
     enable_metrics: bool,
+    metrics_access: crate::metrics::MetricsAccess,
+    readiness_checks: Vec<crate::health::ReadinessCheck>,
     shutdown: CancellationToken,
     insecure_bind: Option<crate::consent::InsecureBindAcknowledgement>,
 }
@@ -177,6 +179,8 @@ impl<G: Grant> HttpTransportConfig<G> {
             host_origin,
             bearer: Some(bearer),
             enable_metrics: false,
+            metrics_access: crate::metrics::MetricsAccess::loopback_only(),
+            readiness_checks: Vec::new(),
             shutdown,
             insecure_bind: None,
         }
@@ -227,6 +231,8 @@ impl<G: Grant> HttpTransportConfig<G> {
             host_origin,
             bearer: None,
             enable_metrics: false,
+            metrics_access: crate::metrics::MetricsAccess::loopback_only(),
+            readiness_checks: Vec::new(),
             shutdown,
             insecure_bind: None,
         }
@@ -246,12 +252,15 @@ impl<G: Grant> HttpTransportConfig<G> {
         self
     }
 
-    /// Enable the unauthenticated `/metrics` endpoint.
+    /// Enable the `/metrics` endpoint.
     ///
     /// When enabled, Prometheus metrics are exposed at `/metrics`. This
-    /// endpoint is **not** protected by bearer authentication, so it must be
-    /// exposed only on a trusted network or behind a reverse proxy that
-    /// restricts access.
+    /// endpoint is **not** protected by MCP bearer authentication — it has its
+    /// own access control instead. By default `/metrics` is loopback-only: a
+    /// peer that is not `127.0.0.1`/`::1` gets a 403, regardless of any MCP
+    /// bearer token it presents. Call
+    /// [`with_metrics_token`](Self::with_metrics_token) to also admit a
+    /// non-loopback peer that presents a distinct metrics bearer token.
     ///
     /// # Example
     ///
@@ -271,6 +280,32 @@ impl<G: Grant> HttpTransportConfig<G> {
     #[must_use]
     pub fn with_metrics(mut self, enabled: bool) -> Self {
         self.enable_metrics = enabled;
+        self
+    }
+
+    /// Require this token from any non-loopback peer of `/metrics`.
+    ///
+    /// Without this, `/metrics` is loopback-only: a peer that is not
+    /// `127.0.0.1`/`::1` is refused regardless of any MCP bearer token it
+    /// presents. Calling this lets a non-loopback Prometheus scraper in by
+    /// presenting `digest`'s plaintext as its own bearer token — deliberately
+    /// **not** the same token store as MCP authentication, so an MCP token
+    /// never grants `/metrics`. See [`mecmcp_auth::TokenSecret::mint`] to
+    /// generate one.
+    #[must_use]
+    pub fn with_metrics_token(mut self, digest: mecmcp_auth::TokenDigest) -> Self {
+        self.metrics_access = crate::metrics::MetricsAccess::loopback_or_token(digest);
+        self
+    }
+
+    /// Add a named `/readyz` probe.
+    ///
+    /// `mecmcp-transport` has no audit sink or inventory of its own, so it
+    /// runs no checks by default and reports ready. Each consuming server
+    /// wires its own checks (audit sink writable, inventory loaded) here.
+    #[must_use]
+    pub fn with_readiness_check(mut self, check: crate::health::ReadinessCheck) -> Self {
+        self.readiness_checks.push(check);
         self
     }
 }
@@ -475,12 +510,20 @@ where
         ));
     }
 
-    // Merge metrics endpoint if enabled (unauthenticated)
+    // Merge metrics endpoint if enabled, gated by MetricsAccess (loopback
+    // peer, or a non-loopback peer presenting the configured metrics token).
     if let Some(runtime) = metrics_runtime {
-        router = router.merge(runtime.router()).layer(Extension(runtime));
+        let gated = crate::metrics::gate_metrics_router(runtime.router(), config.metrics_access);
+        router = router.merge(gated).layer(Extension(runtime));
     }
 
-    // Apply Host/Origin validation to the entire router (covers /mcp and /metrics).
+    // Merge health endpoints unconditionally: unlike /metrics, a health probe
+    // is not opt-in, and neither route consults device or customer data.
+    router = router.merge(crate::health::health_router(Arc::from(
+        config.readiness_checks,
+    )));
+
+    // Apply Host/Origin validation to the entire router (covers /mcp, /metrics, and /healthz+/readyz).
     // This prevents DNS rebinding attacks where an attacker-controlled page
     // requests /metrics with a foreign Host header to read unauthenticated data,
     // and ensures Origin validation uses exact matching (no port wildcards).
@@ -1396,6 +1439,11 @@ mod tests {
     async fn metrics_endpoint_enforces_host_allowlist() {
         // Test that /metrics enforces the Host allowlist, preventing DNS rebinding
         // attacks where an attacker page requests /metrics with a foreign Host.
+        //
+        // Both requests carry a loopback ConnectInfo: this test is about the
+        // Host/Origin layer, not the loopback-or-token metrics access gate
+        // added for MEC-48, which is covered by its own tests in metrics.rs.
+        let peer: std::net::SocketAddr = "127.0.0.1:0".parse().expect("address");
         let config = HttpTransportConfig::<NoGrant>::unauthenticated(
             TransportIdentity::new("testmcp", "test", "test", ["device"]),
             LimitsConfig::default(),
@@ -1416,6 +1464,7 @@ mod tests {
                     .method("GET")
                     .uri("/metrics")
                     .header(header::HOST, "attacker.example")
+                    .extension(axum::extract::ConnectInfo(peer))
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -1430,11 +1479,13 @@ mod tests {
 
         // Allowed Host should be accepted
         let allowed_response = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
                     .uri("/metrics")
                     .header(header::HOST, "allowed.example.test")
+                    .extension(axum::extract::ConnectInfo(peer))
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -1445,6 +1496,78 @@ mod tests {
             allowed_response.status(),
             StatusCode::OK,
             "allowed Host should serve /metrics"
+        );
+
+        // MEC-48: a non-loopback peer is refused even with an allowed Host —
+        // the loopback-or-token gate sits inside Host/Origin validation. Reuses
+        // this test's router/recorder rather than building a second one:
+        // PrometheusRuntime::install is a process-global recorder, and a
+        // second `build_streamable_http_router(..).with_metrics(true)` in the
+        // same test binary panics on install (mecmcp-transport has no
+        // per-test recorder teardown).
+        let non_loopback: std::net::SocketAddr = "203.0.113.7:0".parse().expect("address");
+        let non_loopback_response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .header(header::HOST, "allowed.example.test")
+                    .extension(axum::extract::ConnectInfo(non_loopback))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            non_loopback_response.status(),
+            StatusCode::FORBIDDEN,
+            "a non-loopback peer must be refused by default even with an allowed Host"
+        );
+    }
+
+    /// MEC-48: `/healthz` and `/readyz` are merged unconditionally, unlike
+    /// `/metrics`, which stays opt-in.
+    #[tokio::test]
+    async fn health_endpoints_are_reachable_with_metrics_disabled() {
+        let config = HttpTransportConfig::<NoGrant>::unauthenticated(
+            TransportIdentity::new("testmcp", "test", "test", ["device"]),
+            LimitsConfig::default(),
+            HostOriginPolicy::enforced(Vec::<String>::new(), Vec::<String>::new()),
+            CancellationToken::new(),
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
+        );
+        let plan = build_streamable_http_router(|| Ok::<_, std::io::Error>(EmptyServer), config)
+            .expect("router build failed");
+        let router = plan.router;
+
+        let healthz = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(healthz.status(), StatusCode::OK, "healthz needs no auth");
+
+        let readyz = router
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            readyz.status(),
+            StatusCode::OK,
+            "readyz with no configured checks reports ready"
         );
     }
 

@@ -12,6 +12,7 @@ mod concurrency;
 mod config;
 mod consent;
 pub mod evidence_transport;
+mod health;
 mod identity;
 mod listener;
 mod metrics;
@@ -47,6 +48,7 @@ pub use concurrency::{
 #[allow(deprecated)]
 pub use config::{LimitsConfig, LimitsConfigError, streamable_http_server_config};
 pub use consent::{InsecureBindAcknowledgement, NoAuthAcknowledgement};
+pub use health::ReadinessCheck;
 pub use identity::TransportIdentity;
 pub use listener::ListenerRefusal;
 pub use metrics::PrometheusRuntime;
