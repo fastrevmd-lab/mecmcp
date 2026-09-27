@@ -155,7 +155,7 @@ pub struct TokenEntry<G: Grant = NoGrant> {
     /// The human on whose behalf this credential acts.
     ///
     /// Server-verified provenance field. Populated for agent tokens acting
-    /// under delegation (e.g., "fastrevmd@gmail.com"). May also be set for
+    /// under delegation (e.g., "dev@example.com"). May also be set for
     /// human-operator tokens to record the identity the token represents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_behalf_of: Option<String>,
@@ -756,7 +756,7 @@ mod tests {
             "created_at_unix": 1783850400,
             "provider": "anthropic",
             "provider_tier": "public",
-            "on_behalf_of": "fastrevmd@gmail.com"
+            "on_behalf_of": "dev@example.com"
         }"#;
         let entry: TokenEntry = serde_json::from_str(raw).expect("parse");
         entry
