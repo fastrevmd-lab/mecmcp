@@ -5,7 +5,10 @@
 shipped in mecmcp **0.14.0** (2026-08-23; see
 [`CHANGELOG.md`](../CHANGELOG.md)) — see
 [#292](https://github.com/fastrevmd-lab/mecmcp/issues/292) for the
-implementation history. SSDF is the only supported off-host transport today;
+implementation history. It carries the change-lifecycle evidence records
+(proposal, approval, apply intent, receipt); the per-call tool audit stream
+(Part 1's `audit.jsonl`) is not forwarded and stays on the host. SSDF is the
+only supported off-host transport today for the records it does carry;
 syslog forwarding was designed, staged and rejected — see
 [Why not syslog](#why-not-syslog-to-the-existing-collector) below. See
 [Enabling it](#enabling-it) to turn it on for a server.
@@ -53,6 +56,12 @@ under the write identity, which SSDF grants INSERT-only on purpose — is
 resolved: the sink reads a high-water mark under a separate, SELECT-only
 identity instead (ssdf#47; see
 [`sinks/ssdf.rs`](../crates/mecmcp-audit/src/sinks/ssdf.rs)).
+
+The sink ships `ClosedSegment`s from the evidence recorder
+([`recorder.rs`](../crates/mecmcp-audit/src/recorder.rs)) — the four
+change-lifecycle record types. It does not carry the per-call tool audit
+stream from Part 1: nothing feeds `audit.jsonl` into `SsdfSink` today, so
+those records stay on the MCP host.
 
 ### Enabling it
 
@@ -193,6 +202,10 @@ JSONL sinks get the equivalent through logrotate: `daily`, `rotate 14`,
   SSDF sink (shipped in 0.14.0, #292; see [Enabling it](#enabling-it)), and
   standing up a second, unchained forwarding path beside it is the thing
   [Why not syslog](#why-not-syslog-to-the-existing-collector) exists to avoid.
+- **The per-call audit stream is not forwarded off-host.** Only
+  change-lifecycle evidence (proposal, approval, apply intent, receipt)
+  reaches `ssdf.audit`; Part 1's `audit.jsonl` — the per-call tool-call
+  trail — stays on the MCP host with no chained off-host copy.
 - **The device-side record omits the approver.** A two-person apply commits
   naming only the applier — see
   [rustjunosmcp#307](https://github.com/fastrevmd-lab/rustjunosmcp/issues/307).
