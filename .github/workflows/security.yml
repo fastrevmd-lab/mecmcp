@@ -36,11 +36,6 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Cargo.lock is gitignored here — this is a library, and the consuming
-      # binaries pin transitively through their own lockfiles. Generate one so
-      # the audit has something to scan.
-      - name: Ensure Cargo.lock exists
-        run: test -f Cargo.lock || cargo generate-lockfile
       - name: cargo-audit (RUSTSEC advisories)
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
@@ -54,5 +49,5 @@ jobs:
       # crates.io, which the job already needs. Matches rustpanosmcp.
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
-      - name: cargo-deny (licenses + bans + sources)
-        run: cargo deny check licenses bans sources
+      - name: cargo-deny (advisories + licenses + bans + sources)
+        run: cargo deny check advisories licenses bans sources
