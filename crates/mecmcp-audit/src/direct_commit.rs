@@ -52,10 +52,16 @@ impl DirectCommitPolicy {
     /// Call once, at process startup, after CLI parsing and before serving any
     /// request. A no-op when the flag is off, so a default deployment's
     /// startup log carries no mention of a risk it did not take.
+    ///
+    /// Deliberately NOT on `target: "audit"`: that stream carries one record
+    /// per tool call with a fixed schema (`AuditScope`'s `Drop` impl), and a
+    /// startup banner has none of those fields. Emitting it there would
+    /// pollute the audit stream with something no consumer can parse as an
+    /// action record — the per-call `direct_commit_allowed=true` tag on
+    /// `AuditScope` is what belongs there instead.
     pub fn log_startup(&self, binary_name: &'static str) {
         if self.allowed {
             tracing::warn!(
-                target: "audit",
                 binary = binary_name,
                 "SECURITY: --allow-direct-commit is enabled on this server. Direct-write tools \
                  will commit device changes with no independent second-principal approval. \
