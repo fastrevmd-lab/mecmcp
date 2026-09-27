@@ -87,6 +87,12 @@ fn disabling_redaction_only_happens_through_install_and_is_logged_and_audited() 
     let xml = "<password>FAKEhunter2</password>";
     assert_eq!(redact_xml_str(xml).unwrap(), xml);
 
+    // N7: the disabled-policy passthrough must still validate well-formedness
+    // — it must not become a way to skip the "this is valid XML" check every
+    // other entry point enforces just because redaction itself is off.
+    let err = redact_xml_str("<unclosed>").unwrap_err();
+    assert!(matches!(err, mecmcp_redact::RedactError::InvalidXml(_)));
+
     // 4. `install` is idempotent: a later call (e.g. a second, mistaken
     // startup invocation) cannot flip the policy back.
     install(RedactionPolicy::Enabled);

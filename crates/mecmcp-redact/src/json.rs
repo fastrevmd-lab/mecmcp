@@ -8,7 +8,7 @@
 //! guarantee the way an allowlist projection is.
 
 use crate::denylist::is_denylisted_key;
-use crate::shape::{looks_like_embedded_blob, looks_like_secret_value};
+use crate::shape::looks_like_secret_value;
 use serde_json::Value;
 
 const PLACEHOLDER: &str = "[REDACTED]";
@@ -33,7 +33,14 @@ pub fn redact(value: &mut Value) {
         Value::String(s) => {
             if looks_like_secret_value(s) {
                 *s = PLACEHOLDER.to_string();
-            } else if looks_like_embedded_blob(s) {
+            } else {
+                // Run the text-path scan over every non-denylisted string,
+                // not just ones that already look like a multi-line/PEM
+                // blob — a single-line `{"msg": "... password=X ..."}`
+                // payload (a Mist event, syslog-as-JSON) needs the same
+                // `k=v` scan (N5). `text::redact`'s non-forced path only
+                // touches known value shapes, so this is a no-op on
+                // ordinary strings.
                 *s = crate::text::redact(s);
             }
         }
@@ -167,5 +174,19 @@ mod tests {
         let original = v.clone();
         redact(&mut v);
         assert_eq!(v, original);
+    }
+
+    /// N5: a single-line `k=v` secret embedded in an ordinary log/event
+    /// string must be caught, not just multi-line blobs or PEM/`SECRET-DATA`
+    /// markers — this is exactly the shape of a Mist event or a
+    /// syslog-as-JSON payload.
+    #[test]
+    fn n5_single_line_kv_secret_in_an_unlisted_string_field_is_redacted() {
+        let mut v = json!({"msg": "login ok user=admin password=QQvalue8 src=192.0.2.1"});
+        redact(&mut v);
+        let s = v["msg"].as_str().expect("msg is a string");
+        assert!(!s.contains("QQvalue8"), "got: {s}");
+        assert!(s.contains("user=admin"), "got: {s}");
+        assert!(s.contains("src=192.0.2.1"), "got: {s}");
     }
 }

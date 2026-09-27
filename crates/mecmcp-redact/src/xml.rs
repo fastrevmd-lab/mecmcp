@@ -11,7 +11,7 @@
 
 use crate::RedactError;
 use crate::denylist::is_denylisted_key;
-use crate::shape::{looks_like_embedded_blob, looks_like_secret_value};
+use crate::shape::looks_like_secret_value;
 use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
@@ -53,7 +53,16 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
                     .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
             }
             Event::Empty(e) => {
+                // An empty element (`<community name="..."/>`) is its own
+                // open-and-close in one event — it never reaches the
+                // `Event::Start`/`Event::End` pair that pushes its name onto
+                // `tag_stack`, so without pushing it here a denylisted
+                // element name on the empty form fails to redact its own
+                // attributes even though the non-empty `<community
+                // name="..."></community>` form does (N4).
+                tag_stack.push(local_name(e.name()));
                 let rewritten = redact_attributes(&e, &tag_stack)?;
+                tag_stack.pop();
                 writer
                     .write_event(Event::Empty(rewritten))
                     .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
@@ -79,10 +88,15 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
                     quick_xml::events::BytesCData::new(
                         String::from_utf8_lossy(PLACEHOLDER).into_owned(),
                     )
-                } else if looks_like_embedded_blob(&decoded) {
-                    quick_xml::events::BytesCData::new(crate::text::redact(&decoded))
                 } else {
-                    quick_xml::events::BytesCData::new(decoded)
+                    // Run the text-path scan over every CDATA body, not just
+                    // ones that already look like a multi-line blob or PEM —
+                    // a single-line `user login password=X ok` payload (a
+                    // Mist event, syslog-as-JSON) needs the same `k=v` scan
+                    // (N5). `text::redact`'s non-forced path only touches
+                    // known value shapes, so this is a no-op on ordinary
+                    // CDATA.
+                    quick_xml::events::BytesCData::new(crate::text::redact(&decoded))
                 };
                 writer
                     .write_event(Event::CData(out))
@@ -109,6 +123,42 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
 
 fn local_name(name: QName<'_>) -> Vec<u8> {
     name.local_name().as_ref().to_vec()
+}
+
+/// Validate that `input` is well-formed XML — every element opened is closed
+/// before EOF — without redacting or otherwise transforming it.
+///
+/// This is the same depth tracking [`redact`] does via `tag_stack`, factored
+/// out so `redact_xml_str`'s disabled-policy passthrough (which must not
+/// redact, but still must not become a way to skip the "this is valid XML"
+/// check every other entry point enforces) can reuse it instead of running a
+/// second, easily-drifting scan loop (N7).
+///
+/// # Errors
+/// Returns [`RedactError::InvalidXml`] on a parse error or an element left
+/// open at EOF.
+pub(crate) fn validate(input: &str) -> Result<(), RedactError> {
+    let mut reader = Reader::from_str(input);
+    let mut depth: usize = 0;
+    loop {
+        match reader
+            .read_event()
+            .map_err(|e| RedactError::InvalidXml(e.to_string()))?
+        {
+            Event::Eof => {
+                return if depth > 0 {
+                    Err(RedactError::InvalidXml(
+                        "unclosed element at end of input".to_string(),
+                    ))
+                } else {
+                    Ok(())
+                };
+            }
+            Event::Start(_) => depth += 1,
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
 }
 
 /// Whether any element currently open (not just the immediate parent) is a
@@ -160,10 +210,11 @@ fn redact_text_bytes<'a>(
         .into_owned();
     if ancestor_is_secret || looks_like_secret_value(&decoded) {
         Ok(BytesText::new(&String::from_utf8_lossy(PLACEHOLDER)).into_owned())
-    } else if looks_like_embedded_blob(&decoded) {
-        Ok(BytesText::new(&crate::text::redact(&decoded)).into_owned())
     } else {
-        Ok(BytesText::new(&decoded).into_owned())
+        // Same reasoning as the CDATA branch above (N5): scan every text
+        // node's body, not only ones that already look like an embedded
+        // blob.
+        Ok(BytesText::new(&crate::text::redact(&decoded)).into_owned())
     }
 }
 
@@ -263,5 +314,35 @@ another line</output>"#;
         let got = redact(xml).unwrap();
         assert!(!got.contains("fakesaltfakehash"), "got: {got}");
         assert!(got.contains("another line"), "got: {got}");
+    }
+
+    // --- N4: a denylisted element name on the self-closing `Empty` form
+    // must redact its own attributes exactly like the `Start`/`End` form. ---
+
+    #[test]
+    fn n4_denylisted_empty_element_attribute_is_redacted() {
+        let xml = r#"<snmp><community name="QQcomm1"/></snmp>"#;
+        let got = redact(xml).unwrap();
+        assert!(!got.contains("QQcomm1"), "got: {got}");
+    }
+
+    #[test]
+    fn n4_denylisted_empty_element_under_entry_is_redacted() {
+        let xml = r#"<entry><password value="QQpw2"/></entry>"#;
+        let got = redact(xml).unwrap();
+        assert!(!got.contains("QQpw2"), "got: {got}");
+    }
+
+    // --- N5: a single-line `k=v` secret inside an otherwise ordinary text
+    // node must be caught by the text-path scan, not just multi-line blobs
+    // or PEM/`SECRET-DATA` markers. ---
+
+    #[test]
+    fn n5_single_line_kv_secret_in_text_node_is_redacted() {
+        let xml = "<message>user login password=QQvalue9 ok</message>";
+        let got = redact(xml).unwrap();
+        assert!(!got.contains("QQvalue9"), "got: {got}");
+        assert!(got.contains("user login"), "got: {got}");
+        assert!(got.contains("ok</message>"), "got: {got}");
     }
 }

@@ -61,8 +61,8 @@ pub(crate) fn digest_hex(key: &[u8], data: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    const KEY_A: &[u8] = b"QQtest-install-key-A";
-    const KEY_B: &[u8] = b"QQtest-install-key-B";
+    const KEY_A: &[u8] = b"QQtest-install-key-A-0000000000000000";
+    const KEY_B: &[u8] = b"QQtest-install-key-B-0000000000000000";
 
     #[test]
     fn digest_is_stable_for_the_same_key_and_content_addressed() {
@@ -88,27 +88,32 @@ mod tests {
         );
     }
 
-    /// The load-bearing property: digesting the unredacted bytes and then
-    /// separately redacting them must not change the digest that was already
-    /// computed. There is no shared mutable state between the two calls —
-    /// this is really a test that the API shape makes the correct order
-    /// (digest first, from the original bytes) the only order there is.
+    /// N9: the load-bearing property is that the digest changes when the
+    /// *secret* changes, even though the *redacted* body it is paired with
+    /// does not — that is the whole point of digesting the unredacted bytes
+    /// (see the module docs). Two inputs differing only inside a redacted
+    /// span must produce identical `redact_and_digest` output but different
+    /// digests; if the digest were computed on the redacted copy instead, a
+    /// rotated PSK would look like no change at all. (The prior version of
+    /// this test hashed the same bytes twice and asserted the two hashes
+    /// were equal, which holds for any pure function and proves nothing.)
     #[test]
-    fn digest_of_unredacted_input_is_unaffected_by_later_redaction() {
-        let raw = r#"{"password": "FAKEsupersecret123"}"#;
-        let digest_before = digest_hex(KEY_A, raw.as_bytes());
+    fn digest_changes_when_a_secret_changes_even_though_the_redacted_output_does_not() {
+        let raw_before = r#"{"password": "FAKEsupersecretAAA"}"#;
+        let raw_after = r#"{"password": "FAKEsupersecretBBB"}"#;
 
-        let mut value: serde_json::Value = serde_json::from_str(raw).unwrap();
-        crate::json::redact(&mut value);
-        assert_ne!(
-            value["password"], "FAKEsupersecret123",
-            "sanity: redaction must actually have changed the value"
+        let out_before = crate::redact_and_digest(raw_before, crate::Format::Json, KEY_A).unwrap();
+        let out_after = crate::redact_and_digest(raw_after, crate::Format::Json, KEY_A).unwrap();
+
+        assert_eq!(
+            out_before.redacted, out_after.redacted,
+            "sanity: both secrets are under the same denylisted key, so the \
+             redacted body must not reveal which one changed"
         );
-
-        // Re-hashing the *original* bytes — the only input the digest API
-        // ever sees — reproduces the same digest no matter what redaction
-        // subsequently did to a derived copy.
-        let digest_after = digest_hex(KEY_A, raw.as_bytes());
-        assert_eq!(digest_before, digest_after);
+        assert_ne!(
+            out_before.digest, out_after.digest,
+            "the digest must still distinguish the two inputs even though \
+             the redacted body cannot"
+        );
     }
 }

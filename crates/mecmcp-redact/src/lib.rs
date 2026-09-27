@@ -75,7 +75,22 @@ pub enum RedactError {
     /// given input that does not parse as XML.
     #[error("input is not well-formed XML, refusing to guess: {0}")]
     InvalidXml(String),
+    /// [`redact_and_digest`] was given a `digest_key` shorter than
+    /// [`MIN_DIGEST_KEY_LEN`] bytes. An empty or low-entropy key makes the
+    /// HMAC fingerprint effectively public, restoring the guessing oracle
+    /// keying the digest exists to close — see the [`digest`] module docs.
+    #[error(
+        "digest key is {0} bytes, at least {MIN_DIGEST_KEY_LEN} are required to keep the HMAC \
+         fingerprint from being a guessing oracle for low-entropy secrets"
+    )]
+    WeakDigestKey(usize),
 }
+
+/// The minimum acceptable length, in bytes, for the `digest_key` passed to
+/// [`redact_and_digest`]. Below this, the key no longer supplies enough
+/// entropy to keep the paired digest from being replayable offline against
+/// candidate low-entropy secrets (an SNMP community string, a short PSK).
+pub const MIN_DIGEST_KEY_LEN: usize = 32;
 
 /// Redact unstructured plain text. Always succeeds — there is no parse step
 /// to fail on free-form text — and passes input through unchanged when
@@ -123,17 +138,11 @@ pub fn redact_json_value(value: &mut serde_json::Value) {
 /// Returns [`RedactError::InvalidXml`] when `input` does not parse as XML.
 pub fn redact_xml_str(input: &str) -> Result<String, RedactError> {
     if matches!(active(), RedactionPolicy::DisabledByOperator { .. }) {
-        // Same validate-without-redact contract as `redact_json_str`.
-        let mut reader = quick_xml::Reader::from_str(input);
-        loop {
-            match reader
-                .read_event()
-                .map_err(|e| RedactError::InvalidXml(e.to_string()))?
-            {
-                quick_xml::events::Event::Eof => break,
-                _ => continue,
-            }
-        }
+        // Same validate-without-redact contract as `redact_json_str`, and
+        // the same well-formedness check `xml::redact` itself enforces
+        // (N7) — a disabled policy must not become a way to skip the "this
+        // is valid XML" check callers rely on.
+        xml::validate(input)?;
         return Ok(input.to_string());
     }
     xml::redact(input)
@@ -170,12 +179,19 @@ pub struct RedactedOutput {
 /// # Errors
 /// Returns [`RedactError::InvalidJson`] or [`RedactError::InvalidXml`] per
 /// `format`, for the same reasons [`redact_json_str`] and [`redact_xml_str`]
-/// do. [`Format::Text`] never fails.
+/// do. [`Format::Text`] never fails for those reasons.
+///
+/// Returns [`RedactError::WeakDigestKey`] when `digest_key` is shorter than
+/// [`MIN_DIGEST_KEY_LEN`] bytes, regardless of `format` — an empty or
+/// constant key is rejected rather than silently accepted (N8).
 pub fn redact_and_digest(
     raw: &str,
     format: Format,
     digest_key: &[u8],
 ) -> Result<RedactedOutput, RedactError> {
+    if digest_key.len() < MIN_DIGEST_KEY_LEN {
+        return Err(RedactError::WeakDigestKey(digest_key.len()));
+    }
     let digest = digest::digest_hex(digest_key, raw.as_bytes());
     let redacted = match format {
         Format::Text => redact_text(raw),
@@ -190,7 +206,7 @@ pub fn redact_and_digest(
 mod tests {
     use super::*;
 
-    const TEST_DIGEST_KEY: &[u8] = b"QQtest-install-digest-key";
+    const TEST_DIGEST_KEY: &[u8] = b"QQtest-install-digest-key-0000000000000000";
 
     #[test]
     fn redact_and_digest_digest_matches_direct_digest_of_raw_input() {
@@ -209,8 +225,8 @@ mod tests {
     #[test]
     fn redact_and_digest_digest_depends_on_the_key() {
         let raw = r#"{"community": "FAKEcommunity123"}"#;
-        let a = redact_and_digest(raw, Format::Json, b"QQkey-a").unwrap();
-        let b = redact_and_digest(raw, Format::Json, b"QQkey-b").unwrap();
+        let a = redact_and_digest(raw, Format::Json, b"QQkey-a-0000000000000000000000000").unwrap();
+        let b = redact_and_digest(raw, Format::Json, b"QQkey-b-0000000000000000000000000").unwrap();
         assert_ne!(a.digest, b.digest);
     }
 
@@ -224,6 +240,21 @@ mod tests {
     fn redact_and_digest_rejects_malformed_xml_rather_than_guessing() {
         let err = redact_and_digest("<unclosed>", Format::Xml, TEST_DIGEST_KEY).unwrap_err();
         assert!(matches!(err, RedactError::InvalidXml(_)));
+    }
+
+    /// N8: an empty (or otherwise too-short) digest key must be rejected —
+    /// accepting it would restore the F8 unkeyed-digest guessing oracle for
+    /// low-entropy secrets in all but name.
+    #[test]
+    fn redact_and_digest_rejects_an_empty_digest_key() {
+        let err = redact_and_digest("hello", Format::Text, b"").unwrap_err();
+        assert!(matches!(err, RedactError::WeakDigestKey(0)));
+    }
+
+    #[test]
+    fn redact_and_digest_rejects_a_digest_key_shorter_than_the_minimum() {
+        let err = redact_and_digest("hello", Format::Text, b"short-key").unwrap_err();
+        assert!(matches!(err, RedactError::WeakDigestKey(9)));
     }
 
     #[test]

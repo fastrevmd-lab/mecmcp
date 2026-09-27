@@ -80,31 +80,57 @@ fn no_denylisted_key_fixture_secret_survives_any_format() {
     }
 }
 
-/// Render `key` in its hyphenated vendor spelling: `pre_shared_key` ->
-/// `pre-shared-key`. The other property test above renders keys in their
-/// already-normalized form (`presharedkey`), which is exactly the spelling
-/// [`mecmcp_redact::denylist::is_denylisted_key`] normalizes *to*, not the
-/// hyphenated form a real vendor field name typically arrives in — that gap
-/// is why F1 (hyphen/underscore-joined keys defeating the text tokenizer)
-/// went uncaught by the exhaustive property test that was supposed to cover
-/// exactly this.
-fn hyphenate(key: &str) -> String {
-    key.chars()
-        .map(|c| if c == '_' { '-' } else { c })
-        .collect()
+/// Real, hyphenated multi-word vendor spellings of denylist terms.
+///
+/// N6 / MEC-121 F1: the previous version of this test rendered
+/// `hyphenate(DENYLISTED_KEYS[i])`, but every entry in
+/// [`DENYLISTED_KEYS`] is already normalized down to a single run of
+/// alphanumerics with no `_` for `hyphenate` to swap — so it rendered the
+/// exact same already-normalized field name as the first property test above
+/// (`presharedkey`, not `pre-shared-key`), making it redundant rather than a
+/// distinct hyphenated-spelling check. It also always suffixed a digit index
+/// onto the fake secret, which coincidentally never exercised the N1 "digit
+/// free value" tokenizer bug even where that bug did apply. This table names
+/// the actual hyphenated forms a vendor CLI uses, and the accompanying test
+/// renders the TEXT case in bare `key value` form with a digit-free secret,
+/// which is exactly the shape that triggers N1.
+const VENDOR_SPELLINGS: &[&str] = &[
+    "pre-shared-key",
+    "private-key",
+    "api-key",
+    "authentication-key",
+    "shared-secret",
+    "bind-pw",
+    "encryption-key",
+    "x-passphrase",
+];
+
+fn alpha_letter(i: usize) -> char {
+    (b'a' + u8::try_from(i).expect("VENDOR_SPELLINGS is well under 26 entries")) as char
 }
 
 #[test]
 fn no_denylisted_key_fixture_secret_survives_any_format_in_its_hyphenated_vendor_spelling() {
-    for (i, key) in DENYLISTED_KEYS.iter().enumerate() {
-        let field = hyphenate(key);
+    for (i, hyphenated) in VENDOR_SPELLINGS.iter().enumerate() {
         for &format in FORMATS {
-            let secret = format!("QQZZH{i:04}{}", format_name(format));
-            let input = render(&field, &secret, format);
+            // Deliberately all-alphabetic, no digits: the exhaustive test
+            // above always suffixes a digit index onto its fake secret,
+            // which happens to mask the N1 "type keyword" heuristic bug in
+            // the text tokenizer — a digit-free secret is exactly the shape
+            // a real SNMP community string or weak PSK takes.
+            let secret = format!("QQvendorspell{}{}", alpha_letter(i), format_name(format));
+            let input = match format {
+                // Bare `key value trailing` form, the shape N1's bug
+                // actually reaches (the `key=`/`key:` forms tested by
+                // `render` don't go through the same "value or type
+                // keyword?" branch).
+                Format::Text => format!("{hyphenated} {secret} trailing"),
+                Format::Json | Format::Xml => render(hyphenated, &secret, format),
+            };
             let got = redact(&input, format);
             assert!(
                 !got.contains(&secret),
-                "denylisted key '{key}' (hyphenated field '{field}') leaked in {}: {got}",
+                "vendor-spelled key '{hyphenated}' leaked in {}: {got}",
                 format_name(format)
             );
         }

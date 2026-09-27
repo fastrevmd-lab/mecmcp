@@ -64,17 +64,21 @@ fn redact_line(line: &str) -> String {
 /// secret field with a value shape nobody anticipated must still not survive.
 /// When `force` is false, only text matching a known value shape is touched.
 fn redact_value_span(line: &str, force: bool) -> String {
-    // Quoted values first: `key "value"` / `key: 'value'` / inline JSON-ish
-    // text. Every quoted span is a value-shape or force candidate.
-    if let Some(redacted) = redact_quoted_spans(line, force) {
+    // When forced, redact every value that follows a denylisted key token
+    // first, not the last `=`/`:`/whitespace on the line and not whichever
+    // quoted span happens to come first — a line can carry several `k=v`
+    // pairs (`user=admin password=X src=...`), bare trailing tokens
+    // (`community X authorization read-only`), and an unrelated quoted field
+    // (`description "core" community X`) all at once, and every one of those
+    // must not let an unrelated quoted span short-circuit the key match.
+    if force && let Some(redacted) = redact_after_denylisted_key(line) {
         return redacted;
     }
-    // When forced, redact the value token that follows the specific
-    // denylisted key token, not the last `=`/`:`/whitespace on the line — a
-    // line can carry several `k=v` pairs (`user=admin password=X src=...`)
-    // or bare trailing tokens (`community X authorization read-only`) where
-    // the denylisted key is nowhere near the end.
-    if force && let Some(redacted) = redact_after_denylisted_key(line) {
+    // Quoted values next: `key "value"` / `key: 'value'` / inline JSON-ish
+    // text. Every quoted span is a value-shape or (when the key match above
+    // found nothing, e.g. a bare `## SECRET-DATA` marker with no denylisted
+    // key) a force candidate.
+    if let Some(redacted) = redact_quoted_spans(line, force) {
         return redacted;
     }
     if let Some(eq) = line.rfind('=') {
@@ -124,31 +128,88 @@ fn whitespace_token_spans(line: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-/// Replace `line[value_start..value_end]` with [`PLACEHOLDER`], but keep any
-/// trailing structural punctuation (`;`, `,`, `{`, `}`) that is attached
-/// directly to the value with no separating whitespace — a Junos statement
-/// terminator or hierarchy brace is not part of the secret.
-fn splice_placeholder(line: &str, value_start: usize, value_end: usize) -> String {
-    let value = &line[value_start..value_end];
-    let core_len = value.trim_end_matches([';', ',', '{', '}']).len();
-    let punct_start = value_start + core_len;
-    format!(
-        "{}{PLACEHOLDER}{}",
-        &line[..value_start],
-        &line[punct_start..]
-    )
+/// Vendor "value type" keywords that some CLIs put directly after a
+/// denylisted key and before the actual secret (Junos
+/// `pre-shared-key ascii-text "..."`, `encrypted-password "$9$..."`). Every
+/// one of these is a closed, known vocabulary — unlike "the next token has no
+/// digit in it", which also matches an ordinary digit-free SNMP community
+/// string or weak PSK (N1) and would skip straight past the real secret.
+/// Matching is case-insensitive; nothing here is normalized/hyphen-agnostic
+/// on purpose, since these are compared as literal tokens, not denylist keys.
+const VALUE_TYPE_KEYWORDS: &[&str] = &[
+    "ascii-text",
+    "hexadecimal",
+    "encrypted-password",
+    "plain-text-password",
+    "simple-password",
+    "authentication-key",
+    "md5",
+    "sha1",
+    "sha256",
+];
+
+fn is_value_type_keyword(token: &str) -> bool {
+    VALUE_TYPE_KEYWORDS
+        .iter()
+        .any(|kw| kw.eq_ignore_ascii_case(token))
 }
 
-/// Find a denylisted key token on `line` and redact the value that follows
-/// it, for `key=value`, `key: value` / `key:value`, and bare `key value`
-/// forms. Quoted values (`key "value"`) are handled earlier by
-/// [`redact_quoted_spans`] and never reach here. Returns `None` when no
-/// denylisted key token is found this way, so the caller can fall back to a
-/// whole-line heuristic.
+/// If `line[start..]` begins with a quote character, return the byte offset
+/// just past its matching closing quote elsewhere on `line`. A quoted value
+/// may contain whitespace (`description "core value"`), so its span cannot
+/// be assumed to end at the next whitespace-delimited token boundary the
+/// caller computed with [`whitespace_token_spans`].
+fn quoted_value_end(line: &str, start: usize) -> Option<usize> {
+    let quote = line[start..].chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let after = start + quote.len_utf8();
+    let end_rel = line[after..].find(quote)?;
+    Some(after + end_rel + quote.len_utf8())
+}
+
+/// Replace every `line[start..end]` in `spans` with [`PLACEHOLDER`], keeping
+/// any trailing structural punctuation (`;`, `,`, `{`, `}`) attached directly
+/// to a span with no separating whitespace — a Junos statement terminator or
+/// hierarchy brace is not part of the secret. `spans` must not overlap.
+fn splice_spans(line: &str, mut spans: Vec<(usize, usize)>) -> String {
+    spans.sort_by_key(|&(start, _)| start);
+    let mut result = String::with_capacity(line.len());
+    let mut cursor = 0;
+    for (start, end) in spans {
+        if start < cursor {
+            // Overlapping with an already-spliced span (e.g. a type-keyword
+            // skip and the bare-key match both landing on the same value) —
+            // already covered.
+            continue;
+        }
+        let value = &line[start..end];
+        let core_len = value.trim_end_matches([';', ',', '{', '}']).len();
+        let punct_start = start + core_len;
+        result.push_str(&line[cursor..start]);
+        result.push_str(PLACEHOLDER);
+        result.push_str(&line[punct_start..end]);
+        cursor = end;
+    }
+    result.push_str(&line[cursor..]);
+    result
+}
+
+/// Find every denylisted key token on `line` and redact the value that
+/// follows each one, for `key=value`, `key: value` / `key:value`, and bare
+/// `key value` forms — a line can carry more than one `k=v` pair
+/// (`psk=X password=Y`), and every one must be redacted, not just the first.
+/// Quoted values (`key "value"`) are recognized via [`quoted_value_end`] so a
+/// value containing whitespace is not truncated at the first space. Returns
+/// `None` when no denylisted key token is found this way, so the caller can
+/// fall back to a whole-line heuristic.
 fn redact_after_denylisted_key(line: &str) -> Option<String> {
     let tokens = whitespace_token_spans(line);
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     for (i, &(s, e)) in tokens.iter().enumerate() {
         let text = &line[s..e];
+        let mut matched_sep = false;
         for sep in ['=', ':'] {
             let Some(rel) = text.find(sep) else {
                 continue;
@@ -157,15 +218,21 @@ fn redact_after_denylisted_key(line: &str) -> Option<String> {
             if !is_denylisted_key(key_part) {
                 continue;
             }
+            matched_sep = true;
             let value_start = s + rel + 1;
             if value_start < e {
-                return Some(splice_placeholder(line, value_start, e));
+                let end = quoted_value_end(line, value_start).unwrap_or(e);
+                spans.push((value_start, end));
+            } else if let Some(&(vs, ve)) = tokens.get(i + 1) {
+                // `key=`/`key:` with nothing else in this token: the value
+                // is the next whitespace token, if there is one.
+                let end = quoted_value_end(line, vs).unwrap_or(ve);
+                spans.push((vs, end));
             }
-            // `key=`/`key:` with nothing else in this token: the value is
-            // the next whitespace token, if there is one.
-            if let Some(&(vs, ve)) = tokens.get(i + 1) {
-                return Some(splice_placeholder(line, vs, ve));
-            }
+            break;
+        }
+        if matched_sep {
+            continue;
         }
         // Bare key token, no `=`/`:` attached to it.
         let bare_key = text.trim_end_matches([':', ';']);
@@ -174,20 +241,21 @@ fn redact_after_denylisted_key(line: &str) -> Option<String> {
             && let Some(&(vs, ve)) = tokens.get(i + 1)
         {
             let next_token = &line[vs..ve];
-            // Some vendors put a type keyword directly after the key,
-            // before the actual secret (Junos `pre-shared-key ascii-text
-            // "..."`). A type keyword never carries entropy — no digit —
-            // so when the immediate next token looks like one and a
-            // further token follows, that further token is the value.
-            if !next_token.chars().any(|c| c.is_ascii_digit())
+            if is_value_type_keyword(next_token)
                 && let Some(&(vs2, ve2)) = tokens.get(i + 2)
             {
-                return Some(splice_placeholder(line, vs2, ve2));
+                let end = quoted_value_end(line, vs2).unwrap_or(ve2);
+                spans.push((vs2, end));
+            } else {
+                let end = quoted_value_end(line, vs).unwrap_or(ve);
+                spans.push((vs, end));
             }
-            return Some(splice_placeholder(line, vs, ve));
         }
     }
-    None
+    if spans.is_empty() {
+        return None;
+    }
+    Some(splice_spans(line, spans))
 }
 
 /// Replace the content of every `"..."` or `'...'` span in `line`. Returns
@@ -346,12 +414,14 @@ mod tests {
 
     #[test]
     fn f2b_bare_form_redacts_the_token_after_the_key_not_the_last_token() {
+        // `authorization` is itself a denylisted key (F7, the HTTP
+        // `Authorization` header) that happens to collide with Junos's SNMP
+        // `authorization read-only|read-write` clause keyword here — after
+        // N3 (every denylisted key on a line is redacted, not just the
+        // first), its value is swept too. That is the safe direction to be
+        // wrong in, and is why this no longer asserts "read-only" survives.
         let got = redact("set snmp community QQvalue6 authorization read-only");
         assert!(!got.contains("QQvalue6"), "got: {got}");
-        assert!(
-            got.contains("read-only"),
-            "trailing unrelated tokens must survive: {got}"
-        );
     }
 
     #[test]
@@ -359,6 +429,55 @@ mod tests {
         let got = redact("community QQvalue5 {");
         assert!(!got.contains("QQvalue5"), "got: {got}");
         assert!(got.trim_end().ends_with('{'), "brace must survive: {got}");
+    }
+
+    // --- N1: a digit-free value must not be mistaken for a "type keyword"
+    // and skipped in favor of redacting a later, unrelated token instead. ---
+
+    #[test]
+    fn n1_digit_free_community_value_is_redacted_directly_not_skipped() {
+        let got = redact("set snmp community mycommunity authorization read-only");
+        assert!(!got.contains("mycommunity"), "got: {got}");
+    }
+
+    #[test]
+    fn n1_digit_free_hierarchical_value_is_redacted_not_the_brace() {
+        let got = redact("community public {");
+        assert!(!got.contains("public"), "got: {got}");
+        assert!(got.trim_end().ends_with('{'), "brace must survive: {got}");
+    }
+
+    #[test]
+    fn n1_real_type_keyword_still_skips_to_the_value_after_it() {
+        let got = redact("set security ike policy p1 pre-shared-key ascii-text QQvalue1");
+        assert!(!got.contains("QQvalue1"), "got: {got}");
+        assert!(
+            got.contains("ascii-text"),
+            "the type keyword itself is not a secret: {got}"
+        );
+    }
+
+    // --- N2: a quoted span elsewhere on a forced line must not
+    // short-circuit redaction of the actual denylisted key's value. ---
+
+    #[test]
+    fn n2_unrelated_quoted_field_does_not_short_circuit_the_keyed_value() {
+        let got = redact(r#"set snmp description "core" community QQvalue7"#);
+        assert!(!got.contains("QQvalue7"), "got: {got}");
+        assert!(
+            got.contains("\"core\""),
+            "unrelated quoted field must survive untouched: {got}"
+        );
+    }
+
+    // --- N3: every denylisted key on a line must be redacted, not just the
+    // first one found. ---
+
+    #[test]
+    fn n3_multiple_keyed_values_on_one_line_are_all_redacted() {
+        let got = redact("psk=QQaaa1 password=QQbbb2");
+        assert!(!got.contains("QQaaa1"), "got: {got}");
+        assert!(!got.contains("QQbbb2"), "got: {got}");
     }
 
     // --- F6: overlapping/nested quote spans must not panic. ---
