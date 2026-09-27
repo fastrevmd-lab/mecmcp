@@ -41,7 +41,7 @@ LLM / MCP client ──(1)── mecmcp server ──(2)── network device / 
 
 | # | Threat | Control | Status |
 |---|---|---|---|
-| T1 | **Prompt-injected tool call.** Via the user, a document or device output, the model is steered into a destructive call. | Per-token tool and device allowlists: [`mecmcp-auth/src/scope.rs`](../crates/mecmcp-auth/src/scope.rs). Two-person change sets, where the approver must differ from the owner and must echo the plan digest: [`mecmcp-changeset/src/changeset.rs`](../crates/mecmcp-changeset/src/changeset.rs). Plane-owned-device refusal and command blocklists: [`mecmcp-policy`](../crates/mecmcp-policy/src/lib.rs). **Nothing detects the injection itself.** | 🟡 |
+| T1 | **Prompt-injected tool call.** Via the user, a document or device output, the model is steered into a destructive call. | Per-token tool and device allowlists: [`mecmcp-auth/src/scope.rs`](../crates/mecmcp-auth/src/scope.rs). Two-person change sets, where the approver must differ from the owner and must echo the plan digest: [`mecmcp-changeset/src/changeset.rs`](../crates/mecmcp-changeset/src/changeset.rs). Plane-owned-device refusal and a command blocklist that is **fail-open** (see T11): [`mecmcp-policy`](../crates/mecmcp-policy/src/lib.rs). **Nothing detects the injection itself.** | 🟡 |
 | T2 | **Direct commit bypasses two-person control.** Each server also exposes single-call commit tools, gated only by token scope. | A second-approver rule and an `--allow-direct-commit` opt-in are in progress (internal MEC-12, no public issue yet). | ❌ |
 | T3 | **Stolen or guessed bearer token.** | 256-bit tokens, a digest-only store and constant-time compare ([`mecmcp-auth/src/token.rs`](../crates/mecmcp-auth/src/token.rs)). Per-token rate, concurrency and session limits. Plain HTTP off-loopback, or no auth off-loopback, is refused at startup ([`mecmcp-runtime/src/cli_validate.rs`](../crates/mecmcp-runtime/src/cli_validate.rs)). | ✅ |
 | T4 | **DNS rebinding.** A browser reaches a loopback server. | A Host/Origin allowlist applied to every route, `/metrics` included ([`mecmcp-transport/src/server.rs`](../crates/mecmcp-transport/src/server.rs)). | ✅ |
@@ -51,6 +51,8 @@ LLM / MCP client ──(1)── mecmcp server ──(2)── network device / 
 | T8 | **Tool output leaks secrets to the model provider.** Configs carry hashes, PSKs and SNMP communities. | A shared `mecmcp-redact` crate (on by default, operator-only off switch) is built but not merged (internal MEC-11). Wiring it into the servers is internal MEC-14. **Today, tool output reaches the model unredacted.** | ❌ |
 | T9 | **Secrets in files, logs or `Debug` output.** | `OutboundSecret` and `SecretBytes` never print their value. Files are read with `O_NOFOLLOW` plus owner/mode/size checks ([`mecmcp-secret/src/lib.rs`](../crates/mecmcp-secret/src/lib.rs)). | ✅ |
 | T10 | **Supply chain.** A malicious crate or image. | Gitleaks, `cargo audit`, and `cargo deny` (licences, bans, sources) run in CI ([`security.yml`](../.github/workflows/security.yml)). **`Cargo.lock` is gitignored**, so the audited graph is regenerated on every run. Adding the lockfile, `deny advisories`, Trivy and a CycloneDX SBOM: [#379](https://github.com/fastrevmd-lab/mecmcp/issues/379). | 🟡 |
+| T11 | **Free-form command slips past the blocklist.** A model with command scope runs an operational command the operator did not list. | `mecmcp-policy` is a **fail-open** deny-pattern glob blocklist: whitespace is normalised, then any command no deny rule matches is **allowed** ([`mecmcp-policy/src/lib.rs`](../crates/mecmcp-policy/src/lib.rs)). It is only as complete as the operator's list; an abbreviation or re-spelling the patterns miss runs. A fail-closed allowlist mode is internal MEC-88 (no public issue yet). | 🟡 |
+| T12 | **MITM on the device channel (NETCONF/SSH, SCP).** An on-path host impersonates a device. It reads configs, returns forged output, and captures passwords (key auth does not hand over the key). | This repository has no NETCONF client. Each server uses `rustnetconf`. The shared SCP client supports strict `known_hosts`, trust-on-first-use (changed keys rejected) and pinned fingerprints, but it also offers `AcceptAll` and has no default, so each server chooses ([`mecmcp-scp/src/config.rs`](../crates/mecmcp-scp/src/config.rs)). In rustjunosmcp, `--ssh-accept-new-host-keys` currently sets NETCONF to `AcceptAll`, which is no verification at all: [rustjunosmcp#415](https://github.com/fastrevmd-lab/rustjunosmcp/issues/415). | 🟡 |
 
 ## Residual risk (accepted)
 
@@ -75,7 +77,7 @@ LLM / MCP client ──(1)── mecmcp server ──(2)── network device / 
 
 ## Per-server delta
 
-Each server inherits T1–T10. What differs:
+Each server inherits T1–T12. What differs:
 
 - **rustjunosmcp:** NETCONF/SSH to devices. Host-key trust, commit-confirmed defaults and the free-form command blocklist: see [its threat model](https://github.com/fastrevmd-lab/rustjunosmcp/blob/main/docs/THREAT-MODEL.md).
 - **rustpanosmcp:** HTTPS with `X-PAN-KEY`. Has its own [`THREAT_MODEL.md`](https://github.com/fastrevmd-lab/rustpanosmcp/blob/main/THREAT_MODEL.md).
