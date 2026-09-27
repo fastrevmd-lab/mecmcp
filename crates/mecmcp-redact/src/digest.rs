@@ -31,6 +31,7 @@ pub fn digest_hex(data: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "readability in tests")]
 mod tests {
     use super::*;
 

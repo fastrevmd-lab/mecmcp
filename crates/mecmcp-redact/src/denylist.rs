@@ -54,9 +54,7 @@ pub fn is_denylisted_key(key: &str) -> bool {
     if normalized.is_empty() {
         return false;
     }
-    DENYLISTED_KEYS
-        .iter()
-        .any(|term| normalized.contains(term))
+    DENYLISTED_KEYS.iter().any(|term| normalized.contains(term))
 }
 
 #[cfg(test)]
@@ -67,10 +65,7 @@ mod tests {
     fn every_spec_key_matches_its_own_variants() {
         let cases: &[(&str, &[&str])] = &[
             ("secret", &["secret", "Secret", "SECRET"]),
-            (
-                "private-key",
-                &["private-key", "private_key", "privateKey"],
-            ),
+            ("private-key", &["private-key", "private_key", "privateKey"]),
             (
                 "pre-shared-key",
                 &["pre-shared-key", "pre_shared_key", "preSharedKey"],

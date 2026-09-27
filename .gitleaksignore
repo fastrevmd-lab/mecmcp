@@ -1,0 +1,11 @@
+# Historical findings from commit c31c102 (mecmcp-redact's initial add):
+# two test fixtures that are intentionally secret-shaped (a bare PEM header
+# with no key material, and a PEM block with a fabricated "FAKE" base64
+# body) to test the PEM-block redactor. A later commit adds inline
+# `gitleaks:allow` comments on these lines, but gitleaks scans each
+# commit's own patch in history mode, so the original commit's diff still
+# matches the private-key rule forever. Ignored here by exact fingerprint
+# (commit:file:rule:line) only -- not by path or a repo-wide regex -- so
+# this can never mask an unrelated real secret.
+c31c102fd98a12ead59e65125cf8b85220e9b716:crates/mecmcp-redact/src/shape.rs:private-key:123
+c31c102fd98a12ead59e65125cf8b85220e9b716:crates/mecmcp-redact/src/text.rs:private-key:184

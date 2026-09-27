@@ -15,7 +15,7 @@
 //!   certificates). A [`projection::FieldAllowlist`] states which fields
 //!   survive; everything else is dropped, known or not. This is the strong
 //!   guarantee, and it only exists where a server bothers to declare one.
-//! - [`json`], [`xml`], [`text`] — **denylist-and-shape**, for everything
+//! - `json`, `xml`, `text` — **denylist-and-shape**, for everything
 //!   else: raw vendor JSON/XML/text passed through mostly as-is. A fixed key
 //!   denylist (see [`denylist`]) catches known-sensitive field names under
 //!   any of their common spellings; a value-shape catch-all (see [`shape`])
@@ -49,7 +49,7 @@ pub mod shape;
 mod text;
 mod xml;
 
-pub use policy::{active, install, RedactionPolicy};
+pub use policy::{RedactionPolicy, active, install};
 
 /// A tool-output body's wire format, so [`redact_and_digest`] knows which
 /// unstructured redactor to run.
@@ -169,6 +169,7 @@ pub fn redact_and_digest(raw: &str, format: Format) -> Result<RedactedOutput, Re
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "readability in tests")]
 mod tests {
     use super::*;
 

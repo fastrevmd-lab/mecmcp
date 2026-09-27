@@ -97,9 +97,7 @@ mod tests {
 
     #[test]
     fn pan_os_aq_suffix_matches() {
-        assert!(looks_like_secret_value(
-            "AKKgtu07M3XlnBEEmH0OZ1YkKl9-AQ=="
-        ));
+        assert!(looks_like_secret_value("AKKgtu07M3XlnBEEmH0OZ1YkKl9-AQ=="));
     }
 
     #[test]
@@ -120,7 +118,7 @@ mod tests {
 
     #[test]
     fn pem_begin_and_end_detected() {
-        assert!(is_pem_begin("-----BEGIN RSA PRIVATE KEY-----"));
+        assert!(is_pem_begin("-----BEGIN RSA PRIVATE KEY-----")); // gitleaks:allow -- bare PEM header, no key material
         assert!(is_pem_begin("-----BEGIN CERTIFICATE-----"));
         assert!(is_pem_end("-----END RSA PRIVATE KEY-----"));
         assert!(!is_pem_begin("not a pem line"));

@@ -1,6 +1,6 @@
 //! Allowlist-shaped redaction for structured data.
 //!
-//! The denylist in [`crate::json`] and [`crate::text`] answers "does this
+//! The denylist in `crate::json` and `crate::text` answers "does this
 //! look like one of the secret shapes we know about" — a negative test that,
 //! by construction, cannot cover a field it has never seen. For the handful
 //! of resource shapes a server controls completely — UniFi's `list`/
@@ -65,6 +65,7 @@ impl FieldAllowlist {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "readability in tests")]
 mod tests {
     use super::*;
     use serde_json::json;

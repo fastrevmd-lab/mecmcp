@@ -9,9 +9,9 @@
 //! malformed input: [`redact`] returns [`crate::RedactError::InvalidXml`]
 //! instead of emitting a best-effort partial result.
 
+use crate::RedactError;
 use crate::denylist::is_denylisted_key;
 use crate::shape::looks_like_secret_value;
-use crate::RedactError;
 use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
@@ -36,7 +36,15 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
             .read_event()
             .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
         match event {
-            Event::Eof => break,
+            Event::Eof => {
+                if let Some(unclosed) = tag_stack.last() {
+                    return Err(RedactError::InvalidXml(format!(
+                        "unclosed element <{}>",
+                        String::from_utf8_lossy(unclosed)
+                    )));
+                }
+                break;
+            }
             Event::Start(e) => {
                 tag_stack.push(local_name(e.name()).to_vec());
                 let rewritten = redact_attributes(&e)?;
@@ -113,7 +121,7 @@ fn redact_attributes<'a>(start: &BytesStart<'a>) -> Result<BytesStart<'a>, Redac
         let attr = attr.map_err(|e| RedactError::InvalidXml(e.to_string()))?;
         let key = String::from_utf8_lossy(local_name(attr.key).as_slice()).into_owned();
         let value = attr
-            .unescape_value()
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
             .map_err(|e| RedactError::InvalidXml(e.to_string()))?
             .into_owned();
         let redacted_value = if is_denylisted_key(&key) || looks_like_secret_value(&value) {
@@ -133,12 +141,14 @@ fn redact_text_bytes<'a>(
     text: &BytesText<'a>,
     enclosing_key_is_secret: bool,
 ) -> Result<BytesText<'static>, RedactError> {
-    let decoded = text
-        .unescape()
+    let raw = text
+        .decode()
+        .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
+    let decoded = quick_xml::escape::unescape(&raw)
         .map_err(|e| RedactError::InvalidXml(e.to_string()))?
         .into_owned();
     if enclosing_key_is_secret || looks_like_secret_value(&decoded) {
-        Ok(BytesText::new(&String::from_utf8_lossy(PLACEHOLDER).into_owned()).into_owned())
+        Ok(BytesText::new(&String::from_utf8_lossy(PLACEHOLDER)).into_owned())
     } else {
         Ok(BytesText::new(&decoded).into_owned())
     }
@@ -159,6 +169,7 @@ fn redact_comment(text: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "readability in tests")]
 mod tests {
     use super::*;
 

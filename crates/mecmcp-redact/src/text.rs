@@ -8,7 +8,7 @@
 //! value: on ambiguity about where a value ends, it takes the larger span.
 
 use crate::denylist::is_denylisted_key;
-use crate::shape::{is_pem_begin, is_pem_end, line_has_secret_data_marker, looks_like_secret_value};
+use crate::shape::{is_pem_begin, is_pem_end, looks_like_secret_value};
 
 const PLACEHOLDER: &str = "[REDACTED]";
 
@@ -44,8 +44,12 @@ fn redact_line(line: &str) -> String {
         let (prefix, suffix) = line.split_at(idx);
         return format!("{}{}", redact_value_span(prefix, true), suffix);
     }
+    // Keep `-`/`_` attached to the token: they're intra-key separators
+    // (`private_key`, `pre-shared-key`) that `is_denylisted_key` normalizes
+    // away itself. Splitting on them here would break a compound key into
+    // pieces that individually match nothing on the denylist.
     let has_denylisted_key = line
-        .split(|c: char| !c.is_ascii_alphanumeric())
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
         .any(is_denylisted_key);
     if has_denylisted_key {
         return redact_value_span(line, true);
@@ -181,7 +185,7 @@ mod tests {
 
     #[test]
     fn pem_block_body_is_removed_but_headers_survive() {
-        let pem = "intro line\n-----BEGIN RSA PRIVATE KEY-----\nMIIFAKEBASE64==\nMoreFakeBase64==\n-----END RSA PRIVATE KEY-----\ntrailer line";
+        let pem = "intro line\n-----BEGIN RSA PRIVATE KEY-----\nMIIFAKEBASE64==\nMoreFakeBase64==\n-----END RSA PRIVATE KEY-----\ntrailer line"; // gitleaks:allow -- fabricated base64 body ("FAKE"), not a real key
         let got = redact(pem);
         assert!(got.contains("-----BEGIN RSA PRIVATE KEY-----"));
         assert!(got.contains("-----END RSA PRIVATE KEY-----"));
