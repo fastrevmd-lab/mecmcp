@@ -1,7 +1,14 @@
 # Audit forwarding standard
 
-**Status:** emission rules are **normative now**. Transport is **specified but
-not yet implemented** — see [#292](https://github.com/fastrevmd-lab/mecmcp/issues/292).
+**Status:** emission rules are **normative now**. Transport is **implemented**
+— the direct hash-chained ClickHouse (SSDF) sink described in Part 2 first
+shipped in mecmcp **0.14.0** (2026-08-23; see
+[`CHANGELOG.md`](../CHANGELOG.md)) — see
+[#292](https://github.com/fastrevmd-lab/mecmcp/issues/292) for the
+implementation history. SSDF is the only supported off-host transport today;
+syslog forwarding was designed, staged and rejected — see
+[Why not syslog](#why-not-syslog-to-the-existing-collector) below. See
+[Enabling it](#enabling-it) to turn it on for a server.
 
 ## Why this exists
 
@@ -39,11 +46,23 @@ Records are written by `mecmcp-audit` directly into `ssdf.audit` over the
 ClickHouse HTTP interface, carrying `prev_hash`/`row_hash` so that deletion or
 modification of a row is detectable.
 
-Implementation, open questions and design requirements are tracked in
-[#292](https://github.com/fastrevmd-lab/mecmcp/issues/292). Two are unresolved
-and block coding: the contract's dedup guard requires `SELECT` that its own write
-identity is specified not to have, and it is not yet agreed whether the per-call
-audit stream ships alongside the change-lifecycle evidence records.
+Implementation history and design requirements are tracked in
+[#292](https://github.com/fastrevmd-lab/mecmcp/issues/292). The dedup guard
+question — the contract's `INSERT … WHERE NOT EXISTS (SELECT …)` cannot run
+under the write identity, which SSDF grants INSERT-only on purpose — is
+resolved: the sink reads a high-water mark under a separate, SELECT-only
+identity instead (ssdf#47; see
+[`sinks/ssdf.rs`](../crates/mecmcp-audit/src/sinks/ssdf.rs)).
+
+### Enabling it
+
+Off by default and inert unless configured. Pass `--ssdf-audit-endpoint
+<url>` — for example on rustjunosmcp — plus the paired credential and
+identity flags (`EvidenceArgs` in
+[`mecmcp-runtime/src/cli.rs`](../crates/mecmcp-runtime/src/cli.rs) has the
+full set); a server started without `--ssdf-audit-endpoint` runs its evidence
+pipeline as a no-op. The sink itself lives in
+[`crates/mecmcp-audit/src/sinks/ssdf.rs`](../crates/mecmcp-audit/src/sinks/ssdf.rs).
 
 ### Why not syslog to the existing collector
 
@@ -169,11 +188,11 @@ JSONL sinks get the equivalent through logrotate: `daily`, `rotate 14`,
 
 ## Known gaps
 
-- **No native sink yet.** That is #292. Central forwarding
-  (`systemd-journal-upload`/rsyslog) is deliberately **not** configured: the
-  destination this family wants is the hash-chained SSDF sink, and standing up
-  a second, unchained forwarding path first would be the thing #292 exists to
-  avoid.
+- **Central forwarding via `systemd-journal-upload`/rsyslog is deliberately
+  not configured.** The destination this family wants is the hash-chained
+  SSDF sink (shipped in 0.14.0, #292; see [Enabling it](#enabling-it)), and
+  standing up a second, unchained forwarding path beside it is the thing
+  [Why not syslog](#why-not-syslog-to-the-existing-collector) exists to avoid.
 - **The device-side record omits the approver.** A two-person apply commits
   naming only the applier — see
   [rustjunosmcp#307](https://github.com/fastrevmd-lab/rustjunosmcp/issues/307).
