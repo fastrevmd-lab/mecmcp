@@ -166,6 +166,7 @@ async fn approval_creation_rejects_separator_in_approver() {
             "device1".into(),
             "bad|approver".into(),
             created.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await;
     assert!(
@@ -207,6 +208,7 @@ async fn approval_creation_rejects_separator_in_owner() {
             "device1".into(),
             "clean-approver".into(),
             created.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await;
     assert!(

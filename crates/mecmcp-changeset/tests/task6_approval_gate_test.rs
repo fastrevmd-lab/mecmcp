@@ -82,6 +82,7 @@ async fn test_create_then_approve_as_owner_is_denied() {
             "device-a".to_string(),
             "alice".to_string(),
             created.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await;
 
@@ -124,6 +125,7 @@ async fn test_create_then_approve_as_distinct_principal_succeeds() {
             "device-a".to_string(),
             "bob".to_string(),
             created.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .expect("approve");
@@ -131,6 +133,134 @@ async fn test_create_then_approve_as_distinct_principal_succeeds() {
     assert_eq!(approved.state, ChangeSetState::Approved);
     assert_eq!(approved.approver, Some("bob".to_string()));
     assert_eq!(approved.owner, "alice");
+}
+
+/// House rule: a human approves. An agent acting as the second principal must
+/// not be able to move a change set to `Approved`, even though it is a distinct
+/// principal from the owner.
+#[tokio::test]
+async fn test_approve_by_agent_actor_is_denied() {
+    let (_dir, coordinator) = setup_coordinator();
+
+    let actions = vec![TestAction {
+        action: "set".to_string(),
+        target: "/test/path".to_string(),
+    }];
+
+    let created = coordinator
+        .create_change_set(
+            "device-a".to_string(),
+            actions,
+            "alice".to_string(),
+            test_fingerprint(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .expect("create");
+
+    let result = coordinator
+        .approve_change_set(
+            created.change_set_id.clone(),
+            "device-a".to_string(),
+            "bob".to_string(),
+            created.digest.clone(),
+            mecmcp_audit::ActorType::Agent,
+        )
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.field(), "approver_actor_type");
+    assert!(err.message().contains("must be a human principal"));
+
+    // Denied, so the change set is still Planned and a genuine human approval
+    // can still land.
+    let status = coordinator
+        .change_set_status(created.change_set_id.clone(), "device-a".to_string())
+        .await
+        .expect("status");
+    assert_eq!(status.state, ChangeSetState::Planned);
+}
+
+/// The stdio path and any unattributed caller carry `ActorType::Unknown`, not
+/// `Human` — the same denial applies, so a caller context that never
+/// established who is acting cannot approve either.
+#[tokio::test]
+async fn test_approve_by_unknown_actor_is_denied() {
+    let (_dir, coordinator) = setup_coordinator();
+
+    let actions = vec![TestAction {
+        action: "set".to_string(),
+        target: "/test/path".to_string(),
+    }];
+
+    let created = coordinator
+        .create_change_set(
+            "device-a".to_string(),
+            actions,
+            "alice".to_string(),
+            test_fingerprint(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .expect("create");
+
+    let result = coordinator
+        .approve_change_set(
+            created.change_set_id.clone(),
+            "device-a".to_string(),
+            "bob".to_string(),
+            created.digest.clone(),
+            mecmcp_audit::ActorType::Unknown,
+        )
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.field(), "approver_actor_type");
+}
+
+/// The self-approval check must still win when both denials apply: a
+/// non-human owner attempting to approve their own plan gets the
+/// self-approval message, not the actor-type one, so an operator reading the
+/// error is told the more specific and more actionable fact.
+#[tokio::test]
+async fn test_owner_approving_own_plan_as_agent_gets_self_approval_error() {
+    let (_dir, coordinator) = setup_coordinator();
+
+    let actions = vec![TestAction {
+        action: "set".to_string(),
+        target: "/test/path".to_string(),
+    }];
+
+    let created = coordinator
+        .create_change_set(
+            "device-a".to_string(),
+            actions,
+            "alice".to_string(),
+            test_fingerprint(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .expect("create");
+
+    let result = coordinator
+        .approve_change_set(
+            created.change_set_id.clone(),
+            "device-a".to_string(),
+            "alice".to_string(),
+            created.digest.clone(),
+            mecmcp_audit::ActorType::Agent,
+        )
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.field(), "change_set_id");
+    assert!(
+        err.message()
+            .contains("owner cannot approve their own plan")
+    );
 }
 
 #[tokio::test]
@@ -161,6 +291,7 @@ async fn test_second_approval_is_denied() {
             "device-a".to_string(),
             "bob".to_string(),
             created.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .expect("approve");
@@ -174,6 +305,7 @@ async fn test_second_approval_is_denied() {
             "device-a".to_string(),
             "charlie".to_string(),
             created.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await;
 
@@ -323,6 +455,7 @@ async fn test_approval_digest_tamper_detection_swap_approver() {
             "device-a".to_string(),
             "bob".to_string(),
             created.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .expect("approve");
@@ -394,6 +527,7 @@ async fn test_new_approval_has_approval_digest() {
             "device-a".to_string(),
             "bob".to_string(),
             created.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .expect("approve");
