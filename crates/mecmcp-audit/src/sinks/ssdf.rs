@@ -39,6 +39,7 @@
 use crate::evidence::ClosedSegment;
 use crate::sinks::delivery_ledger::{DeliveryLedger, DeliveryStatus, SegmentId};
 use base64::Engine;
+use mecmcp_secret::OutboundSecret;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -49,17 +50,21 @@ use std::time::Duration;
 use thiserror::Error;
 
 /// Configuration for the SSDF sink.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SsdfSinkConfig {
-    /// ClickHouse HTTP endpoint (e.g., "http://192.0.2.40:8123").
-    /// HTTPS not supported by StdHttpTransport; use HTTP or a TLS proxy.
+    /// ClickHouse HTTP endpoint (e.g., "http://127.0.0.1:8123").
+    /// `StdHttpTransport` speaks plaintext HTTP only, and refuses it to
+    /// anything but a loopback host — the Basic-auth credentials on this
+    /// connection are sent in the clear. Reach a remote ClickHouse via a
+    /// loopback TLS-terminating proxy, or supply the TLS-capable transport
+    /// from `mecmcp-transport` in place of `StdHttpTransport`.
     pub endpoint: String,
     /// ClickHouse database name (e.g., "ssdf").
     pub database: String,
     /// ClickHouse username (e.g., "ssdf_audit").
     pub username: String,
     /// ClickHouse password.
-    pub password: String,
+    pub password: OutboundSecret,
     /// Read identity used only for the dedup high-water mark.
     ///
     /// `ssdf_audit` is INSERT-only by design, so it cannot perform the read that
@@ -68,7 +73,7 @@ pub struct SsdfSinkConfig {
     /// verify_audit" (ssdf#47).
     pub verify_username: String,
     /// Password for [`verify_username`](Self::verify_username).
-    pub verify_password: String,
+    pub verify_password: OutboundSecret,
     /// Path to the durable outbox spool file.
     pub outbox_path: PathBuf,
     /// Path to the delivery ledger.
@@ -77,6 +82,23 @@ pub struct SsdfSinkConfig {
     pub initial_backoff: Duration,
     /// Maximum retry backoff duration.
     pub max_backoff: Duration,
+}
+
+impl std::fmt::Debug for SsdfSinkConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SsdfSinkConfig")
+            .field("endpoint", &self.endpoint)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("verify_username", &self.verify_username)
+            .field("verify_password", &"<redacted>")
+            .field("outbox_path", &self.outbox_path)
+            .field("ledger_path", &self.ledger_path)
+            .field("initial_backoff", &self.initial_backoff)
+            .field("max_backoff", &self.max_backoff)
+            .finish()
+    }
 }
 
 /// Errors that can occur in the SSDF sink.
@@ -315,7 +337,8 @@ impl SsdfSink {
             "Basic {}",
             base64::engine::general_purpose::STANDARD.encode(format!(
                 "{}:{}",
-                self.config.verify_username, self.config.verify_password
+                self.config.verify_username,
+                self.config.verify_password.expose()
             ))
         )
     }
@@ -701,8 +724,11 @@ impl SsdfSink {
                     "Authorization".to_string(),
                     format!(
                         "Basic {}",
-                        base64::prelude::BASE64_STANDARD
-                            .encode(format!("{}:{}", self.config.username, self.config.password))
+                        base64::prelude::BASE64_STANDARD.encode(format!(
+                            "{}:{}",
+                            self.config.username,
+                            self.config.password.expose()
+                        ))
                     ),
                 ),
             ],
@@ -926,6 +952,23 @@ pub fn split_endpoint(url: &str) -> Result<(bool, String, u16, String), SsdfSink
         ),
         None => (host_port, if tls { 443 } else { 80 }),
     };
+
+    // Plaintext HTTP carries the writer and verify Basic-auth credentials on
+    // the wire in the clear. Off-loopback, that is a credential leak to
+    // anyone on the network path; on loopback, the traffic never leaves the
+    // host. Hostnames are refused rather than resolved: resolving them to
+    // decide trust is a DNS-rebinding TOCTOU, matching the same host-is-
+    // loopback rule `mecmcp-runtime` applies to its own bind address.
+    if !tls
+        && !host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    {
+        return Err(SsdfSinkError::Http(format!(
+            "endpoint {url} uses http:// to a non-loopback host ({host}); use https:// or a \
+             loopback address"
+        )));
+    }
 
     let path_with_slash = if path.is_empty() {
         "/".to_string()
@@ -1283,14 +1326,24 @@ mod tests {
             endpoint: "http://test.clickhouse:8123".to_string(),
             database: "ssdf".to_string(),
             username: "ssdf_audit".to_string(),
-            password: "test_password".to_string(),
+            password: OutboundSecret::new_unchecked("test_password".to_string()),
             verify_username: "ssdf_audit_verify".to_string(),
-            verify_password: "test_verify_password".to_string(),
+            verify_password: OutboundSecret::new_unchecked("test_verify_password".to_string()),
             outbox_path: dir.path().join("outbox.jsonl"),
             ledger_path: dir.path().join("ledger.jsonl"),
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(60),
         }
+    }
+
+    #[test]
+    fn debug_never_prints_the_passwords() {
+        let dir = TempDir::new().unwrap();
+        let config = make_test_config(&dir);
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("test_password"));
+        assert!(!rendered.contains("test_verify_password"));
+        assert!(rendered.contains("<redacted>"));
     }
 
     fn make_test_segment() -> ClosedSegment {
@@ -1853,5 +1906,42 @@ mod tests {
             error.to_string().contains("response limit"),
             "the refusal must name the limit rather than fail obscurely: {error}"
         );
+    }
+
+    #[test]
+    fn split_endpoint_accepts_http_to_loopback() {
+        let (tls, host, port, path) = split_endpoint("http://127.0.0.1:8123/").unwrap();
+        assert!(!tls);
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 8123);
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn split_endpoint_refuses_http_off_loopback() {
+        let error = split_endpoint("http://192.0.2.40:8123/").unwrap_err();
+        assert!(
+            error.to_string().contains("non-loopback"),
+            "must name the refusal reason: {error}"
+        );
+
+        // A hostname is refused even when an operator believes it resolves to
+        // loopback: resolving it to decide trust would be a DNS-rebinding
+        // TOCTOU, so only a literal loopback IP is accepted.
+        let error = split_endpoint("http://localhost:8123/").unwrap_err();
+        assert!(error.to_string().contains("non-loopback"));
+
+        let error = split_endpoint("http://clickhouse.internal:8123/").unwrap_err();
+        assert!(error.to_string().contains("non-loopback"));
+    }
+
+    #[test]
+    fn split_endpoint_still_accepts_https_off_loopback() {
+        // The loopback restriction is specific to plaintext HTTP, where
+        // credentials travel unencrypted. HTTPS to a remote host is fine at
+        // this layer (StdHttpTransport itself still refuses to speak it).
+        let (tls, host, ..) = split_endpoint("https://192.0.2.40:8443/").unwrap();
+        assert!(tls);
+        assert_eq!(host, "192.0.2.40");
     }
 }
