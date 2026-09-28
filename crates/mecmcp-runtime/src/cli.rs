@@ -411,6 +411,14 @@ impl EvidenceArgs {
         // `mecmcp-verify` cannot disagree about it.
         mecmcp_audit::evidence::validate_server_id(&server_id)
             .map_err(EvidenceArgsError::InvalidServerId)?;
+        // Refuses http:// to a non-loopback host, exactly as the transport does
+        // on every send. Checking it here too, rather than leaving it to the
+        // first delivery attempt, is the difference between a server that
+        // refuses to start and one that starts, spools every segment to the
+        // outbox, and fails every delivery forever: a server that starts with a
+        // half-configured pipeline spools evidence it can never deliver.
+        mecmcp_audit::sinks::ssdf::split_endpoint(&endpoint)
+            .map_err(|error| EvidenceArgsError::InvalidEndpoint(error.to_string()))?;
         if endpoint.starts_with("https://") && self.ssdf_audit_ca_file.is_none() {
             return Err(EvidenceArgsError::MissingTrustAnchor);
         }
@@ -501,6 +509,9 @@ pub enum EvidenceArgsError {
     /// The chain identity is empty or holds characters that cannot key a chain.
     #[error("--ssdf-audit-server-id is not usable: {0}")]
     InvalidServerId(String),
+    /// The endpoint is malformed, or uses `http://` to a non-loopback host.
+    #[error("--ssdf-audit-endpoint is not usable: {0}")]
+    InvalidEndpoint(String),
     /// A credential file failed its checks — wrong mode, wrong owner, symlink.
     #[error("credential file rejected (must be a regular file, 0600, owned by this user): {0}")]
     Credential(#[from] mecmcp_secret::SecretError),
@@ -515,10 +526,13 @@ pub enum EvidenceArgsError {
 /// UTF-8 conversion would silently substitute replacement characters -- both
 /// surfacing later as an authentication failure that looks like a wrong
 /// password rather than a mangled one.
-fn read_password(path: Option<&Path>, flag: &'static str) -> Result<String, EvidenceArgsError> {
+fn read_password(
+    path: Option<&Path>,
+    flag: &'static str,
+) -> Result<mecmcp_secret::OutboundSecret, EvidenceArgsError> {
     let path = path.ok_or(EvidenceArgsError::MissingPassword { flag })?;
     let secret = mecmcp_secret::load_from_file(path, mecmcp_secret::SecretLimits::default())?;
-    Ok(secret.expose().to_owned())
+    Ok(secret)
 }
 
 /// A fresh run identifier for this process lifetime.

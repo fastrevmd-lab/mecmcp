@@ -22,7 +22,18 @@ mod rate_limit;
 mod server;
 mod session;
 mod target;
+// Test-only surface (issue #184, mecmcp#357): the loopback client and serving
+// harness a consumer's integration tests use. Gated on the feature rather
+// than `any(test, ...)`: `test_client` calls into the optional `ureq`
+// dependency, which `cfg(test)` alone does not pull in, so a plain
+// `cargo test` with no features would compile the module against a crate
+// that is not there. `cargo test -p mecmcp-transport --features test-util`
+// (or a consumer's dev-dependency doing the same) is what exercises this
+// code; a release build enables neither, which is what keeps `ureq` and this
+// scaffolding out of `cargo tree -e normal`.
+#[cfg(feature = "test-util")]
 pub mod test_client;
+#[cfg(feature = "test-util")]
 pub mod test_harness;
 pub mod tls;
 
