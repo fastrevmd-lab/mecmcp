@@ -237,6 +237,20 @@ fn value_end_at_least(line: &str, start: usize, token_end: usize) -> usize {
     quoted_value_end(line, start).map_or(token_end, |end| end.max(token_end))
 }
 
+/// Index of the first whitespace token at or after `from` that is not made up
+/// solely of [`SUBTOKEN_SPLIT_CHARS`] (`{`, `&`, `;` ...). A lone hierarchy
+/// brace or separator between a key and its value (`password { X }`,
+/// `password: & X`) is structure, not the secret, so the value is the token
+/// after it (V1).
+fn next_value_token(line: &str, tokens: &[(usize, usize)], from: usize) -> Option<usize> {
+    (from..tokens.len()).find(|&j| {
+        let (s, e) = tokens[j];
+        line[s..e]
+            .chars()
+            .any(|c| !SUBTOKEN_SPLIT_CHARS.contains(&c))
+    })
+}
+
 /// If `line[start..]` begins with a quote character, return the byte offset
 /// just past its matching closing quote elsewhere on `line`. A quoted value
 /// may contain whitespace (`description "core value"`), so its span cannot
@@ -333,7 +347,9 @@ fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
                     // through to redacting the *next whitespace token*
                     // instead, leaking the real secret in plain sight.
                     spans.push((value_start, value_end_at_least(line, value_start, e)));
-                } else if let Some(&(vs, ve)) = tokens.get(i + 1) {
+                } else if let Some(&(vs, ve)) =
+                    next_value_token(line, &tokens, i + 1).and_then(|j| tokens.get(j))
+                {
                     // `key=`/`key:` with nothing but structural punctuation
                     // after it in this token (`password=`, `password={`): the
                     // value is the next whitespace token, if there is one.
@@ -355,7 +371,8 @@ fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
         let bare_key = line[s..e].trim_end_matches([':', ';']);
         if !bare_key.is_empty()
             && is_denylisted_key(bare_key)
-            && let Some(&(vs, ve)) = tokens.get(i + 1)
+            && let Some(j) = next_value_token(line, &tokens, i + 1)
+            && let Some(&(vs, ve)) = tokens.get(j)
         {
             let next_token = &line[vs..ve];
             let is_keyword = is_value_type_keyword(next_token);
@@ -375,7 +392,9 @@ fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
                 if !is_keyword {
                     spans.push((vs, value_end_at_least(line, vs, ve)));
                 }
-                if let Some(&(vs2, ve2)) = tokens.get(i + 2) {
+                if let Some(&(vs2, ve2)) =
+                    next_value_token(line, &tokens, j + 1).and_then(|k| tokens.get(k))
+                {
                     spans.push((vs2, value_end_at_least(line, vs2, ve2)));
                 }
             } else {
@@ -870,6 +889,22 @@ mod tests {
             ("password=& QQu2", "QQu2"),
             ("psk=; QQu3", "QQu3"),
             ("password=, QQu4", "QQu4"),
+        ] {
+            let got = redact(input);
+            assert!(!got.contains(secret), "input: {input} got: {got}");
+        }
+    }
+
+    #[test]
+    fn v1_punctuation_only_token_between_key_and_value_does_not_leak() {
+        for (input, secret) in [
+            ("password { QQv1 }", "QQv1"),
+            ("password: { QQv2 }", "QQv2"),
+            ("password = { QQv3 }", "QQv3"),
+            ("psk & QQv4", "QQv4"),
+            ("secret ; QQv5", "QQv5"),
+            ("password: & QQv6", "QQv6"),
+            ("password=& ; QQv7", "QQv7"),
         ] {
             let got = redact(input);
             assert!(!got.contains(secret), "input: {input} got: {got}");
