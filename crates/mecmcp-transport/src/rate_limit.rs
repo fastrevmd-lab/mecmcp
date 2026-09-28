@@ -55,12 +55,17 @@ fn resolve_rate_limit_ip(
         return peer;
     }
 
-    let entries: Vec<&str> = headers
-        .get_all(&X_FORWARDED_FOR)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .collect();
+    let mut entries: Vec<&str> = Vec::new();
+    for value in headers.get_all(&X_FORWARDED_FOR) {
+        // A non-visible-ASCII header line is exactly the "unparsable entry"
+        // case the doc above promises to fail closed on: skipping it (rather
+        // than falling back to `peer`) would silently drop it from the
+        // right-to-left walk instead of stopping the walk at it.
+        let Ok(value) = value.to_str() else {
+            return peer;
+        };
+        entries.extend(value.split(','));
+    }
 
     for entry in entries.into_iter().rev() {
         let Ok(addr) = entry.trim().parse::<IpAddr>() else {
@@ -953,9 +958,9 @@ mod tests {
 
     #[test]
     fn trusted_proxy_forwarded_for_is_honored() {
-        // A trusted proxy appends the real client after whatever the client
-        // itself sent; "198.51.100.7" here is attacker-controlled, "10.0.0.1"
-        // is what the trusted proxy recorded as the peer it saw.
+        // "10.0.0.1" is the trusted proxy's own address (it equals `peer`
+        // below), so the walk skips it and uses "198.51.100.7" — the real
+        // client address the proxy recorded — as the rate-limit key.
         let headers = {
             let mut map = http::HeaderMap::new();
             map.insert("x-forwarded-for", "198.51.100.7, 10.0.0.1".parse().unwrap());

@@ -67,6 +67,10 @@ pub fn load(
 /// [`load`]: no client certificate is requested. mTLS is opt-in per listener,
 /// never inferred, so a caller that never passes `Some` sees zero behavior
 /// change.
+///
+/// No CRL is consulted: any certificate chaining to `client_ca_path` is
+/// accepted for the CA bundle's lifetime. Revoking a client means rotating
+/// the CA (or removing it from the bundle), not blocklisting a serial.
 pub fn load_with_client_auth(
     cert_path: &Path,
     key_path: &Path,
