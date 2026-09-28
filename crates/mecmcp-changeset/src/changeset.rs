@@ -185,11 +185,14 @@ impl ChangesetCoordinator {
         Ok(record.into())
     }
 
-    /// Approves an unexpired change set with an independent principal.
+    /// Approves an unexpired change set with an independent human principal.
     ///
     /// This is the approval gate: the approver must be distinct from the owner,
-    /// the change set must be in `Planned` state, the approval window must not
-    /// have expired, and the provided digest must match the stored digest exactly.
+    /// must be `mecmcp_audit::ActorType::Human` — the house rule is that a human
+    /// approves, so an agent or unattributed caller cannot stand in as the second
+    /// principal — the change set must be in `Planned` state, the approval window
+    /// must not have expired, and the provided digest must match the stored digest
+    /// exactly.
     ///
     /// On success, the change set transitions to `Approved`, the approver is recorded,
     /// and an approval digest is computed over `(change_set_id, plan_digest, owner,
@@ -201,6 +204,7 @@ impl ChangesetCoordinator {
     /// - The expected digest format is invalid
     /// - The change set does not exist or belongs to another device
     /// - The approver is the same as the owner (self-approval denied)
+    /// - `approver_actor_type` is not `Human`
     /// - The change set is not in `Planned` state
     /// - The approval window has expired
     /// - The provided digest does not match the stored digest
@@ -211,6 +215,7 @@ impl ChangesetCoordinator {
         device: String,
         approver: String,
         expected_digest: String,
+        approver_actor_type: mecmcp_audit::ActorType,
     ) -> Result<ChangeSetOutput, CoordinatorError> {
         validate_digest(&expected_digest, "expected_digest")
             .map_err(|e| CoordinatorError::new("expected_digest", e.to_string()))?;
@@ -221,6 +226,17 @@ impl ChangesetCoordinator {
             return Err(CoordinatorError::new(
                 "change_set_id",
                 "the change-set owner cannot approve their own plan",
+            ));
+        }
+
+        // Checked after self-approval so a proposer who is also non-human still
+        // gets the more specific "cannot approve their own plan" message. Checked
+        // before anything else stateful: this is a fact about the caller, not the
+        // record, and must not depend on what state the record happens to be in.
+        if approver_actor_type != mecmcp_audit::ActorType::Human {
+            return Err(CoordinatorError::new(
+                "approver_actor_type",
+                "the change-set approver must be a human principal",
             ));
         }
 

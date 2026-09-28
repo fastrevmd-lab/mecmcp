@@ -22,7 +22,9 @@ Three steps, three principals (owner, approver, owner):
 
 1. **Plan** — the owner calls `create_change_set(device, actions, expected_fingerprint)`. The coordinator computes a digest over `(owner, device, expected_fingerprint, actions)` and persists the plan as `Planned`. The digest is the approval target.
 
-2. **Approve** — a *different* principal calls `approve_change_set(change_set_id, expected_digest)`. The coordinator validates the approver is not the owner, the digest matches exactly, and the approval window has not expired. On success, the change set transitions to `Approved`, and an approval digest is computed over `(change_set_id, plan_digest, owner, approver, approved_at)` and stored for tamper detection.
+2. **Approve** — a *different* principal calls `approve_change_set(change_set_id, expected_digest, approver_actor_type)`. The coordinator validates the approver is not the owner, that `approver_actor_type` is `mecmcp_audit::ActorType::Human`, the digest matches exactly, and the approval window has not expired. On success, the change set transitions to `Approved`, and an approval digest is computed over `(change_set_id, plan_digest, owner, approver, approved_at)` and stored for tamper detection.
+
+   The human-only rule is deliberate and non-negotiable: an agent or an unattributed caller (`ActorType::Agent` or `ActorType::Unknown` — which is what a stdio session with no caller context carries) can propose a change set, but cannot be the second principal that approves it. House rule: deterministic code decides, a human approves.
 
 3. **Apply** — the owner calls `apply_change_set(change_set_id, expected_digest, expected_fingerprint, transaction)`. The coordinator acquires the device guard, validates the approval is fresh, stages all actions through the `DeviceTransaction`, and records the operation. The staged handle is returned to the caller, who then calls `commit_operation()` to finalize.
 
@@ -194,6 +196,15 @@ When lab mode is enabled, `waive_approval()` transitions a change set from `Plan
 ```
 
 A waiver can never be mistaken for a genuine two-person approval: the `"approver"` field is absent (or `null`), and a `"waived"` object is present. The waiver digest covers `(change_set_id, plan_digest, owner, waived_at, "lab-mode-waived")`, making it tamper-evident but distinct from genuine approvals.
+
+### Direct-commit tools go through `mecmcp_audit::DirectCommitPolicy`
+
+Some vendor tools (Junos template rendering and one-shot commit, PAN-OS's legacy stage→validate→commit flow, device rollback and upgrade) never created a change set at all — they stage, validate, and commit a device in one call. That flow has no independent approver by construction, so `mecmcp_audit::DirectCommitPolicy` gates it separately from everything above: a server built with `DirectCommitPolicy::new(false)` (the default posture) refuses those tools outright, on stdio exactly as on HTTP, because the policy is a process-level setting and never reads caller context. An operator who passes `--allow-direct-commit` gets `DirectCommitPolicy::new(true)`, which:
+
+- logs a loud, structured warning at startup (`DirectCommitPolicy::log_startup`) so the risk is visible in the server's own log, not just in its invocation;
+- lets the gated tools run, tagging the per-call `AuditScope` (`direct_commit_allowed=true`) so every use is in the audit trail, not just the failures.
+
+**Residual risk:** `--allow-direct-commit` is an escape hatch, not a fix. An operator who sets it has chosen to run tools that mutate a device with no second-principal review; that choice is audited, but it is not prevented. Vendor servers should route as much of their write surface through the change-set flow above as their vendor API allows, and reserve this flag for the tools that genuinely cannot fit that shape.
 
 ### Policy signature drift rejects commits
 
