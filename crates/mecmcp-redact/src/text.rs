@@ -30,12 +30,20 @@ pub fn redact(input: &str) -> String {
     // more deeply than the key line is its value, however many lines it
     // spans, and none of them are visited by the per-line key/shape scan.
     let mut block_scalar_indent: Option<usize> = None;
+    // Z1: YAML lets a mapping key's sequence sit at the key's own indent
+    // (`community:\n- X`, the default for PyYAML/kubectl/Ansible dumps), so
+    // when the denylisted key's value is empty (not a `|`/`>` scalar), `- `
+    // items at exactly the key's indent still belong to it.
+    let mut carry_allows_seq = false;
     for line in input.split('\n') {
         let trimmed = line.trim().trim_end_matches('\r');
 
         if let Some(indent) = block_scalar_indent {
             let is_blank = trimmed.is_empty();
-            if !is_blank && indent_len(line) <= indent {
+            let ind = indent_len(line);
+            let indentless_seq_item =
+                carry_allows_seq && ind == indent && (trimmed == "-" || trimmed.starts_with("- "));
+            if !is_blank && ind <= indent && !indentless_seq_item {
                 block_scalar_indent = None;
             } else if is_blank {
                 // Blank lines inside a block scalar are part of its value in
@@ -77,6 +85,7 @@ pub fn redact(input: &str) -> String {
             {
                 out.push(redact_line(line));
                 block_scalar_indent = Some(indent_len(line));
+                carry_allows_seq = tail.is_empty();
                 continue;
             }
         }
@@ -410,19 +419,12 @@ fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
         // compound key name; if what remains after the cut still has an
         // alphanumeric byte, that is the attached value, not a value token
         // further along the line.
-        let key_end = s + line[s..e]
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-            .unwrap_or(e - s);
-        if key_end < e {
-            let key_candidate = &line[s..key_end];
-            let rest = &line[key_end..e];
-            if !key_candidate.is_empty()
-                && is_denylisted_key(key_candidate)
-                && rest.chars().any(|c| c.is_ascii_alphanumeric())
-            {
-                spans.push((key_end, line.len()));
-                continue;
-            }
+        // Z2: the key need not start the token (`user.password/X`,
+        // `"password"->X`, `$h->{password}->X`), so walk every identifier
+        // run in the token, not just the first.
+        if let Some(run_end) = attached_value_key_end(&line[s..e]) {
+            spans.push((s + run_end, line.len()));
+            continue;
         }
         // Bare key token, no `=`/`:` attached to it.
         let bare_key = line[s..e].trim_end_matches([':', ';']);
@@ -434,6 +436,30 @@ fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
         }
     }
     spans
+}
+
+/// Z2: within one whitespace token, find the first `[A-Za-z0-9_-]` run that
+/// is a denylisted key and is followed (later in the token) by an
+/// alphanumeric byte — the attached value. Returns the run's end offset
+/// relative to the token.
+fn attached_value_key_end(token: &str) -> Option<usize> {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let mut i = 0;
+    while i < token.len() {
+        let Some(start) = token[i..].find(is_ident).map(|o| i + o) else {
+            break;
+        };
+        let end = token[start..]
+            .find(|c: char| !is_ident(c))
+            .map_or(token.len(), |o| start + o);
+        if is_denylisted_key(&token[start..end])
+            && token[end..].chars().any(|c| c.is_ascii_alphanumeric())
+        {
+            return Some(end);
+        }
+        i = end;
+    }
+    None
 }
 
 /// Byte ranges of the *content* of every `"..."` / `'...'` span in `line`
@@ -1213,6 +1239,51 @@ mod tests {
     // attached directly to the key (no whitespace) must not make the whole
     // token normalize into a denylist match, which then redacts the wrong
     // (later) token instead of the actually-attached value. ---
+
+    // --- Z1/Z2 (mecmcp#386 re-review, MEC-397). ---
+
+    #[test]
+    fn z1_indentless_sequence_under_a_denylisted_key_is_redacted() {
+        let got = redact("community:\n- QQseq1\nhost: r1");
+        assert!(!got.contains("QQseq1"), "got: {got}");
+        assert!(got.contains("host: r1"), "got: {got}");
+    }
+
+    #[test]
+    fn z1_indentless_sequence_of_maps_under_a_denylisted_key_is_redacted() {
+        let got = redact("secrets:\n- name: db\n  value: QQseq2\nnext: ok");
+        assert!(!got.contains("QQseq2"), "got: {got}");
+        assert!(!got.contains("name: db"), "got: {got}");
+        assert!(got.contains("next: ok"), "got: {got}");
+    }
+
+    #[test]
+    fn z1_sequence_at_key_indent_does_not_extend_a_block_scalar() {
+        // `|` scalars end at the key's indent; only an empty value opens
+        // an indentless sequence.
+        let got = redact("password: |\n  QQbs\n- item\nnext: ok");
+        assert!(!got.contains("QQbs"), "got: {got}");
+        assert!(got.contains("- item"), "got: {got}");
+    }
+
+    #[test]
+    fn z1_indented_key_with_value_on_next_line_is_redacted() {
+        let got = redact("  password:\n    QQy3\n  next: ok");
+        assert!(!got.contains("QQy3"), "got: {got}");
+        assert!(got.contains("next: ok"), "got: {got}");
+    }
+
+    #[test]
+    fn z2_attached_value_after_a_key_not_at_token_start_is_redacted() {
+        for (input, secret) in [
+            ("user.password/QQdot tail", "QQdot"),
+            ("\"password\"->QQq1 tail", "QQq1"),
+            ("$h->{password}->QQj3 tail", "QQj3"),
+        ] {
+            let got = redact(input);
+            assert!(!got.contains(secret), "{input} -> {got}");
+        }
+    }
 
     #[test]
     fn y2_arrow_attached_directly_to_the_key_redacts_the_attached_value() {
