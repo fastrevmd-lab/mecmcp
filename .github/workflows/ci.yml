@@ -36,10 +36,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Build workspace
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
       - name: Run tests
         # `test-util` on both crates, or the tests behind it are silently not
@@ -47,10 +47,10 @@ jobs:
         # offer -- seeding a change set in a state only the lifecycle can
         # produce, and installing a tracing subscriber per thread -- and a gate
         # that CI does not open is a test that does not exist.
-        run: cargo test --workspace --features mecmcp-audit/test-util,mecmcp-changeset/test-util,mecmcp-transport/test-util
+        run: cargo test --workspace --locked --features mecmcp-audit/test-util,mecmcp-changeset/test-util,mecmcp-transport/test-util
 
       - name: Build documentation
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --locked
 
   msrv:
     # mecmcp-auth is a library consumed by two binaries, so an accidental MSRV
