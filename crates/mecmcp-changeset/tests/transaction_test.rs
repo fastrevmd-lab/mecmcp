@@ -541,7 +541,7 @@ fn test_attribution() -> Attribution {
             provider_tier: Tier::Public,
             skills_used: vec![],
         }),
-        on_behalf_of: Some("fastrevmd@gmail.com".into()),
+        on_behalf_of: Some("dev@example.com".into()),
         change_ref: Some("CHG0012345".into()),
         request_id: Uuid::new_v4(),
         // Hand-built rather than derived from a token entry, so the model,
@@ -890,10 +890,10 @@ async fn provenance_string_matches_owner_example() {
         skills_used: vec![],
     };
 
-    let provenance = agent.provenance_string(Some("fastrevmd@gmail.com"));
+    let provenance = agent.provenance_string(Some("dev@example.com"));
     assert_eq!(
         provenance,
-        "anthropic-public, claude-opus-5, none, fastrevmd@gmail.com"
+        "anthropic-public, claude-opus-5, none, dev@example.com"
     );
 }
 

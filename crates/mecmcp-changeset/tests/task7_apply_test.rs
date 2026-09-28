@@ -239,7 +239,7 @@ fn test_attribution(principal: &str) -> Attribution {
             provider_tier: Tier::Public,
             skills_used: vec![],
         }),
-        on_behalf_of: Some("fastrevmd@gmail.com".into()),
+        on_behalf_of: Some("dev@example.com".into()),
         change_ref: Some("CHG0012345".into()),
         request_id: Uuid::new_v4(),
         token_verified_fields: mecmcp_audit::TokenVerifiedFields::none(),
