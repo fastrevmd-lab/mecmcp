@@ -65,6 +65,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/METRICS.md` for the Prometheus scrape config migration, including the
   reverse-proxy caveat.
 - **Raised MSRV to 1.89** and removed the `aes` pin from the CI msrv job that PR #344 added. All six consumer repos are moving to 1.89 in parallel PRs, so the objection that blocked raising the floor in #344 no longer stands.
+- **`mecmcp-transport`: `test_client` and `test_harness` moved behind a `test-util` feature** (mecmcp#387). Neither is part of the crate's default public API anymore, and the `ureq` dependency they pulled in is no longer part of the normal (non-`test-util`) dependency graph. **Breaking change** for any consumer that used them: add `features = ["test-util"]` to the `mecmcp-transport` dev-dependency entry.
+- **`mecmcp-http`: a configured private CA now replaces the public root store instead of adding to it** (mecmcp#387). `extra_root_certificates`, when non-empty, is passed through `tls_certs_only` rather than `tls_certs_merge`/`add_root_certificate`, matching "private CA means private CA only." **Behaviour change** for any deployment that relied on the previous additive semantics (a private CA trusted *alongside* the public roots): to keep public trust, configure no `extra_root_certificates`.
 
 ## [0.23.1] - 2026-09-05
 
