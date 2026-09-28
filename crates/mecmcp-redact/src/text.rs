@@ -50,7 +50,9 @@ pub fn redact(input: &str) -> String {
             // P1: a comment line never ends a block collection (only a
             // `|`/`>` scalar is ended by a less-indented comment), so it must
             // not end an empty-value carry — the rest of the value would leak.
-            let is_comment = carry_allows_seq && trimmed.starts_with('#');
+            // Only at `ind <= indent`: deeper `#` lines are value content
+            // (block scalars, quoted continuations) and stay redacted.
+            let is_comment = carry_allows_seq && ind <= indent && trimmed.starts_with('#');
             if !is_blank && !is_comment && ind <= indent && !indentless_seq_item {
                 block_scalar_indent = None;
             } else if is_comment {
@@ -1306,6 +1308,24 @@ mod tests {
         let got = redact("password: |\n  QQbs\n# c\n  plain: keep\nnext: ok");
         assert!(!got.contains("QQbs"), "got: {got}");
         assert!(got.contains("plain: keep"), "got: {got}");
+    }
+
+    #[test]
+    fn p1_hash_content_deeper_than_key_stays_redacted() {
+        // Percy MEC-445: `#` lines deeper than the key are value content,
+        // not comments.
+        for (input, secret) in [
+            ("secrets:\n  k: |\n    #QQn1\n    #QQn2\nnext: ok", "QQn1"),
+            ("secrets:\n  k: \"abc\n    #QQq1\"\nnext: ok", "QQq1"),
+            ("secrets:\n  k: 'abc\n    #QQq2'\nnext: ok", "QQq2"),
+            ("community:\n- |\n  #QQs1\nnext: ok", "QQs1"),
+        ] {
+            let got = redact(input);
+            assert!(!got.contains(secret), "got: {got}");
+            assert!(got.contains("next: ok"), "got: {got}");
+        }
+        let got = redact("secrets:\n  k: |\n    #QQn1\n    #QQn2\nnext: ok");
+        assert!(!got.contains("QQn2"), "got: {got}");
     }
 
     #[test]
