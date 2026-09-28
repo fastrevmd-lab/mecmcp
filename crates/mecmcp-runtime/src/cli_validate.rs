@@ -65,6 +65,13 @@ pub enum CliRefusal {
         /// Whether key was set.
         key: bool,
     },
+    /// A client-CA path with no server TLS is not a meaningful configuration.
+    ///
+    /// Fail closed rather than silently ignoring it: an operator who set
+    /// `--tls-client-ca` expects client certificates to be required, and
+    /// serving plain HTTP anyway would be silent, not degraded.
+    #[error("--tls-client-ca requires --tls-cert and --tls-key to also be set")]
+    TlsClientCaRequiresTls,
 }
 
 /// Validate all serve arguments before inventory, secrets, sockets, or TLS load.
@@ -88,6 +95,10 @@ pub fn validate(cli: &Cli) -> Result<(), CliRefusal> {
         (false, false) => false,
         (cert, key) => return Err(CliRefusal::TlsPairIncomplete { cert, key }),
     };
+
+    if cli.tls_client_ca.is_some() && !tls_configured {
+        return Err(CliRefusal::TlsClientCaRequiresTls);
+    }
 
     // Determine if host is loopback.
     let host_is_loopback = match cli.host.parse::<IpAddr>() {
@@ -478,6 +489,36 @@ mod tests {
             "/tmp/c.pem",
         ]));
         assert!(matches!(r, Err(CliRefusal::TlsPairIncomplete { .. })));
+    }
+
+    #[test]
+    fn tls_client_ca_without_tls_pair_refused() {
+        let r = validate(&parse(&[
+            "-t",
+            "streamable-http",
+            "--tokens-file",
+            "/tmp/t.json",
+            "--tls-client-ca",
+            "/tmp/ca.pem",
+        ]));
+        assert_eq!(r, Err(CliRefusal::TlsClientCaRequiresTls));
+    }
+
+    #[test]
+    fn tls_client_ca_with_tls_pair_ok() {
+        let r = validate(&parse(&[
+            "-t",
+            "streamable-http",
+            "--tokens-file",
+            "/tmp/t.json",
+            "--tls-cert",
+            "/tmp/c.pem",
+            "--tls-key",
+            "/tmp/k.pem",
+            "--tls-client-ca",
+            "/tmp/ca.pem",
+        ]));
+        assert!(r.is_ok(), "got {r:?}");
     }
 
     #[test]

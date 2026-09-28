@@ -616,6 +616,13 @@ pub struct Cli {
     #[arg(long)]
     pub tls_key: Option<PathBuf>,
 
+    /// PEM-encoded CA bundle for mutual TLS (streamable-http only). Requires
+    /// --tls-cert/--tls-key. When set, the listener requires every client to
+    /// present a certificate chaining to this CA; clients without one are
+    /// rejected at the TLS handshake, before any application code runs.
+    #[arg(long)]
+    pub tls_client_ca: Option<PathBuf>,
+
     /// Disable bearer-token auth. Refuses to bind off-loopback.
     #[arg(long)]
     pub allow_no_auth: bool,
