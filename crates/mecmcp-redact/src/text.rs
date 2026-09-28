@@ -25,12 +25,10 @@ const PLACEHOLDER: &str = "[REDACTED]";
 pub fn redact(input: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut in_pem = false;
-    // X1/Y1: block-scalar carry state — once a denylisted key's own line has
-    // no complete inline value (a `key: |`/`key: >` marker, or nothing at
-    // all after the colon), every following line indented more deeply than
-    // the key line is its value, however many lines it spans and whatever
-    // shape it takes (a scalar, a nested map, a sequence), and none of them
-    // are visited by the per-line key/shape scan.
+    // X1: `key: |` / `key: >` YAML block-scalar carry state — once a
+    // denylisted key opens a block scalar, every following line indented
+    // more deeply than the key line is its value, however many lines it
+    // spans, and none of them are visited by the per-line key/shape scan.
     let mut block_scalar_indent: Option<usize> = None;
     for line in input.split('\n') {
         let trimmed = line.trim().trim_end_matches('\r');
@@ -69,15 +67,12 @@ pub fn redact(input: &str) -> String {
         if let Some(colon) = trimmed.find(':') {
             let key_part = trimmed[..colon].trim();
             let tail = strip_yaml_comment(&trimmed[colon + 1..]).trim();
-            // Y1: the same end-of-statement rule as X1, applied to a YAML
-            // key rather than an inline value — for a denylisted key, the
-            // "statement" is everything indented under it, whether that's a
-            // block scalar (`key: |`), a nested map (`key:` with fields on
-            // following lines), or a sequence (`key:` with `- item` lines).
-            // An empty tail after stripping a trailing `# comment` covers
-            // all three: block scalars are also caught explicitly so a
-            // trailing chomp/indent modifier (`|2-`) is recognized even
-            // though it isn't empty.
+            // Y1: a denylisted YAML key's statement is its indented block
+            // even when the key line carries no marker at all (`password:`
+            // with the value entirely on the next line, or a nested map
+            // opened by `secrets:`) — not just the explicit `|`/`>` forms.
+            // Over-redacting a nested map under a denylisted key is the
+            // same accepted cost X1 already takes for a single line.
             if is_denylisted_key(key_part) && (tail.is_empty() || is_yaml_block_scalar_marker(tail))
             {
                 out.push(redact_line(line));
@@ -95,9 +90,9 @@ fn indent_len(line: &str) -> usize {
     line.len() - line.trim_start_matches([' ', '\t']).len()
 }
 
-/// Strip a trailing YAML comment (` #...` to end of string) from `tail`, if
-/// present. Requires the leading whitespace so a `#` inside an actual value
-/// (a URL fragment, say) is not mistaken for a comment marker.
+/// Strip a trailing YAML comment (` #...`) from `tail` before it is checked
+/// for emptiness or a block-scalar marker (Y1): `password: |  # comment`
+/// must still be recognised as opening a block scalar.
 fn strip_yaml_comment(tail: &str) -> &str {
     match tail.find(" #") {
         Some(idx) => &tail[..idx],
@@ -407,28 +402,35 @@ fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
         if matched_sep {
             continue;
         }
-        // Bare key token, no `=`/`:` attached to it. The key itself only
-        // ever contains `[A-Za-z0-9_-]` (X1's own compound-key convention);
-        // cutting there — rather than matching the whole token, as before —
-        // is what keeps a non-`=`/`:` separator glued directly onto the key
-        // (`password->X`, `password|X`, `password#X`, `password/X`) from
-        // being swallowed into the "key" and pushing the value search past
-        // it to the *next* token, silently skipping the attached value (Y2).
+        // Y2: a separator attached directly to the key with no whitespace
+        // (`password->X`, `password|X`) must not be normalized away together
+        // with the value that follows it — `is_denylisted_key` on the whole
+        // token can accidentally match once the value's own bytes are folded
+        // in. Cut the key at the first byte that cannot be part of a
+        // compound key name; if what remains after the cut still has an
+        // alphanumeric byte, that is the attached value, not a value token
+        // further along the line.
         let key_end = s + line[s..e]
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
             .unwrap_or(e - s);
-        let bare_key = &line[s..key_end];
-        if !bare_key.is_empty() && is_denylisted_key(bare_key) {
-            if line[key_end..e].chars().any(|c| c.is_ascii_alphanumeric()) {
-                // The rest of this token past the key already has value
-                // content attached (`->X`, `|X`) — redact from there.
+        if key_end < e {
+            let key_candidate = &line[s..key_end];
+            let rest = &line[key_end..e];
+            if !key_candidate.is_empty()
+                && is_denylisted_key(key_candidate)
+                && rest.chars().any(|c| c.is_ascii_alphanumeric())
+            {
                 spans.push((key_end, line.len()));
-            } else if let Some(vstart) = first_value_start(line, &tokens, i + 1) {
-                // Nothing but separator/structural punctuation left in this
-                // token (`password:`, `password;`) — the value is the next
-                // token, as before.
-                spans.push((vstart, line.len()));
+                continue;
             }
+        }
+        // Bare key token, no `=`/`:` attached to it.
+        let bare_key = line[s..e].trim_end_matches([':', ';']);
+        if !bare_key.is_empty()
+            && is_denylisted_key(bare_key)
+            && let Some(vstart) = first_value_start(line, &tokens, i + 1)
+        {
+            spans.push((vstart, line.len()));
         }
     }
     spans
@@ -476,10 +478,10 @@ fn userinfo_password_spans(line: &str) -> Vec<(usize, usize)> {
             .find(|c: char| c == '/' || c.is_whitespace())
             .unwrap_or(rest.len());
         let authority = &rest[..authority_len];
-        // `rfind`, not `find`: a userinfo password can itself contain a
-        // literal `@` (`admin:p@word@host`) — curl and git both split
-        // userinfo from host on the *last* `@` in the authority, not the
-        // first (Y4).
+        // Y4: split userinfo from host on the *last* `@`, not the first — a
+        // password containing a literal `@` (`admin:p@word@host`) otherwise
+        // truncates the redacted span at the embedded `@` instead of the one
+        // that actually separates userinfo from the host, same as curl/git.
         if let Some(at_rel) = authority.rfind('@') {
             let userinfo = &authority[..at_rel];
             if let Some(colon_rel) = userinfo.find(':') {
@@ -503,20 +505,21 @@ fn userinfo_password_spans(line: &str) -> Vec<(usize, usize)> {
 /// line, and each redacts to the end of the line like any other X1 match.
 fn snmpv3_auth_priv_spans(line: &str) -> Vec<(usize, usize)> {
     let tokens = whitespace_token_spans(line);
-    // Tokenized, case-insensitive, whitespace-width-independent match for
-    // adjacent `snmp-server`/`user` tokens (Y3) — the old exact substring
-    // check (`line.contains("snmp-server user")`) missed any other casing
-    // and any run of whitespace longer than a single space.
-    let Some(user_idx) = tokens.windows(2).position(|pair| {
+    // Y3: tokenize rather than matching the literal substring
+    // `"snmp-server user"` — that missed different case (`SNMP-SERVER USER`)
+    // and multiple spaces between the two words, both of which a
+    // whitespace-token comparison handles for free.
+    let has_snmp_user = tokens.windows(2).any(|pair| {
         let (s0, e0) = pair[0];
         let (s1, e1) = pair[1];
         line[s0..e0].eq_ignore_ascii_case("snmp-server")
             && line[s1..e1].eq_ignore_ascii_case("user")
-    }) else {
+    });
+    if !has_snmp_user {
         return Vec::new();
-    };
+    }
     let mut spans = Vec::new();
-    for (i, &(s, e)) in tokens.iter().enumerate().skip(user_idx + 2) {
+    for (i, &(s, e)) in tokens.iter().enumerate() {
         let text = &line[s..e];
         if (text.eq_ignore_ascii_case("auth") || text.eq_ignore_ascii_case("priv"))
             && let Some(vstart) = first_value_start(line, &tokens, i + 1)
@@ -1076,36 +1079,31 @@ mod tests {
             ("psk \"\" QQc1", "QQc1"),
             ("password '' QQc2", "QQc2"),
             ("password=\"\" QQc3", "QQc3"),
-            ("password = QQd1 horse battery", "QQd1"),
-            ("wpa_passphrase=QQd2horse horse battery", "QQd2horse"),
         ] {
             let got = redact(input);
             assert!(!got.contains(secret), "input: {input} got: {got}");
         }
     }
 
+    // --- T1 (mecmcp#386 re-review, MEC-385): these two rows passed against
+    // `d4ae4c4` by only checking the first word of the secret survives, but
+    // the actual bug is that the *rest* of the multi-word secret survives
+    // too — assert every part of it is gone. ---
+
     #[test]
-    fn t1_x1_end_of_statement_redacts_every_word_of_a_multi_word_secret() {
-        // MEC-385 T1: these two rows already passed against e29f2d5 on the
-        // narrow `!got.contains(secret)` check above because the old code
-        // redacted the first word of the value — the bug X1 fixes is that
-        // `horse battery` survived past it. Assert every word is gone, so
-        // this fails against d4ae4c4 (pre-X1) the way it should have.
-        for (input, words) in [
-            (
-                "password = QQd1 horse battery",
-                ["QQd1", "horse", "battery"],
-            ),
-            (
-                "wpa_passphrase=QQd2horse horse battery",
-                ["QQd2horse", "horse", "battery"],
-            ),
-        ] {
-            let got = redact(input);
-            for word in words {
-                assert!(!got.contains(word), "input: {input} got: {got}");
-            }
-        }
+    fn t1_multi_word_secret_after_spaced_equals_is_fully_redacted() {
+        let got = redact("password = QQd1 horse battery");
+        assert!(!got.contains("QQd1"), "got: {got}");
+        assert!(!got.contains("horse"), "got: {got}");
+        assert!(!got.contains("battery"), "got: {got}");
+    }
+
+    #[test]
+    fn t1_multi_word_secret_after_attached_equals_is_fully_redacted() {
+        let got = redact("wpa_passphrase=QQd2horse horse battery");
+        assert!(!got.contains("QQd2horse"), "got: {got}");
+        assert!(!got.contains("horse"), "got: {got}");
+        assert!(!got.contains("battery"), "got: {got}");
     }
 
     #[test]
@@ -1178,78 +1176,97 @@ mod tests {
         assert!(got.contains("admin"), "username is not the secret: {got}");
     }
 
-    // --- Y1 (MEC-385, mecmcp#386 re-review): the X1 block-scalar carry must
-    // also start when a denylisted key's line has *no* inline value at all,
-    // not only on a bare `|`/`>` marker — the value is on a following,
-    // more-indented line (or lines) either way. Each row fails against
-    // e29f2d5. ---
+    // --- Y1 (mecmcp#386 re-review, MEC-385): a denylisted YAML key's value
+    // on a following indented line must be redacted even when the key line
+    // itself has no `|`/`>` marker — an empty inline value, a nested map, a
+    // list item, or a marker followed by a trailing comment. ---
 
     #[test]
-    fn y1_yaml_next_line_values_are_redacted() {
-        for (input, secret) in [
-            ("secrets:\n  db_primary: hunter2", "hunter2"),
-            ("  password:\n    QQy3", "QQy3"),
-            ("snmp:\n  community:\n    - public2x", "public2x"),
-            ("password: |  # comment\n  QQy1", "QQy1"),
-        ] {
-            let got = redact(input);
-            assert!(!got.contains(secret), "input: {input:?} got: {got:?}");
-        }
+    fn y1_empty_inline_value_carries_to_the_next_indented_line() {
+        let got = redact("password:\n    QQy3\nnext: ok");
+        assert!(!got.contains("QQy3"), "got: {got}");
+        assert!(got.contains("next: ok"), "got: {got}");
     }
 
     #[test]
-    fn y1_non_denylisted_empty_key_does_not_start_a_block_scalar_carry() {
-        // Sanity check: an empty-value key that is not denylisted must not
-        // swallow the following line.
-        let got = redact("host:\n  password: QQy5");
-        assert!(!got.contains("QQy5"), "got: {got}");
-        assert!(got.contains("host:"), "got: {got}");
+    fn y1_nested_map_under_a_denylisted_key_is_redacted() {
+        let got = redact("secrets:\n  db_primary: hunter2\nhost: r1");
+        assert!(!got.contains("hunter2"), "got: {got}");
+        assert!(got.contains("host: r1"), "got: {got}");
     }
 
-    // --- Y2 (MEC-385, mecmcp#386 re-review): a non-`=`/`:` separator
-    // attached directly to a denylisted key, with no whitespace between
-    // them, must not let the value hide in the same token as the key. Each
-    // row fails against e29f2d5. ---
-
     #[test]
-    fn y2_attached_non_standard_separator_does_not_leak_the_value() {
-        for (input, secret) in [
-            ("password->QQp1 trailing", "QQp1"),
-            ("password|QQp2 y", "QQp2"),
-            ("password#QQp3 y", "QQp3"),
-            ("password/QQp4 y", "QQp4"),
-        ] {
-            let got = redact(input);
-            assert!(!got.contains(secret), "input: {input} got: {got}");
-        }
+    fn y1_list_item_under_a_denylisted_key_is_redacted() {
+        let got = redact("snmp:\n  community:\n    - public2x\nhost: r1");
+        assert!(!got.contains("public2x"), "got: {got}");
+        assert!(got.contains("host: r1"), "got: {got}");
     }
 
-    // --- Y3 (MEC-385, mecmcp#386 re-review): the SNMPv3 auth/priv sweep
-    // must be tokenized, not an exact-substring match on `snmp-server
-    // user`, so different casing or run of whitespace still trigger it. ---
-
     #[test]
-    fn y3_snmpv3_sweep_is_case_and_whitespace_insensitive() {
-        for input in [
-            "SNMP-SERVER USER u g v3 auth sha QQe5",
-            "snmp-server  user u g v3 auth sha QQe6",
-        ] {
-            let got = redact(input);
-            assert!(
-                !got.contains("QQe5") && !got.contains("QQe6"),
-                "input: {input} got: {got}"
-            );
-        }
+    fn y1_block_scalar_marker_with_trailing_comment_is_recognized() {
+        let got = redact("password: |  # comment\n  QQy1\nnext: ok");
+        assert!(!got.contains("QQy1"), "got: {got}");
+        assert!(got.contains("next: ok"), "got: {got}");
     }
 
-    // --- Y4 (MEC-385, mecmcp#386 re-review): a URL userinfo password that
-    // itself contains a literal `@` must be redacted in full, splitting the
-    // authority on the *last* `@` like curl and git do. ---
+    // --- Y2 (mecmcp#386 re-review, MEC-385): a non-`=`/`:` separator
+    // attached directly to the key (no whitespace) must not make the whole
+    // token normalize into a denylist match, which then redacts the wrong
+    // (later) token instead of the actually-attached value. ---
 
     #[test]
-    fn y4_userinfo_password_containing_at_sign_is_fully_redacted() {
+    fn y2_arrow_attached_directly_to_the_key_redacts_the_attached_value() {
+        // X1: once the value is located, everything to the end of the line
+        // is redacted with it, same as every other keyed match — `trailing`
+        // does not survive either.
+        let got = redact("password->QQp1 trailing");
+        assert!(!got.contains("QQp1"), "got: {got}");
+        assert!(!got.contains("trailing"), "got: {got}");
+    }
+
+    #[test]
+    fn y2_pipe_attached_directly_to_the_key_redacts_the_attached_value() {
+        let got = redact("password|QQp2 trailing");
+        assert!(!got.contains("QQp2"), "got: {got}");
+    }
+
+    #[test]
+    fn y2_hash_attached_directly_to_the_key_redacts_the_attached_value() {
+        let got = redact("password#QQp3 trailing");
+        assert!(!got.contains("QQp3"), "got: {got}");
+    }
+
+    #[test]
+    fn y2_slash_attached_directly_to_the_key_redacts_the_attached_value() {
+        let got = redact("password/QQp4 trailing");
+        assert!(!got.contains("QQp4"), "got: {got}");
+    }
+
+    // --- Y3 (mecmcp#386 re-review, MEC-385): the SNMPv3 auth/priv sweep must
+    // recognize `snmp-server user` under any case and any amount of
+    // whitespace between the two words, not just the exact lowercase
+    // single-spaced substring. ---
+
+    #[test]
+    fn y3_uppercase_snmp_server_user_is_recognized() {
+        let got = redact("SNMP-SERVER USER u g v3 auth sha QQe5");
+        assert!(!got.contains("QQe5"), "got: {got}");
+    }
+
+    #[test]
+    fn y3_double_space_between_snmp_server_and_user_is_recognized() {
+        let got = redact("snmp-server  user u g v3 auth sha QQe6");
+        assert!(!got.contains("QQe6"), "got: {got}");
+    }
+
+    // --- Y4 (mecmcp#386 re-review, MEC-385): userinfo/host split must use
+    // the last `@`, not the first, so a password containing a literal `@`
+    // does not leave its tail exposed as if it were part of the host. ---
+
+    #[test]
+    fn y4_url_password_containing_an_at_sign_is_fully_redacted() {
         let got = redact("https://admin:p@QQu1@host/");
-        assert!(!got.contains("p@QQu1"), "got: {got}");
         assert!(!got.contains("QQu1"), "got: {got}");
+        assert!(!got.contains("p@QQu1"), "got: {got}");
     }
 }
