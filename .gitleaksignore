@@ -37,3 +37,12 @@ fa0203387c621a193b1a77419b1273cae5f5f747:crates/mecmcp-redact/src/text.rs:junos-
 fa0203387c621a193b1a77419b1273cae5f5f747:crates/mecmcp-redact/src/text.rs:junos-type9-secret:650
 fa0203387c621a193b1a77419b1273cae5f5f747:crates/mecmcp-redact/src/text.rs:junos-type9-secret:655
 fa0203387c621a193b1a77419b1273cae5f5f747:crates/mecmcp-redact/src/text.rs:junos-type9-secret:657
+
+# Historical finding from commit f881ae9 (X-round: redact to end-of-statement
+# for denylisted keys): a doc comment illustrating why the key scan and the
+# value-shape scan must both run uses a synthetic Junos type-9 hash as its
+# example, the same shape as the crate's other fixtures. (Not quoted here:
+# doing so once already recreated the match against this ignore file itself,
+# one commit later.) Ignored here by exact fingerprint (commit:file:rule:line)
+# only, per the convention above.
+f881ae94be7bdecb4bb3bba9774fb31cb1db7368:crates/mecmcp-redact/src/text.rs:junos-type9-secret:131
