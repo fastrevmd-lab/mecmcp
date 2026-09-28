@@ -251,6 +251,48 @@ fn next_value_token(line: &str, tokens: &[(usize, usize)], from: usize) -> Optio
     })
 }
 
+/// Span(s) to redact for the value found at token index `j` (already
+/// selected by [`next_value_token`], so it is not itself a
+/// [`SUBTOKEN_SPLIT_CHARS`]-only token).
+///
+/// `j`'s token can still be something that is not the secret itself: a bare
+/// separator (`password = X`), a Cisco-style digit type code (`password 7
+/// X`), FortiOS's `ENC` marker (`psksecret ENC X`), or a known value-type
+/// keyword (`pre-shared-key ascii-text X`). W1 (mecmcp#386 re-review): this
+/// check has to run wherever `next_value_token` is used to locate a value —
+/// the `key=`/`key:` empty-value branch used it to find the token but never
+/// applied this check, so `password= - QQw1` redacted the `-` separator
+/// instead of walking past it to the real secret, the same class of leak R1
+/// fixed for the bare-key branch. Centralizing both call sites on this
+/// helper is what keeps the two branches from drifting apart again.
+fn resolve_value_spans(line: &str, tokens: &[(usize, usize)], j: usize) -> Vec<(usize, usize)> {
+    let (vs, ve) = tokens[j];
+    let next_token = &line[vs..ve];
+    let is_keyword = is_value_type_keyword(next_token);
+    let skip_over = is_keyword
+        || is_lone_separator(next_token)
+        || is_enc_token(next_token)
+        || is_short_digit_code(next_token);
+    let mut spans = Vec::new();
+    if skip_over {
+        // The type keyword itself is kept visible (it is a closed, known
+        // vocabulary, not a secret); everything else found here is redacted
+        // along with the value, which is the safe direction to over-redact
+        // in.
+        if !is_keyword {
+            spans.push((vs, value_end_at_least(line, vs, ve)));
+        }
+        if let Some(&(vs2, ve2)) =
+            next_value_token(line, tokens, j + 1).and_then(|k| tokens.get(k))
+        {
+            spans.push((vs2, value_end_at_least(line, vs2, ve2)));
+        }
+    } else {
+        spans.push((vs, value_end_at_least(line, vs, ve)));
+    }
+    spans
+}
+
 /// If `line[start..]` begins with a quote character, return the byte offset
 /// just past its matching closing quote elsewhere on `line`. A quoted value
 /// may contain whitespace (`description "core value"`), so its span cannot
@@ -347,13 +389,11 @@ fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
                     // through to redacting the *next whitespace token*
                     // instead, leaking the real secret in plain sight.
                     spans.push((value_start, value_end_at_least(line, value_start, e)));
-                } else if let Some(&(vs, ve)) =
-                    next_value_token(line, &tokens, i + 1).and_then(|j| tokens.get(j))
-                {
+                } else if let Some(j) = next_value_token(line, &tokens, i + 1) {
                     // `key=`/`key:` with nothing but structural punctuation
                     // after it in this token (`password=`, `password={`): the
                     // value is the next whitespace token, if there is one.
-                    spans.push((vs, value_end_at_least(line, vs, ve)));
+                    spans.extend(resolve_value_spans(line, &tokens, j));
                 }
                 break;
             }
@@ -372,34 +412,13 @@ fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
         if !bare_key.is_empty()
             && is_denylisted_key(bare_key)
             && let Some(j) = next_value_token(line, &tokens, i + 1)
-            && let Some(&(vs, ve)) = tokens.get(j)
         {
-            let next_token = &line[vs..ve];
-            let is_keyword = is_value_type_keyword(next_token);
-            // R1: anything that is not a real value-type keyword — a bare
-            // separator (`password = X`), a Cisco-style digit type code
-            // (`password 7 X`), or FortiOS's `ENC` marker (`psksecret ENC
-            // X`) — is itself not the value, so token i+2 must be swept too,
-            // not treated as an unrelated trailing token. The type keyword
-            // itself is kept visible (it is a closed, known vocabulary, not
-            // a secret); everything else is redacted along with the value,
-            // which is the safe direction to over-redact in.
-            let skip_over = is_keyword
-                || is_lone_separator(next_token)
-                || is_enc_token(next_token)
-                || is_short_digit_code(next_token);
-            if skip_over {
-                if !is_keyword {
-                    spans.push((vs, value_end_at_least(line, vs, ve)));
-                }
-                if let Some(&(vs2, ve2)) =
-                    next_value_token(line, &tokens, j + 1).and_then(|k| tokens.get(k))
-                {
-                    spans.push((vs2, value_end_at_least(line, vs2, ve2)));
-                }
-            } else {
-                spans.push((vs, value_end_at_least(line, vs, ve)));
-            }
+            // R1: anything found at `j` that is not a real value-type
+            // keyword — a bare separator (`password = X`), a Cisco-style
+            // digit type code (`password 7 X`), or FortiOS's `ENC` marker
+            // (`psksecret ENC X`) — is itself not the value, so the token
+            // after it must be swept too; see `resolve_value_spans`.
+            spans.extend(resolve_value_spans(line, &tokens, j));
         }
     }
     spans
@@ -909,5 +928,37 @@ mod tests {
             let got = redact(input);
             assert!(!got.contains(secret), "input: {input} got: {got}");
         }
+    }
+
+    // --- W1 (mecmcp#386 re-review, sibling gap to V1): the `key=`/`key:`
+    // empty-value branch found its value token via `next_value_token` but,
+    // unlike the bare-key branch, never checked whether that token was
+    // itself a separator/digit-code/ENC-marker/type-keyword rather than the
+    // real value — so `password= - QQw1` redacted the `-` and left the real
+    // secret one token further along exposed. ---
+
+    #[test]
+    fn w1_separator_or_type_token_after_attached_equals_or_colon_does_not_leak() {
+        for (input, secret) in [
+            ("password= - QQw1", "QQw1"),
+            ("password= 7 QQw2", "QQw2"),
+            ("password: ENC QQw3", "QQw3"),
+            ("psk: -> QQw4", "QQw4"),
+            ("secret= 5 QQw5", "QQw5"),
+            ("password: ascii-text QQw6", "QQw6"),
+        ] {
+            let got = redact(input);
+            assert!(!got.contains(secret), "input: {input} got: {got}");
+        }
+    }
+
+    #[test]
+    fn w1_type_keyword_after_attached_colon_stays_visible() {
+        let got = redact("password: ascii-text QQw7");
+        assert!(!got.contains("QQw7"), "got: {got}");
+        assert!(
+            got.contains("ascii-text"),
+            "the type keyword itself is not a secret: {got}"
+        );
     }
 }
