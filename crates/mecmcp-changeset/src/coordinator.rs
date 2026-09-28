@@ -84,6 +84,134 @@ impl From<PersistenceError> for CoordinatorError {
     }
 }
 
+/// HMAC key for the v6 (keyed) approval digest.
+///
+/// `ChangesetCoordinator` derives `Debug` for tracing and test-failure output,
+/// and `Arc<[u8]>`'s own `Debug` prints the raw bytes — a coordinator holding a
+/// bare `Arc<[u8]>` key would leak it through any `{:?}` of the coordinator, a
+/// tracing field, or a panic message. This wraps the bytes so that path prints
+/// `ApprovalDigestKey(<redacted>)` instead, and zeroizes them when the last
+/// clone is dropped (MEC-457 review, finding 3).
+#[derive(Clone)]
+pub struct ApprovalDigestKey(Arc<zeroize::Zeroizing<Box<[u8]>>>);
+
+impl ApprovalDigestKey {
+    /// Wraps raw key bytes.
+    #[must_use]
+    pub fn new(bytes: impl Into<Box<[u8]>>) -> Self {
+        Self(Arc::new(zeroize::Zeroizing::new(bytes.into())))
+    }
+}
+
+impl std::fmt::Debug for ApprovalDigestKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApprovalDigestKey(<redacted>)")
+    }
+}
+
+impl std::ops::Deref for ApprovalDigestKey {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<Arc<[u8]>> for ApprovalDigestKey {
+    fn from(bytes: Arc<[u8]>) -> Self {
+        Self::new(bytes.as_ref())
+    }
+}
+
+/// Minimum acceptable length, in bytes, for a loaded approval digest key.
+///
+/// HMAC-SHA256 accepts a key of any length, so this is not a cryptographic
+/// requirement of the algorithm -- it exists so `--approval-digest-key`
+/// pointed at an accidentally short or empty file fails to start rather than
+/// producing a weak, guessable key silently.
+pub const MIN_APPROVAL_DIGEST_KEY_BYTES: usize = 32;
+
+/// Error loading an approval digest key from a file.
+#[derive(Debug)]
+pub enum ApprovalDigestKeyError {
+    /// The file could not be read, or failed a permission/ownership check.
+    Io {
+        /// The path that failed to load.
+        path: PathBuf,
+        /// The underlying error.
+        source: mecmcp_secret::SecretError,
+    },
+    /// The file's contents are shorter than [`MIN_APPROVAL_DIGEST_KEY_BYTES`].
+    TooShort {
+        /// The path that was too short.
+        path: PathBuf,
+        /// The actual length in bytes.
+        len: usize,
+    },
+}
+
+impl std::fmt::Display for ApprovalDigestKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { path, source } => {
+                write!(
+                    f,
+                    "could not read approval digest key '{}': {source}",
+                    path.display()
+                )
+            }
+            Self::TooShort { path, len } => write!(
+                f,
+                "approval digest key '{}' is {len} bytes; at least {MIN_APPROVAL_DIGEST_KEY_BYTES} are required",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ApprovalDigestKeyError {}
+
+impl From<ApprovalDigestKeyError> for CoordinatorError {
+    fn from(error: ApprovalDigestKeyError) -> Self {
+        Self::new("approval_digest_key", error.to_string())
+    }
+}
+
+impl ApprovalDigestKey {
+    /// Loads a key from a file, applying the same hardened-file checks
+    /// [`crate::persistence::read_state`] uses: the file must be a regular
+    /// file, owned by the effective uid, mode 0600 (no group/other access),
+    /// and not a symlink. Rejects a key shorter than
+    /// [`MIN_APPROVAL_DIGEST_KEY_BYTES`].
+    ///
+    /// This is the one place a deployment turns `--approval-digest-key
+    /// <path>` into a key: callers should pass the result straight to
+    /// [`ChangesetCoordinator::load_with_key`] rather than loading the file
+    /// themselves, so the load path and the permission checks cannot drift
+    /// from `read_state_with_key`'s (MEC-457 review, finding 2).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, fails a permission or
+    /// ownership check, or is shorter than the minimum key length.
+    pub fn load_from_file(path: &Path) -> Result<Self, ApprovalDigestKeyError> {
+        let bytes =
+            mecmcp_secret::read_hardened_file(path, mecmcp_secret::FileLimits { max_bytes: 4096 })
+                .map_err(|source| ApprovalDigestKeyError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        let bytes = bytes.expose();
+        if bytes.len() < MIN_APPROVAL_DIGEST_KEY_BYTES {
+            return Err(ApprovalDigestKeyError::TooShort {
+                path: path.to_path_buf(),
+                len: bytes.len(),
+            });
+        }
+        Ok(Self::new(bytes))
+    }
+}
+
 /// Changeset coordinator managing in-memory state, endpoint locks, and persistence.
 ///
 /// This coordinator is vendor-agnostic and manages the lifecycle of operations and
@@ -112,7 +240,7 @@ pub struct ChangesetCoordinator {
     /// distribution story for. `approve_change_set` reads this at approval
     /// time; `load_with_recovery_and_key` reads it at load time, because a
     /// v6-signed record already on disk cannot be verified without it (MEC-457).
-    approval_digest_key: Option<Arc<[u8]>>,
+    approval_digest_key: Option<ApprovalDigestKey>,
 }
 
 impl ChangesetCoordinator {
@@ -146,8 +274,8 @@ impl ChangesetCoordinator {
     /// file does not retroactively verify what load already accepted or
     /// rejected.
     #[must_use]
-    pub fn with_approval_digest_key(mut self, key: Arc<[u8]>) -> Self {
-        self.approval_digest_key = Some(key);
+    pub fn with_approval_digest_key(mut self, key: impl Into<ApprovalDigestKey>) -> Self {
+        self.approval_digest_key = Some(key.into());
         self
     }
 
@@ -232,7 +360,7 @@ impl ChangesetCoordinator {
         limits: OperationLimits,
         approval_ttl: Duration,
         lab_mode: bool,
-        approval_digest_key: Option<Arc<[u8]>>,
+        approval_digest_key: Option<ApprovalDigestKey>,
     ) -> Result<Self, CoordinatorError> {
         Self::load_with_recovery_and_key(
             path,
@@ -298,7 +426,7 @@ impl ChangesetCoordinator {
         approval_ttl: Duration,
         lab_mode: bool,
         staged_recovery: StagedRecovery,
-        approval_digest_key: Option<Arc<[u8]>>,
+        approval_digest_key: Option<ApprovalDigestKey>,
     ) -> Result<Self, CoordinatorError> {
         let Some(path) = path else {
             return Ok(Self {

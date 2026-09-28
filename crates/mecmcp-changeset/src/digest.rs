@@ -378,10 +378,6 @@ pub fn compute_approval_digest_v5(
 /// can never be tricked into accepting the wrong rule for the version a record
 /// claims.
 ///
-/// # Errors
-///
-/// Returns an error if the inputs cannot be serialized. HMAC accepts any key
-/// length, so the key itself cannot cause a failure here.
 #[must_use]
 pub fn compute_approval_digest_v6(
     key: &[u8],

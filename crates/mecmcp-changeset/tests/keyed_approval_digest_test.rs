@@ -54,7 +54,7 @@ async fn setup_keyed_coordinator(
         limits(),
         Duration::from_secs(15 * 60),
         false,
-        Some(Arc::clone(&key)),
+        Some(Arc::clone(&key).into()),
     )
     .expect("coordinator")
     .with_approval_digest_key(key);
@@ -200,7 +200,7 @@ async fn reloading_a_v6_file_with_the_correct_key_succeeds() {
         limits(),
         Duration::from_secs(900),
         false,
-        Some(key),
+        Some(key.into()),
     )
     .expect("load with the correct key must succeed");
 
@@ -209,6 +209,95 @@ async fn reloading_a_v6_file_with_the_correct_key_succeeds() {
         .await
         .expect("status");
     assert_eq!(status.state, ChangeSetState::Approved);
+}
+
+/// Percy's review (MEC-457, finding 1): a keyed deployment must not accept an
+/// approval that was forged by downgrading `digest_version` to 5 (or 4, or the
+/// legacy encoding). Those digests are unkeyed — anyone who can write the
+/// state file can recompute them without ever holding the key. Only a v6
+/// digest is bound to the key, so once a key is configured, any approver-
+/// bearing approval that isn't v6 must be rejected outright, not verified
+/// under its own claimed rule.
+#[tokio::test]
+async fn downgrade_to_v5_is_rejected_when_a_key_is_configured() {
+    let key: Arc<[u8]> = Arc::from(b"the-deployment-key".as_slice());
+    let (_dir, state_path, coordinator) = setup_keyed_coordinator(Arc::clone(&key)).await;
+    let approved = create_and_approve(&coordinator).await;
+    drop(coordinator);
+
+    let mut state = read_state_with_key(&state_path, limits().max_state_bytes, Some(&key))
+        .expect("read with the correct key");
+    let id = approved.change_set_id.clone();
+    let (plan, owner) = {
+        let record = state.change_sets.get(&id).expect("change set");
+        (record.digest.clone(), record.owner.clone())
+    };
+    let preview = state
+        .change_sets
+        .get(&id)
+        .and_then(|record| record.preview.as_ref())
+        .map(|preview| preview.digest.clone());
+    {
+        let record = state.change_sets.get_mut(&id).expect("change set");
+        let approval = record.approval.as_mut().expect("approval");
+        approval.approver = Some("mallory".to_string());
+        approval.digest_version = 5;
+        approval.digest = mecmcp_changeset::digest::compute_approval_digest_v5(
+            &id,
+            &plan,
+            preview.as_deref(),
+            &owner,
+            "mallory",
+            approval.approved_at_unix,
+        );
+    }
+    write_state_for_test(&state_path, &state, limits().max_state_bytes)
+        .expect("write forged v5 approval");
+
+    let reloaded = read_state_with_key(&state_path, limits().max_state_bytes, Some(&key));
+    assert!(
+        reloaded.is_err(),
+        "a keyless v5 forgery must not be accepted by a keyed coordinator"
+    );
+    assert!(
+        reloaded
+            .unwrap_err()
+            .to_string()
+            .contains("requires keyed (v6) approvals")
+    );
+
+    assert!(
+        ChangesetCoordinator::load_with_key(
+            Some(&state_path),
+            limits(),
+            Duration::from_secs(900),
+            false,
+            Some(key.into()),
+        )
+        .is_err(),
+        "load_with_key must refuse the same downgraded file"
+    );
+}
+
+/// Percy's review (MEC-457, finding 3): the coordinator derives `Debug`, and a
+/// bare `Arc<[u8]>` key would print its raw bytes through any `{:?}` of the
+/// coordinator — a tracing field, a panic message, or (as here) a test
+/// assertion failure. `ApprovalDigestKey` must redact instead.
+#[tokio::test]
+async fn debug_output_never_contains_the_approval_digest_key() {
+    let key: Arc<[u8]> = Arc::from(b"super-secret-deployment-key".as_slice());
+    // `Arc<[u8]>`'s own (undesired) `Debug` prints the bytes as a numeric
+    // array, not ASCII text -- so the leak-detecting assertion has to look
+    // for that shape, not the plaintext key.
+    let leaked_form = format!("{:?}", key.as_ref());
+    let (_dir, _state_path, coordinator) = setup_keyed_coordinator(key).await;
+
+    let rendered = format!("{coordinator:?}");
+    assert!(
+        !rendered.contains(&leaked_form),
+        "coordinator Debug output must not contain the approval digest key bytes: {rendered}"
+    );
+    assert!(rendered.contains("ApprovalDigestKey(<redacted>)"));
 }
 
 /// Tamper-evidence: editing the approver in a v6-signed record — without

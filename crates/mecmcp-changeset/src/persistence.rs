@@ -312,6 +312,24 @@ pub fn validate_state_with_key(
                 ));
             }
 
+            // Fail closed on a downgrade: once a deployment holds an approval
+            // digest key, the key decides whether an approval verifies, not
+            // whichever `digest_version` the record happens to claim. Accepting
+            // a v4/v5/legacy approver digest here would let anyone who can write
+            // the state file (but not read the key) forge an approval simply by
+            // omitting `digest_version: 6` — the exact downgrade the keying
+            // feature exists to close (MEC-457 review, finding 1).
+            if approval_digest_key.is_some()
+                && approval.approver.is_some()
+                && approval.digest_version != 6
+            {
+                return Err(PersistenceError::new(format!(
+                    "changeset state approval carries digest_version {} but this deployment \
+                     requires keyed (v6) approvals: it is not signed under the keyed rule",
+                    approval.digest_version
+                )));
+            }
+
             let expected_approval_digest = if let Some(approver) = &approval.approver {
                 if version >= 4 {
                     // Which rule applies is carried by the record, not the file.

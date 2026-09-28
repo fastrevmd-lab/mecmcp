@@ -668,6 +668,20 @@ pub struct Cli {
     /// when audit-redact requests hmac. Path only; the key is never a flag/env value.
     #[arg(long)]
     pub audit_hmac_key_file: Option<PathBuf>,
+
+    /// File containing the HMAC key for the change-set approval digest.
+    ///
+    /// Path only, like `--audit-hmac-key-file`: this crate does not depend on
+    /// `mecmcp-changeset`, so it does not load the key itself. A server that
+    /// uses change-set approvals should load this path with
+    /// `mecmcp_changeset::ApprovalDigestKey::load_from_file` and pass the
+    /// result to `ChangesetCoordinator::load_with_key` (not also to
+    /// `with_approval_digest_key` -- `load_with_key` already stores it on the
+    /// returned coordinator; passing it to both just risks the two drifting).
+    /// Omitted, a deployment keeps signing and accepting the unkeyed v5
+    /// approval digest (MEC-457).
+    #[arg(long)]
+    pub approval_digest_key_file: Option<PathBuf>,
 }
 
 /// Top-level management commands.
