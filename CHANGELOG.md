@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-09-28
+
 ### Added
 
 - **transport: `/healthz` and `/readyz`** (MEC-48, mecmcp#377). Both are
