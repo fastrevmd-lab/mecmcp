@@ -964,9 +964,12 @@ pub fn split_endpoint(url: &str) -> Result<(bool, String, u16, String), SsdfSink
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback())
     {
+        // Print only the scheme and host, never the full `url`: a URL can
+        // carry Basic-auth userinfo (`http://user:pass@host`), and that must
+        // not land in a startup error that reaches stderr or a log.
         return Err(SsdfSinkError::Http(format!(
-            "endpoint {url} uses http:// to a non-loopback host ({host}); use https:// or a \
-             loopback address"
+            "endpoint uses http:// to a non-loopback host ({host}); use https:// or a loopback \
+             address"
         )));
     }
 
