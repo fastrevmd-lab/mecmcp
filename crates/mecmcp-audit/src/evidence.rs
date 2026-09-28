@@ -182,6 +182,14 @@ pub struct ClosedSegment {
     records: Vec<EvidenceRecord>,
     /// Hash of the final record in this segment (segment head).
     pub head_hash: String,
+    /// Detached Ed25519 signature over `head_hash`, base64-encoded
+    /// ([`crate::signing::encode_signature`]).
+    ///
+    /// `None` when the recorder that closed this segment has no signing key
+    /// configured. `#[serde(default)]` so an outbox entry spooled before this
+    /// field existed still deserializes, as an unsigned segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 /// Segment archive: stores finalized segments.
@@ -439,6 +447,10 @@ pub fn close(seg: ChainSegment) -> Result<ClosedSegment, EvidenceError> {
         prev_hash: seg.prev_hash,
         records: seg.records,
         head_hash,
+        // Signing happens one layer up, in `EvidenceRecorder::roll`, which is
+        // the only caller with a key to sign with. `close` itself is a pure
+        // hashing step and stays that way.
+        signature: None,
     })
 }
 

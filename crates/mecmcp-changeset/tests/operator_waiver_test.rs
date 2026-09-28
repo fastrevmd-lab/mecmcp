@@ -647,6 +647,102 @@ async fn an_expired_waiver_does_not_authorize_apply() {
     );
 }
 
+/// `compute_waiver_digest_v3` needs no key -- it is a plain hash, not a MAC --
+/// so it verifies on its own bytes regardless of whether this deployment
+/// currently runs in lab mode. A valid, unexpired waiver record must still be
+/// refused at apply time once lab mode is off, or write access to the state
+/// file (without ever running with lab mode enabled) would be enough to forge
+/// an approval (MEC-457 review, finding 1, "also check").
+///
+/// Sabotage-verify: remove the `!self.lab_mode()` check added alongside this
+/// test in `apply.rs` and confirm this test fails.
+#[tokio::test]
+async fn lab_mode_disabled_after_waiver_does_not_authorize_apply() {
+    let harness = planned_change_set_harness().await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_secs();
+
+    let waiver = WaiverRecord {
+        kind: WaiverKind::LabMode,
+        reason: "lab-mode".to_owned(),
+        expires_at_unix: None,
+        ticket: None,
+    };
+
+    let waiver_digest = compute_waiver_digest_v3(
+        &harness.change_set_id,
+        &harness.digest,
+        &harness.owner,
+        now,
+        &waiver,
+    );
+
+    let state_path = harness._temp_dir.path().join("state.json");
+    let mut state = read_state(&state_path, 8 * 1024 * 1024).expect("read state");
+
+    let change_set = state
+        .change_sets
+        .get_mut(&harness.change_set_id)
+        .expect("change set exists");
+
+    change_set.state = ChangeSetState::Approved;
+    change_set.approval = Some(ApprovalRecord {
+        approver: None,
+        approved_at_unix: now,
+        digest: waiver_digest,
+        digest_version: 4,
+        waived: Some(waiver),
+    });
+
+    write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
+
+    // Reload with lab_mode=false, as if the waiver were forged directly into
+    // the state file on a deployment that never ran with lab mode enabled.
+    let limits = OperationLimits {
+        max_operations: 1024,
+        max_change_sets: 1024,
+        max_actions_per_set: 64,
+        max_state_bytes: 8 * 1024 * 1024,
+        max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
+    };
+    let approval_ttl = Duration::from_secs(15 * 60);
+    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false)
+        .expect("reload coordinator with lab mode disabled");
+
+    let fingerprint = harness
+        .transaction
+        .fingerprint()
+        .await
+        .expect("fingerprint");
+    let error = coordinator
+        .apply_change_set(
+            harness.change_set_id.clone(),
+            harness.device.clone(),
+            "https://test-device.example.com".to_string(),
+            harness.owner.clone(),
+            harness.digest.clone(),
+            fingerprint,
+            &harness.transaction,
+            "set",
+            None,
+            None,
+            &test_attribution("alice"),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a lab-mode waiver must not authorize apply when lab mode is disabled");
+
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("lab mode"),
+        "the refusal must name lab mode, not report a generic missing approval: {message}"
+    );
+}
+
 /// The pre-guard waiver expiry check must fail fast without waiting for the
 /// device guard. Isolate it by pre-holding the guard: a dead check would block.
 #[tokio::test]

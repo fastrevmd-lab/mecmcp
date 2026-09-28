@@ -3,8 +3,8 @@
 use crate::{
     coordinator::{ChangesetCoordinator, CoordinatorError},
     digest::{
-        change_set_digest, compute_approval_digest_v5, compute_waiver_digest_v3, validate_digest,
-        validate_principal_for_digest,
+        change_set_digest, compute_approval_digest_v5, compute_approval_digest_v6,
+        compute_waiver_digest_v3, validate_digest, validate_principal_for_digest,
     },
     lifecycle::ChangeSetState,
     records::{ApprovalRecord, ChangeSetRecord, WaiverKind, WaiverRecord},
@@ -299,14 +299,39 @@ impl ChangesetCoordinator {
             .preview
             .as_ref()
             .map(|preview| preview.digest.clone());
-        let approval_digest = compute_approval_digest_v5(
-            &change_set_id,
-            &record.digest,
-            preview_digest.as_deref(),
-            &record.owner,
-            &approver,
-            now,
-        );
+
+        // v6: keyed with an HMAC only this deployment holds, so an approval
+        // digest cannot be forged or replayed by anyone who can merely read or
+        // edit the state file (MEC-457). Falls back to the unkeyed v5 digest
+        // when no key is configured, so a deployment that has not been given
+        // one keeps working exactly as before -- signing is optional, not the
+        // absence of an approval.
+        let (approval_digest, digest_version) = if let Some(key) = self.approval_digest_key() {
+            (
+                compute_approval_digest_v6(
+                    key,
+                    &change_set_id,
+                    &record.digest,
+                    preview_digest.as_deref(),
+                    &record.owner,
+                    &approver,
+                    now,
+                ),
+                6,
+            )
+        } else {
+            (
+                compute_approval_digest_v5(
+                    &change_set_id,
+                    &record.digest,
+                    preview_digest.as_deref(),
+                    &record.owner,
+                    &approver,
+                    now,
+                ),
+                5,
+            )
+        };
 
         let observed = record.state;
         record.state = ChangeSetState::Approved;
@@ -315,7 +340,7 @@ impl ChangesetCoordinator {
             approver: Some(approver.clone()),
             approved_at_unix: now,
             digest: approval_digest,
-            digest_version: 5,
+            digest_version,
             waived: None,
         });
 
