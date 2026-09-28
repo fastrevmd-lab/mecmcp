@@ -1951,7 +1951,7 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-redact"
-version = "0.24.0"
+version = "0.24.1"
 dependencies = [
  "hmac",
  "quick-xml",
