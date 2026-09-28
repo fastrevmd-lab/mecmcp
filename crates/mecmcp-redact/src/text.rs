@@ -314,7 +314,10 @@ fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
                 matched_sep = true;
                 matched_this_subtoken = true;
                 let value_start = ss + rel + 1;
-                if value_start < e {
+                let has_value_here = line[value_start..e]
+                    .chars()
+                    .any(|c| !SUBTOKEN_SPLIT_CHARS.contains(&c));
+                if has_value_here {
                     // S1/T1: run the value to the *whole whitespace token's*
                     // end, not just this sub-token's end — a generated
                     // PSK/password routinely contains `& ; , ? { }`, and
@@ -331,7 +334,8 @@ fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
                     // instead, leaking the real secret in plain sight.
                     spans.push((value_start, value_end_at_least(line, value_start, e)));
                 } else if let Some(&(vs, ve)) = tokens.get(i + 1) {
-                    // `key=`/`key:` with nothing else in this (sub)token: the
+                    // `key=`/`key:` with nothing but structural punctuation
+                    // after it in this token (`password=`, `password={`): the
                     // value is the next whitespace token, if there is one.
                     spans.push((vs, value_end_at_least(line, vs, ve)));
                 }
@@ -857,5 +861,18 @@ mod tests {
     fn t1_value_starting_with_ampersand_inside_a_query_string_is_redacted() {
         let got = redact("a=1&password=&QQm5&b=2");
         assert!(!got.contains("QQm5"), "got: {got}");
+    }
+
+    #[test]
+    fn u1_split_char_only_value_then_whitespace_does_not_leak_next_token() {
+        for (input, secret) in [
+            ("password={ QQu1 }", "QQu1"),
+            ("password=& QQu2", "QQu2"),
+            ("psk=; QQu3", "QQu3"),
+            ("password=, QQu4", "QQu4"),
+        ] {
+            let got = redact(input);
+            assert!(!got.contains(secret), "input: {input} got: {got}");
+        }
     }
 }
