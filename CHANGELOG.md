@@ -29,6 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **transport: `LimitsConfig::default()` now rate-limits by default**
+  (MEC-347). Per-IP and per-token rate limits were `0` (disabled) out of the
+  box, so a fresh install ran fully unmetered until an operator opted in.
+  Defaults are now `max_requests_per_second_per_ip: 50` /
+  `max_request_burst_per_ip: 100` and `max_requests_per_second_per_token: 20`
+  / `max_request_burst_per_token: 40`. Set either pair to `0`/`0` to disable
+  that axis, as before.
+
 ## [0.24.0] - 2026-09-28
 
 ### Added
