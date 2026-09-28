@@ -347,9 +347,11 @@ an exact version.
 > - **Host and Origin validation outside `/mcp`.** `build_rmcp_server_config`
 >   gives rmcp the Host allowlist, but that only guards the service nested at
 >   `/mcp`. The builder additionally layers this crate's own Host/Origin
->   middleware over the *entire* router, which is what stops an attacker-
->   controlled page reading the unauthenticated `/metrics` endpoint with a
->   foreign Host header. That middleware is private and installed only by
+>   middleware over the *entire* router, which is what stops a DNS-rebinding
+>   attacker page — whose request lands on the victim's own loopback
+>   interface and so passes the `/metrics` loopback gate — from reading
+>   `/metrics` with a foreign Host header. That middleware is private and
+>   installed only by
 >   `build_streamable_http_router`. A hand assembly therefore keeps the Host
 >   guard on `/mcp` and loses it everywhere else — and loses Origin checking
 >   entirely, since `build_rmcp_server_config` deliberately empties rmcp's

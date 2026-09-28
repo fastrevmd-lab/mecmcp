@@ -29,8 +29,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **transport: `/healthz` and `/readyz`** (MEC-48, mecmcp#377). Both are
+  unauthenticated, always mounted, and return no device or customer data.
+  `/healthz` reports the process is up with no dependency check. `/readyz`
+  runs the consumer-supplied `ReadinessCheck`s registered with
+  `HttpTransportConfig::with_readiness_check` — 200 when all pass (including
+  when none are configured), 503 listing the failed check names otherwise. A
+  probe's failure reason is `&'static str`, not `String`: since `/readyz` is
+  unauthenticated, the type keeps a probe from formatting a runtime value
+  (a path, an I/O error) into the response body — log that detail
+  server-side instead. `mecmcp-transport` ships no checks of its own; each
+  consuming server wires in audit-sink-writable and inventory-loaded checks
+  as a follow-up.
+- **`mecmcp-policy`: fail-closed allowlist mode (MEC-92).** `Policy::new` now takes a `CommandMode` (`Allowlist` or `Blocklist`) that governs the commands and pfe_commands domains; the config domain is unchanged. `Allowlist` is the default and refuses everything until entries are added: entries are literal whitespace-token prefixes (never globs — `*`, `?`, `[` in an entry are a compile-time error via `compile_allowlist_entries`), abbreviations are never expanded, and a piped command needs every `|` stage after the first to match a separate `allowed_pipes` list that defaults to empty. `;`, `>`, `<`, a backtick, or a newline anywhere refuses the command outright. `Blocklist` keeps the pre-MEC-92 fail-open behaviour byte-for-byte, for callers that request it explicitly — nothing in the crate maps an absent mode to `Blocklist`. **Breaking API change:** `Decision` gained a `DenyAllowlist` variant (any exhaustive match on `Decision` needs a new arm), and `Policy::new` takes a `CommandMode` plus `CommandDomain<A>` (blocklist + allowlist bundle) instead of bare `DomainRules<A>` for the commands/pfe_commands parameters. `Decision` is now `#[must_use]` and gained `is_allowed()`, which is true only for `Decision::Allow`; callers must gate on `is_allowed()` or match all three variants exhaustively — matching only `Decision::Deny` and treating everything else as allowed silently lets `DenyAllowlist` refusals through. Library only — no MCP server wires this up yet; that's tracked in the sibling MEC-88 consumer tasks.
+
 ### Changed
 
+- **transport: `/metrics` defaults to loopback-only** (MEC-48, mecmcp#377).
+  **Behaviour change:** a peer that is not `127.0.0.1`/`::1` now gets a 403
+  from `/metrics`, regardless of any MCP bearer token it presents — where
+  previously any peer that passed the Host/Origin allowlist and IP rate limit
+  could reach it. A loopback peer that also carries a request-forwarding
+  header (`Forwarded`, `X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP`) is
+  treated as non-loopback, since a same-host reverse proxy — the deployment
+  shape this project documents for its own servers — otherwise makes every
+  forwarded caller look loopback at the TCP layer. Loopback detection also
+  now canonicalizes the peer address first, so an IPv4-mapped IPv6 address
+  (`::ffff:127.0.0.1`, seen on a dual-stack listener) is recognized as
+  loopback rather than refused. Call the new
+  `HttpTransportConfig::with_metrics_token` to also admit a non-loopback peer
+  presenting a dedicated metrics bearer token (checked independently of the
+  MCP token store, so an MCP token still never grants `/metrics`). See
+  `docs/METRICS.md` for the Prometheus scrape config migration, including the
+  reverse-proxy caveat.
 - **Raised MSRV to 1.89** and removed the `aes` pin from the CI msrv job that PR #344 added. All six consumer repos are moving to 1.89 in parallel PRs, so the objection that blocked raising the floor in #344 no longer stands.
 
 ## [0.23.1] - 2026-09-05
