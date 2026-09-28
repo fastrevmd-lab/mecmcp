@@ -333,7 +333,7 @@ impl EvidenceRecorder {
     /// remember to invoke as a separate step after closing a segment — nothing
     /// called it outside tests, so a deployed server produced unsigned
     /// evidence even with a key on disk. This attaches signing to the one
-    /// place every segment closes, [`roll`](Self::roll), so a configured key
+    /// place every segment closes, `roll`, so a configured key
     /// signs every segment with no further action (MEC-457).
     #[must_use]
     pub fn with_signing_key(mut self, key: SigningKey) -> Self {
