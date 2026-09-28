@@ -256,6 +256,22 @@ impl ChangesetCoordinator {
                     "approval record must contain either an approver or a waiver",
                 ));
             }
+            // A waiver digest is unkeyed (compute_waiver_digest_v3 needs no
+            // key), so it verifies on its own hash regardless of whether this
+            // deployment currently runs in lab mode. Someone with write access
+            // to the state file could write a well-formed waiver record for a
+            // change set that was never actually waived under lab mode, and
+            // loading it would treat it as a valid approval. `waive_approval`
+            // already refuses to create a waiver outside lab mode; re-check it
+            // here too, since lab mode can be toggled off (or the record can be
+            // moved to a deployment where it never was on) between waiving and
+            // applying (MEC-457 review, finding 1, "also check").
+            if approval.waived.is_some() && !self.lab_mode() {
+                return Err(CoordinatorError::new(
+                    "change_set_id",
+                    "change set was approved by a lab-mode waiver, but lab mode is not enabled on this deployment",
+                ));
+            }
         } else {
             // Legacy approval: must have an approver in the top-level field
             if change_set.approver.is_none() {
