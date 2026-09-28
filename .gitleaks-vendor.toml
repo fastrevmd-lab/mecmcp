@@ -1,4 +1,4 @@
-title = "mecmcp vendor gitleaks rules (canonical, extended by all 15 repos)"
+title = "gitleaks vendor secrets rules (canonical)"
 
 [extend]
 useDefault = true
@@ -25,6 +25,12 @@ tags = ["junos", "secret"]
 id = "junos-type1-secret"
 description = "Junos $1$ (MD5 crypt) secret"
 regex = '''\$1\$[A-Za-z0-9./]{1,8}\$[A-Za-z0-9./]{22}'''
+tags = ["junos", "secret"]
+
+[[rules]]
+id = "junos-sha1-secret"
+description = "Junos $sha1$ encrypted-password"
+regex = '''\$sha1\$\d+\$[A-Za-z0-9./]{1,64}\$[A-Za-z0-9./]{20,}'''
 tags = ["junos", "secret"]
 
 [[rules]]
