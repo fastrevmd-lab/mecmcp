@@ -29,8 +29,9 @@ membership, no offboarding story, and one shared secret per team in practice.
   the control that makes a 150-person org safe, and it has to be in the scope
   model rather than in a policy document.
 
-Builds on `mecmcp-auth`. The `Principal` type in `mecmcp-audit` is already
-designed to carry either a token name or an OIDC subject.
+Builds on `mecmcp-auth`. The `Principal` type in `mecmcp-audit` today has
+`Token(String)` and `Unauthenticated` variants only; an OIDC-subject variant
+is future work tracked by the phased plan below.
 
 ## 2. Attribution — the piece that makes AI-driven ops auditable
 
