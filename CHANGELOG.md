@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-09-28
+
+> **Upgrade note.** This patch release changes a default: servers that relied
+> on `LimitsConfig::default()` being unmetered now get per-IP and per-token
+> rate limits (below). Set either pair to `0`/`0` to keep the old behaviour.
+
 ### Changed
 
 - **transport: `LimitsConfig::default()` now rate-limits by default**
@@ -38,6 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `max_request_burst_per_ip: 100` and `max_requests_per_second_per_token: 20`
   / `max_request_burst_per_token: 40`. Set either pair to `0`/`0` to disable
   that axis, as before.
+
+### Maintenance
+
+- **ci:** the build-test job builds with `--locked` (#396).
+- **transport:** stale comments that described `Cargo.lock` as gitignored
+  are corrected (#395).
+- **hygiene:** canonical shared gitleaks vendor rules added (MEC-30, #388);
+  personal email domain in test fixtures replaced with a synthetic one (#391).
 
 ## [0.24.0] - 2026-09-28
 
