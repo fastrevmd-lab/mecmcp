@@ -298,6 +298,7 @@ async fn apply_approved_change_set_succeeds() {
             device.clone(),
             approver.to_string(),
             digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -388,6 +389,7 @@ async fn apply_same_change_set_twice_fails() {
             device.clone(),
             approver.to_string(),
             digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -488,6 +490,7 @@ async fn partial_failure_auto_reverts_and_marks_failed() {
             device.clone(),
             approver.to_string(),
             digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -580,6 +583,7 @@ async fn apply_with_mismatched_digest_fails() {
             device.clone(),
             approver.to_string(),
             digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -643,6 +647,7 @@ async fn apply_with_mismatched_fingerprint_fails() {
             device.clone(),
             approver.to_string(),
             digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -845,6 +850,7 @@ async fn apply_with_invalid_endpoint_fails() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -910,6 +916,7 @@ async fn apply_accepts_a_non_https_vendor_endpoint() {
             device.clone(),
             approver.to_string(),
             created.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -985,6 +992,7 @@ async fn apply_persists_valid_endpoint_and_reloads() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1073,6 +1081,7 @@ async fn apply_after_approval_expired_fails() {
             device.clone(),
             approver.to_string(),
             digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1279,6 +1288,7 @@ async fn fingerprint_read_failure_with_failed_rollback_marks_indeterminate() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1357,6 +1367,7 @@ async fn finding_1_canonicalize_endpoint_key() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1425,6 +1436,7 @@ async fn finding_1_reject_malformed_endpoint() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1497,6 +1509,7 @@ async fn finding_2_persist_policy_signature() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1576,6 +1589,7 @@ async fn finding_3_persist_config_lock_held() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1746,6 +1760,7 @@ async fn finding_8_expire_after_guard_wait() {
             device.clone(),
             approver.to_string(),
             digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1830,6 +1845,7 @@ async fn finding_1_serialize_by_device_not_endpoint() {
             device.clone(),
             approver1.to_string(),
             create_output1.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1880,6 +1896,7 @@ async fn finding_1_serialize_by_device_not_endpoint() {
             device.clone(),
             approver2.to_string(),
             create_output2.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -2077,6 +2094,7 @@ async fn finding_2_cleanup_reservation_on_pre_stage_check_abort() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -2146,6 +2164,7 @@ async fn finding_2_cleanup_reservation_on_pre_stage_check_abort() {
             device.clone(),
             approver.to_string(),
             create_output2.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -2216,6 +2235,7 @@ async fn finding_3_recorded_state_reports_actual_persisted_state() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -2402,6 +2422,7 @@ async fn finding_4_reject_legacy_plan_with_empty_policy_signature() {
             device.clone(),
             approver2.to_string(),
             create_output2.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -2467,6 +2488,7 @@ async fn finding_6_accept_case_insensitive_scheme() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();

@@ -85,6 +85,7 @@ async fn approving_records_the_approver_and_the_decision() {
             "vsrx-ci".to_string(),
             "user:alice".to_string(),
             output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();

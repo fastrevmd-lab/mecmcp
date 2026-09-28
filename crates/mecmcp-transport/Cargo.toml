@@ -45,9 +45,24 @@ tokio-util  = { version = "0.7", default-features = false, features = ["rt"] }
 tower-http  = { version = "0.7", features = ["limit"] }
 tracing     = { workspace = true }
 # HTTP client for test_client module (issue #184). Consumers use this in their
-# integration tests to validate MCP endpoints.
-ureq        = { version = "3", default-features = false, features = ["json"] }
+# integration tests to validate MCP endpoints. Optional and only pulled in by
+# the `test-util` feature below — a normal `cargo build` must not ship an HTTP
+# client and test scaffolding it never calls.
+ureq        = { version = "3", default-features = false, features = ["json"], optional = true }
 zeroize     = "1"
+
+[features]
+# Gates `test_client` and `test_harness` (and the `ureq` dependency they need).
+# A consumer's integration tests enable this in their own `[dev-dependencies]`
+# entry for this crate; it must never be on for the normal dependency, or a
+# release build ships the test client and the loopback-serving harness.
+test-util = ["dep:ureq"]
+
+# `router_integration.rs` drives the router through `test_client::McpClient`,
+# which only exists behind `test-util`.
+[[test]]
+name = "router_integration"
+required-features = ["test-util"]
 
 [dev-dependencies]
 # Test-only: `test-util` exposes audit capture helpers. It must NOT be enabled

@@ -217,6 +217,7 @@ async fn test_waived_record_is_distinguishable_from_genuine_approval() {
             "device-b".to_string(),
             "bob".to_string(),
             approved_cs.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .expect("approve");

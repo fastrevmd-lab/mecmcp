@@ -9,3 +9,31 @@
 # this can never mask an unrelated real secret.
 c31c102fd98a12ead59e65125cf8b85220e9b716:crates/mecmcp-redact/src/shape.rs:private-key:123
 c31c102fd98a12ead59e65125cf8b85220e9b716:crates/mecmcp-redact/src/text.rs:private-key:184
+
+# Historical findings from mecmcp-redact's own commits (c31c102, 103b596,
+# fa02033, 72aef8d): synthetic Junos $9$ crypt-hash and Mist x_passphrase
+# fixtures (e.g. "$9$fakehash", "FAKEwifikey") used to test this crate's own
+# vendor-secret-shape detectors. These commits predate MEC-30's merge of the
+# shared vendor rules (junos-type9-secret, mist-x-passphrase) into this
+# repo's .gitleaks.toml, so the rules didn't exist yet when the fixtures
+# were written and there was nothing to add an inline `gitleaks:allow` for.
+# Ignored here by exact fingerprint (commit:file:rule:line) only.
+103b596d19bfdb2582ba9979fd94442b7a16d850:crates/mecmcp-redact/src/json.rs:junos-type9-secret:153
+103b596d19bfdb2582ba9979fd94442b7a16d850:crates/mecmcp-redact/src/xml.rs:junos-type9-secret:249
+72aef8d876e49ca5d1498ea1495b67903dffbf90:crates/mecmcp-redact/src/text.rs:junos-type9-secret:796
+c31c102fd98a12ead59e65125cf8b85220e9b716:crates/mecmcp-redact/src/projection.rs:mist-x-passphrase:80
+c31c102fd98a12ead59e65125cf8b85220e9b716:crates/mecmcp-redact/src/projection.rs:junos-type9-secret:81
+c31c102fd98a12ead59e65125cf8b85220e9b716:crates/mecmcp-redact/src/shape.rs:junos-type9-secret:16
+c31c102fd98a12ead59e65125cf8b85220e9b716:crates/mecmcp-redact/src/shape.rs:junos-type9-secret:82
+c31c102fd98a12ead59e65125cf8b85220e9b716:crates/mecmcp-redact/src/shape.rs:junos-type9-secret:116
+c31c102fd98a12ead59e65125cf8b85220e9b716:crates/mecmcp-redact/src/text.rs:junos-type9-secret:142
+c31c102fd98a12ead59e65125cf8b85220e9b716:crates/mecmcp-redact/src/text.rs:junos-type9-secret:168
+c31c102fd98a12ead59e65125cf8b85220e9b716:crates/mecmcp-redact/tests/property_no_secret_survives.rs:junos-type9-secret:34
+c31c102fd98a12ead59e65125cf8b85220e9b716:crates/mecmcp-redact/tests/value_shapes_all_formats.rs:junos-type9-secret:15
+c31c102fd98a12ead59e65125cf8b85220e9b716:crates/mecmcp-redact/tests/value_shapes_all_formats.rs:junos-type9-secret:66
+fa0203387c621a193b1a77419b1273cae5f5f747:crates/mecmcp-redact/src/text.rs:junos-type9-secret:71
+fa0203387c621a193b1a77419b1273cae5f5f747:crates/mecmcp-redact/src/text.rs:junos-type9-secret:72
+fa0203387c621a193b1a77419b1273cae5f5f747:crates/mecmcp-redact/src/text.rs:junos-type9-secret:648
+fa0203387c621a193b1a77419b1273cae5f5f747:crates/mecmcp-redact/src/text.rs:junos-type9-secret:650
+fa0203387c621a193b1a77419b1273cae5f5f747:crates/mecmcp-redact/src/text.rs:junos-type9-secret:655
+fa0203387c621a193b1a77419b1273cae5f5f747:crates/mecmcp-redact/src/text.rs:junos-type9-secret:657
