@@ -75,9 +75,12 @@ pub struct LimitsConfig {
     /// trusting `X-Forwarded-For` from an unlisted peer would let any client
     /// spoof its way around its own per-IP limit by setting the header on its
     /// own request. Only when the immediate peer's address falls inside one of
-    /// these ranges (a known reverse proxy or load balancer) is the leftmost
-    /// address in `X-Forwarded-For` used as the rate-limit key instead of the
-    /// peer address.
+    /// these ranges (a known reverse proxy or load balancer) is
+    /// `X-Forwarded-For` consulted: the rightmost entry not itself inside
+    /// `trusted_proxies` is used as the rate-limit key instead of the peer
+    /// address. List only proxies that append or overwrite this header for
+    /// every request they forward — a CIDR that also covers an untrusted host
+    /// lets that host spoof its rate-limit key.
     #[serde(default)]
     pub trusted_proxies: Vec<ipnet::IpNet>,
     /// Max concurrent MCP sessions. `0` disables.
