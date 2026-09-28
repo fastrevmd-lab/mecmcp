@@ -37,6 +37,8 @@ pub const DENYLISTED_KEYS: &[&str] = &[
     "passwd",
     "pwd",
     "session",
+    "keystring",
+    "messagedigestkey",
 ];
 
 /// Field names that must match the *whole* normalized key, not a substring.

@@ -339,10 +339,13 @@ another line</output>"#;
 
     #[test]
     fn n5_single_line_kv_secret_in_text_node_is_redacted() {
+        // X1 (mecmcp#386 re-review): the value locator redacts to the end
+        // of the text node once the key is found, so trailing text after
+        // the secret (`ok`) is swept too — the accepted over-redaction
+        // cost; only the text *before* the key is unaffected.
         let xml = "<message>user login password=QQvalue9 ok</message>";
         let got = redact(xml).unwrap();
         assert!(!got.contains("QQvalue9"), "got: {got}");
         assert!(got.contains("user login"), "got: {got}");
-        assert!(got.contains("ok</message>"), "got: {got}");
     }
 }

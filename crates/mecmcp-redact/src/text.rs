@@ -6,6 +6,14 @@
 //! [`crate::shape`] catch-all per line, plus a dedicated PEM-block and
 //! `## SECRET-DATA` handler, and always **replaces** rather than "cleans" a
 //! value: on ambiguity about where a value ends, it takes the larger span.
+//!
+//! X1 (mecmcp#386 re-review): the value locator does not try to guess how
+//! many wrapper tokens (separators, type codes, `ENC` markers, ...) sit
+//! between a denylisted key and its value. Once the key is found, everything
+//! from the first non-punctuation token onward is redacted to the end of the
+//! line — real vendor syntax puts an unbounded number of such tokens in
+//! between, and guessing a fixed lookahead only ever produces another
+//! counterexample. Over-redacting the rest of the line is the accepted cost.
 
 use crate::denylist::is_denylisted_key;
 use crate::shape::{is_pem_begin, is_pem_end, looks_like_secret_value};
@@ -17,8 +25,30 @@ const PLACEHOLDER: &str = "[REDACTED]";
 pub fn redact(input: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut in_pem = false;
+    // X1: `key: |` / `key: >` YAML block-scalar carry state — once a
+    // denylisted key opens a block scalar, every following line indented
+    // more deeply than the key line is its value, however many lines it
+    // spans, and none of them are visited by the per-line key/shape scan.
+    let mut block_scalar_indent: Option<usize> = None;
     for line in input.split('\n') {
         let trimmed = line.trim().trim_end_matches('\r');
+
+        if let Some(indent) = block_scalar_indent {
+            let is_blank = trimmed.is_empty();
+            if !is_blank && indent_len(line) <= indent {
+                block_scalar_indent = None;
+            } else if is_blank {
+                // Blank lines inside a block scalar are part of its value in
+                // YAML but never carry secret bytes themselves; pass through.
+                out.push(line.to_string());
+                continue;
+            } else {
+                let prefix = &line[..indent_len(line)];
+                out.push(format!("{prefix}{PLACEHOLDER}"));
+                continue;
+            }
+        }
+
         if in_pem {
             if is_pem_end(trimmed) {
                 in_pem = false;
@@ -34,9 +64,38 @@ pub fn redact(input: &str) -> String {
             out.push(PLACEHOLDER.to_string());
             continue;
         }
+        if let Some(colon) = trimmed.find(':') {
+            let key_part = trimmed[..colon].trim();
+            let tail = &trimmed[colon + 1..];
+            if is_denylisted_key(key_part) && is_yaml_block_scalar_marker(tail) {
+                out.push(redact_line(line));
+                block_scalar_indent = Some(indent_len(line));
+                continue;
+            }
+        }
         out.push(redact_line(line));
     }
     out.join("\n")
+}
+
+/// Byte length of the leading run of spaces/tabs on `line`.
+fn indent_len(line: &str) -> usize {
+    line.len() - line.trim_start_matches([' ', '\t']).len()
+}
+
+/// Whether `tail` (the text after a `key:`) is a YAML block-scalar
+/// indicator: `|` or `>`, optionally followed by a chomping modifier (`+`,
+/// `-`) or an explicit indentation-indicator digit (`|2`, `>-1`, ...). When
+/// it is, the value is not on this line at all — it is every following line
+/// indented more deeply than the key.
+fn is_yaml_block_scalar_marker(tail: &str) -> bool {
+    let trimmed = tail.trim();
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some('|' | '>') => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '+' || c == '-' || c.is_ascii_digit())
 }
 
 fn redact_line(line: &str) -> String {
@@ -65,14 +124,15 @@ fn redact_line(line: &str) -> String {
 /// When `force` is false, only text matching a known value shape is touched.
 fn redact_value_span(line: &str, force: bool) -> String {
     // When forced, take the union of every span any pass would redact on its
-    // own: the denylisted-key matches, every quoted span that itself looks
-    // like a secret value, and every whitespace token that looks like one —
-    // a line can carry a keyed value (`password=X`) *and* an unrelated
-    // shape-matching value the key scan never touches (`secret X $9$hash`,
-    // `password=X hash "$9$hash"`). Splicing once over the union (rather than
-    // returning as soon as the key scan finds something) is what keeps the
-    // quoted-span and shape passes from being silently skipped whenever a key
-    // happens to match earlier on the same line.
+    // own: the denylisted-key matches (each running to the end of the line,
+    // per X1), every quoted span that itself looks like a secret value, and
+    // every whitespace token that looks like one — a line can carry a keyed
+    // value (`password=X`) *and* an unrelated shape-matching value the key
+    // scan never touches (`secret X $9$hash`, `password=X hash "$9$hash"`).
+    // Splicing once over the union (rather than returning as soon as the key
+    // scan finds something) is what keeps the quoted-span and shape passes
+    // from being silently skipped whenever a key happens to match earlier on
+    // the same line.
     if force {
         let key_spans = denylisted_key_spans(line);
         // S2: when no denylisted key was found on a forced line (a `##
@@ -151,11 +211,9 @@ fn whitespace_token_spans(line: &str) -> Vec<(usize, usize)> {
 /// Vendor "value type" keywords that some CLIs put directly after a
 /// denylisted key and before the actual secret (Junos
 /// `pre-shared-key ascii-text "..."`, `encrypted-password "$9$..."`). Every
-/// one of these is a closed, known vocabulary — unlike "the next token has no
-/// digit in it", which also matches an ordinary digit-free SNMP community
-/// string or weak PSK (N1) and would skip straight past the real secret.
-/// Matching is case-insensitive; nothing here is normalized/hyphen-agnostic
-/// on purpose, since these are compared as literal tokens, not denylist keys.
+/// one of these is a closed, known vocabulary, so it is safe to keep visible
+/// rather than folding it into the redacted span like everything else X1
+/// sweeps to the end of the line.
 const VALUE_TYPE_KEYWORDS: &[&str] = &[
     "ascii-text",
     "hexadecimal",
@@ -172,31 +230,6 @@ fn is_value_type_keyword(token: &str) -> bool {
     VALUE_TYPE_KEYWORDS
         .iter()
         .any(|kw| kw.eq_ignore_ascii_case(token))
-}
-
-/// A bare separator occupying its own whitespace-delimited token —
-/// `password = X`, `password => X`, `password := X`, `password -> X`,
-/// `password == X` — rather than attached to the key (`password=X`, handled
-/// by the `key=value` scan instead). A token made up entirely of `= : > - ~`
-/// characters is a separator, never the value itself (R1/S4): treating it as
-/// an unrecognized "value" left the real value one token further along
-/// exposed. No real secret value is composed only of these characters.
-fn is_lone_separator(token: &str) -> bool {
-    !token.is_empty()
-        && token
-            .chars()
-            .all(|c| matches!(c, '=' | ':' | '>' | '-' | '~'))
-}
-
-/// A one- or two-digit Cisco-style type code (`password 7 X`, `secret 5 X`).
-fn is_short_digit_code(token: &str) -> bool {
-    (1..=2).contains(&token.len()) && !token.is_empty() && token.bytes().all(|b| b.is_ascii_digit())
-}
-
-/// Vendor `ENC`-prefixed ciphertext marker used as its own token (FortiOS
-/// `set psksecret ENC <blob>`), case-insensitive.
-fn is_enc_token(token: &str) -> bool {
-    token.eq_ignore_ascii_case("ENC")
 }
 
 /// Characters that can join otherwise-independent `key=value` pairs into one
@@ -228,84 +261,36 @@ fn subtoken_spans(line: &str, start: usize, end: usize) -> Vec<(usize, usize)> {
     spans
 }
 
-/// `quoted_value_end(line, start).unwrap_or(fallback_end)`, but never
-/// shorter than `token_end` — a quoted value that closes before its
-/// enclosing whitespace token ends (`password="ab"QQtail`) must still have
-/// the rest of that token swept (R4): a value cannot leak just because a
-/// quote happened to close early inside the same token.
-fn value_end_at_least(line: &str, start: usize, token_end: usize) -> usize {
-    quoted_value_end(line, start).map_or(token_end, |end| end.max(token_end))
-}
-
-/// Index of the first whitespace token at or after `from` that is not made up
-/// solely of [`SUBTOKEN_SPLIT_CHARS`] (`{`, `&`, `;` ...). A lone hierarchy
-/// brace or separator between a key and its value (`password { X }`,
-/// `password: & X`) is structure, not the secret, so the value is the token
-/// after it (V1).
-fn next_value_token(line: &str, tokens: &[(usize, usize)], from: usize) -> Option<usize> {
-    (from..tokens.len()).find(|&j| {
-        let (s, e) = tokens[j];
-        line[s..e]
-            .chars()
-            .any(|c| !SUBTOKEN_SPLIT_CHARS.contains(&c))
-    })
-}
-
-/// Span(s) to redact for the value found at token index `j` (already
-/// selected by [`next_value_token`], so it is not itself a
-/// [`SUBTOKEN_SPLIT_CHARS`]-only token).
+/// Byte offset where a value begins, searching forward from whitespace-token
+/// index `from` for the first token that contains at least one alphanumeric
+/// character — i.e. is not pure separator/structural punctuation (`=`, `:`,
+/// `{`, `&`, a bare quote pair, a Cisco-style `->`/`:=` arrow, ...). Bare
+/// punctuation never carries the secret itself (X1, subsuming the old R1/S4
+/// separator check); skipping it is what keeps `password = X`,
+/// `password { X }`, and `password: & X` from mistaking the separator for
+/// the value.
 ///
-/// `j`'s token can still be something that is not the secret itself: a bare
-/// separator (`password = X`), a Cisco-style digit type code (`password 7
-/// X`), FortiOS's `ENC` marker (`psksecret ENC X`), or a known value-type
-/// keyword (`pre-shared-key ascii-text X`). W1 (mecmcp#386 re-review): this
-/// check has to run wherever `next_value_token` is used to locate a value —
-/// the `key=`/`key:` empty-value branch used it to find the token but never
-/// applied this check, so `password= - QQw1` redacted the `-` separator
-/// instead of walking past it to the real secret, the same class of leak R1
-/// fixed for the bare-key branch. Centralizing both call sites on this
-/// helper is what keeps the two branches from drifting apart again.
-fn resolve_value_spans(line: &str, tokens: &[(usize, usize)], j: usize) -> Vec<(usize, usize)> {
-    let (vs, ve) = tokens[j];
-    let next_token = &line[vs..ve];
-    let is_keyword = is_value_type_keyword(next_token);
-    let skip_over = is_keyword
-        || is_lone_separator(next_token)
-        || is_enc_token(next_token)
-        || is_short_digit_code(next_token);
-    let mut spans = Vec::new();
-    if skip_over {
-        // The type keyword itself is kept visible (it is a closed, known
-        // vocabulary, not a secret); everything else found here is redacted
-        // along with the value, which is the safe direction to over-redact
-        // in.
-        if !is_keyword {
-            spans.push((vs, value_end_at_least(line, vs, ve)));
-        }
-        if let Some(&(vs2, ve2)) =
-            next_value_token(line, tokens, j + 1).and_then(|k| tokens.get(k))
-        {
-            spans.push((vs2, value_end_at_least(line, vs2, ve2)));
-        }
+/// When that token is a known [`VALUE_TYPE_KEYWORDS`] entry, the keyword
+/// itself is not the secret either (N1) — it is kept visible by continuing
+/// the search past it, one keyword at a time, rather than being folded into
+/// the redacted span like an unrecognized wrapper token is.
+///
+/// Once this offset is found, the caller redacts everything from it to the
+/// end of the line (X1): unlike the value-type keywords, there is no closed
+/// vocabulary of "things vendors put between a key and its value" to skip
+/// past one token at a time, so the only fail-closed choice is to stop
+/// trying to guess where the value ends.
+fn first_value_start(line: &str, tokens: &[(usize, usize)], from: usize) -> Option<usize> {
+    let j = (from..tokens.len()).find(|&j| {
+        let (s, e) = tokens[j];
+        line[s..e].chars().any(|c| c.is_ascii_alphanumeric())
+    })?;
+    let (s, e) = tokens[j];
+    if is_value_type_keyword(&line[s..e]) {
+        first_value_start(line, tokens, j + 1)
     } else {
-        spans.push((vs, value_end_at_least(line, vs, ve)));
+        Some(s)
     }
-    spans
-}
-
-/// If `line[start..]` begins with a quote character, return the byte offset
-/// just past its matching closing quote elsewhere on `line`. A quoted value
-/// may contain whitespace (`description "core value"`), so its span cannot
-/// be assumed to end at the next whitespace-delimited token boundary the
-/// caller computed with [`whitespace_token_spans`].
-fn quoted_value_end(line: &str, start: usize) -> Option<usize> {
-    let quote = line[start..].chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let after = start + quote.len_utf8();
-    let end_rel = line[after..].find(quote)?;
-    Some(after + end_rel + quote.len_utf8())
 }
 
 /// Replace every `line[start..end]` in `spans` with [`PLACEHOLDER`], keeping
@@ -323,8 +308,8 @@ fn splice_spans(line: &str, mut spans: Vec<(usize, usize)>) -> String {
     let mut cursor = 0;
     for (start, end) in spans {
         if start < cursor {
-            // Overlapping with an already-spliced span (e.g. a type-keyword
-            // skip and the bare-key match both landing on the same value) —
+            // Overlapping with an already-spliced span (e.g. two denylisted
+            // keys on the same line, each redacting to the end of it) —
             // already covered.
             continue;
         }
@@ -340,17 +325,18 @@ fn splice_spans(line: &str, mut spans: Vec<(usize, usize)>) -> String {
     result
 }
 
-/// Find every denylisted key token on `line` and return the span of the
-/// value that follows each one, for `key=value`, `key: value` / `key:value`,
-/// and bare `key value` forms — a line can carry more than one `k=v` pair
-/// (`psk=X password=Y`), and every one must be redacted, not just the first.
+/// Find every denylisted key token on `line` and return the span from the
+/// start of its value to the **end of the line** (X1) — for `key=value`,
+/// `key: value` / `key:value`, and bare `key value` forms. A line can carry
+/// more than one `k=v` pair (`psk=X password=Y`), and every one must be
+/// found, not just the first; each redacts to the end of the line
+/// regardless, so overlap between them is harmless and expected.
+///
 /// Each whitespace token is additionally split on [`SUBTOKEN_SPLIT_CHARS`]
 /// before the `=`/`:` scan (R3), so a key buried inside a compound token
 /// (`url=...&password=X`, `{"password":"X"}`) is still found, not just a key
-/// that is the entire token. Quoted values (`key "value"`) are recognized via
-/// [`quoted_value_end`] so a value containing whitespace is not truncated at
-/// the first space, and never end before their enclosing token does (R4).
-/// Returns an empty `Vec` when no denylisted key token is found this way.
+/// that is the entire token. Returns an empty `Vec` when no denylisted key
+/// token is found this way.
 fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
     let tokens = whitespace_token_spans(line);
     let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -374,33 +360,25 @@ fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
                     .chars()
                     .any(|c| !SUBTOKEN_SPLIT_CHARS.contains(&c));
                 if has_value_here {
-                    // S1/T1: run the value to the *whole whitespace token's*
-                    // end, not just this sub-token's end — a generated
-                    // PSK/password routinely contains `& ; , ? { }`, and
-                    // ending at the sub-token boundary left everything after
-                    // the first one unredacted (`password=X,Y` -> only `X`).
-                    // Over-redacting the rest of a query string this way is
-                    // the safe direction to be wrong in. Comparing against
-                    // the sub-token end `se` (T1) rather than the whole
-                    // token end `e` missed the case where the split char sits
-                    // immediately after the key (`password=&QQm3`): the
-                    // sub-token `password=` ends right at `value_start`, so
-                    // the value was mistaken for empty and the code fell
-                    // through to redacting the *next whitespace token*
-                    // instead, leaking the real secret in plain sight.
-                    spans.push((value_start, value_end_at_least(line, value_start, e)));
-                } else if let Some(j) = next_value_token(line, &tokens, i + 1) {
+                    // `key=value...`: everything from the first byte of the
+                    // value to the end of the line is redacted (X1), not
+                    // just this whitespace token — `password=X more words`
+                    // is a real multi-word secret shape, not `X` followed by
+                    // unrelated content.
+                    spans.push((value_start, line.len()));
+                } else if let Some(vstart) = first_value_start(line, &tokens, i + 1) {
                     // `key=`/`key:` with nothing but structural punctuation
-                    // after it in this token (`password=`, `password={`): the
-                    // value is the next whitespace token, if there is one.
-                    spans.extend(resolve_value_spans(line, &tokens, j));
+                    // after it in this token (`password=`, `password={`):
+                    // the value starts at the next non-punctuation token, if
+                    // there is one, and runs to the end of the line.
+                    spans.push((vstart, line.len()));
                 }
                 break;
             }
             if matched_this_subtoken {
-                // The value span above already extends to the whitespace
-                // token's end, so later sub-tokens of the same token have
-                // nothing left to contribute.
+                // The value span above already extends to the end of the
+                // line, so later sub-tokens of the same token have nothing
+                // left to contribute.
                 break;
             }
         }
@@ -411,14 +389,9 @@ fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
         let bare_key = line[s..e].trim_end_matches([':', ';']);
         if !bare_key.is_empty()
             && is_denylisted_key(bare_key)
-            && let Some(j) = next_value_token(line, &tokens, i + 1)
+            && let Some(vstart) = first_value_start(line, &tokens, i + 1)
         {
-            // R1: anything found at `j` that is not a real value-type
-            // keyword — a bare separator (`password = X`), a Cisco-style
-            // digit type code (`password 7 X`), or FortiOS's `ENC` marker
-            // (`psksecret ENC X`) — is itself not the value, so the token
-            // after it must be swept too; see `resolve_value_spans`.
-            spans.extend(resolve_value_spans(line, &tokens, j));
+            spans.push((vstart, line.len()));
         }
     }
     spans
@@ -448,11 +421,68 @@ fn quoted_content_spans(line: &str) -> Vec<(usize, usize)> {
     spans
 }
 
+/// Byte range of the password in a `scheme://user:PASS@host` URL userinfo
+/// component (X3). Credentials embedded in a URL's userinfo are not covered
+/// by any keyed or crypt-hash shape check, and a recognized key elsewhere on
+/// the same line (`psk=A url=https://admin:X@h/`) must not suppress this
+/// pass — it is folded into [`shape_matching_spans`], which always runs.
+fn userinfo_password_spans(line: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    while let Some(rel) = line[cursor..].find("://") {
+        let authority_start = cursor + rel + 3;
+        if authority_start > line.len() {
+            break;
+        }
+        let rest = &line[authority_start..];
+        let authority_len = rest
+            .find(|c: char| c == '/' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        let authority = &rest[..authority_len];
+        if let Some(at_rel) = authority.find('@') {
+            let userinfo = &authority[..at_rel];
+            if let Some(colon_rel) = userinfo.find(':') {
+                let pass_start = authority_start + colon_rel + 1;
+                let pass_end = authority_start + at_rel;
+                if pass_start < pass_end {
+                    spans.push((pass_start, pass_end));
+                }
+            }
+        }
+        cursor = (authority_start + authority_len.max(1)).min(line.len());
+    }
+    spans
+}
+
+/// SNMPv3 `snmp-server user <name> <group> v3 auth <alg> X priv <alg>
+/// [bits] Y` (X2): the authentication and privacy keys are not carried by
+/// any denylisted key token — `auth`/`priv` are too generic to denylist
+/// outright without matching unrelated words — so they are only treated as
+/// secret-bearing when they follow a `snmp-server user` clause on the same
+/// line, and each redacts to the end of the line like any other X1 match.
+fn snmpv3_auth_priv_spans(line: &str) -> Vec<(usize, usize)> {
+    if !line.contains("snmp-server user") {
+        return Vec::new();
+    }
+    let tokens = whitespace_token_spans(line);
+    let mut spans = Vec::new();
+    for (i, &(s, e)) in tokens.iter().enumerate() {
+        let text = &line[s..e];
+        if (text.eq_ignore_ascii_case("auth") || text.eq_ignore_ascii_case("priv"))
+            && let Some(vstart) = first_value_start(line, &tokens, i + 1)
+        {
+            spans.push((vstart, line.len()));
+        }
+    }
+    spans
+}
+
 /// Union of every quoted span and every whitespace token on `line` that
-/// itself looks like a secret value (S3): both passes run independently
-/// rather than the first shape match short-circuiting the other, since a
-/// line can carry more than one shape-matching value and only some of them
-/// are quoted (`foo "$9$aaa" bar $9$bbb`).
+/// itself looks like a secret value (S3), plus the URL-userinfo (X3) and
+/// SNMPv3 auth/priv (X2) passes: all run independently rather than the
+/// first match short-circuiting the rest, since a line can carry more than
+/// one shape-matching value and only some of them are quoted or keyed
+/// (`foo "$9$aaa" bar $9$bbb`).
 fn shape_matching_spans(line: &str) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     for &(start, end) in &quoted_content_spans(line) {
@@ -465,6 +495,8 @@ fn shape_matching_spans(line: &str) -> Vec<(usize, usize)> {
             spans.push((start, end));
         }
     }
+    spans.extend(userinfo_password_spans(line));
+    spans.extend(snmpv3_auth_priv_spans(line));
     spans
 }
 
@@ -562,16 +594,17 @@ mod tests {
     // --- F2: redact the value that follows the key, not the last span. ---
 
     #[test]
-    fn f2a_equals_form_redacts_the_matching_keys_value_not_the_last_one() {
+    fn f2a_equals_form_redacts_the_matching_keys_value_to_end_of_line() {
+        // X1: once the value is located, everything to the end of the line
+        // is redacted with it — `src=192.0.2.1` no longer survives here,
+        // which is the accepted over-redaction cost the re-review calls out
+        // (`community X authorization read-only` -> `community
+        // [REDACTED]`). Only the *preceding* field is unaffected.
         let got = redact("login ok user=admin password=QQvalue8 src=192.0.2.1");
         assert!(!got.contains("QQvalue8"), "got: {got}");
         assert!(
             got.contains("user=admin"),
-            "unrelated field must survive: {got}"
-        );
-        assert!(
-            got.contains("src=192.0.2.1"),
-            "unrelated field must survive: {got}"
+            "field before the key is untouched: {got}"
         );
     }
 
@@ -629,7 +662,7 @@ mod tests {
         assert!(!got.contains("QQvalue7"), "got: {got}");
         assert!(
             got.contains("\"core\""),
-            "unrelated quoted field must survive untouched: {got}"
+            "unrelated quoted field before the key must survive untouched: {got}"
         );
     }
 
@@ -875,11 +908,13 @@ mod tests {
     // token* instead, leaking the real secret in plain sight. ---
 
     #[test]
-    fn t1_value_starting_with_ampersand_is_redacted_not_the_next_word() {
+    fn t1_value_starting_with_ampersand_is_redacted() {
+        // X1: the value now redacts to the end of the line, so the
+        // unrelated trailing words this test used to assert survive
+        // (`user`, `bob`) are swallowed too — the accepted over-redaction
+        // cost, same as f2a.
         let got = redact("password=&QQm3 user bob");
         assert!(!got.contains("QQm3"), "got: {got}");
-        assert!(got.contains("user"), "got: {got}");
-        assert!(got.contains("bob"), "got: {got}");
     }
 
     #[test]
@@ -931,10 +966,10 @@ mod tests {
     }
 
     // --- W1 (mecmcp#386 re-review, sibling gap to V1): the `key=`/`key:`
-    // empty-value branch found its value token via `next_value_token` but,
-    // unlike the bare-key branch, never checked whether that token was
-    // itself a separator/digit-code/ENC-marker/type-keyword rather than the
-    // real value — so `password= - QQw1` redacted the `-` and left the real
+    // empty-value branch found its value token via a lookahead but, unlike
+    // the bare-key branch, never checked whether that token was itself a
+    // separator/digit-code/ENC-marker/type-keyword rather than the real
+    // value — so `password= - QQw1` redacted the `-` and left the real
     // secret one token further along exposed. ---
 
     #[test]
@@ -960,5 +995,112 @@ mod tests {
             got.contains("ascii-text"),
             "the type keyword itself is not a secret: {got}"
         );
+    }
+
+    // --- X1 (mecmcp#386 re-review, structural fix): fail closed to the end
+    // of the statement rather than looking ahead a fixed number of tokens.
+    // Every input from the re-review's counterexample table, table-driven so
+    // each one fails against d4ae4c4 and passes here. ---
+
+    #[test]
+    fn x1_multi_token_wrappers_between_key_and_value_do_not_leak() {
+        for (input, secret) in [
+            ("enable password level 15 Summer2024", "Summer2024"),
+            (
+                "ntp authentication-key 1 md5 104D000A0618 7",
+                "104D000A0618",
+            ),
+            ("enable secret level 15 0 QQa2plain", "QQa2plain"),
+            ("psksecret = ENC QQa7", "QQa7"),
+            ("pre-shared-key = ascii-text QQa8", "QQa8"),
+            ("password = 7 QQa5", "QQa5"),
+            ("secret 5 = QQf7", "QQf7"),
+            ("password == = QQd2", "QQd2"),
+            ("password ( QQb1 )", "QQb1"),
+            ("password [ QQb2 ]", "QQb2"),
+            ("password=( QQb3 )", "QQb3"),
+            ("password | QQb4", "QQb4"),
+            ("password <- QQb5", "QQb5"),
+            ("password: # QQb6", "QQb6"),
+            ("password is QQb7", "QQb7"),
+            ("psk \"\" QQc1", "QQc1"),
+            ("password '' QQc2", "QQc2"),
+            ("password=\"\" QQc3", "QQc3"),
+            ("password = QQd1 horse battery", "QQd1"),
+            ("wpa_passphrase=QQd2horse horse battery", "QQd2horse"),
+        ] {
+            let got = redact(input);
+            assert!(!got.contains(secret), "input: {input} got: {got}");
+        }
+    }
+
+    #[test]
+    fn x1_yaml_block_scalar_value_on_a_following_indented_line_is_redacted() {
+        let got = redact("password: |\n  QQyaml1\nnext_field: ok");
+        assert!(!got.contains("QQyaml1"), "got: {got}");
+        assert!(got.contains("next_field: ok"), "got: {got}");
+    }
+
+    #[test]
+    fn x1_yaml_block_scalar_folded_indicator_with_chomp_is_redacted() {
+        let got = redact("secret: >-\n    QQyaml2\n    QQyaml3\nhost: r1");
+        assert!(!got.contains("QQyaml2"), "got: {got}");
+        assert!(!got.contains("QQyaml3"), "got: {got}");
+        assert!(got.contains("host: r1"), "got: {got}");
+    }
+
+    #[test]
+    fn x1_yaml_block_scalar_carry_ends_at_dedent() {
+        let got = redact("password: |\n  QQyaml4\nsibling: visible");
+        assert!(!got.contains("QQyaml4"), "got: {got}");
+        assert!(got.contains("sibling: visible"), "got: {got}");
+    }
+
+    // --- X2 (mecmcp#386 re-review): denylist gaps for common IOS/SNMP
+    // credential keys. ---
+
+    #[test]
+    fn x2_ios_key_chain_key_string_is_redacted() {
+        let got = redact("key-string QQe1");
+        assert!(!got.contains("QQe1"), "got: {got}");
+    }
+
+    #[test]
+    fn x2_ospf_message_digest_key_is_redacted() {
+        let got = redact("ip ospf message-digest-key 1 md5 QQe2");
+        assert!(!got.contains("QQe2"), "got: {got}");
+    }
+
+    #[test]
+    fn x2_snmpv3_auth_and_priv_keys_are_redacted() {
+        let got = redact("snmp-server user u g v3 auth sha QQe3 priv aes 128 QQe4");
+        assert!(!got.contains("QQe3"), "got: {got}");
+        assert!(!got.contains("QQe4"), "got: {got}");
+    }
+
+    #[test]
+    fn x2_auth_priv_keywords_off_an_snmp_user_line_are_not_specially_swept() {
+        // Sanity check that the SNMPv3 special case is scoped to
+        // `snmp-server user` lines and does not fire on unrelated uses of
+        // the words "auth"/"priv".
+        let got = redact("auth priv are just words here");
+        assert_eq!(got, "auth priv are just words here");
+    }
+
+    // --- X3 (mecmcp#386 re-review): a recognized key on the line must not
+    // suppress the URL-userinfo shape check for the rest of it. ---
+
+    #[test]
+    fn x3_url_userinfo_password_is_redacted_even_with_an_unrelated_keyed_value() {
+        let got = redact("psk=QQf1 url=https://admin:QQf2@host/api");
+        assert!(!got.contains("QQf1"), "got: {got}");
+        assert!(!got.contains("QQf2"), "got: {got}");
+    }
+
+    #[test]
+    fn x3_url_userinfo_password_is_redacted_with_no_denylisted_key_on_the_line() {
+        let got = redact("output: https://admin:QQf3@host/api");
+        assert!(!got.contains("QQf3"), "got: {got}");
+        assert!(got.contains("admin"), "username is not the secret: {got}");
     }
 }

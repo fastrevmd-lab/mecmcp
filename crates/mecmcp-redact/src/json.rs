@@ -182,11 +182,15 @@ mod tests {
     /// syslog-as-JSON payload.
     #[test]
     fn n5_single_line_kv_secret_in_an_unlisted_string_field_is_redacted() {
+        // X1 (mecmcp#386 re-review): the value locator now redacts to the
+        // end of the line/string once a denylisted key is found, rather than
+        // guessing where the value ends — so `src=192.0.2.1`, which trails
+        // `password=`, is swept too. That is the accepted over-redaction
+        // cost; only the field *before* the key is unaffected.
         let mut v = json!({"msg": "login ok user=admin password=QQvalue8 src=192.0.2.1"});
         redact(&mut v);
         let s = v["msg"].as_str().expect("msg is a string");
         assert!(!s.contains("QQvalue8"), "got: {s}");
         assert!(s.contains("user=admin"), "got: {s}");
-        assert!(s.contains("src=192.0.2.1"), "got: {s}");
     }
 }
