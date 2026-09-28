@@ -1,0 +1,48 @@
+[package]
+name        = "mecmcp-oidc"
+description = "OIDC discovery, JWKS caching, and JWT verification for mechub MCP servers (resource-server core)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace       = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mecmcp-http = { version = "0.24.0", path = "../mecmcp-http" }
+async-trait = { workspace = true }
+# Widely-used, actively maintained JWT crate (>200M downloads) with a built-in
+# `jwk` module for JSON Web Key parsing. Chosen over hand-rolled JWT parsing
+# per the dependency-surface-is-attack-surface lens: signature verification,
+# base64url framing, and JWK-to-key conversion are exactly the kind of code a
+# parser differential turns into an exploit, and this crate is the de facto
+# standard resource-server dependency in the Rust ecosystem for that reason.
+# "aws_lc_rs", not "rust_crypto": jsonwebtoken's "rust_crypto" backend pulls
+# in the RustCrypto `rsa` crate unconditionally (it is a feature-level
+# dependency, not gated per algorithm), and that crate carries RUSTSEC-2023-0071
+# ("Marvin Attack": non-constant-time RSA, exploitable over the network) with
+# no fixed release available. This server verifies bearer tokens presented
+# over the network — exactly the setting the advisory's own workaround
+# section says to avoid the crate in — so the RustCrypto backend is not an
+# acceptable choice here even though it would avoid a native build dependency.
+# aws-lc-rs is already in this workspace's dependency graph (mecmcp-transport
+# pulls it in via russh), so this does not add new build tooling either.
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+tokio        = { version = "1", features = ["sync", "time"] }
+tracing      = { workspace = true }
+
+[dev-dependencies]
+# Already resolved transitively via jsonwebtoken's "aws_lc_rs" feature; named
+# directly only to generate an ephemeral RSA keypair for offline test
+# fixtures (signing tokens and building a matching JWKS via
+# `jsonwebtoken::jwk::Jwk::from_encoding_key`). Never used outside
+# `#[cfg(test)]` code, and no key it produces is ever persisted.
+aws-lc-rs    = "1"
+pem          = "3"
+tokio        = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
