@@ -229,6 +229,7 @@ async fn test_applied_change_set_with_actions() {
             "device-a".to_string(),
             "bob".to_string(),
             created.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .expect("approve");

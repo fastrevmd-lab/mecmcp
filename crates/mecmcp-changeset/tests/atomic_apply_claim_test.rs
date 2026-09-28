@@ -60,6 +60,7 @@ async fn seed_approved(coord: &ChangesetCoordinator, id: &str) {
             "vsrx-ci".to_owned(),
             "approver".to_owned(),
             digest,
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .expect("approve");

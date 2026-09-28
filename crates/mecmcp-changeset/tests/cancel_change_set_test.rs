@@ -68,6 +68,7 @@ async fn drive_to(
             device.to_owned(),
             "bob".to_owned(),
             digest.to_owned(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .expect("approve");
@@ -155,6 +156,7 @@ async fn test_approver_can_cancel_approved_change_set() {
             "device-a".to_string(),
             "bob".to_string(),
             created.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .expect("approve");
