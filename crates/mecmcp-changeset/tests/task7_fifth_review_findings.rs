@@ -390,6 +390,7 @@ async fn finding_1_lock_risk_persisted_before_drift_check() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -506,6 +507,7 @@ async fn finding_2_operation_record_write_failure_returns_handle() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -592,6 +594,7 @@ async fn finding_3_staged_converted_to_indeterminate_on_restart() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();

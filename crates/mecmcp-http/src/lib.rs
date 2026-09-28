@@ -161,11 +161,18 @@ pub struct HttpClientConfig {
     /// Enforced while the body streams in, not from `Content-Length` — see
     /// [`HttpError::ResponseTooLarge`].
     pub max_response_bytes: usize,
-    /// Additional root certificates in PEM format (additive trust only).
+    /// Additional root certificates in PEM format.
     ///
     /// Each string is a PEM-encoded certificate. There is **no** API to disable
     /// certificate verification. This exists to support private-CA endpoints
     /// and integration testing against local TLS servers.
+    ///
+    /// A non-empty list **replaces** the platform's built-in root store rather
+    /// than adding to it: a client configured with a private CA talks only to
+    /// that CA's endpoints, and a certificate from any public CA — including
+    /// one for a look-alike or compromised domain — is refused rather than
+    /// silently accepted alongside the intended pin. Leave this empty to trust
+    /// the ordinary public root store.
     pub extra_root_certificates: Vec<String>,
 }
 
@@ -879,6 +886,7 @@ impl HttpClient {
         // Iterating rather than taking the first entry matters too: root bundles
         // routinely hold several certificates, and using only the first would be
         // a silent truncation of the trust the operator asked for.
+        let mut extra_certs = Vec::new();
         for (index, cert_pem) in config.extra_root_certificates.iter().enumerate() {
             let mut found = 0usize;
             for entry in CertificateDer::pem_slice_iter(cert_pem.as_bytes()) {
@@ -903,7 +911,7 @@ impl HttpClient {
                         detail: error.to_string(),
                     }
                 })?;
-                builder = builder.add_root_certificate(cert);
+                extra_certs.push(cert);
                 found += 1;
             }
             if found == 0 {
@@ -912,6 +920,20 @@ impl HttpClient {
                     detail: "no CERTIFICATE block found".to_owned(),
                 });
             }
+        }
+
+        // `tls_certs_only`, not `tls_certs_merge`: a private CA pins the
+        // client to that CA, not just adds to what it already trusts.
+        // `tls_certs_merge` (the old `add_root_certificate`) keeps the
+        // platform's built-in root store trusted alongside it, so an operator
+        // who configured a private CA for an internal endpoint got a client
+        // that would just as happily validate a certificate from any public
+        // CA — including one for a look-alike or compromised domain — and
+        // never notice the pin was not doing the one thing they set it up
+        // for. An empty list leaves the built-in store as the only trust
+        // anchor, which is the ordinary public-endpoint case.
+        if !extra_certs.is_empty() {
+            builder = builder.tls_certs_only(extra_certs);
         }
 
         let inner = builder.build().map_err(|e| HttpError::ClientConstruction {
@@ -1513,6 +1535,37 @@ mod tests {
         assert!(
             client.send(request).await.is_err(),
             "an untrusted self-signed certificate must not be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_private_ca_does_not_also_trust_an_unrelated_one() {
+        // Two independent self-signed roots stand in for "the operator's
+        // private CA" and "some other certificate", respectively. The client
+        // is configured to trust only the first; the server presents the
+        // second. `tls_certs_only` must mean only, not "in addition to
+        // whatever else this build of the client would otherwise trust" --
+        // the regression this guards is a revert to `tls_certs_merge`
+        // (`add_root_certificate`), which would keep this passing today only
+        // by accident, via the default rejection of an unknown root, rather
+        // than by construction.
+        let (configured_ca_pem, _unused_server_config) = tls_material();
+        let (_other_cert_pem, servers_actual_config) = tls_material();
+
+        let (listener, port) = bind_local().await;
+        serve(
+            listener,
+            servers_actual_config,
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            1,
+        );
+
+        let client = client_trusting(configured_ca_pem);
+        let request = HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap();
+
+        assert!(
+            client.send(request).await.is_err(),
+            "a private-CA-pinned client must refuse a certificate that CA did not issue"
         );
     }
 

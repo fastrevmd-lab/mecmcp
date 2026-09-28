@@ -47,7 +47,7 @@ jobs:
         # offer -- seeding a change set in a state only the lifecycle can
         # produce, and installing a tracing subscriber per thread -- and a gate
         # that CI does not open is a test that does not exist.
-        run: cargo test --workspace --features mecmcp-audit/test-util,mecmcp-changeset/test-util
+        run: cargo test --workspace --features mecmcp-audit/test-util,mecmcp-changeset/test-util,mecmcp-transport/test-util
 
       - name: Build documentation
         run: cargo doc --workspace --no-deps

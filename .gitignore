@@ -1,6 +1,5 @@
 /target
 **/*.rs.bk
-Cargo.lock
 
 # Agent scratch: git worktrees for parallel task branches.
 /.claude/

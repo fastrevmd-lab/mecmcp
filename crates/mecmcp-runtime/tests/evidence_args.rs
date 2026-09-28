@@ -84,8 +84,8 @@ fn a_configured_endpoint_produces_a_pipeline_config() {
     // Trailing newline stripped: a password file written with an editor ends
     // in one, and sending it would fail auth in a way that reads like a wrong
     // password rather than a stray byte.
-    assert_eq!(config.sink.password, "write-secret");
-    assert_eq!(config.sink.verify_password, "verify-secret");
+    assert_eq!(config.sink.password.expose(), "write-secret");
+    assert_eq!(config.sink.verify_password.expose(), "verify-secret");
     assert!(
         !config.run_id.is_empty() && config.run_id != config.server_id,
         "each process lifetime needs its own run id: {config:?}"
@@ -275,7 +275,7 @@ fn only_one_line_ending_is_stripped_from_a_password() {
     .unwrap()
     .expect("configured");
 
-    assert_eq!(config.sink.password, "trailing space ");
+    assert_eq!(config.sink.password.expose(), "trailing space ");
 }
 
 /// An empty credential file is a configuration error, not an empty password.
@@ -451,5 +451,71 @@ fn an_https_endpoint_without_a_ca_is_refused() {
         !text.contains("ProtectSystem"),
         "the CA refusal must not carry the spool-path rationale, which is about \
          a different flag entirely: {text}"
+    );
+}
+
+/// A plaintext endpoint to a non-loopback host is refused at configuration
+/// time, matching the refusal `split_endpoint` already applies on every send.
+///
+/// Catching it here fails the server at startup. Leaving it to the transport
+/// alone means the server starts, spools every segment to the outbox, and
+/// fails every delivery attempt forever — which reads as an outage, not as
+/// the misconfiguration it is.
+#[test]
+fn a_plaintext_endpoint_to_a_non_loopback_host_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = secret(dir.path(), "w", "write-secret");
+    let verify = secret(dir.path(), "v", "verify-secret");
+
+    let error = parse(&[
+        "--ssdf-audit-endpoint",
+        "http://192.0.2.40:8123",
+        "--ssdf-audit-server-id",
+        "junos-950",
+        "--ssdf-audit-password-file",
+        write.to_str().unwrap(),
+        "--ssdf-audit-verify-password-file",
+        verify.to_str().unwrap(),
+        "--ssdf-audit-outbox",
+        dir.path().join("outbox").to_str().unwrap(),
+        "--ssdf-audit-ledger",
+        dir.path().join("ledger").to_str().unwrap(),
+    ])
+    .into_config()
+    .expect_err("http:// to a non-loopback host must be refused");
+    assert!(
+        format!("{error}").contains("loopback"),
+        "the error must say why: {error}"
+    );
+}
+
+/// A plaintext endpoint to loopback is accepted: the traffic never leaves the
+/// host, so there is nothing for the loopback-only rule to refuse.
+#[test]
+fn a_plaintext_endpoint_to_loopback_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = secret(dir.path(), "w", "write-secret");
+    let verify = secret(dir.path(), "v", "verify-secret");
+
+    let config = parse(&[
+        "--ssdf-audit-endpoint",
+        "http://127.0.0.1:8123",
+        "--ssdf-audit-server-id",
+        "junos-950",
+        "--ssdf-audit-password-file",
+        write.to_str().unwrap(),
+        "--ssdf-audit-verify-password-file",
+        verify.to_str().unwrap(),
+        "--ssdf-audit-outbox",
+        dir.path().join("outbox").to_str().unwrap(),
+        "--ssdf-audit-ledger",
+        dir.path().join("ledger").to_str().unwrap(),
+    ])
+    .into_config()
+    .unwrap();
+
+    assert!(
+        config.is_some(),
+        "a loopback http:// endpoint must be accepted"
     );
 }
