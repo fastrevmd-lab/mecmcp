@@ -3,6 +3,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal as _, Write};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::filter::filter_fn;
@@ -75,7 +76,18 @@ impl FileHandle {
         // and an operator who deliberately points the audit log through a
         // symlink should keep that link rather than have it resolved away.
         let path = std::path::absolute(path)?;
-        let f = OpenOptions::new().create(true).append(true).open(&path)?;
+        // 0600: this file carries audit records, which routinely include
+        // request arguments and principal identity. `create(true)` alone
+        // leaves a pre-existing file's mode untouched and a new one at the
+        // process umask, which is world- or group-readable under the
+        // systemd default. The mode applies only to a file this call
+        // creates; an operator who deliberately widened an existing audit
+        // log's permissions is not silently overridden on every rotation.
+        let f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)?;
         Ok(FileHandle {
             file: Arc::new(Mutex::new(f)),
             path: Arc::from(path.as_path()),
@@ -113,6 +125,7 @@ impl FileHandle {
         let fresh = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&*self.path)?;
 
         let mut guard = self.file.lock().expect("audit file mutex not poisoned");
@@ -338,6 +351,44 @@ pub fn init_tracing(cfg: &AuditConfig) -> io::Result<Option<AuditFileSink>> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A freshly created audit file must not be group- or world-readable,
+    /// regardless of the process umask.
+    #[test]
+    fn a_newly_created_audit_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let _handle = FileHandle::open(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "audit log must be created at exactly 0600, got {mode:o}"
+        );
+    }
+
+    /// A rotated-in file must keep the same restrictive mode.
+    #[test]
+    fn a_reopened_audit_file_is_also_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let handle = FileHandle::open(&path).unwrap();
+
+        std::fs::rename(&path, dir.path().join("audit.log.1")).unwrap();
+        handle.reopen().unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "reopened audit log must stay at 0600, got {mode:o}"
+        );
+    }
 
     /// A configured audit file that cannot be opened must fail startup.
     ///
