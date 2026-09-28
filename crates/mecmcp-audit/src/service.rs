@@ -16,7 +16,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::recorder::{EvidenceRecorder, RecorderConfig, resume_head};
+use crate::signing::load_signing_key;
 use crate::sinks::ssdf::{HttpTransport, SsdfSink, SsdfSinkConfig, SsdfSinkError};
+use std::path::PathBuf;
 
 /// How a server configures its evidence pipeline.
 #[derive(Debug, Clone)]
@@ -34,6 +36,15 @@ pub struct EvidenceConfig {
     pub delivery_interval: Duration,
     /// Where the segments go.
     pub sink: SsdfSinkConfig,
+    /// Path to an Ed25519 signing key (see [`crate::signing::load_signing_key`]
+    /// for the file format and permission requirement).
+    ///
+    /// `None` means every segment this pipeline produces closes unsigned --
+    /// a deployment that has not provisioned a key yet, not an error. When
+    /// present, the key is loaded once at startup and every segment is
+    /// signed automatically as it closes (MEC-457); there is no separate
+    /// step to remember.
+    pub signing_key_path: Option<PathBuf>,
 }
 
 /// A running evidence pipeline: recorder, sink, and the drain between them.
@@ -101,15 +112,18 @@ impl EvidenceService {
         let remote = sink.remote_head(&config.server_id)?;
         let local = sink.produced_head(&config.server_id)?;
 
-        let recorder = Arc::new(
-            EvidenceRecorder::new(RecorderConfig {
-                server_id: config.server_id.clone(),
-                run_id: config.run_id.clone(),
-                resume_from: resume_head(remote, local),
-                records_per_segment: config.records_per_segment,
-            })
-            .spooling_to(Arc::clone(&sink)),
-        );
+        let mut recorder_builder = EvidenceRecorder::new(RecorderConfig {
+            server_id: config.server_id.clone(),
+            run_id: config.run_id.clone(),
+            resume_from: resume_head(remote, local),
+            records_per_segment: config.records_per_segment,
+        })
+        .spooling_to(Arc::clone(&sink));
+        if let Some(key_path) = &config.signing_key_path {
+            let key = load_signing_key(key_path)?;
+            recorder_builder = recorder_builder.with_signing_key(key);
+        }
+        let recorder = Arc::new(recorder_builder);
 
         let degraded = Arc::new(AtomicBool::new(false));
         let worker = {

@@ -82,6 +82,7 @@ fn spooled_evidence_is_delivered_by_the_service() {
             records_per_segment: 1,
             delivery_interval: Duration::from_millis(20),
             sink: sink_config(dir.path()),
+            signing_key_path: None,
         },
         transport.clone(),
     )
@@ -127,6 +128,7 @@ fn shutdown_delivers_what_is_still_pending() {
             // Long enough that the pump cannot be what delivers it.
             delivery_interval: Duration::from_secs(3600),
             sink: sink_config(dir.path()),
+            signing_key_path: None,
         },
         transport.clone(),
     )
@@ -172,6 +174,7 @@ fn the_tail_is_read_after_replay_not_before() {
                 records_per_segment: 1,
                 delivery_interval: Duration::from_secs(3600),
                 sink: sink_config(dir.path()),
+                signing_key_path: None,
             },
             failing,
         )
@@ -203,6 +206,7 @@ fn the_tail_is_read_after_replay_not_before() {
             records_per_segment: 1,
             delivery_interval: Duration::from_secs(3600),
             sink: sink_config(dir.path()),
+            signing_key_path: None,
         },
         transport.clone(),
     )
@@ -247,6 +251,7 @@ fn segments_rolled_without_a_flush_survive_shutdown() {
             records_per_segment: 1,
             delivery_interval: Duration::from_secs(3600),
             sink: sink_config(dir.path()),
+            signing_key_path: None,
         },
         transport.clone(),
     )
@@ -296,6 +301,7 @@ fn a_failing_delivery_is_reported_as_degraded() {
             records_per_segment: 1,
             delivery_interval: Duration::from_millis(20),
             sink: sink_config(dir.path()),
+            signing_key_path: None,
         },
         transport.clone(),
     )
@@ -342,6 +348,7 @@ fn shutdown_does_not_wait_out_backoff() {
             records_per_segment: 1,
             delivery_interval: Duration::from_millis(20),
             sink,
+            signing_key_path: None,
         },
         transport.clone(),
     )
@@ -361,5 +368,118 @@ fn shutdown_does_not_wait_out_backoff() {
         took < Duration::from_secs(10),
         "shutdown waited out the backoff ({took:?}); during an outage that is a \
          stall long enough for an operator to SIGKILL through the final flush"
+    );
+}
+
+/// A configured signing key signs every segment automatically, with no
+/// separate call from the caller (MEC-457).
+///
+/// Before this, `sign_head` was reachable only from tests: nothing in the
+/// service or recorder ever called it, so a deployed server with a key on
+/// disk still shipped unsigned segments. `signing_key_path` gives
+/// `EvidenceService` a key to load at startup, and `EvidenceRecorder::roll`
+/// is the one place every segment closes, which is where it gets used.
+///
+/// The signature does not travel through the ClickHouse row (`SsdfRow` has no
+/// such column); it is part of the `ClosedSegment` written to the durable
+/// local outbox, which is what `mecmcp-verify` reads. So this asserts against
+/// the outbox file rather than what the transport received.
+#[test]
+fn signing_key_signs_every_segment_produced_by_the_service() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (signing_key, verifying_key) = mecmcp_audit::signing::generate_keypair();
+    let key_path = dir.path().join("audit_signing_key");
+    std::fs::write(
+        &key_path,
+        mecmcp_audit::signing::encode_signing_key(&signing_key),
+    )
+    .unwrap();
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let sink = sink_config(dir.path());
+    let outbox_path = sink.outbox_path.clone();
+    let transport = Arc::new(CountingTransport::default());
+    let service = EvidenceService::start_with_transport(
+        EvidenceConfig {
+            server_id: "junos-950".to_string(),
+            run_id: "run-1".to_string(),
+            records_per_segment: 1,
+            delivery_interval: Duration::from_millis(20),
+            sink,
+            signing_key_path: Some(key_path),
+        },
+        transport.clone(),
+    )
+    .unwrap();
+
+    // `records_per_segment: 1` rolls a segment on the very next append.
+    service
+        .recorder()
+        .apply_intent("req-1", "cs-1", "vsrx-ci", "alice")
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while transport.inserts.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    service.shutdown().unwrap();
+
+    let outbox = std::fs::read_to_string(&outbox_path).unwrap();
+    let first_line = outbox
+        .lines()
+        .next()
+        .expect("the recorder rolled a segment; the outbox must hold it");
+    let closed: mecmcp_audit::evidence::ClosedSegment = serde_json::from_str(first_line).unwrap();
+    let signature_b64 = closed
+        .signature
+        .clone()
+        .expect("a segment closed under a configured signing key must carry a signature");
+
+    let signature = mecmcp_audit::signing::decode_signature(&signature_b64).unwrap();
+    mecmcp_audit::signing::verify_head(&closed, &signature, &verifying_key)
+        .expect("the spooled signature must verify against the configured key's public half");
+}
+
+/// With no signing key configured, segments close unsigned rather than the
+/// pipeline refusing to start -- a deployment with no key provisioned yet is
+/// not a misconfiguration.
+#[test]
+fn no_signing_key_leaves_segments_unsigned() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = sink_config(dir.path());
+    let outbox_path = sink.outbox_path.clone();
+    let transport = Arc::new(CountingTransport::default());
+    let service = EvidenceService::start_with_transport(
+        EvidenceConfig {
+            server_id: "junos-950".to_string(),
+            run_id: "run-1".to_string(),
+            records_per_segment: 1,
+            delivery_interval: Duration::from_millis(20),
+            sink,
+            signing_key_path: None,
+        },
+        transport.clone(),
+    )
+    .unwrap();
+
+    service
+        .recorder()
+        .apply_intent("req-1", "cs-1", "vsrx-ci", "alice")
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while transport.inserts.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    service.shutdown().unwrap();
+
+    let outbox = std::fs::read_to_string(&outbox_path).unwrap();
+    let first_line = outbox.lines().next().unwrap();
+    let closed: mecmcp_audit::evidence::ClosedSegment = serde_json::from_str(first_line).unwrap();
+    assert!(
+        closed.signature.is_none(),
+        "no key was configured; the segment must not carry a signature"
     );
 }

@@ -374,6 +374,15 @@ pub struct EvidenceArgs {
     /// Records per segment before one is closed and spooled.
     #[arg(long, default_value_t = 64)]
     pub ssdf_audit_records_per_segment: usize,
+
+    /// Ed25519 signing key for evidence segments. Must be 0600.
+    ///
+    /// Optional: a deployment that has not provisioned a key produces
+    /// unsigned segments rather than failing to start. When given, every
+    /// segment is signed as it closes with no further operator step
+    /// (MEC-457) -- there is no separate "sign" step to remember or forget.
+    #[arg(long)]
+    pub ssdf_audit_signing_key: Option<PathBuf>,
 }
 
 impl EvidenceArgs {
@@ -461,6 +470,7 @@ impl EvidenceArgs {
                 initial_backoff: std::time::Duration::from_secs(1),
                 max_backoff: std::time::Duration::from_secs(60),
             },
+            signing_key_path: self.ssdf_audit_signing_key.clone(),
         }))
     }
 }
