@@ -84,10 +84,16 @@ impl Default for LimitsConfig {
             max_request_body_bytes: 10 * 1024 * 1024,
             max_inflight_requests: 64,
             max_inflight_requests_per_token: 16,
-            max_requests_per_second_per_ip: 0,
-            max_request_burst_per_ip: 0,
-            max_requests_per_second_per_token: 0,
-            max_request_burst_per_token: 0,
+            // A fresh install gets rate limiting without operator action. An
+            // unmetered listener is a request-flood surface the moment a bearer
+            // token leaks or a client misbehaves; `0` (disabled) should be an
+            // opt-out an operator makes deliberately, not the shape a server
+            // ships in. IP limits sit above token limits because one address
+            // can host several tokens behind a NAT or proxy.
+            max_requests_per_second_per_ip: 50,
+            max_request_burst_per_ip: 100,
+            max_requests_per_second_per_token: 20,
+            max_request_burst_per_token: 40,
             max_inflight_requests_per_device: 4,
             max_sessions: 128,
             max_sessions_per_token: 16,
@@ -225,6 +231,8 @@ mod tests {
         assert_eq!(c.max_sessions_per_token, 16);
         assert_eq!(c.idle_timeout(), Some(Duration::from_secs(300)));
         assert_eq!(c.max_lifetime(), Some(Duration::from_secs(3600)));
+        assert!(c.ip_rate_limit_enabled());
+        assert!(c.token_rate_limit_enabled());
     }
 
     #[test]
@@ -239,14 +247,14 @@ mod tests {
     }
 
     #[test]
-    fn rate_limits_default_disabled_and_valid() {
+    fn rate_limits_default_enabled_and_valid() {
         let config = LimitsConfig::default();
-        assert_eq!(config.max_requests_per_second_per_ip, 0);
-        assert_eq!(config.max_request_burst_per_ip, 0);
-        assert_eq!(config.max_requests_per_second_per_token, 0);
-        assert_eq!(config.max_request_burst_per_token, 0);
-        assert!(!config.ip_rate_limit_enabled());
-        assert!(!config.token_rate_limit_enabled());
+        assert_eq!(config.max_requests_per_second_per_ip, 50);
+        assert_eq!(config.max_request_burst_per_ip, 100);
+        assert_eq!(config.max_requests_per_second_per_token, 20);
+        assert_eq!(config.max_request_burst_per_token, 40);
+        assert!(config.ip_rate_limit_enabled());
+        assert!(config.token_rate_limit_enabled());
         assert_eq!(config.validate(), Ok(()));
     }
 
