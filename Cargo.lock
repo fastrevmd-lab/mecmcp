@@ -1614,6 +1614,9 @@ name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -1880,6 +1883,7 @@ dependencies = [
  "async-trait",
  "getrandom 0.4.3",
  "hex",
+ "hmac",
  "mecmcp-audit",
  "mecmcp-secret",
  "rustix",
@@ -2072,6 +2076,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "ipnet",
  "mecmcp-audit",
  "mecmcp-auth",
  "metrics",
@@ -2086,6 +2091,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tower",
  "tower-http 0.7.1",
