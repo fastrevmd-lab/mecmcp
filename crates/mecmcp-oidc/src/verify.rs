@@ -3,8 +3,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use jsonwebtoken::Algorithm;
 use jsonwebtoken::errors::ErrorKind;
-use jsonwebtoken::jwk::Jwk;
+use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
 use serde::Deserialize;
 
 use crate::cache::{CacheConfig, KeyCache};
@@ -126,6 +127,21 @@ impl TokenVerifier {
     }
 }
 
+/// Asymmetric signature algorithms this verifier accepts. A resource server
+/// only ever holds a public key, never a shared secret, so no symmetric
+/// (`HS*`) algorithm belongs here — see [`matching_algorithm`].
+const ALLOWED_ALGORITHMS: &[Algorithm] = &[
+    Algorithm::RS256,
+    Algorithm::RS384,
+    Algorithm::RS512,
+    Algorithm::PS256,
+    Algorithm::PS384,
+    Algorithm::PS512,
+    Algorithm::ES256,
+    Algorithm::ES384,
+    Algorithm::EdDSA,
+];
+
 /// Resolve which algorithm to validate with, and reject a mismatch between
 /// what the JWK declares and what the token's header claims.
 ///
@@ -135,13 +151,23 @@ impl TokenVerifier {
 /// try to get it accepted as, say, HS256 by relabeling the header, which is
 /// the classic "alg confusion" JWT attack. Rejecting the mismatch outright
 /// (rather than silently preferring one source) keeps that unrepresentable.
-fn matching_algorithm(
-    jwk: &Jwk,
-    header_alg: jsonwebtoken::Algorithm,
-) -> Result<jsonwebtoken::Algorithm, VerificationFailure> {
+///
+/// A JWKS is public by definition, so an `oct` (symmetric) key published
+/// there is either a misconfiguration or a hostile IdP — either way, treating
+/// its bytes as an HMAC secret would let anyone who can read the JWKS forge a
+/// token. Both the key's own algorithm family and the header's algorithm must
+/// come from [`ALLOWED_ALGORITHMS`], which excludes every `HS*` variant.
+fn matching_algorithm(jwk: &Jwk, header_alg: Algorithm) -> Result<Algorithm, VerificationFailure> {
+    if matches!(jwk.algorithm, AlgorithmParameters::OctetKey(_)) {
+        return Err(VerificationFailure::UnsupportedAlgorithm);
+    }
+    if !ALLOWED_ALGORITHMS.contains(&header_alg) {
+        return Err(VerificationFailure::UnsupportedAlgorithm);
+    }
+
     match jwk.common.key_algorithm {
         Some(declared) => {
-            let declared_alg = jsonwebtoken::Algorithm::try_from(declared)
+            let declared_alg = Algorithm::try_from(declared)
                 .map_err(|_| VerificationFailure::UnsupportedAlgorithm)?;
             if declared_alg == header_alg {
                 Ok(declared_alg)
@@ -374,6 +400,36 @@ mod tests {
         assert_eq!(
             result.unwrap_err(),
             VerificationFailure::UnknownKeyId(Some("some-other-kid".to_string()))
+        );
+    }
+
+    /// F1 regression: a symmetric (`oct`) JWK combined with a header-chosen
+    /// `alg` must never be accepted, or anyone who can read the (public by
+    /// definition) JWKS can forge tokens for any subject and role by signing
+    /// HS256 with the published key bytes. Fails against the pre-fix code.
+    #[tokio::test]
+    async fn rejects_a_symmetric_oct_jwk_used_to_forge_hs256() {
+        let secret = b"jwks-are-public-do-not-trust-these-bytes-as-a-hmac-secret";
+        let encoding_key = EncodingKey::from_secret(secret);
+        let mut jwk = Jwk::from_encoding_key(&encoding_key, jsonwebtoken::Algorithm::HS256)
+            .expect("oct JWK derivation");
+        jwk.common.key_id = Some(KID.to_owned());
+
+        let jwks = JwkSet { keys: vec![jwk] };
+        let verifier = verifier_for(jwks);
+
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        header.kid = Some(KID.to_owned());
+        let mut claims = valid_claims();
+        claims["sub"] = serde_json::json!("attacker");
+        claims["groups"] = serde_json::json!(["pci-approvers"]);
+        let forged =
+            jsonwebtoken::encode(&header, &claims, &encoding_key).expect("forge HS256 token");
+
+        let result = verifier.verify(&forged).await;
+        assert_eq!(
+            result.unwrap_err(),
+            VerificationFailure::UnsupportedAlgorithm
         );
     }
 

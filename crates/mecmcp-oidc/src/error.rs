@@ -38,6 +38,20 @@ pub enum FetchError {
         /// Parse failure detail.
         detail: String,
     },
+    /// The discovery document's `issuer` does not match the configured
+    /// issuer. Per OIDC Discovery §4.3 this is a hard mismatch, not a detail
+    /// to log and continue past — an IdP claiming to be someone else is the
+    /// same class of problem as an unreachable IdP, so this fails closed
+    /// through the same [`crate::error::VerificationFailure::KeysUnavailable`] path.
+    #[error(
+        "OIDC discovery document issuer {discovered:?} does not match configured issuer {configured:?}"
+    )]
+    IssuerMismatch {
+        /// The issuer this verifier was configured with.
+        configured: String,
+        /// The issuer the discovery document actually declared.
+        discovered: String,
+    },
 }
 
 /// Why a presented JWT was rejected.

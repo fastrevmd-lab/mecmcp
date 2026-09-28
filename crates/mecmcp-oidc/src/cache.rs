@@ -153,6 +153,12 @@ impl KeyCache {
     async fn refresh(&self, state: &mut CacheState) -> Result<(), crate::error::FetchError> {
         if state.jwks_uri.is_none() {
             let discovery = self.source.fetch_discovery(&self.issuer).await?;
+            if discovery.issuer != self.issuer {
+                return Err(crate::error::FetchError::IssuerMismatch {
+                    configured: self.issuer.clone(),
+                    discovered: discovery.issuer,
+                });
+            }
             state.jwks_uri = Some(discovery.jwks_uri);
         }
         // Safe: the branch above guarantees `Some` on every path that reaches here.
@@ -348,6 +354,45 @@ mod tests {
         assert!(
             matches!(result, Err(VerificationFailure::KeysUnavailable { .. })),
             "keys older than max_key_age must fail closed rather than be served indefinitely"
+        );
+    }
+
+    struct MismatchedIssuerSource;
+
+    #[async_trait::async_trait]
+    impl KeySource for MismatchedIssuerSource {
+        async fn fetch_discovery(
+            &self,
+            _issuer: &str,
+        ) -> Result<DiscoveryDocument, crate::error::FetchError> {
+            Ok(DiscoveryDocument {
+                issuer: "https://evil.example.org".to_owned(),
+                jwks_uri: "https://elsewhere.example.net/jwks".to_owned(),
+            })
+        }
+
+        async fn fetch_jwks(&self, _jwks_uri: &str) -> Result<JwkSet, crate::error::FetchError> {
+            unreachable!("issuer mismatch must be caught before the JWKS is ever fetched")
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_document_issuer_mismatch_fails_closed() {
+        pause();
+        let cache = KeyCache::new(
+            Arc::new(MismatchedIssuerSource),
+            "https://idp.example.com",
+            config(
+                Duration::from_secs(10),
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            ),
+        );
+
+        let result = cache.keys().await;
+        assert!(
+            matches!(result, Err(VerificationFailure::KeysUnavailable { .. })),
+            "a discovery document claiming a different issuer must fail closed, not be trusted"
         );
     }
 
