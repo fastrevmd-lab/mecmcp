@@ -41,10 +41,21 @@ pub fn redact(input: &str) -> String {
         if let Some(indent) = block_scalar_indent {
             let is_blank = trimmed.is_empty();
             let ind = indent_len(line);
-            let indentless_seq_item =
-                carry_allows_seq && ind == indent && (trimmed == "-" || trimmed.starts_with("- "));
-            if !is_blank && ind <= indent && !indentless_seq_item {
+            // P2: `-<TAB>value` is a valid sequence entry too.
+            let indentless_seq_item = carry_allows_seq
+                && ind == indent
+                && trimmed
+                    .strip_prefix('-')
+                    .is_some_and(|r| r.is_empty() || r.starts_with([' ', '\t']));
+            // P1: a comment line never ends a block collection (only a
+            // `|`/`>` scalar is ended by a less-indented comment), so it must
+            // not end an empty-value carry — the rest of the value would leak.
+            let is_comment = carry_allows_seq && trimmed.starts_with('#');
+            if !is_blank && !is_comment && ind <= indent && !indentless_seq_item {
                 block_scalar_indent = None;
+            } else if is_comment {
+                out.push(redact_line(line));
+                continue;
             } else if is_blank {
                 // Blank lines inside a block scalar are part of its value in
                 // YAML but never carry secret bytes themselves; pass through.
@@ -1271,6 +1282,37 @@ mod tests {
         let got = redact("  password:\n    QQy3\n  next: ok");
         assert!(!got.contains("QQy3"), "got: {got}");
         assert!(got.contains("next: ok"), "got: {got}");
+    }
+
+    // --- P1/P2 (mecmcp#386 re-review, MEC-423). ---
+
+    #[test]
+    fn p1_comment_inside_indentless_sequence_does_not_end_the_carry() {
+        let got = redact("community:\n- QQe4\n# c\n- QQe5\nnext: ok");
+        assert!(!got.contains("QQe4"), "got: {got}");
+        assert!(!got.contains("QQe5"), "got: {got}");
+        assert!(got.contains("next: ok"), "got: {got}");
+    }
+
+    #[test]
+    fn p1_shallow_comment_inside_nested_map_does_not_end_the_carry() {
+        let got = redact("secrets:\n  a: 1\n# c\n  b: QQe1\nnext: ok");
+        assert!(!got.contains("QQe1"), "got: {got}");
+        assert!(got.contains("next: ok"), "got: {got}");
+    }
+
+    #[test]
+    fn p1_comment_still_ends_a_block_scalar() {
+        let got = redact("password: |\n  QQbs\n# c\n  plain: keep\nnext: ok");
+        assert!(!got.contains("QQbs"), "got: {got}");
+        assert!(got.contains("plain: keep"), "got: {got}");
+    }
+
+    #[test]
+    fn p2_tab_after_dash_is_a_sequence_item() {
+        let got = redact("community:\n-\tQQa4\nhost: r1");
+        assert!(!got.contains("QQa4"), "got: {got}");
+        assert!(got.contains("host: r1"), "got: {got}");
     }
 
     #[test]
