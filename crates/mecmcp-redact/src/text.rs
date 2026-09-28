@@ -314,14 +314,21 @@ fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
                 matched_sep = true;
                 matched_this_subtoken = true;
                 let value_start = ss + rel + 1;
-                if value_start < se {
-                    // S1: run the value to the *whole whitespace token's*
+                if value_start < e {
+                    // S1/T1: run the value to the *whole whitespace token's*
                     // end, not just this sub-token's end — a generated
                     // PSK/password routinely contains `& ; , ? { }`, and
                     // ending at the sub-token boundary left everything after
                     // the first one unredacted (`password=X,Y` -> only `X`).
                     // Over-redacting the rest of a query string this way is
-                    // the safe direction to be wrong in.
+                    // the safe direction to be wrong in. Comparing against
+                    // the sub-token end `se` (T1) rather than the whole
+                    // token end `e` missed the case where the split char sits
+                    // immediately after the key (`password=&QQm3`): the
+                    // sub-token `password=` ends right at `value_start`, so
+                    // the value was mistaken for empty and the code fell
+                    // through to redacting the *next whitespace token*
+                    // instead, leaking the real secret in plain sight.
                     spans.push((value_start, value_end_at_least(line, value_start, e)));
                 } else if let Some(&(vs, ve)) = tokens.get(i + 1) {
                     // `key=`/`key:` with nothing else in this (sub)token: the
@@ -817,5 +824,38 @@ mod tests {
     fn s4_double_equals_separator_does_not_leak_the_value() {
         let got = redact("password == QQw3");
         assert!(!got.contains("QQw3"), "got: {got}");
+    }
+
+    // --- T1 (mecmcp#386 re-review, regression from R3/S1): a keyed value
+    // that *starts* with a SUBTOKEN_SPLIT_CHARS character (`password=&X`)
+    // has an empty sub-token after the `=`, so `denylisted_key_spans`
+    // mistook the value for absent and redacted the *next whitespace
+    // token* instead, leaking the real secret in plain sight. ---
+
+    #[test]
+    fn t1_value_starting_with_ampersand_is_redacted_not_the_next_word() {
+        let got = redact("password=&QQm3 user bob");
+        assert!(!got.contains("QQm3"), "got: {got}");
+        assert!(got.contains("user"), "got: {got}");
+        assert!(got.contains("bob"), "got: {got}");
+    }
+
+    #[test]
+    fn t1_value_starting_with_comma_does_not_leak_a_later_key() {
+        let got = redact("password=,QQm1 psk=QQm2");
+        assert!(!got.contains("QQm1"), "got: {got}");
+        assert!(!got.contains("QQm2"), "got: {got}");
+    }
+
+    #[test]
+    fn t1_value_starting_with_brace_is_redacted() {
+        let got = redact("psk={QQm4} x");
+        assert!(!got.contains("QQm4"), "got: {got}");
+    }
+
+    #[test]
+    fn t1_value_starting_with_ampersand_inside_a_query_string_is_redacted() {
+        let got = redact("a=1&password=&QQm5&b=2");
+        assert!(!got.contains("QQm5"), "got: {got}");
     }
 }
