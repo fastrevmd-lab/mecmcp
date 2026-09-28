@@ -74,26 +74,32 @@ fn redact_value_span(line: &str, force: bool) -> String {
     // quoted-span and shape passes from being silently skipped whenever a key
     // happens to match earlier on the same line.
     if force {
-        let mut spans = denylisted_key_spans(line);
-        for &(start, end) in &quoted_content_spans(line) {
-            if looks_like_secret_value(&line[start..end]) {
-                spans.push((start, end));
-            }
-        }
-        for &(start, end) in &whitespace_token_spans(line) {
-            if looks_like_secret_value(&line[start..end]) {
-                spans.push((start, end));
-            }
+        let key_spans = denylisted_key_spans(line);
+        // S2: when no denylisted key was found on a forced line (a `##
+        // SECRET-DATA` marker with an unrecognized field name, say), every
+        // quoted span must still be redacted regardless of shape — the old
+        // unconditional quoted-span fallback this replaced is exactly the
+        // backstop `## SECRET-DATA` exists for, and it must not fail open.
+        let no_keyed_value = key_spans.is_empty();
+        let mut spans = key_spans;
+        spans.extend(shape_matching_spans(line));
+        if no_keyed_value {
+            spans.extend(quoted_content_spans(line));
         }
         if !spans.is_empty() {
             return splice_spans(line, spans);
         }
-        // Nothing keyed or shape-matched: fall through to the unconditional
-        // `=`/`:`/last-token redaction below so a forced line still never
-        // passes through untouched (a `## SECRET-DATA` marker with no
-        // recognizable value shape on its line, say).
-    } else if let Some(redacted) = redact_quoted_spans(line, false) {
-        return redacted;
+        // Nothing keyed, quoted, or shape-matched: fall through to the
+        // unconditional `=`/`:`/last-token redaction below so a forced line
+        // still never passes through untouched.
+    } else {
+        // S3: a shape-matching quoted span must not suppress the same shape
+        // check over the rest of the line (`foo "$9$aaa" bar $9$bbb` must
+        // redact both hashes, not just the quoted one).
+        let spans = shape_matching_spans(line);
+        if !spans.is_empty() {
+            return splice_spans(line, spans);
+        }
     }
     if let Some(eq) = line.rfind('=') {
         let (head, tail) = line.split_at(eq + 1);
@@ -168,13 +174,18 @@ fn is_value_type_keyword(token: &str) -> bool {
         .any(|kw| kw.eq_ignore_ascii_case(token))
 }
 
-/// A bare `=`, `:`, or `=>` occupying its own whitespace-delimited token —
-/// `password = X` / `password => X` — rather than attached to the key
-/// (`password=X`, handled by the `key=value` scan instead). Every one of
-/// these is a separator, never the value itself (R1): treating it as an
-/// unrecognized "value" left the real value one token further along exposed.
+/// A bare separator occupying its own whitespace-delimited token —
+/// `password = X`, `password => X`, `password := X`, `password -> X`,
+/// `password == X` — rather than attached to the key (`password=X`, handled
+/// by the `key=value` scan instead). A token made up entirely of `= : > - ~`
+/// characters is a separator, never the value itself (R1/S4): treating it as
+/// an unrecognized "value" left the real value one token further along
+/// exposed. No real secret value is composed only of these characters.
 fn is_lone_separator(token: &str) -> bool {
-    matches!(token, "=" | ":" | "=>")
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|c| matches!(c, '=' | ':' | '>' | '-' | '~'))
 }
 
 /// A one- or two-digit Cisco-style type code (`password 7 X`, `secret 5 X`).
@@ -291,6 +302,7 @@ fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
         let mut matched_sep = false;
         for (ss, se) in subtoken_spans(line, s, e) {
             let text = &line[ss..se];
+            let mut matched_this_subtoken = false;
             for sep in ['=', ':'] {
                 let Some(rel) = text.find(sep) else {
                     continue;
@@ -300,14 +312,28 @@ fn denylisted_key_spans(line: &str) -> Vec<(usize, usize)> {
                     continue;
                 }
                 matched_sep = true;
+                matched_this_subtoken = true;
                 let value_start = ss + rel + 1;
                 if value_start < se {
-                    spans.push((value_start, value_end_at_least(line, value_start, se)));
+                    // S1: run the value to the *whole whitespace token's*
+                    // end, not just this sub-token's end — a generated
+                    // PSK/password routinely contains `& ; , ? { }`, and
+                    // ending at the sub-token boundary left everything after
+                    // the first one unredacted (`password=X,Y` -> only `X`).
+                    // Over-redacting the rest of a query string this way is
+                    // the safe direction to be wrong in.
+                    spans.push((value_start, value_end_at_least(line, value_start, e)));
                 } else if let Some(&(vs, ve)) = tokens.get(i + 1) {
                     // `key=`/`key:` with nothing else in this (sub)token: the
                     // value is the next whitespace token, if there is one.
                     spans.push((vs, value_end_at_least(line, vs, ve)));
                 }
+                break;
+            }
+            if matched_this_subtoken {
+                // The value span above already extends to the whitespace
+                // token's end, so later sub-tokens of the same token have
+                // nothing left to contribute.
                 break;
             }
         }
@@ -373,23 +399,24 @@ fn quoted_content_spans(line: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-/// Replace the content of every `"..."` or `'...'` span in `line`. Returns
-/// `None` when there are no quoted spans, or when `force` is false and none
-/// of them looks like a secret value (so the caller falls through to the
-/// `=`/`:`/bare-token rules instead).
-fn redact_quoted_spans(line: &str, force: bool) -> Option<String> {
-    let spans = quoted_content_spans(line);
-    if spans.is_empty() {
-        return None;
+/// Union of every quoted span and every whitespace token on `line` that
+/// itself looks like a secret value (S3): both passes run independently
+/// rather than the first shape match short-circuiting the other, since a
+/// line can carry more than one shape-matching value and only some of them
+/// are quoted (`foo "$9$aaa" bar $9$bbb`).
+fn shape_matching_spans(line: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for &(start, end) in &quoted_content_spans(line) {
+        if looks_like_secret_value(&line[start..end]) {
+            spans.push((start, end));
+        }
     }
-    let any_match = force
-        || spans
-            .iter()
-            .any(|&(start, end)| looks_like_secret_value(&line[start..end]));
-    if !any_match {
-        return None;
+    for &(start, end) in &whitespace_token_spans(line) {
+        if looks_like_secret_value(&line[start..end]) {
+            spans.push((start, end));
+        }
     }
-    Some(splice_spans(line, spans))
+    spans
 }
 
 #[cfg(test)]
@@ -689,5 +716,106 @@ mod tests {
     fn r4_trailing_text_after_an_early_closing_quote_is_redacted() {
         let got = redact(r#"password="ab"QQtail3"#);
         assert!(!got.contains("QQtail3"), "got: {got}");
+    }
+
+    // --- S1 (mecmcp#386 re-review, regression from the R3 fix): the
+    // sub-token split must not truncate a keyed value at the first
+    // `& ; , ? { }` — a generated PSK/password routinely contains one. ---
+
+    #[test]
+    fn s1_comma_inside_a_keyed_value_does_not_truncate_it() {
+        let got = redact("password=QQp1,QQp2");
+        assert!(!got.contains("QQp1"), "got: {got}");
+        assert!(!got.contains("QQp2"), "got: {got}");
+    }
+
+    #[test]
+    fn s1_semicolon_inside_a_keyed_value_does_not_truncate_it() {
+        let got = redact("password=QQs1;QQs2");
+        assert!(!got.contains("QQs1"), "got: {got}");
+        assert!(!got.contains("QQs2"), "got: {got}");
+    }
+
+    #[test]
+    fn s1_ampersand_inside_a_keyed_value_does_not_truncate_it() {
+        let got = redact("password=QQa1&QQa2");
+        assert!(!got.contains("QQa1"), "got: {got}");
+        assert!(!got.contains("QQa2"), "got: {got}");
+    }
+
+    #[test]
+    fn s1_question_mark_inside_a_keyed_value_does_not_truncate_it() {
+        let got = redact("psk=QQq1?QQq2");
+        assert!(!got.contains("QQq1"), "got: {got}");
+        assert!(!got.contains("QQq2"), "got: {got}");
+    }
+
+    #[test]
+    fn s1_brace_inside_a_keyed_value_does_not_truncate_it() {
+        let got = redact("password=QQb1}QQb2");
+        assert!(!got.contains("QQb1"), "got: {got}");
+        assert!(!got.contains("QQb2"), "got: {got}");
+    }
+
+    #[test]
+    fn s1_comma_inside_a_json_string_leaf_does_not_truncate_it() {
+        let got = crate::redact_json_str(r#"{"note":"password=QQz1,QQz2"}"#).expect("valid json");
+        assert!(!got.contains("QQz1"), "got: {got}");
+        assert!(!got.contains("QQz2"), "got: {got}");
+    }
+
+    // --- S2 (mecmcp#386 re-review, regression from the R2 refactor): a
+    // forced line with no keyed value and no shape match must still
+    // force-redact every quoted span — `## SECRET-DATA` is Junos's own
+    // backstop for secrets under keys we don't list and must not fail open.
+
+    #[test]
+    fn s2_forced_quoted_span_with_no_shape_match_is_still_redacted() {
+        let got = redact(r#"foo "QQf1 two" bar ## SECRET-DATA"#);
+        assert!(!got.contains("QQf1"), "got: {got}");
+    }
+
+    #[test]
+    fn s2_forced_quoted_span_before_a_semicolon_is_still_redacted() {
+        let got = redact(r#"foo "QQf2"; ## SECRET-DATA"#);
+        assert!(!got.contains("QQf2"), "got: {got}");
+    }
+
+    #[test]
+    fn s2_forced_quoted_span_under_an_unlisted_key_is_still_redacted() {
+        let got = redact(r#"hmac-key "QQg6 x"; ## SECRET-DATA"#);
+        assert!(!got.contains("QQg6"), "got: {got}");
+    }
+
+    // --- S3 (pre-existing, same class as R2 on the non-forced path): a
+    // shape-matching quoted span must not suppress the shape pass over the
+    // rest of the line. ---
+
+    #[test]
+    fn s3_shape_match_outside_quotes_is_redacted_even_after_a_quoted_shape_match() {
+        let got = redact(r#"foo "$9$aaaaaaaaaaaaaaaa" bar $9$bbbbbbbbbbbbbbbb"#);
+        assert!(!got.contains("aaaaaaaaaaaaaaaa"), "got: {got}");
+        assert!(!got.contains("bbbbbbbbbbbbbbbb"), "got: {got}");
+    }
+
+    // --- S4 (optional): any token made only of separator characters is a
+    // separator, not the value. ---
+
+    #[test]
+    fn s4_walrus_style_separator_does_not_leak_the_value() {
+        let got = redact("password := QQw1");
+        assert!(!got.contains("QQw1"), "got: {got}");
+    }
+
+    #[test]
+    fn s4_arrow_separator_does_not_leak_the_value() {
+        let got = redact("password -> QQw2");
+        assert!(!got.contains("QQw2"), "got: {got}");
+    }
+
+    #[test]
+    fn s4_double_equals_separator_does_not_leak_the_value() {
+        let got = redact("password == QQw3");
+        assert!(!got.contains("QQw3"), "got: {got}");
     }
 }
