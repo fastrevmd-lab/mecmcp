@@ -360,6 +360,88 @@ pub fn compute_approval_digest_v5(
     format!("sha256:{}", digest_hex(&canonical))
 }
 
+/// The approval digest, keyed so it cannot be forged without the deployment's key.
+///
+/// v5 bound `(change_set_id, plan_digest, preview_digest, owner, approver,
+/// approved_at)` with a plain SHA-256 over the tuple. A plain hash is public: it
+/// authenticates that *some* set of bytes produced this digest, not that the
+/// person who wrote it was the recorded approver. Anyone who can write the state
+/// file — an operator with `sudo`, a bug in a neighbouring writer, a restore from
+/// an untrusted backup — can also recompute a v5 digest over edited fields and
+/// the record still verifies. v6 replaces the hash with HMAC-SHA256 under a key
+/// the deployment holds and the state file never carries, so recomputing a valid
+/// digest requires the key, not just the fields (MEC-457).
+///
+/// The domain marker changes from `"mecmcp-approval-v5"` to
+/// `"mecmcp-approval-v6"` for the same reason it changed at v4 and v5: it keeps
+/// a v6 digest structurally unable to equal a same-input v5 one, so a verifier
+/// can never be tricked into accepting the wrong rule for the version a record
+/// claims.
+///
+/// # Errors
+///
+/// Returns an error if the inputs cannot be serialized. HMAC accepts any key
+/// length, so the key itself cannot cause a failure here.
+#[must_use]
+pub fn compute_approval_digest_v6(
+    key: &[u8],
+    change_set_id: &str,
+    plan_digest: &str,
+    preview_digest: Option<&str>,
+    owner: &str,
+    approver: &str,
+    approved_at_unix: u64,
+) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+
+    let canonical = serde_json::to_vec(&(
+        "mecmcp-approval-v6",
+        change_set_id,
+        plan_digest,
+        preview_digest,
+        owner,
+        approver,
+        approved_at_unix,
+    ))
+    .expect("approval digest inputs are primitives and cannot fail to serialize");
+
+    let mut mac =
+        <Hmac<Sha256>>::new_from_slice(key).expect("HMAC-SHA256 accepts a key of any length");
+    mac.update(&canonical);
+    format!("sha256:{}", bytes_hex(&mac.finalize().into_bytes()))
+}
+
+/// Verifies a v6 approval digest against the deployment's key.
+///
+/// Compares in constant time. A digest field is read from a state file an
+/// attacker may have written, so the comparison must not let a byte-by-byte
+/// timing difference leak how much of a forged guess was correct.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn verify_approval_digest_v6(
+    key: &[u8],
+    change_set_id: &str,
+    plan_digest: &str,
+    preview_digest: Option<&str>,
+    owner: &str,
+    approver: &str,
+    approved_at_unix: u64,
+    candidate: &str,
+) -> bool {
+    use subtle::ConstantTimeEq;
+
+    let expected = compute_approval_digest_v6(
+        key,
+        change_set_id,
+        plan_digest,
+        preview_digest,
+        owner,
+        approver,
+        approved_at_unix,
+    );
+    expected.as_bytes().ct_eq(candidate.as_bytes()).into()
+}
+
 /// Validates that a principal identifier does not contain the digest separator.
 ///
 /// `compute_approval_digest` and the legacy `compute_waiver_digest` join their
@@ -465,6 +547,85 @@ mod preview_binding_tests {
             "sha256:1bb4ce2e69d14289e1f7a76992b1545f2d081fe1abe03b3d12467a47664cbd24",
             "the v4 encoding changed; every stored v4 approval is now unverifiable"
         );
+    }
+
+    /// The point of v6: without the key, the digest cannot be reproduced even
+    /// with every plaintext field in hand.
+    #[test]
+    fn a_different_key_is_a_different_approval() {
+        let a = compute_approval_digest_v6(
+            b"key-a",
+            "cs1",
+            "sha256:plan",
+            Some("sha256:preview-a"),
+            "alice",
+            "bob",
+            1_700_000_000,
+        );
+        let b = compute_approval_digest_v6(
+            b"key-b",
+            "cs1",
+            "sha256:plan",
+            Some("sha256:preview-a"),
+            "alice",
+            "bob",
+            1_700_000_000,
+        );
+        assert_ne!(a, b, "the key is not bound");
+    }
+
+    /// The whole point: recomputing v6 over the exact same fields with the
+    /// wrong key must not verify. This is what "keyed" means operationally —
+    /// v5 has no key at all, so this scenario cannot even be expressed for it.
+    #[test]
+    fn verification_fails_without_the_correct_key() {
+        let digest = compute_approval_digest_v6(
+            b"the-real-key",
+            "cs1",
+            "sha256:plan",
+            Some("sha256:preview"),
+            "alice",
+            "bob",
+            1_700_000_000,
+        );
+        assert!(verify_approval_digest_v6(
+            b"the-real-key",
+            "cs1",
+            "sha256:plan",
+            Some("sha256:preview"),
+            "alice",
+            "bob",
+            1_700_000_000,
+            &digest,
+        ));
+        assert!(!verify_approval_digest_v6(
+            b"a-forged-key",
+            "cs1",
+            "sha256:plan",
+            Some("sha256:preview"),
+            "alice",
+            "bob",
+            1_700_000_000,
+            &digest,
+        ));
+    }
+
+    /// v5 and v6 must never agree, even on the inputs they share, so a v5
+    /// digest can never be replayed as a v6 one.
+    #[test]
+    fn v5_and_v6_do_not_collide() {
+        let v5 =
+            compute_approval_digest_v5("cs1", "sha256:plan", None, "alice", "bob", 1_700_000_000);
+        let v6 = compute_approval_digest_v6(
+            b"key",
+            "cs1",
+            "sha256:plan",
+            None,
+            "alice",
+            "bob",
+            1_700_000_000,
+        );
+        assert_ne!(v5, v6);
     }
 
     /// Every field still moves the digest — the preview is an addition, not a

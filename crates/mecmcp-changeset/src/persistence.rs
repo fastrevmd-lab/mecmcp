@@ -5,7 +5,7 @@ use crate::{
     digest::{
         compute_approval_digest_legacy, compute_approval_digest_v4, compute_approval_digest_v5,
         compute_waiver_digest, compute_waiver_digest_v3, validate_fingerprint,
-        validate_principal_for_digest,
+        validate_principal_for_digest, verify_approval_digest_v6,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -60,6 +60,25 @@ struct OnDiskChangesetState {
 /// Returns an error if the file does not exist, has incorrect permissions,
 /// contains an unsupported version, or fails validation.
 pub fn read_state(path: &Path, max_state_bytes: u64) -> Result<ChangesetState, PersistenceError> {
+    read_state_with_key(path, max_state_bytes, None)
+}
+
+/// Reads and validates the changeset state from disk, verifying any v6 approval
+/// digest against `approval_digest_key`.
+///
+/// [`read_state`] is this with `approval_digest_key: None` — the shape every
+/// caller that predates keyed approvals still uses. A record whose
+/// `digest_version` is 6 cannot be verified without the key: see
+/// [`validate_state_with_key`].
+///
+/// # Errors
+///
+/// As [`read_state`].
+pub fn read_state_with_key(
+    path: &Path,
+    max_state_bytes: u64,
+    approval_digest_key: Option<&[u8]>,
+) -> Result<ChangesetState, PersistenceError> {
     // One implementation of the symlink / regular-file / mode / owner / size
     // checks, shared with `mecmcp-auth`, `mecmcp-inventory` and `mecmcp-secret`
     // (#173, #187). The copy that used to live here called `symlink_metadata`
@@ -84,14 +103,14 @@ pub fn read_state(path: &Path, max_state_bytes: u64) -> Result<ChangesetState, P
     let on_disk: OnDiskChangesetState = serde_json::from_slice(bytes)
         .map_err(|error| PersistenceError::new(format!("invalid changeset state JSON: {error}")))?;
 
-    if !(1..=6).contains(&on_disk.version) {
+    if !(1..=7).contains(&on_disk.version) {
         return Err(PersistenceError::new(format!(
             "unsupported changeset state version {}",
             on_disk.version
         )));
     }
 
-    validate_state(&on_disk.state, on_disk.version)?;
+    validate_state_with_key(&on_disk.state, on_disk.version, approval_digest_key)?;
 
     // Defect 1 fix: migrate legacy waiver digests to v3 after successful validation.
     // This is safe precisely because the legacy digest was just verified — we are
@@ -160,6 +179,26 @@ pub fn read_state(path: &Path, max_state_bytes: u64) -> Result<ChangesetState, P
 ///
 /// Returns an error if the state contains invalid or inconsistent records.
 pub fn validate_state(state: &ChangesetState, version: u32) -> Result<(), PersistenceError> {
+    validate_state_with_key(state, version, None)
+}
+
+/// Validates the in-memory state for consistency, verifying any v6 approval
+/// digest against `approval_digest_key`.
+///
+/// [`validate_state`] is this with `approval_digest_key: None`. A record whose
+/// `approval.digest_version` is 6 can only be validated with the key that
+/// signed it — without one, such a record is rejected as unverifiable rather
+/// than silently accepted, since accepting it would mean trusting a digest this
+/// function cannot actually check.
+///
+/// # Errors
+///
+/// As [`validate_state`].
+pub fn validate_state_with_key(
+    state: &ChangesetState,
+    version: u32,
+    approval_digest_key: Option<&[u8]>,
+) -> Result<(), PersistenceError> {
     const MAX_OPERATIONS: usize = 1024;
     const MAX_CHANGE_SETS: usize = 1024;
     const MAX_CHANGE_SET_ACTIONS: usize = 64;
@@ -302,6 +341,42 @@ pub fn validate_state(state: &ChangesetState, version: u32) -> Result<(), Persis
                             approver,
                             approval.approved_at_unix,
                         ),
+                        6 => {
+                            // Keyed: verified here rather than recomputed and
+                            // compared below, because a v6 digest is an HMAC
+                            // and its own verification is already
+                            // constant-time. Recomputing it into a plain
+                            // `String` and handing it to the generic
+                            // `!=` comparison below would work too, but would
+                            // make the constant-time property depend on
+                            // `String`'s `PartialEq` staying that way, which
+                            // it makes no promise to.
+                            let Some(key) = approval_digest_key else {
+                                return Err(PersistenceError::new(
+                                    "changeset state approval carries a v6 (keyed) digest but \
+                                     no approval digest key was supplied; it cannot be verified",
+                                ));
+                            };
+                            if verify_approval_digest_v6(
+                                key,
+                                id,
+                                &record.digest,
+                                record
+                                    .preview
+                                    .as_ref()
+                                    .map(|preview| preview.digest.as_str()),
+                                &record.owner,
+                                approver,
+                                approval.approved_at_unix,
+                                &approval.digest,
+                            ) {
+                                approval.digest.clone()
+                            } else {
+                                return Err(PersistenceError::new(
+                                    "changeset state approval digest mismatch: approval evidence has been tampered with",
+                                ));
+                            }
+                        }
                         other => {
                             return Err(PersistenceError::new(format!(
                                 "changeset state approval carries unsupported digest version {other}"
@@ -540,7 +615,18 @@ pub(crate) fn write_state(
         .change_sets
         .values()
         .any(|cs| cs.approval.as_ref().is_some_and(|a| a.digest_version >= 5));
-    let version = if preview_bound_approvals_need_v6 {
+    // Version 7 is required once an approval is signed under the v6 (keyed)
+    // rule (MEC-457). A v1-v6 reader recomputes the unkeyed v4/v5 digest for
+    // any approval it sees and would reject the file outright — a v6 digest is
+    // an HMAC output, not a hash of visible fields, so it cannot even
+    // coincidentally match. Content-based like every rule above it.
+    let keyed_approvals_need_v7 = state
+        .change_sets
+        .values()
+        .any(|cs| cs.approval.as_ref().is_some_and(|a| a.digest_version >= 6));
+    let version = if keyed_approvals_need_v7 {
+        7
+    } else if preview_bound_approvals_need_v6 {
         6
     } else if handleless_applies_need_v5 {
         5
