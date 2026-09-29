@@ -7,8 +7,9 @@
 //!   family is roughly ninety additional crates; a server that never sets
 //!   `OtelConfig` should not pay for them. [`OtelConfig`] itself is always
 //!   compiled (it is plain data), but building an exporter from it is gated
-//!   behind the `otel` Cargo feature. A caller that sets [`AuditConfig::otel`]
-//!   without that feature enabled gets a startup error, not silence -- see
+//!   behind the `otel` Cargo feature. A caller that sets
+//!   `AuditConfig::otel` without that feature enabled gets a startup error,
+//!   not silence -- see
 //!   [`crate::init_tracing`], which applies the same "refuse rather than drop
 //!   a requested sink" rule to `--audit-log-file` (#158).
 //! - **It only speaks plain HTTP.** `opentelemetry-otlp` is built here with
@@ -24,8 +25,8 @@
 /// How to export traces and metrics.
 ///
 /// Always compiled, whether or not the `otel` feature is enabled, so a
-/// server's CLI parsing does not need to be feature-gated too -- only
-/// [`build`] is.
+/// server's CLI parsing does not need to be feature-gated too -- only the
+/// `otel` feature's `build` function is.
 ///
 /// Export cadence is the SDK's own default (a few seconds for traces, 60s for
 /// metrics) rather than a field here -- exposing it added two more flags for
@@ -36,7 +37,7 @@ pub struct OtelConfig {
     /// exported to `{endpoint}/v1/traces`, metrics to `{endpoint}/v1/metrics`.
     ///
     /// `http://` only -- see the module docs for why. A `https://` value is
-    /// refused at [`build`] time rather than silently sent in the clear.
+    /// refused at export-setup time rather than silently sent in the clear.
     pub endpoint: String,
     /// The `service.name` resource attribute every span and metric carries.
     pub service_name: String,
