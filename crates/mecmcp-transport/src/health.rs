@@ -184,6 +184,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_registered_auth_failure_tracker_flips_readyz() {
+        // `mecmcp-secret::AuthFailureTracker` has no dependency on this
+        // crate — its `probe()` closure satisfies `ReadinessCheck::new`'s
+        // `Fn() -> Result<(), &'static str> + Send + Sync` bound by shape
+        // alone. This proves that shape actually plugs in and that a
+        // simulated auth failure is visible on `/readyz` (MEC-539).
+        let tracker = mecmcp_secret::AuthFailureTracker::new();
+        let checks: Arc<[ReadinessCheck]> = Arc::from([ReadinessCheck::new(
+            "auth",
+            tracker.probe("outbound authentication is failing"),
+        )]);
+        let router = health_router(checks);
+
+        let response = call(router.clone(), "/readyz").await;
+        assert_eq!(response.status(), StatusCode::OK, "starts ready");
+
+        tracker.record_failure();
+        let response = call(router.clone(), "/readyz").await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a simulated auth failure must flip /readyz to failing"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("auth"));
+        assert!(text.contains("outbound authentication is failing"));
+
+        tracker.record_success();
+        let response = call(router, "/readyz").await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "recovery must clear the failing state"
+        );
+    }
+
+    #[tokio::test]
     async fn healthz_does_not_consult_readiness_checks() {
         // A readiness probe that would fail readyz must not affect healthz —
         // liveness has no dependencies by definition.
