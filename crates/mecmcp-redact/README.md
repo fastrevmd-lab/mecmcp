@@ -61,15 +61,17 @@ use mecmcp_redact::Untrusted;
 
 let hostname = Untrusted::new(device_response.hostname.clone());
 let tagged = hostname.render_tagged("device.hostname");
-// tagged: "<untrusted-device-content source=\"device.hostname\">...\n<hostname>\n</untrusted-device-content>"
+// tagged: "<untrusted-device-content id=\"a1b2c3d4e5f60789\" source=\"device.hostname\">...\n<hostname>\n</untrusted-device-content id=\"a1b2c3d4e5f60789\">"
 ```
 
 `mecmcp-server::tool_error_with_untrusted_detail` is the sanctioned entry
 point for a tool handler's error path — see `crates/mecmcp-changeset/src/apply.rs`
 for a worked example of tagging a vendor transaction error before it becomes
-part of a `CoordinatorError` message. `render_tagged` neutralizes any literal
-occurrence of its own delimiter inside the content first, so device text
-cannot forge a closing tag and escape its own marker.
+part of a `CoordinatorError` message. `render_tagged` entity-escapes `&`, `<`
+and `>` in the content and the `source` label, so no tag-shaped text of any
+spelling can appear inside the block, and pairs each rendering with a random
+id shared by its open and close tags, so device text cannot forge a matching
+closing tag even in escaped form.
 
 This is a visibility mechanism, not a sandbox: a model that ignores the
 delimiter entirely is a prompting and policy problem downstream of this

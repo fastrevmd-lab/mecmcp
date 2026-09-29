@@ -301,13 +301,14 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         assert!(text.contains("staging failed"));
         assert!(text.contains("candidate database locked by another session"));
-        assert!(text.contains("<untrusted-device-content source=\"device.stage_error\">"));
-        assert!(text.contains("</untrusted-device-content>"));
+        assert!(text.contains("<untrusted-device-content id=\""));
+        assert!(text.contains("source=\"device.stage_error\""));
+        assert!(text.contains("</untrusted-device-content id=\""));
     }
 
     /// A device trying to forge its own closing delimiter must not be able
-    /// to make the rendered text contain two closing tags a naive
-    /// downstream reader could mistake the forged one for the real boundary.
+    /// to make the rendered text contain a second, matching closing tag: the
+    /// forged text is entity-escaped, not passed through literally.
     #[test]
     fn tool_error_with_untrusted_detail_survives_a_forged_delimiter_in_the_device_text() {
         let result = tool_error_with_untrusted_detail(
@@ -316,7 +317,8 @@ mod tests {
             "device.stage_error",
         );
         let text = text_of(&result);
-        assert_eq!(text.matches("</untrusted-device-content>").count(), 1);
+        assert_eq!(text.matches("</untrusted-device-content id=\"").count(), 1);
+        assert!(text.contains("&lt;/untrusted-device-content&gt;"));
     }
 
     #[test]
