@@ -3,7 +3,7 @@
 use crate::lifecycle::{ApplyHandle, change_set_transition_allowed};
 use crate::{
     lifecycle::{ChangeSetState, LifecycleState},
-    persistence::{ChangesetState, PersistenceError, read_state, write_state},
+    persistence::{ChangesetState, PersistenceError, read_state_with_key, write_state},
     records::{ChangeSetRecord, OperationRecord},
     types::OperationLimits,
 };
@@ -84,6 +84,134 @@ impl From<PersistenceError> for CoordinatorError {
     }
 }
 
+/// HMAC key for the v6 (keyed) approval digest.
+///
+/// `ChangesetCoordinator` derives `Debug` for tracing and test-failure output,
+/// and `Arc<[u8]>`'s own `Debug` prints the raw bytes — a coordinator holding a
+/// bare `Arc<[u8]>` key would leak it through any `{:?}` of the coordinator, a
+/// tracing field, or a panic message. This wraps the bytes so that path prints
+/// `ApprovalDigestKey(<redacted>)` instead, and zeroizes them when the last
+/// clone is dropped (MEC-457 review, finding 3).
+#[derive(Clone)]
+pub struct ApprovalDigestKey(Arc<zeroize::Zeroizing<Box<[u8]>>>);
+
+impl ApprovalDigestKey {
+    /// Wraps raw key bytes.
+    #[must_use]
+    pub fn new(bytes: impl Into<Box<[u8]>>) -> Self {
+        Self(Arc::new(zeroize::Zeroizing::new(bytes.into())))
+    }
+}
+
+impl std::fmt::Debug for ApprovalDigestKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApprovalDigestKey(<redacted>)")
+    }
+}
+
+impl std::ops::Deref for ApprovalDigestKey {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<Arc<[u8]>> for ApprovalDigestKey {
+    fn from(bytes: Arc<[u8]>) -> Self {
+        Self::new(bytes.as_ref())
+    }
+}
+
+/// Minimum acceptable length, in bytes, for a loaded approval digest key.
+///
+/// HMAC-SHA256 accepts a key of any length, so this is not a cryptographic
+/// requirement of the algorithm -- it exists so `--approval-digest-key`
+/// pointed at an accidentally short or empty file fails to start rather than
+/// producing a weak, guessable key silently.
+pub const MIN_APPROVAL_DIGEST_KEY_BYTES: usize = 32;
+
+/// Error loading an approval digest key from a file.
+#[derive(Debug)]
+pub enum ApprovalDigestKeyError {
+    /// The file could not be read, or failed a permission/ownership check.
+    Io {
+        /// The path that failed to load.
+        path: PathBuf,
+        /// The underlying error.
+        source: mecmcp_secret::SecretError,
+    },
+    /// The file's contents are shorter than [`MIN_APPROVAL_DIGEST_KEY_BYTES`].
+    TooShort {
+        /// The path that was too short.
+        path: PathBuf,
+        /// The actual length in bytes.
+        len: usize,
+    },
+}
+
+impl std::fmt::Display for ApprovalDigestKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { path, source } => {
+                write!(
+                    f,
+                    "could not read approval digest key '{}': {source}",
+                    path.display()
+                )
+            }
+            Self::TooShort { path, len } => write!(
+                f,
+                "approval digest key '{}' is {len} bytes; at least {MIN_APPROVAL_DIGEST_KEY_BYTES} are required",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ApprovalDigestKeyError {}
+
+impl From<ApprovalDigestKeyError> for CoordinatorError {
+    fn from(error: ApprovalDigestKeyError) -> Self {
+        Self::new("approval_digest_key", error.to_string())
+    }
+}
+
+impl ApprovalDigestKey {
+    /// Loads a key from a file, applying the same hardened-file checks
+    /// [`crate::persistence::read_state`] uses: the file must be a regular
+    /// file, owned by the effective uid, mode 0600 (no group/other access),
+    /// and not a symlink. Rejects a key shorter than
+    /// [`MIN_APPROVAL_DIGEST_KEY_BYTES`].
+    ///
+    /// This is the one place a deployment turns `--approval-digest-key
+    /// <path>` into a key: callers should pass the result straight to
+    /// [`ChangesetCoordinator::load_with_key`] rather than loading the file
+    /// themselves, so the load path and the permission checks cannot drift
+    /// from `read_state_with_key`'s (MEC-457 review, finding 2).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, fails a permission or
+    /// ownership check, or is shorter than the minimum key length.
+    pub fn load_from_file(path: &Path) -> Result<Self, ApprovalDigestKeyError> {
+        let bytes =
+            mecmcp_secret::read_hardened_file(path, mecmcp_secret::FileLimits { max_bytes: 4096 })
+                .map_err(|source| ApprovalDigestKeyError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        let bytes = bytes.expose();
+        if bytes.len() < MIN_APPROVAL_DIGEST_KEY_BYTES {
+            return Err(ApprovalDigestKeyError::TooShort {
+                path: path.to_path_buf(),
+                len: bytes.len(),
+            });
+        }
+        Ok(Self::new(bytes))
+    }
+}
+
 /// Changeset coordinator managing in-memory state, endpoint locks, and persistence.
 ///
 /// This coordinator is vendor-agnostic and manages the lifecycle of operations and
@@ -103,6 +231,16 @@ pub struct ChangesetCoordinator {
     /// configured should not be forced to build chains nothing will read. When
     /// absent, every emission point is a no-op (mecmcp#292).
     evidence: Option<Arc<EvidenceRecorder>>,
+    /// HMAC key for the v6 (keyed) approval digest, when a deployment has one
+    /// configured.
+    ///
+    /// Optional for the same reason `evidence` is: a deployment that has not
+    /// been given a key keeps signing approvals under the unkeyed v5 rule,
+    /// rather than being forced to provision a key it may not yet have a
+    /// distribution story for. `approve_change_set` reads this at approval
+    /// time; `load_with_recovery_and_key` reads it at load time, because a
+    /// v6-signed record already on disk cannot be verified without it (MEC-457).
+    approval_digest_key: Option<ApprovalDigestKey>,
 }
 
 impl ChangesetCoordinator {
@@ -122,6 +260,29 @@ impl ChangesetCoordinator {
     pub(crate) fn evidence(&self) -> Option<&EvidenceRecorder> {
         self.evidence.as_deref()
     }
+
+    /// Sign approvals with a keyed (v6) digest instead of the unkeyed v5 one.
+    ///
+    /// Once set, every approval this coordinator records is bound to
+    /// `approval_digest_key`: forging or editing one requires the key, not just
+    /// the visible fields a v5 digest is computed from (MEC-457).
+    ///
+    /// This only affects *new* approvals recorded through this instance.
+    /// Verifying a v6 digest already on disk at load time is
+    /// [`load_with_recovery_and_key`](Self::load_with_recovery_and_key)'s job —
+    /// setting this builder after [`load`](Self::load) has already read the
+    /// file does not retroactively verify what load already accepted or
+    /// rejected.
+    #[must_use]
+    pub fn with_approval_digest_key(mut self, key: impl Into<ApprovalDigestKey>) -> Self {
+        self.approval_digest_key = Some(key.into());
+        self
+    }
+
+    /// The approval digest key, if this coordinator has one.
+    pub(crate) fn approval_digest_key(&self) -> Option<&[u8]> {
+        self.approval_digest_key.as_deref()
+    }
 }
 
 impl Default for ChangesetCoordinator {
@@ -134,6 +295,7 @@ impl Default for ChangesetCoordinator {
             approval_ttl: Duration::from_secs(15 * 60),
             evidence: None,
             lab_mode: false,
+            approval_digest_key: None,
         }
     }
 }
@@ -182,6 +344,34 @@ impl ChangesetCoordinator {
         )
     }
 
+    /// [`load`](Self::load), verifying any on-disk v6 approval digest against
+    /// `approval_digest_key`.
+    ///
+    /// A deployment that configures a key must pass it here, not just to
+    /// [`with_approval_digest_key`](Self::with_approval_digest_key) afterwards:
+    /// the file is read and its approvals verified during this call, before
+    /// that builder would ever run.
+    ///
+    /// # Errors
+    ///
+    /// As [`load`](Self::load).
+    pub fn load_with_key(
+        path: Option<&Path>,
+        limits: OperationLimits,
+        approval_ttl: Duration,
+        lab_mode: bool,
+        approval_digest_key: Option<ApprovalDigestKey>,
+    ) -> Result<Self, CoordinatorError> {
+        Self::load_with_recovery_and_key(
+            path,
+            limits,
+            approval_ttl,
+            lab_mode,
+            StagedRecovery::Discard,
+            approval_digest_key,
+        )
+    }
+
     /// Loads the coordinator, choosing how `Staged` operations survive a restart.
     ///
     /// [`load`](Self::load) defaults to [`StagedRecovery::Discard`], which is right
@@ -212,6 +402,32 @@ impl ChangesetCoordinator {
         lab_mode: bool,
         staged_recovery: StagedRecovery,
     ) -> Result<Self, CoordinatorError> {
+        Self::load_with_recovery_and_key(
+            path,
+            limits,
+            approval_ttl,
+            lab_mode,
+            staged_recovery,
+            None,
+        )
+    }
+
+    /// [`load_with_recovery`](Self::load_with_recovery), verifying any on-disk
+    /// v6 approval digest against `approval_digest_key`. See
+    /// [`load_with_key`](Self::load_with_key) for why the key is a parameter
+    /// here rather than a builder call made afterwards.
+    ///
+    /// # Errors
+    ///
+    /// As [`load_with_recovery`](Self::load_with_recovery).
+    pub fn load_with_recovery_and_key(
+        path: Option<&Path>,
+        limits: OperationLimits,
+        approval_ttl: Duration,
+        lab_mode: bool,
+        staged_recovery: StagedRecovery,
+        approval_digest_key: Option<ApprovalDigestKey>,
+    ) -> Result<Self, CoordinatorError> {
         let Some(path) = path else {
             return Ok(Self {
                 state: Mutex::new(ChangesetState::default()),
@@ -221,6 +437,7 @@ impl ChangesetCoordinator {
                 approval_ttl,
                 lab_mode,
                 evidence: None,
+                approval_digest_key,
             });
         };
 
@@ -232,7 +449,7 @@ impl ChangesetCoordinator {
         }
 
         let mut state = if path.exists() {
-            read_state(path, limits.max_state_bytes)?
+            read_state_with_key(path, limits.max_state_bytes, approval_digest_key.as_deref())?
         } else {
             ChangesetState::default()
         };
@@ -325,6 +542,7 @@ impl ChangesetCoordinator {
             limits,
             approval_ttl,
             lab_mode,
+            approval_digest_key,
         })
     }
 

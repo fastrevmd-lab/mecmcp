@@ -25,12 +25,18 @@ pub use changeset::ChangeSetOutput;
 pub use commit_metadata::{
     AttachOutcome, CommitMetaError, CommitMetadataSink, apply_commit_metadata,
 };
-pub use coordinator::{ChangesetCoordinator, CoordinatorError, StagedRecovery};
+pub use coordinator::{
+    ApprovalDigestKey, ApprovalDigestKeyError, ChangesetCoordinator, CoordinatorError,
+    MIN_APPROVAL_DIGEST_KEY_BYTES, StagedRecovery,
+};
 pub use lifecycle::{ApplyHandle, ChangeSetState, LifecycleState, change_set_transition_allowed};
 pub use operation::StageOutput;
 #[cfg(feature = "test-util")]
 pub use persistence::write_state_for_test;
-pub use persistence::{ChangesetState, PersistenceError, read_state, validate_state};
+pub use persistence::{
+    ChangesetState, PersistenceError, read_state, read_state_with_key, validate_state,
+    validate_state_with_key,
+};
 pub use records::{
     ApprovalRecord, ChangeSetRecord, OperationRecord, PreviewError, PreviewRecord, RecordError,
     TargetError, WaiverKind, WaiverRecord, change_set_digest, change_set_digest_with_targets,

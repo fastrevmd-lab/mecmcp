@@ -116,6 +116,9 @@ pub enum SsdfSinkError {
     /// Invalid segment encoding.
     #[error("invalid segment encoding: {0}")]
     InvalidSegment(String),
+    /// The configured evidence signing key could not be loaded.
+    #[error("evidence signing key: {0}")]
+    Signing(#[from] crate::signing::SigningError),
 }
 
 /// SSDF row format for ClickHouse JSONEachRow insertion.

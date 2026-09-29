@@ -1883,12 +1883,14 @@ dependencies = [
  "async-trait",
  "getrandom 0.4.3",
  "hex",
+ "hmac",
  "mecmcp-audit",
  "mecmcp-secret",
  "rustix",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1896,6 +1898,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
