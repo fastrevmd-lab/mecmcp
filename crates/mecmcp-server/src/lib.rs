@@ -25,6 +25,9 @@
 //!
 //! [`bounded_text`] is the other half, for the places that genuinely want a
 //! prefix — a log line, a preview — and it says so in its return value.
+//! [`truncate_items`] is the list-shaped version of the same idea, for a
+//! handler that would rather hand back the first `N` of `M` entries with an
+//! explicit marker than refuse the whole call.
 
 pub mod authorize;
 
@@ -120,6 +123,71 @@ pub fn bounded_text(input: &str, max_bytes: usize) -> BoundedText {
         truncated: true,
         original_bytes,
         omitted_bytes: original_bytes - end,
+    }
+}
+
+/// A list capped at `max_items`, with an explicit count of what was shown.
+///
+/// Unlike [`BoundedText`] this is an opt-in truncation, not a refusal: a
+/// handler returning a device's interface list, log tail, or client table
+/// chooses to hand back a prefix plus a marker rather than making the caller
+/// choose between an oversized [`tool_result`] refusal and no data at all.
+/// The caller decides which shape fits — this type only makes the shape it
+/// returns impossible to mistake for a complete list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TruncatedItems<T> {
+    /// At most `max_items` elements, in original order.
+    pub items: Vec<T>,
+    /// Whether any elements were omitted.
+    pub truncated: bool,
+    /// `items.len()` — how many are in this result.
+    pub shown: usize,
+    /// How many elements were in the input before truncation.
+    pub total: usize,
+}
+
+impl<T> TruncatedItems<T> {
+    /// A caller-facing marker, e.g. `"truncated: 10 of 42 shown"`.
+    ///
+    /// `None` when nothing was omitted, so a caller does not have to parse a
+    /// marker string to learn whether the result is complete.
+    #[must_use]
+    pub fn marker(&self) -> Option<String> {
+        self.truncated
+            .then(|| format!("truncated: {} of {} shown", self.shown, self.total))
+    }
+}
+
+/// Cap `items` at `max_items` elements, reporting how many were shown of how
+/// many there were.
+///
+/// # Examples
+/// ```
+/// use mecmcp_server::truncate_items;
+///
+/// let result = truncate_items(vec![1, 2, 3, 4, 5], 3);
+/// assert_eq!(result.items, vec![1, 2, 3]);
+/// assert!(result.truncated);
+/// assert_eq!(result.marker().as_deref(), Some("truncated: 3 of 5 shown"));
+/// ```
+#[must_use]
+pub fn truncate_items<T>(mut items: Vec<T>, max_items: usize) -> TruncatedItems<T> {
+    let total = items.len();
+    if total <= max_items {
+        return TruncatedItems {
+            items,
+            truncated: false,
+            shown: total,
+            total,
+        };
+    }
+    items.truncate(max_items);
+    let shown = items.len();
+    TruncatedItems {
+        items,
+        truncated: true,
+        shown,
+        total,
     }
 }
 
@@ -456,5 +524,44 @@ mod tests {
         assert_eq!(bounded.text, "");
         assert!(bounded.truncated);
         assert_eq!(bounded.omitted_bytes, 8);
+    }
+
+    #[test]
+    fn well_under_cap_is_not_truncated() {
+        let result = truncate_items(vec![1, 2, 3], 10);
+        assert_eq!(result.items, vec![1, 2, 3]);
+        assert!(!result.truncated);
+        assert_eq!(result.shown, 3);
+        assert_eq!(result.total, 3);
+        assert_eq!(result.marker(), None);
+    }
+
+    #[test]
+    fn exactly_at_cap_is_not_truncated() {
+        let result = truncate_items(vec![1, 2, 3], 3);
+        assert_eq!(result.items, vec![1, 2, 3]);
+        assert!(!result.truncated);
+        assert_eq!(result.shown, 3);
+        assert_eq!(result.total, 3);
+        assert_eq!(result.marker(), None);
+    }
+
+    #[test]
+    fn over_cap_is_truncated_with_a_marker() {
+        let result = truncate_items(vec![1, 2, 3, 4, 5], 3);
+        assert_eq!(result.items, vec![1, 2, 3]);
+        assert!(result.truncated);
+        assert_eq!(result.shown, 3);
+        assert_eq!(result.total, 5);
+        assert_eq!(result.marker().as_deref(), Some("truncated: 3 of 5 shown"));
+    }
+
+    #[test]
+    fn a_zero_cap_yields_no_items_rather_than_panicking() {
+        let result = truncate_items(vec![1, 2, 3], 0);
+        assert!(result.items.is_empty());
+        assert!(result.truncated);
+        assert_eq!(result.shown, 0);
+        assert_eq!(result.total, 3);
     }
 }

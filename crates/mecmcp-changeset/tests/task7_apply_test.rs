@@ -1016,7 +1016,11 @@ async fn apply_persists_valid_endpoint_and_reloads() {
         .await
         .unwrap();
 
-    // Reload the coordinator from the state file
+    // Reload the coordinator from the state file. Drop the first coordinator
+    // first: it holds the state file's single-writer lock for its whole
+    // lifetime (MEC-540), which a second live coordinator on the same path
+    // would otherwise be refused.
+    drop(coordinator);
     let reloaded = ChangesetCoordinator::load(
         Some(&state_path),
         OperationLimits::default(),
@@ -1532,7 +1536,11 @@ async fn finding_2_persist_policy_signature() {
         .await
         .unwrap();
 
-    // Reload and verify the policy signature was persisted
+    // Reload and verify the policy signature was persisted. Drop the first
+    // coordinator first: it holds the state file's single-writer lock for
+    // its whole lifetime (MEC-540), which a second live coordinator on the
+    // same path would otherwise be refused.
+    drop(coordinator);
     let reloaded = ChangesetCoordinator::load(
         Some(&state_path),
         OperationLimits::default(),

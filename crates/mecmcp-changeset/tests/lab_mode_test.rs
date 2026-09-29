@@ -307,7 +307,11 @@ async fn test_waived_record_round_trips() {
         .await
         .expect("waive");
 
-    // Reload the coordinator — validate_state is called on load
+    // Reload the coordinator — validate_state is called on load. Drop the
+    // first coordinator first: it holds the state file's single-writer lock
+    // for its whole lifetime (MEC-540), which a second live coordinator on
+    // the same path would otherwise be refused.
+    drop(coordinator);
     let coordinator2 = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, true)
         .expect("reload coordinator");
 

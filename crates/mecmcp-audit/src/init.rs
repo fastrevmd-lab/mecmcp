@@ -42,6 +42,88 @@ pub struct AuditConfig {
     pub redaction: Option<crate::redact::AuditRedaction>,
     /// When true, `target="audit"` events are also sent to journald natively.
     pub journald: bool,
+    /// When set, spans and metrics are also exported over OpenTelemetry.
+    ///
+    /// Always compiled -- see [`crate::otel`] for why -- but building the
+    /// exporter requires the `otel` Cargo feature. Setting this without that
+    /// feature enabled fails [`init_tracing`] rather than silently dropping
+    /// the requested export, the same rule #158 applies to `audit_log_file`.
+    pub otel: Option<crate::otel::OtelConfig>,
+}
+
+/// Holds the process-lifetime OpenTelemetry provider handles, when
+/// [`AuditConfig::otel`] was set and this call installed the subscriber.
+///
+/// Set at most once, by whichever [`init_tracing`] call actually installs the
+/// global subscriber -- `init_tracing` is idempotent, and a later call's otel
+/// providers would export from exporters nothing reads from, the same
+/// reasoning [`AuditFileSink`] already applies to the audit file handle.
+#[cfg(feature = "otel")]
+static OTEL_GUARD: std::sync::OnceLock<crate::otel::OtelGuard> = std::sync::OnceLock::new();
+
+/// Flush and shut down the OpenTelemetry exporters installed by
+/// [`init_tracing`], if any were configured.
+///
+/// Best-effort and a no-op when no `otel` config was set, when this build
+/// lacks the `otel` feature, or when nothing has called `init_tracing` yet.
+pub fn shutdown_otel() {
+    #[cfg(feature = "otel")]
+    if let Some(guard) = OTEL_GUARD.get() {
+        guard.shutdown();
+    }
+}
+
+/// The otel layer's own filter, deliberately separate from `RUST_LOG`.
+///
+/// The otel layer sits outside [`crate::redact::AuditRedaction`]: it sees
+/// every span's attributes and every event's fields, not just `target:
+/// "audit"` records, and it exports whatever level is active. Reusing
+/// `RUST_LOG` for it means an operator turning up logging for local
+/// debugging -- the ordinary way to chase a bug in one crate -- also turns up
+/// what leaves the host over OTLP, including `debug!`/`trace!` bodies that
+/// routinely carry device names, hostnames, or full RPC payloads. This filter
+/// defaults to `info` and is overridable only through `MECMCP_OTEL_FILTER`,
+/// never `RUST_LOG`.
+///
+/// It also always suppresses the exporter's own HTTP client traffic
+/// (`opentelemetry*`, `hyper`, `reqwest`, `h2`): without that, exporting a
+/// span produces a client span, which this same layer then tries to export,
+/// a feedback loop that never settles.
+#[cfg(feature = "otel")]
+fn otel_filter() -> EnvFilter {
+    let directives = std::env::var("MECMCP_OTEL_FILTER").unwrap_or_else(|_| "info".to_string());
+    let directives = format!(
+        "{directives},opentelemetry=off,opentelemetry_sdk=off,opentelemetry_otlp=off,hyper=off,reqwest=off,h2=off"
+    );
+    EnvFilter::try_new(directives).unwrap_or_else(|_| EnvFilter::new("info"))
+}
+
+#[cfg(feature = "otel")]
+fn build_otel_layer<S>(cfg: &AuditConfig) -> io::Result<Option<Box<dyn Layer<S> + Send + Sync>>>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
+{
+    let Some(otel_cfg) = &cfg.otel else {
+        return Ok(None);
+    };
+    let (layer, guard) = crate::otel::build(otel_cfg).map_err(io::Error::other)?;
+    // Ignore a second set(): only the call that goes on to install the
+    // subscriber owns providers anything reads from, and that call is the
+    // first one to reach here in practice (init_tracing is documented
+    // idempotent, not concurrent).
+    let _ = OTEL_GUARD.set(guard);
+    Ok(Some(layer.with_filter(otel_filter()).boxed()))
+}
+
+#[cfg(not(feature = "otel"))]
+fn build_otel_layer<S>(cfg: &AuditConfig) -> io::Result<Option<Box<dyn Layer<S> + Send + Sync>>>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    if cfg.otel.is_some() {
+        return Err(io::Error::other(crate::otel::OtelError::NotCompiled));
+    }
+    Ok(None)
 }
 
 /// A cloneable append writer over a shared file handle.
@@ -251,7 +333,9 @@ impl AuditFileSink {
 /// # Errors
 ///
 /// Returns an error when the explicitly enabled journald layer cannot be
-/// constructed, **or when a configured audit file cannot be opened**.
+/// constructed, when a configured audit file cannot be opened, or when
+/// [`AuditConfig::otel`] is set but this build does not have the `otel`
+/// feature enabled -- see [`crate::otel`].
 ///
 /// That second case used to be swallowed with `.ok()`: startup succeeded
 /// without the requested audit file and without a warning, so an operator could
@@ -310,11 +394,13 @@ pub fn init_tracing(cfg: &AuditConfig) -> io::Result<Option<AuditFileSink>> {
     let file_layer = file_handle.clone().map(audit_file_layer);
     let journald_layer =
         make_journald_layer_with(cfg.journald, tracing_journald::layer)?.map(audit_journald_layer);
+    let otel_layer = build_otel_layer(cfg)?;
 
     let subscriber = tracing_subscriber::registry()
         .with(stderr)
         .with(file_layer)
-        .with(journald_layer);
+        .with(journald_layer)
+        .with(otel_layer);
 
     // `set_global_default` directly, rather than `try_init`.
     //
@@ -407,6 +493,7 @@ mod tests {
             audit_log_file: Some(unusable.clone()),
             redaction: None,
             journald: false,
+            otel: None,
         };
         let error = init_tracing(&cfg).unwrap_err();
         assert!(
@@ -431,8 +518,47 @@ mod tests {
             audit_log_file: None,
             redaction: None,
             journald: false,
+            otel: None,
         };
         assert!(init_tracing(&cfg).unwrap().is_none());
+    }
+
+    /// Off by default: no `otel` config means `init_tracing` behaves exactly
+    /// as it did before `AuditConfig::otel` existed, whether or not this
+    /// build has the `otel` feature.
+    #[test]
+    fn no_otel_config_is_not_an_error() {
+        let cfg = AuditConfig {
+            format: AuditFormat::Json,
+            audit_log_file: None,
+            redaction: None,
+            journald: false,
+            otel: None,
+        };
+        assert!(init_tracing(&cfg).is_ok());
+    }
+
+    /// A build without the `otel` feature must refuse a configured otel
+    /// export rather than silently drop it -- the same #158 rule
+    /// `audit_log_file` already follows.
+    #[cfg(not(feature = "otel"))]
+    #[test]
+    fn otel_config_without_the_feature_is_an_error() {
+        let cfg = AuditConfig {
+            format: AuditFormat::Json,
+            audit_log_file: None,
+            redaction: None,
+            journald: false,
+            otel: Some(crate::otel::OtelConfig {
+                endpoint: "http://127.0.0.1:4318".to_string(),
+                service_name: "test".to_string(),
+            }),
+        };
+        let error = init_tracing(&cfg).unwrap_err();
+        assert!(
+            error.to_string().contains("otel"),
+            "the error must say why: {error}"
+        );
     }
 
     /// Reopen must follow the path, not the inode — that is what makes
@@ -583,5 +709,79 @@ mod tests {
         };
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(error.to_string(), "journal unavailable");
+    }
+}
+
+/// Regression tests for a review finding (MEC-459): the otel layer had no
+/// filter of its own, so every `debug!`/`trace!` event from every crate --
+/// including RPC/config bodies a downstream crate logs at `debug!` -- was
+/// exported as a span event, and `AuditRedaction` never sees span attributes
+/// or non-audit events, so it could not help. Gated on `feature = "otel"`
+/// since [`otel_filter`] only exists there.
+#[cfg(all(test, feature = "otel"))]
+#[allow(clippy::unwrap_used)]
+mod otel_filter_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct RecordingLayer {
+        names: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for RecordingLayer {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            self.names
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(event.metadata().name());
+        }
+    }
+
+    #[test]
+    fn default_otel_filter_drops_debug_but_keeps_info() {
+        let recorder = RecordingLayer::default();
+        let subscriber =
+            tracing_subscriber::registry().with(recorder.clone().with_filter(otel_filter()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("tool_call", device = "fw-edge-01");
+            let _entered = span.enter();
+            tracing::info!(target: "rustnetconf", "connected");
+            tracing::debug!(
+                target: "rustnetconf",
+                body = "pre-shared-key ascii-text CANARY-PSK",
+                "raw rpc body"
+            );
+        });
+
+        let names = recorder.names.lock().unwrap();
+        assert_eq!(
+            names.len(),
+            1,
+            "a debug event must not reach the otel layer at the default filter: {names:?}"
+        );
+    }
+
+    #[test]
+    fn otel_filter_always_suppresses_exporter_client_traffic() {
+        // Prevents an export feedback loop: exporting a span produces a
+        // reqwest/hyper/h2 span, which the same layer would otherwise try
+        // to export again.
+        let recorder = RecordingLayer::default();
+        let subscriber =
+            tracing_subscriber::registry().with(recorder.clone().with_filter(otel_filter()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "hyper::client", "connecting");
+            tracing::info!(target: "opentelemetry_sdk", "exporting batch");
+            tracing::info!(target: "reqwest", "sending request");
+        });
+
+        assert!(
+            recorder.names.lock().unwrap().is_empty(),
+            "exporter client traffic must never reach the otel layer, regardless of level"
+        );
     }
 }

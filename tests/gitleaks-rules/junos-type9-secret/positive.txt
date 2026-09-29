@@ -1,0 +1,1 @@
+set system root-authentication encrypted-password "$9$FakeExample1234567890AbCdEfGhIjKlMn";  // gitleaks:allow

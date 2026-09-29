@@ -601,7 +601,11 @@ async fn an_expired_waiver_does_not_authorize_apply() {
 
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
 
-    // Reload coordinator to pick up the modified state
+    // Reload coordinator to pick up the modified state. Drop the harness's
+    // coordinator first: it holds the state file's single-writer lock for
+    // its whole lifetime (MEC-540), which this reload would otherwise be
+    // refused against.
+    drop(harness.coordinator);
     let limits = OperationLimits {
         max_operations: 1024,
         max_change_sets: 1024,
@@ -701,6 +705,10 @@ async fn lab_mode_disabled_after_waiver_does_not_authorize_apply() {
 
     // Reload with lab_mode=false, as if the waiver were forged directly into
     // the state file on a deployment that never ran with lab mode enabled.
+    // Drop the harness's coordinator first: it holds the state file's
+    // single-writer lock for its whole lifetime (MEC-540), which this reload
+    // would otherwise be refused against.
+    drop(harness.coordinator);
     let limits = OperationLimits {
         max_operations: 1024,
         max_change_sets: 1024,
@@ -788,7 +796,10 @@ async fn pre_guard_waiver_expiry_check_fails_without_blocking() {
     });
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
 
-    // Reload coordinator
+    // Reload coordinator. Drop the harness's coordinator first: it holds
+    // the state file's single-writer lock for its whole lifetime (MEC-540),
+    // which this reload would otherwise be refused against.
+    drop(harness.coordinator);
     let limits = OperationLimits {
         max_operations: 1024,
         max_change_sets: 1024,
@@ -889,7 +900,11 @@ async fn post_guard_waiver_expiry_check_detects_toctou_rewrite() {
     });
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
 
-    // Reload coordinator and wrap in Arc for sharing between tasks
+    // Reload coordinator and wrap in Arc for sharing between tasks. Drop
+    // the harness's coordinator first: it holds the state file's
+    // single-writer lock for its whole lifetime (MEC-540), which this
+    // reload would otherwise be refused against.
+    drop(harness.coordinator);
     let limits = OperationLimits {
         max_operations: 1024,
         max_change_sets: 1024,
@@ -1050,7 +1065,10 @@ async fn waiver_at_exact_expiry_instant_is_expired() {
     });
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
 
-    // Reload coordinator
+    // Reload coordinator. Drop the harness's coordinator first: it holds
+    // the state file's single-writer lock for its whole lifetime (MEC-540),
+    // which this reload would otherwise be refused against.
+    drop(harness.coordinator);
     let limits = OperationLimits {
         max_operations: 1024,
         max_change_sets: 1024,

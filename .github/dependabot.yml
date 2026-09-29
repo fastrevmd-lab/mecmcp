@@ -4,11 +4,17 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
     open-pull-requests-limit: 5
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      github_actions-minor-patch:
+        update-types: ["minor", "patch"]
     open-pull-requests-limit: 5
     ignore:
       - dependency-name: dtolnay/rust-toolchain

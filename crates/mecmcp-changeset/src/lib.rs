@@ -17,6 +17,7 @@ pub mod operation;
 pub mod persistence;
 pub mod records;
 pub mod recovery;
+mod state_lock;
 pub mod transaction;
 pub mod types;
 

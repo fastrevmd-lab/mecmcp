@@ -120,3 +120,11 @@ required-features = ["test-util"]
 name = "keyed_approval_digest_test"
 required-features = ["test-util"]
 
+[[test]]
+name = "two_process_state_lock_test"
+required-features = ["test-util"]
+
+[[test]]
+name = "offline_resolution_refuses_running_server_test"
+required-features = ["test-util"]
+

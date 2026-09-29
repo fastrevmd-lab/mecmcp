@@ -1,0 +1,152 @@
+name: Reusable / release container image
+
+# Shared SBOM + build + keyless-cosign-sign pipeline for a container image
+# release, called via `workflow_call` from a vendor repo's own release
+# workflow (which owns the `on: push: tags:` / `workflow_dispatch` trigger).
+#
+# Extracted from rustjunosmcp's release-image.yml (MEC-49) so the sequence
+# is defined once instead of re-implemented per repo (MEC-514). See
+# docs/RELEASE-WORKFLOWS.md in this repo for how to call it and how to
+# migrate an existing per-repo workflow.
+#
+# The calling job MUST grant these permissions itself -- a reusable
+# workflow's permissions can only be narrowed by the caller, never widened:
+#   permissions:
+#     contents: read
+#     packages: write
+#     id-token: write   # required for keyless cosign signing
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: 'Full GHCR image path, e.g. ghcr.io/mechubsec/rust-junosmcp'
+        required: true
+        type: string
+      version:
+        description: 'Version label for the image (-> tags {version}, {major.minor}, latest). Falls back to the pushed tag when empty.'
+        required: false
+        type: string
+        default: ''
+      ref:
+        description: 'Git ref/commit to build. Defaults to the ref that triggered the caller workflow.'
+        required: false
+        type: string
+        default: ''
+      context:
+        description: 'Docker build context'
+        required: false
+        type: string
+        default: '.'
+      platforms:
+        description: 'Comma-separated platform list for docker/build-push-action, e.g. linux/amd64,linux/arm64'
+        required: false
+        type: string
+        default: 'linux/amd64'
+      smoke-test-command:
+        description: 'Optional shell command run after Buildx setup and before push (e.g. a container smoke test script). Skipped when empty.'
+        required: false
+        type: string
+        default: ''
+      cargo-cyclonedx-version:
+        description: 'Pinned cargo-cyclonedx version for --version. Empty installs whatever --locked resolves.'
+        required: false
+        type: string
+        default: ''
+    outputs:
+      digest:
+        description: 'Digest of the pushed image, as returned by docker/build-push-action.'
+        value: ${{ jobs.build-push.outputs.digest }}
+
+jobs:
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Install cargo-cyclonedx
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.cargo-cyclonedx-version }}" ]; then
+            cargo install cargo-cyclonedx --version "${{ inputs.cargo-cyclonedx-version }}" --locked
+          else
+            cargo install cargo-cyclonedx --locked
+          fi
+      # One .cdx.json per workspace member; whichever one matches the binary
+      # that actually ships in the image is the one that matters, but
+      # generating for the whole workspace is cheap and catches drift in the
+      # others too.
+      - name: Generate SBOM
+        run: cargo cyclonedx --all --format json
+      - name: Upload SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-cyclonedx
+          path: '**/*.cdx.json'
+          retention-days: 90
+
+  build-push:
+    runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ inputs.image }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ inputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }}
+            type=raw,value=latest
+
+      - name: Set up QEMU
+        if: contains(inputs.platforms, 'arm') || contains(inputs.platforms, 'ppc') || contains(inputs.platforms, 's390x')
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Smoke test
+        if: inputs.smoke-test-command != ''
+        run: ${{ inputs.smoke-test-command }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Sign image (keyless)
+        # Sign by digest, not by the mutable tags above -- a tag can be
+        # repointed later, but the digest is what was actually just pushed.
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+        env:
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}

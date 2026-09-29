@@ -1,0 +1,1 @@
+PAN-OS master-key encrypted values start with the -AQ== prefix, e.g. -AQ==abc, which is too short to be real.

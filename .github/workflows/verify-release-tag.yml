@@ -1,0 +1,61 @@
+name: verify release tag signature
+
+# Fails closed, visibly, when a `v*` tag lands unsigned. This cannot block
+# the push itself -- GitHub has no tag-protection equivalent of a branch
+# ruleset that runs before the ref exists -- but an unsigned release tag is
+# exactly the kind of problem a red check should surface loudly rather than
+# silently ship. See CONTRIBUTING.md's "Cutting a release" section for the
+# signing step this enforces.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-signature:
+    name: git tag must be annotated and GitHub-verified
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve tag object
+        id: tag
+        run: |
+          set -euo pipefail
+          tag_name="${GITHUB_REF#refs/tags/}"
+          tag_type=$(git cat-file -t "$tag_name")
+          if [[ "$tag_type" != "tag" ]]; then
+            echo "::error::$tag_name is a lightweight tag ($tag_type object) -- release tags must be annotated and signed (git tag -s $tag_name)."
+            exit 1
+          fi
+          tag_sha=$(git rev-parse "$tag_name")
+          echo "name=$tag_name" >> "$GITHUB_OUTPUT"
+          echo "sha=$tag_sha" >> "$GITHUB_OUTPUT"
+
+      # GitHub verifies a tag's signature against whichever GPG or SSH signing
+      # key the pusher has registered on their account -- the same mechanism
+      # behind the "Verified" badge on a commit or tag in the UI. This needs
+      # no shared signing key provisioned into CI: each maintainer who cuts a
+      # release registers their own key on their own GitHub account once.
+      - name: Check GitHub's verification of the tag signature
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_SHA: ${{ steps.tag.outputs.sha }}
+          TAG_NAME: ${{ steps.tag.outputs.name }}
+        run: |
+          set -euo pipefail
+          verified=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_SHA}" --jq '.verification.verified')
+          if [[ "$verified" != "true" ]]; then
+            reason=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_SHA}" --jq '.verification.reason')
+            echo "::error::$TAG_NAME is not a GitHub-verified signature (reason: $reason). Sign it with a GPG or SSH key registered to your GitHub account: git tag -s $TAG_NAME -m '...' && git push origin $TAG_NAME."
+            exit 1
+          fi
+          echo "$TAG_NAME: signature verified"

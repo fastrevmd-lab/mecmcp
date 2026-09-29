@@ -1,0 +1,1 @@
+encrypted-password "$sha1$5$mK2pQxRz9v$Vb9nLkTs4Wc8HuFdEa6oIu3PzMz1GxWyRjNq";  // gitleaks:allow

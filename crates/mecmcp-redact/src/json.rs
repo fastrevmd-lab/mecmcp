@@ -7,7 +7,7 @@
 //! nothing to add a new nested shape, at the cost of never being a positive
 //! guarantee the way an allowlist projection is.
 
-use crate::denylist::is_denylisted_key;
+use crate::denylist::{is_denylisted_key, is_wep_keys_field};
 use crate::shape::looks_like_secret_value;
 use serde_json::Value;
 
@@ -15,19 +15,29 @@ const PLACEHOLDER: &str = "[REDACTED]";
 
 /// Redact `value` in place.
 pub fn redact(value: &mut Value) {
+    redact_inner(value, None);
+}
+
+/// `parent_key` is the JSON object key `value` was found under, if any — the
+/// only context [`is_wep_keys_field`] needs to tell a WEP `keys` table apart
+/// from an unrelated `keys` field without widening the denylist itself.
+fn redact_inner(value: &mut Value, parent_key: Option<&str>) {
     match value {
         Value::Object(map) => {
+            let sibling_type = map.get("type").and_then(Value::as_str).map(str::to_owned);
             for (key, v) in map.iter_mut() {
-                if is_denylisted_key(key) {
+                if is_denylisted_key(key)
+                    || is_wep_keys_field(key, parent_key, sibling_type.as_deref())
+                {
                     *v = redact_leaf(v);
                 } else {
-                    redact(v);
+                    redact_inner(v, Some(key));
                 }
             }
         }
         Value::Array(items) => {
             for item in items.iter_mut() {
-                redact(item);
+                redact_inner(item, parent_key);
             }
         }
         Value::String(s) => {
@@ -174,6 +184,108 @@ mod tests {
         let original = v.clone();
         redact(&mut v);
         assert_eq!(v, original);
+    }
+
+    /// MEC-711: `bgp_config`/`switch_bgp_config`/`vrrp_group` shaped BGP MD5
+    /// auth keys, reachable via get/list_mist_wan_config and
+    /// plan_mist_change, must be redacted under any common spelling.
+    #[test]
+    fn mec_711_bgp_auth_key_is_redacted() {
+        let mut v = json!({
+            "bgp_config": {"neighbors": [{"neighbor": "192.0.2.1", "auth_key": "QWZXbgpmd5001"}]}
+        });
+        redact(&mut v);
+        let s = v.to_string();
+        assert!(!s.contains("QWZXbgpmd5001"), "got: {s}");
+    }
+
+    /// MEC-711: `ospf_areas_network.auth_keys` is a map of key-id to key
+    /// material, reachable via invoke_mist_read on site_setting,
+    /// network_template, and switch profiles.
+    #[test]
+    fn mec_711_ospf_auth_keys_map_is_redacted() {
+        let mut v = json!({
+            "ospf_areas_network": {"auth_keys": {"1": "QWZXospfmd5002", "2": "QWZXospfmd5003"}}
+        });
+        redact(&mut v);
+        let s = v.to_string();
+        assert!(
+            !s.contains("QWZXospfmd5002") && !s.contains("QWZXospfmd5003"),
+            "got: {s}"
+        );
+    }
+
+    /// MEC-711: RADIUS `keywrap_kek`/`keywrap_mack` on
+    /// `radius_auth_server`/`radius_acct_server`/`mxcluster_radsec_auth_server`,
+    /// reachable via list_mist_wlans (`wlan.auth_servers[]`) and
+    /// invoke_mist_read.
+    #[test]
+    fn mec_711_radius_keywrap_kek_and_mack_are_redacted() {
+        let mut v = json!({
+            "wlan": {"auth_servers": [{"host": "10.0.0.1", "keywrap_kek": "QWZXkek004", "keywrap_mack": "QWZXmack005"}]}
+        });
+        redact(&mut v);
+        let s = v.to_string();
+        assert!(
+            !s.contains("QWZXkek004") && !s.contains("QWZXmack005"),
+            "got: {s}"
+        );
+    }
+
+    /// MEC-711: `wlan_auth.keys` (WEP key table), reachable via
+    /// list_mist_wlans. A bare "keys" field is not in the substring
+    /// denylist (it would over-match everywhere), so this relies on the
+    /// context rule: sibling `type: "wep"` on the same `auth` object.
+    #[test]
+    fn mec_711_wep_keys_under_sibling_type_wep_are_redacted() {
+        let mut v = json!({
+            "wlan": {"auth": {"type": "wep", "keys": {"0": "QWZXwep006", "1": "QWZXwep007"}}}
+        });
+        redact(&mut v);
+        let s = v.to_string();
+        assert!(
+            !s.contains("QWZXwep006") && !s.contains("QWZXwep007"),
+            "got: {s}"
+        );
+    }
+
+    /// MEC-711: the same WEP `keys` table also matches under the "parent key
+    /// is auth" half of the context rule, independent of a sibling `type`.
+    #[test]
+    fn mec_711_keys_nested_directly_under_auth_are_redacted() {
+        let mut v = json!({"auth": {"keys": ["QWZXwep008"]}});
+        redact(&mut v);
+        let s = v.to_string();
+        assert!(!s.contains("QWZXwep008"), "got: {s}");
+    }
+
+    /// MEC-711 (over-redaction guard): a "keys" field with neither a
+    /// sibling `type: "wep"` nor an "auth" parent must survive untouched —
+    /// the context rule must not degrade into a bare substring match.
+    #[test]
+    fn mec_711_unrelated_keys_field_is_not_redacted() {
+        let mut v = json!({"ssh": {"keys": ["k1", "k2"]}});
+        redact(&mut v);
+        assert_eq!(v["ssh"]["keys"][0], "k1");
+        assert_eq!(v["ssh"]["keys"][1], "k2");
+    }
+
+    /// MEC-711: low-confidence secret fields (`partner_key`, `account_key`,
+    /// `ldap_client_key`, `openroaming_wba_client_key`) from
+    /// account_zscaler_config/map_micello/sso schemas.
+    #[test]
+    fn mec_711_low_confidence_secret_fields_are_redacted() {
+        let mut v = json!({
+            "partner_key": "QWZX009",
+            "account_key": "QWZX010",
+            "ldap_client_key": "QWZX011",
+            "openroaming_wba_client_key": "QWZX012"
+        });
+        redact(&mut v);
+        let s = v.to_string();
+        for secret in ["QWZX009", "QWZX010", "QWZX011", "QWZX012"] {
+            assert!(!s.contains(secret), "got: {s}");
+        }
     }
 
     /// N5: a single-line `k=v` secret embedded in an ordinary log/event
