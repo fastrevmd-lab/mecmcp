@@ -1,0 +1,68 @@
+name: Reusable / sign release tarball
+
+# Shared keyless-cosign signing for a tarball release asset, called via
+# `workflow_call` from a vendor repo's own `release: published` workflow.
+#
+# Extracted from rustjunosmcp's release-sign-tarball.yml (MEC-49) so the
+# sequence is defined once instead of re-implemented per repo (MEC-514).
+# See docs/RELEASE-WORKFLOWS.md in this repo for how to call it.
+#
+# The calling job MUST grant these permissions itself -- a reusable
+# workflow's permissions can only be narrowed by the caller, never widened:
+#   permissions:
+#     contents: write   # to upload the signature bundle back to the release
+#     id-token: write   # required for keyless cosign signing
+
+on:
+  workflow_call:
+    inputs:
+      asset-pattern:
+        description: 'Glob (relative to the download dir) matching the release asset(s) to sign.'
+        required: false
+        type: string
+        default: '*.tar.gz'
+      tag:
+        description: 'Release tag to download assets from and upload signatures to. Defaults to the tag that published the triggering release.'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  sign-tarball:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+          PATTERN: ${{ inputs.asset-pattern }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$REPO" --pattern "$PATTERN"
+          shopt -s nullglob
+          assets=($PATTERN)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No asset matching '$PATTERN' found on release $TAG; nothing to sign." >&2
+            exit 1
+          fi
+
+      - name: Sign assets (keyless)
+        env:
+          PATTERN: ${{ inputs.asset-pattern }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in $PATTERN; do
+            cosign sign-blob --yes --bundle "${f}.cosign.bundle" "$f"
+          done
+
+      - name: Upload signature bundles to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: gh release upload "$TAG" --repo "$REPO" *.cosign.bundle
