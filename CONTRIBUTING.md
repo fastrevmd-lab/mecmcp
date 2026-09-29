@@ -43,10 +43,11 @@ The workspace forbids `unsafe_code`, warns on `missing_docs`, and in Clippy deni
 Before opening a PR, also run what CI's `security.yml` runs:
 
 ```sh
-cargo generate-lockfile   # Cargo.lock is gitignored; audit/deny need one to scan
 cargo audit
-cargo deny check licenses bans sources
+cargo deny check advisories licenses bans sources
 ```
+
+`security.yml` also generates and validates a CycloneDX SBOM per workspace crate (`cargo cyclonedx --format json --all`, requires `cargo install cargo-cyclonedx --version 0.5.9 --locked`) — a new crate added to the workspace needs no extra step here, the job iterates every `crates/*` member automatically.
 
 ## Downstream impact
 
@@ -55,6 +56,17 @@ Vendor servers (`rustjunosmcp`, `rustpanosmcp`, and others being built on this f
 - Say so explicitly in the PR description, and call out whether it's additive or breaking.
 - If you have access to a consumer checkout, build and run its tests against your branch before asking for review. If you don't, say so in the PR so a reviewer with that access can verify it instead.
 - For a breaking change, match the level of detail README.md's version history uses for past ones (search it for "Upgrading to"): what broke, exactly what a consumer needs to change, and whether a fleet survey found anything actually affected by it.
+
+## Cutting a release
+
+A release is a version-bump PR (search history for "release: v" commits) merged to `main`, followed by a `v<version>` tag pushed at that commit. **The tag must be annotated and signed**, not lightweight:
+
+```sh
+git tag -s v0.25.0 -m "release: v0.25.0"
+git push origin v0.25.0
+```
+
+This requires a GPG or SSH signing key registered to your GitHub account (Settings → SSH and GPG keys) — not a repo secret, and not something CI provisions for you. `.github/workflows/verify-release-tag.yml` runs on every `v*` tag push and fails closed, visibly, if the tag is lightweight or its signature does not verify against a key on the pusher's account (the same check behind the "Verified" badge on a commit or tag in the GitHub UI). It cannot stop the push from landing — GitHub has no pre-push ref protection for tags the way it does for branches — but an unsigned release tag will not go unnoticed.
 
 ## Commit and PR conventions
 

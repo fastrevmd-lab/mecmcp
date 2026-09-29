@@ -11,6 +11,7 @@ pub mod device_log;
 pub mod direct_commit;
 pub mod evidence;
 mod init;
+pub mod otel;
 pub mod recorder;
 mod redact;
 mod schema;
@@ -31,7 +32,10 @@ pub use evidence::{
     ApplyIntentRecord, ApprovalRecord, ChainSegment, ClosedSegment, EvidenceError, EvidenceRecord,
     GENESIS_PREV_HASH, ProposalRecord, ResultReceipt, SegmentArchive, append, close,
 };
-pub use init::{AuditConfig, AuditFileSink, AuditFormat, FileHandle, init_tracing};
+pub use init::{AuditConfig, AuditFileSink, AuditFormat, FileHandle, init_tracing, shutdown_otel};
+#[cfg(feature = "otel")]
+pub use otel::OtelGuard;
+pub use otel::{OtelConfig, OtelError};
 pub use redact::{
     AuditRedaction, FieldTransform, REDACTABLE_FIELDS, RedactError, active, install, render,
 };
@@ -41,5 +45,6 @@ pub use scope::{
 };
 pub use service::{EvidenceConfig, EvidenceService};
 pub use sinks::{
-    DeliveryLedger, DeliveryStatus, ProducedHead, SsdfSink, SsdfSinkConfig, SsdfSinkError,
+    DeliveryLedger, DeliveryReport, DeliveryStatus, ForwardSink, ForwardSinkConfig,
+    ForwardSinkError, ProducedHead, SsdfSink, SsdfSinkConfig, SsdfSinkError,
 };
