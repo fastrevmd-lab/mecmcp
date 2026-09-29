@@ -29,8 +29,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **mecmcp-audit: optional OpenTelemetry trace export, and a generic
+  HTTPS/JSON forward sink for closed evidence segments** (MEC-459). Two
+  independent, off-by-default additions:
+  - `AuditConfig::otel` (`--otel-endpoint`/`--otel-service-name` at the CLI
+    layer) exports spans over OTLP/HTTP when set -- traces only, not
+    metrics: this workspace records metrics through the `metrics` crate, not
+    the OpenTelemetry metrics API, so an OTel meter provider would export on
+    a timer with nothing ever recorded to it. Building the exporter needs
+    `mecmcp-audit`'s new `otel` Cargo feature (~90 extra crates, so it is not
+    a default dependency); setting `AuditConfig::otel` without that feature
+    fails startup loudly rather than silently dropping the export, matching
+    the existing `--audit-log-file` rule (#158). The OTLP client only speaks
+    plain `http://` **to a loopback IP literal** -- a non-loopback host or a
+    hostname (even one that would resolve to loopback) is refused at
+    export-setup time, the same rule `SsdfSinkConfig`/`ForwardSinkConfig`
+    apply to their own endpoints, and for the same reason: this sits outside
+    `AuditRedaction`'s reach, so a plaintext endpoint reachable off-host would
+    leak span attributes and event bodies to anyone on the path. The layer
+    also carries its own filter, defaulting to `info` and overridable only
+    via `MECMCP_OTEL_FILTER` (never `RUST_LOG`, since turning up local
+    debug logging must not also turn up what leaves the host over OTLP), with
+    exporter-client traffic (`opentelemetry*`, `hyper`, `reqwest`, `h2`)
+    always suppressed to avoid an export feedback loop. See
+    `mecmcp-audit::otel` for the full reasoning (decision D4).
+  - `EvidenceConfig::forward_sink` (`--audit-forward-endpoint` and friends)
+    ships the same hash-chained `ClosedSegment` SSDF ships to a second,
+    best-effort destination -- a SIEM, a log collector, an object-lock
+    bucket's HTTP front end. This is not the unchained syslog path
+    `docs/AUDIT-FORWARDING-STANDARD.md` rejected: `prev_hash`/`head_hash`
+    travel with every record, so a receiver can still detect a dropped or
+    altered one. SSDF stays the chain of record; a forward-sink failure is
+    logged and never affects `EvidenceService::delivery_degraded` or
+    `shutdown`'s result. Retry backoff is non-blocking -- a segment not yet
+    due for retry is skipped rather than slept out -- since this sink shares
+    a thread with the SSDF drain loop and an in-line sleep would delay SSDF's
+    own next delivery pass behind it. `EvidenceService::start_with_transports`
+    lets SSDF and the forward sink use independent transports, since the two
+    endpoints are typically different hosts with different trust anchors
+    (`EvidenceArgs::ca_file` vs. `EvidenceArgs::forward_ca_file`);
+    `start_with_transport` (singular) still exists and shares one transport
+    for the cases where that is fine.
+  Both are `None`/off by default, so existing SSDF-only and non-OTel
+  deployments are unaffected.
+  - **Breaking (source, not binary):** `AuditConfig` gained an `otel` field
+    and `EvidenceConfig` gained a `forward_sink` field; neither struct is
+    `#[non_exhaustive]` or `Default`, so any struct literal constructing
+    either needs a new field (`None` preserves prior behavior). A downstream
+    server wiring up `--otel-endpoint` must map it into `AuditConfig::otel`
+    itself -- nothing in this repo does that automatically.
+
+- **redact: `Untrusted<T>` marks device/controller-sourced content before it
+  reaches a model** (MEC-511). Device text (hostnames, descriptions, error
+  bodies) previously flowed into tool output with nothing distinguishing it
+  from operator input or this codebase's own text. `Untrusted::new` wraps a
+  value at the point it's read from a vendor response; `render_tagged`
+  delimits it for inclusion in a tool result, neutralizing any attempt by the
+  content itself to forge a matching closing delimiter.
+  `mecmcp-server::tool_error_with_untrusted_detail` is the new sanctioned
+  entry point for a tool handler's error path, and `mecmcp-changeset`'s
+  device-transaction error formatting (`apply.rs`) is migrated as the
+  reference example.
+
+## [0.24.1] - 2026-09-28
+
+> **Upgrade note.** This patch release changes a default: servers that relied
+> on `LimitsConfig::default()` being unmetered now get per-IP and per-token
+> rate limits (below). Set either pair to `0`/`0` to keep the old behaviour.
+
 ### Changed
 
+- **transport: `LimitsConfig::default()` now rate-limits by default**
+  (MEC-347). Per-IP and per-token rate limits were `0` (disabled) out of the
+  box, so a fresh install ran fully unmetered until an operator opted in.
+  Defaults are now `max_requests_per_second_per_ip: 50` /
+  `max_request_burst_per_ip: 100` and `max_requests_per_second_per_token: 20`
+  / `max_request_burst_per_token: 40`. Set either pair to `0`/`0` to disable
+  that axis, as before.
+
+### Maintenance
+
+- **ci:** the build-test job builds with `--locked` (#396).
+- **transport:** stale comments that described `Cargo.lock` as gitignored
+  are corrected (#395).
+- **hygiene:** canonical shared gitleaks vendor rules added (MEC-30, #388);
+  personal email domain in test fixtures replaced with a synthetic one (#391).
+
+## [0.24.0] - 2026-09-28
+
+### Added
+
+- **transport: `/healthz` and `/readyz`** (MEC-48, mecmcp#377). Both are
+  unauthenticated, always mounted, and return no device or customer data.
+  `/healthz` reports the process is up with no dependency check. `/readyz`
+  runs the consumer-supplied `ReadinessCheck`s registered with
+  `HttpTransportConfig::with_readiness_check` — 200 when all pass (including
+  when none are configured), 503 listing the failed check names otherwise. A
+  probe's failure reason is `&'static str`, not `String`: since `/readyz` is
+  unauthenticated, the type keeps a probe from formatting a runtime value
+  (a path, an I/O error) into the response body — log that detail
+  server-side instead. `mecmcp-transport` ships no checks of its own; each
+  consuming server wires in audit-sink-writable and inventory-loaded checks
+  as a follow-up.
+- **`mecmcp-policy`: fail-closed allowlist mode (MEC-92).** `Policy::new` now takes a `CommandMode` (`Allowlist` or `Blocklist`) that governs the commands and pfe_commands domains; the config domain is unchanged. `Allowlist` is the default and refuses everything until entries are added: entries are literal whitespace-token prefixes (never globs — `*`, `?`, `[` in an entry are a compile-time error via `compile_allowlist_entries`), abbreviations are never expanded, and a piped command needs every `|` stage after the first to match a separate `allowed_pipes` list that defaults to empty. `;`, `>`, `<`, a backtick, or a newline anywhere refuses the command outright. `Blocklist` keeps the pre-MEC-92 fail-open behaviour byte-for-byte, for callers that request it explicitly — nothing in the crate maps an absent mode to `Blocklist`. **Breaking API change:** `Decision` gained a `DenyAllowlist` variant (any exhaustive match on `Decision` needs a new arm), and `Policy::new` takes a `CommandMode` plus `CommandDomain<A>` (blocklist + allowlist bundle) instead of bare `DomainRules<A>` for the commands/pfe_commands parameters. `Decision` is now `#[must_use]` and gained `is_allowed()`, which is true only for `Decision::Allow`; callers must gate on `is_allowed()` or match all three variants exhaustively — matching only `Decision::Deny` and treating everything else as allowed silently lets `DenyAllowlist` refusals through. Library only — no MCP server wires this up yet; that's tracked in the sibling MEC-88 consumer tasks.
+- **mecmcp-audit:** `DirectCommitPolicy`, a shared gate for tools that mutate a device with no change-set approval at all. Off by default: refuses direct-commit tools identically over stdio and HTTP, since the policy is a process-level setting and never reads caller context. When an operator enables it, it logs loudly at startup and tags every use in the `AuditScope` audit trail.
+
+### Changed
+
+- **transport: `/metrics` defaults to loopback-only** (MEC-48, mecmcp#377).
+  **Behaviour change:** a peer that is not `127.0.0.1`/`::1` now gets a 403
+  from `/metrics`, regardless of any MCP bearer token it presents — where
+  previously any peer that passed the Host/Origin allowlist and IP rate limit
+  could reach it. A loopback peer that also carries a request-forwarding
+  header (`Forwarded`, `X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP`) is
+  treated as non-loopback, since a same-host reverse proxy — the deployment
+  shape this project documents for its own servers — otherwise makes every
+  forwarded caller look loopback at the TCP layer. Loopback detection also
+  now canonicalizes the peer address first, so an IPv4-mapped IPv6 address
+  (`::ffff:127.0.0.1`, seen on a dual-stack listener) is recognized as
+  loopback rather than refused. Call the new
+  `HttpTransportConfig::with_metrics_token` to also admit a non-loopback peer
+  presenting a dedicated metrics bearer token (checked independently of the
+  MCP token store, so an MCP token still never grants `/metrics`). See
+  `docs/METRICS.md` for the Prometheus scrape config migration, including the
+  reverse-proxy caveat.
+- **mecmcp-changeset:** `ChangesetCoordinator::approve_change_set` now takes an `approver_actor_type: mecmcp_audit::ActorType` argument and refuses the approval unless it is `Human`. House rule: deterministic code decides, a human approves — an agent or an unattributed caller (`Agent` or `Unknown`, which is what a stdio session with no caller context carries) could always be blocked from *proposing* a change set's own approval by the pre-existing owner check, but nothing stopped it from standing in as the *second* principal. This is a breaking change for every caller of `approve_change_set`.
 - **DOCKER-STANDARD template examples now use mechubsec image names** —
   updated from `ghcr.io/fastrevmd-lab/<binary>` to `ghcr.io/mechubsec/<reponame>`
   to match the org migration.
@@ -38,6 +163,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Raised MSRV to 1.89** and removed the `aes` pin from the CI msrv job that PR #344 added. All six consumer repos are moving to 1.89 in parallel PRs, so the objection that blocked raising the floor in #344 no longer stands.
+- **`mecmcp-transport`: `test_client` and `test_harness` moved behind a `test-util` feature** (mecmcp#387). Neither is part of the crate's default public API anymore, and the `ureq` dependency they pulled in is no longer part of the normal (non-`test-util`) dependency graph. **Breaking change** for any consumer that used them: add `features = ["test-util"]` to the `mecmcp-transport` dev-dependency entry.
+- **`mecmcp-http`: a configured private CA now replaces the public root store instead of adding to it** (mecmcp#387). `extra_root_certificates`, when non-empty, is passed through `tls_certs_only` rather than `tls_certs_merge`/`add_root_certificate`, matching "private CA means private CA only." **Behaviour change** for any deployment that relied on the previous additive semantics (a private CA trusted *alongside* the public roots): to keep public trust, configure no `extra_root_certificates`.
 
 ## [0.23.1] - 2026-09-05
 

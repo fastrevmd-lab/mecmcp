@@ -19,7 +19,7 @@ and is consumed by every vendor server.
 
 Today two servers independently reimplement all of it:
 
-| | [rustjunosmcp](https://github.com/fastrevmd-lab/rustjunosmcp) | [rustpanosmcp](https://github.com/fastrevmd-lab/rustpanosmcp) |
+| | [rustjunosmcp](https://github.com/mechubsec/rustjunosmcp) | [rustpanosmcp](https://github.com/mechubsec/rustpanosmcp) |
 |---|---|---|
 | Vendor | Juniper Junos / SRX | Palo Alto PAN-OS |
 | Device transport | NETCONF over SSH (`rustnetconf`) | HTTPS XML-API (`reqwest`) |
@@ -347,9 +347,11 @@ an exact version.
 > - **Host and Origin validation outside `/mcp`.** `build_rmcp_server_config`
 >   gives rmcp the Host allowlist, but that only guards the service nested at
 >   `/mcp`. The builder additionally layers this crate's own Host/Origin
->   middleware over the *entire* router, which is what stops an attacker-
->   controlled page reading the unauthenticated `/metrics` endpoint with a
->   foreign Host header. That middleware is private and installed only by
+>   middleware over the *entire* router, which is what stops a DNS-rebinding
+>   attacker page — whose request lands on the victim's own loopback
+>   interface and so passes the `/metrics` loopback gate — from reading
+>   `/metrics` with a foreign Host header. That middleware is private and
+>   installed only by
 >   `build_streamable_http_router`. A hand assembly therefore keeps the Host
 >   guard on `/mcp` and loses it everywhere else — and loses Origin checking
 >   entirely, since `build_rmcp_server_config` deliberately empties rmcp's
@@ -701,7 +703,7 @@ asserted. An unchained final hop would discard that guarantee at the point an
 auditor relies on it.
 
 Emission rules are normative today; the sink is tracked in
-[#292](https://github.com/fastrevmd-lab/mecmcp/issues/292). The standard —
+[#292](https://github.com/mechubsec/mecmcp/issues/292). The standard —
 including why the cheaper syslog path was rejected — is in
 [`docs/AUDIT-FORWARDING-STANDARD.md`](docs/AUDIT-FORWARDING-STANDARD.md).
 

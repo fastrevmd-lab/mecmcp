@@ -61,7 +61,7 @@ fn roundtrip_request_id_composition_and_parsing() {
             provider_tier: Tier::Public,
             skills_used: vec![],
         }),
-        on_behalf_of: Some("fastrevmd@gmail.com".into()),
+        on_behalf_of: Some("dev@example.com".into()),
         change_ref: None,
         request_id: known_request_id,
         token_verified_fields: TokenVerifiedFields::none(),

@@ -35,6 +35,12 @@ use std::env;
 use std::path::Path;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+mod auth_readiness;
+mod lifetime;
+
+pub use auth_readiness::AuthFailureTracker;
+pub use lifetime::{CredentialLifetime, CredentialRegistry};
+
 /// An outbound credential. Zeroized on drop.
 ///
 /// Implements neither `Debug`, `Display`, nor `Serialize`, so it cannot be
@@ -401,7 +407,51 @@ fn load_from_file_inner(path: &Path, limits: SecretLimits) -> Result<OutboundSec
             max_bytes: limits.max_bytes,
         },
     )?;
+    secret_from_bytes(path, bytes)
+}
 
+/// Load a secret from a file exactly as [`load_from_file`] does, and also
+/// return a [`CredentialLifetime`] stamped with the file's mtime.
+///
+/// The mtime is read from the same `fstat` call used to validate the file,
+/// so this makes no additional syscall and opens no TOCTOU window beyond
+/// what [`load_from_file`] already has. It is the best available proxy for
+/// "when was this credential last rotated": mechub cannot know when the
+/// value inside the file last changed, only when the file's contents were
+/// last written, which is what a `chmod`/`chown`-free rotation (write a new
+/// value, keep the same path) produces.
+///
+/// # Errors
+/// Returns [`SecretError`] under the same conditions as [`load_from_file`].
+///
+/// # Examples
+/// ```no_run
+/// use mecmcp_secret::{load_from_file_tracked, SecretLimits};
+/// use std::path::Path;
+///
+/// let (secret, lifetime) =
+///     load_from_file_tracked(Path::new("/etc/my-app/token"), SecretLimits::default())?;
+/// println!("credential age: {:?}", lifetime.age());
+/// # Ok::<(), mecmcp_secret::SecretError>(())
+/// ```
+pub fn load_from_file_tracked(
+    path: &Path,
+    limits: SecretLimits,
+) -> Result<(OutboundSecret, CredentialLifetime), SecretError> {
+    let (bytes, mtime) = read_hardened_file_with_mtime_inner(
+        path,
+        FileLimits {
+            max_bytes: limits.max_bytes,
+        },
+    )?;
+    let secret = secret_from_bytes(path, bytes)?;
+    Ok((secret, CredentialLifetime::new(mtime)))
+}
+
+/// Convert hardened file bytes into a validated [`OutboundSecret`]: UTF-8,
+/// trailing-newline stripping, empty rejection. Shared by [`load_from_file_inner`]
+/// and [`load_from_file_tracked`] so the two loaders cannot drift.
+fn secret_from_bytes(path: &Path, bytes: SecretBytes) -> Result<OutboundSecret, SecretError> {
     // Convert to String, zeroizing the bytes on error
     let mut value = match String::from_utf8(bytes.expose().to_vec()) {
         Ok(text) => text,
@@ -437,6 +487,17 @@ fn load_from_file_inner(path: &Path, limits: SecretLimits) -> Result<OutboundSec
 /// Hardened read: open once with `O_NOFOLLOW`, validate the descriptor, read
 /// from that same descriptor.
 fn read_hardened_file_inner(path: &Path, limits: FileLimits) -> Result<SecretBytes, SecretError> {
+    read_hardened_file_with_mtime_inner(path, limits).map(|(bytes, _mtime)| bytes)
+}
+
+/// As [`read_hardened_file_inner`], but also returns the file's mtime from
+/// the same `fstat` call — TOCTOU-safe, unlike a second `stat()` on the path
+/// after the fact. Used by [`load_from_file_tracked`] to derive
+/// [`CredentialLifetime`] without opening the file twice.
+fn read_hardened_file_with_mtime_inner(
+    path: &Path,
+    limits: FileLimits,
+) -> Result<(SecretBytes, std::time::SystemTime), SecretError> {
     use rustix::fs::{Mode, OFlags, fstat, open};
     use rustix::io::Errno;
     use std::io::Read;
@@ -552,7 +613,19 @@ fn read_hardened_file_inner(path: &Path, limits: FileLimits) -> Result<SecretByt
         });
     }
 
-    Ok(SecretBytes(std::mem::take(&mut bytes)))
+    // Derived from the same `fstat` call above, not a fresh `stat()` on the
+    // path: a second lookup would reopen the TOCTOU window this function
+    // exists to close. Clamped to the epoch rather than erroring on a
+    // pre-1970 or malformed timestamp — an implausible mtime is not a reason
+    // to fail a credential read, only to report a lifetime of "since the
+    // epoch".
+    let mtime = std::time::UNIX_EPOCH
+        + std::time::Duration::new(
+            u64::try_from(stat.st_mtime).unwrap_or(0),
+            u32::try_from(stat.st_mtime_nsec).unwrap_or(0),
+        );
+
+    Ok((SecretBytes(std::mem::take(&mut bytes)), mtime))
 }
 
 #[cfg(test)]
@@ -661,6 +734,45 @@ mod tests {
             err.to_string()
                 .contains("MECMCP_SECRET_TEST_NONEXISTENT_VAR_12345")
         );
+    }
+
+    #[test]
+    fn load_from_file_tracked_returns_the_same_secret_as_load_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_secret_file(&dir, "tracked-secret");
+
+        let (secret, lifetime) = load_from_file_tracked(&path, SecretLimits::default()).unwrap();
+        assert_eq!(secret.expose(), "tracked-secret");
+        // Freshly written file: age must be small, not garbage.
+        assert!(lifetime.age() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn load_from_file_tracked_lifetime_reflects_the_files_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_secret_file(&dir, "tracked-secret");
+
+        let expected_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let (_secret, lifetime) = load_from_file_tracked(&path, SecretLimits::default()).unwrap();
+
+        let delta = lifetime
+            .issued_at()
+            .duration_since(expected_mtime)
+            .or_else(|_| expected_mtime.duration_since(lifetime.issued_at()))
+            .unwrap();
+        assert!(delta < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn load_from_file_tracked_rejects_whitespace_only_file_like_load_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_secret_file(&dir, "   \n");
+
+        let result = load_from_file_tracked(&path, SecretLimits::default());
+        let Err(err) = result else {
+            panic!("expected error, got Ok");
+        };
+        assert!(matches!(err, SecretError::FileEmpty { .. }));
     }
 
     #[test]

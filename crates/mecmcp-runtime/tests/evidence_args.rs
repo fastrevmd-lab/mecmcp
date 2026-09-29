@@ -84,8 +84,8 @@ fn a_configured_endpoint_produces_a_pipeline_config() {
     // Trailing newline stripped: a password file written with an editor ends
     // in one, and sending it would fail auth in a way that reads like a wrong
     // password rather than a stray byte.
-    assert_eq!(config.sink.password, "write-secret");
-    assert_eq!(config.sink.verify_password, "verify-secret");
+    assert_eq!(config.sink.password.expose(), "write-secret");
+    assert_eq!(config.sink.verify_password.expose(), "verify-secret");
     assert!(
         !config.run_id.is_empty() && config.run_id != config.server_id,
         "each process lifetime needs its own run id: {config:?}"
@@ -275,7 +275,7 @@ fn only_one_line_ending_is_stripped_from_a_password() {
     .unwrap()
     .expect("configured");
 
-    assert_eq!(config.sink.password, "trailing space ");
+    assert_eq!(config.sink.password.expose(), "trailing space ");
 }
 
 /// An empty credential file is a configuration error, not an empty password.
@@ -451,5 +451,203 @@ fn an_https_endpoint_without_a_ca_is_refused() {
         !text.contains("ProtectSystem"),
         "the CA refusal must not carry the spool-path rationale, which is about \
          a different flag entirely: {text}"
+    );
+}
+
+/// A plaintext endpoint to a non-loopback host is refused at configuration
+/// time, matching the refusal `split_endpoint` already applies on every send.
+///
+/// Catching it here fails the server at startup. Leaving it to the transport
+/// alone means the server starts, spools every segment to the outbox, and
+/// fails every delivery attempt forever — which reads as an outage, not as
+/// the misconfiguration it is.
+#[test]
+fn a_plaintext_endpoint_to_a_non_loopback_host_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = secret(dir.path(), "w", "write-secret");
+    let verify = secret(dir.path(), "v", "verify-secret");
+
+    let error = parse(&[
+        "--ssdf-audit-endpoint",
+        "http://192.0.2.40:8123",
+        "--ssdf-audit-server-id",
+        "junos-950",
+        "--ssdf-audit-password-file",
+        write.to_str().unwrap(),
+        "--ssdf-audit-verify-password-file",
+        verify.to_str().unwrap(),
+        "--ssdf-audit-outbox",
+        dir.path().join("outbox").to_str().unwrap(),
+        "--ssdf-audit-ledger",
+        dir.path().join("ledger").to_str().unwrap(),
+    ])
+    .into_config()
+    .expect_err("http:// to a non-loopback host must be refused");
+    assert!(
+        format!("{error}").contains("loopback"),
+        "the error must say why: {error}"
+    );
+}
+
+/// A plaintext endpoint to loopback is accepted: the traffic never leaves the
+/// host, so there is nothing for the loopback-only rule to refuse.
+#[test]
+fn a_plaintext_endpoint_to_loopback_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = secret(dir.path(), "w", "write-secret");
+    let verify = secret(dir.path(), "v", "verify-secret");
+
+    let config = parse(&[
+        "--ssdf-audit-endpoint",
+        "http://127.0.0.1:8123",
+        "--ssdf-audit-server-id",
+        "junos-950",
+        "--ssdf-audit-password-file",
+        write.to_str().unwrap(),
+        "--ssdf-audit-verify-password-file",
+        verify.to_str().unwrap(),
+        "--ssdf-audit-outbox",
+        dir.path().join("outbox").to_str().unwrap(),
+        "--ssdf-audit-ledger",
+        dir.path().join("ledger").to_str().unwrap(),
+    ])
+    .into_config()
+    .unwrap();
+
+    assert!(
+        config.is_some(),
+        "a loopback http:// endpoint must be accepted"
+    );
+}
+
+/// The base SSDF flag set an assortment of these tests reuse for the forward
+/// sink's own tests, so each one only has to add the `--audit-forward-*` bits
+/// under test.
+fn base_ssdf_args(dir: &std::path::Path) -> Vec<String> {
+    let write = secret(dir, "w", "write-secret");
+    let verify = secret(dir, "v", "verify-secret");
+    vec![
+        "--ssdf-audit-endpoint".to_string(),
+        "http://127.0.0.1:8123".to_string(),
+        "--ssdf-audit-server-id".to_string(),
+        "junos-950".to_string(),
+        "--ssdf-audit-password-file".to_string(),
+        write.to_str().unwrap().to_string(),
+        "--ssdf-audit-verify-password-file".to_string(),
+        verify.to_str().unwrap().to_string(),
+        "--ssdf-audit-outbox".to_string(),
+        dir.join("outbox").to_str().unwrap().to_string(),
+        "--ssdf-audit-ledger".to_string(),
+        dir.join("ledger").to_str().unwrap().to_string(),
+    ]
+}
+
+/// Absent `--audit-forward-endpoint` means no forward sink, same as the
+/// pipeline behaved before this flag existed.
+#[test]
+fn no_forward_endpoint_means_no_forward_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = base_ssdf_args(dir.path());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let config = parse(&args).into_config().unwrap().unwrap();
+    assert!(config.forward_sink.is_none());
+}
+
+/// `--audit-forward-endpoint` alone, without `--ssdf-audit-endpoint`, must be
+/// refused rather than silently produce no pipeline at all -- the forward
+/// sink rides on the SSDF pipeline's recorder and chain identity, and an
+/// operator who asked for it and got nothing has no signal anything is wrong.
+#[test]
+fn forward_endpoint_without_ssdf_endpoint_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let error = parse(&[
+        "--audit-forward-endpoint",
+        "https://collector.example/audit",
+        "--audit-forward-outbox",
+        dir.path().join("fwd-outbox").to_str().unwrap(),
+        "--audit-forward-ledger",
+        dir.path().join("fwd-ledger").to_str().unwrap(),
+    ])
+    .into_config()
+    .expect_err("a forward endpoint with no SSDF endpoint must be refused");
+    assert!(
+        format!("{error}").contains("--ssdf-audit-endpoint"),
+        "the error must say why: {error}"
+    );
+}
+
+/// The full forward flag set, alongside SSDF, produces a usable forward-sink
+/// config with the bearer token loaded from its file.
+#[test]
+fn a_configured_forward_endpoint_produces_a_forward_sink_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut args = base_ssdf_args(dir.path());
+    let token = secret(dir.path(), "token", "s3cret-token");
+    args.extend([
+        "--audit-forward-endpoint".to_string(),
+        "https://collector.example/audit".to_string(),
+        "--audit-forward-token-file".to_string(),
+        token.to_str().unwrap().to_string(),
+        "--audit-forward-outbox".to_string(),
+        dir.path().join("fwd-outbox").to_str().unwrap().to_string(),
+        "--audit-forward-ledger".to_string(),
+        dir.path().join("fwd-ledger").to_str().unwrap().to_string(),
+    ]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    let config = parse(&args).into_config().unwrap().unwrap();
+    let forward = config
+        .forward_sink
+        .expect("a forward endpoint was configured");
+    assert_eq!(forward.endpoint, "https://collector.example/audit");
+    assert_eq!(
+        forward.bearer_token.map(|t| t.expose().to_string()),
+        Some("s3cret-token".to_string())
+    );
+}
+
+/// A forward endpoint with no bearer token is accepted: some collectors
+/// authenticate at the network layer instead.
+#[test]
+fn a_forward_endpoint_with_no_token_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut args = base_ssdf_args(dir.path());
+    args.extend([
+        "--audit-forward-endpoint".to_string(),
+        "http://127.0.0.1:9090/audit".to_string(),
+        "--audit-forward-outbox".to_string(),
+        dir.path().join("fwd-outbox").to_str().unwrap().to_string(),
+        "--audit-forward-ledger".to_string(),
+        dir.path().join("fwd-ledger").to_str().unwrap().to_string(),
+    ]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    let config = parse(&args).into_config().unwrap().unwrap();
+    let forward = config
+        .forward_sink
+        .expect("a forward endpoint was configured");
+    assert!(forward.bearer_token.is_none());
+}
+
+/// A forward endpoint without its outbox path is refused, same as SSDF's own
+/// `--ssdf-audit-outbox` requirement.
+#[test]
+fn a_forward_endpoint_without_an_outbox_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut args = base_ssdf_args(dir.path());
+    args.extend([
+        "--audit-forward-endpoint".to_string(),
+        "https://collector.example/audit".to_string(),
+        "--audit-forward-ledger".to_string(),
+        dir.path().join("fwd-ledger").to_str().unwrap().to_string(),
+    ]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    let error = parse(&args)
+        .into_config()
+        .expect_err("a forward endpoint with no outbox path must be refused");
+    assert!(
+        format!("{error}").contains("--audit-forward-outbox"),
+        "the error must name the missing flag: {error}"
     );
 }

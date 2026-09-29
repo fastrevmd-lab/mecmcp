@@ -162,7 +162,11 @@ async fn expiring_a_change_set_is_persisted_and_visible() {
         "the stale record must be transitioned, not just skipped"
     );
 
-    // And it survived a reload, so the file agrees with memory.
+    // And it survived a reload, so the file agrees with memory. Drop the
+    // first coordinator first: it holds the state file's single-writer lock
+    // for its whole lifetime (MEC-540), which this reload would otherwise
+    // be refused against.
+    drop(coordinator);
     let reloaded = load_coordinator(&dir);
     let after = reloaded.change_sets().await;
     let persisted = after.iter().find(|c| c.id == stale_id).expect("persisted");
@@ -334,7 +338,11 @@ async fn a_sweep_survives_a_refused_insert() {
         .await
         .unwrap_err();
 
-    // Reload from the file, which is what a restart sees.
+    // Reload from the file, which is what a restart sees. Drop the first
+    // coordinator first: it holds the state file's single-writer lock for
+    // its whole lifetime (MEC-540), which this reload would otherwise be
+    // refused against.
+    drop(coordinator);
     let restarted = load_coordinator(&dir);
     let states = restarted.change_sets().await;
     let stale = states

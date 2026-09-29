@@ -1,0 +1,81 @@
+[package]
+name = "mecmcp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Its own workspace root on purpose, matching rustnetconf/fuzz: this crate
+# needs nightly and a sanitizer, and joining the parent workspace would make
+# `cargo build --workspace` / CI depend on both.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+async-trait = "0.1"
+libfuzzer-sys = "0.4"
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
+
+# Same backend choice as mecmcp-oidc itself (see that crate's Cargo.toml):
+# aws_lc_rs, never the rust_crypto feature, because that pulls in the
+# RustCrypto `rsa` crate and RUSTSEC-2023-0071.
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+
+[dependencies.mecmcp-oidc]
+path = "../crates/mecmcp-oidc"
+
+[dependencies.mecmcp-redact]
+path = "../crates/mecmcp-redact"
+
+# Only used to mint the one fixed signing key the token-verification target
+# signs nothing else with. Never used outside the fuzz target, and no key it
+# produces is ever persisted -- same rationale as mecmcp-oidc's own dev-deps.
+[dependencies.aws-lc-rs]
+version = "1"
+
+[dependencies.pem]
+version = "4"
+
+[[bin]]
+name = "oidc_token_verify_never_panics"
+path = "fuzz_targets/oidc_token_verify_never_panics.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "oidc_jwks_parse_is_total"
+path = "fuzz_targets/oidc_jwks_parse_is_total.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "oidc_discovery_parse_is_total"
+path = "fuzz_targets/oidc_discovery_parse_is_total.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_text_never_panics"
+path = "fuzz_targets/redact_text_never_panics.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_json_never_panics"
+path = "fuzz_targets/redact_json_never_panics.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_xml_never_panics"
+path = "fuzz_targets/redact_xml_never_panics.rs"
+test = false
+doc = false
+bench = false

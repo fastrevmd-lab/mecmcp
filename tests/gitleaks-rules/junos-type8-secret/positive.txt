@@ -1,0 +1,1 @@
+master-password "$8$aes256-gcm$hmac-sha2-256$100$xQ7mPz2LkT9vRjWnB4Yc8HuFdEa6oIu3";  // gitleaks:allow

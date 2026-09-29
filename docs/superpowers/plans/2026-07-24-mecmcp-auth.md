@@ -69,7 +69,7 @@ version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.88"
 license      = "MIT"
-repository   = "https://github.com/fastrevmd-lab/mecmcp"
+repository   = "https://github.com/mechubsec/mecmcp"
 authors      = ["fastrevmd-lab"]
 
 [workspace.dependencies]
@@ -2207,7 +2207,7 @@ the crate adopted, and its test suite is the shorter feedback loop.
 
 ```toml
 # ~/Projects/rust-panosmcp/Cargo.toml, in [workspace.dependencies]
-mecmcp-auth = { git = "https://github.com/fastrevmd-lab/mecmcp", tag = "auth-v0.1.0" }
+mecmcp-auth = { git = "https://github.com/mechubsec/mecmcp", tag = "auth-v0.1.0" }
 ```
 
 ```toml
@@ -2343,7 +2343,7 @@ git commit -m "refactor(auth): consume mecmcp-auth for tokens, scopes, and store
 
 ```toml
 # ~/Projects/RustJunosMCP/Cargo.toml, in [workspace.dependencies]
-mecmcp-auth = { git = "https://github.com/fastrevmd-lab/mecmcp", tag = "auth-v0.1.0" }
+mecmcp-auth = { git = "https://github.com/mechubsec/mecmcp", tag = "auth-v0.1.0" }
 ```
 
 ```rust

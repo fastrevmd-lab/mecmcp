@@ -516,23 +516,33 @@ fn verify_run(
         // Verify signatures
         if let Some(pubkey) = pubkeys.get(&server_manifest.server_id) {
             for segment in segments {
-                // Load signature file
-                let sig_file = chains_dir.join(format!(
-                    "{}_seg{}.sig",
-                    server_manifest.server_id, segment.segment_seq
-                ));
+                // The evidence pipeline now signs every segment automatically
+                // as it closes (MEC-457), embedding the signature in the
+                // segment record itself rather than requiring a separate
+                // manual export step. Prefer that embedded signature; fall
+                // back to a detached `<server>_seg<N>.sig` file for chains
+                // produced before this or by an out-of-band export.
+                let sig_b64 = if let Some(embedded) = &segment.signature {
+                    embedded.clone()
+                } else {
+                    let sig_file = chains_dir.join(format!(
+                        "{}_seg{}.sig",
+                        server_manifest.server_id, segment.segment_seq
+                    ));
 
-                if !sig_file.exists() {
-                    violations.push(Violation::SignatureVerificationFailed {
-                        server_id: server_manifest.server_id.clone(),
-                        segment_seq: segment.segment_seq,
-                        pubkey_name: server_manifest.server_id.clone(),
-                        error: "Signature file not found".to_string(),
-                    });
-                    continue;
-                }
+                    if !sig_file.exists() {
+                        violations.push(Violation::SignatureVerificationFailed {
+                            server_id: server_manifest.server_id.clone(),
+                            segment_seq: segment.segment_seq,
+                            pubkey_name: server_manifest.server_id.clone(),
+                            error: "Signature file not found".to_string(),
+                        });
+                        continue;
+                    }
 
-                let sig_b64 = std::fs::read_to_string(&sig_file)?.trim().to_string();
+                    std::fs::read_to_string(&sig_file)?.trim().to_string()
+                };
+
                 match decode_signature(&sig_b64) {
                     Ok(signature) => {
                         if let Err(e) = verify_head(segment, &signature, pubkey) {

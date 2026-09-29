@@ -28,7 +28,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        # dtolnay/rust-toolchain has no version tags; the channel name *is*
+        # the ref, so pinning to a SHA freezes the stable toolchain this job
+        # tests against rather than tracking whatever is newest. That is the
+        # point (an unpinned branch ref is a supply-chain floater like any
+        # other), but it means this SHA needs a deliberate bump now and then
+        # -- check https://github.com/dtolnay/rust-toolchain/tree/stable for
+        # the current head and re-pin periodically.
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09
         with:
           components: clippy, rustfmt
 
@@ -36,10 +43,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Build workspace
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
       - name: Run tests
         # `test-util` on both crates, or the tests behind it are silently not
@@ -47,10 +54,10 @@ jobs:
         # offer -- seeding a change set in a state only the lifecycle can
         # produce, and installing a tracing subscriber per thread -- and a gate
         # that CI does not open is a test that does not exist.
-        run: cargo test --workspace --features mecmcp-audit/test-util,mecmcp-changeset/test-util
+        run: cargo test --workspace --locked --features mecmcp-audit/test-util,mecmcp-changeset/test-util,mecmcp-transport/test-util
 
       - name: Build documentation
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --locked
 
   msrv:
     # mecmcp-auth is a library consumed by two binaries, so an accidental MSRV
@@ -70,16 +77,18 @@ jobs:
         run: rm -f rust-toolchain.toml
 
       - name: Install Rust 1.89
-        uses: dtolnay/rust-toolchain@1.89.0
+        uses: dtolnay/rust-toolchain@b4f984c1e7daae8e175614de3e73a8411a20333c # 1.89.0
 
-      # `Cargo.lock` is gitignored here, so this job resolves fresh on every run
-      # and takes whatever the registry currently offers. That is what makes it
-      # useful -- it catches a dependency raising its floor -- and also what
-      # lets an unrelated release turn every open PR red with no commit behind
-      # it. If a future dependency raises its floor above ours, pin it here
+      # `Cargo.lock` is committed for the other jobs, but this one deletes it and
+      # resolves fresh so it takes whatever the registry currently offers. That is
+      # what makes it useful -- it catches a dependency raising its floor -- and
+      # also what lets an unrelated release turn every open PR red with no commit
+      # behind it. If a future dependency raises its floor above ours, pin it here
       # with `cargo update -p <crate> --precise <version>` rather than silently
       # raising the floor, because the floor is a promise the consumer repos
       # depend on.
+      - name: Drop the committed lockfile
+        run: rm -f Cargo.lock
 
       - name: Check workspace at MSRV
         run: cargo check --workspace --all-targets

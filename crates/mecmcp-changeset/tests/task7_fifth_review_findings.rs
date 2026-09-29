@@ -210,7 +210,7 @@ fn test_attribution(principal: &str) -> Attribution {
             provider_tier: mecmcp_audit::Tier::Public,
             skills_used: vec![],
         }),
-        on_behalf_of: Some("fastrevmd@gmail.com".into()),
+        on_behalf_of: Some("dev@example.com".into()),
         change_ref: Some("CHG0012345".into()),
         request_id: Uuid::new_v4(),
         token_verified_fields: mecmcp_audit::TokenVerifiedFields::none(),
@@ -390,6 +390,7 @@ async fn finding_1_lock_risk_persisted_before_drift_check() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -506,6 +507,7 @@ async fn finding_2_operation_record_write_failure_returns_handle() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -592,6 +594,7 @@ async fn finding_3_staged_converted_to_indeterminate_on_restart() {
             device.clone(),
             approver.to_string(),
             create_output.digest.clone(),
+            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();

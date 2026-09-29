@@ -19,8 +19,14 @@ futures     = "0.3"
 http        = "1"
 http-body   = "1"
 http-body-util = "0.1"
-mecmcp-audit = { version = "0.23.1", path = "../mecmcp-audit" }
-mecmcp-auth = { version = "0.23.1", path = "../mecmcp-auth" }
+# CIDR matching for the trusted-proxy allowlist (which peers may set
+# X-Forwarded-For for per-IP rate limiting). Already in the dependency tree
+# transitively; declared directly because rate_limit.rs parses and matches
+# against it. `serde` feature lets `LimitsConfig` deserialize CIDR strings
+# straight into `IpNet` instead of hand-rolling a `FromStr` wrapper.
+ipnet       = { version = "2", features = ["serde"] }
+mecmcp-audit = { version = "0.24.1", path = "../mecmcp-audit" }
+mecmcp-auth = { version = "0.24.1", path = "../mecmcp-auth" }
 metrics     = { workspace = true }
 # metrics-exporter-prometheus must have default-features = false to avoid
 # pulling in rustls's aws-lc-rs backend via hyper-rustls, which conflicts with
@@ -45,16 +51,37 @@ tokio-util  = { version = "0.7", default-features = false, features = ["rt"] }
 tower-http  = { version = "0.7", features = ["limit"] }
 tracing     = { workspace = true }
 # HTTP client for test_client module (issue #184). Consumers use this in their
-# integration tests to validate MCP endpoints.
-ureq        = { version = "3", default-features = false, features = ["json"] }
+# integration tests to validate MCP endpoints. Optional and only pulled in by
+# the `test-util` feature below — a normal `cargo build` must not ship an HTTP
+# client and test scaffolding it never calls.
+ureq        = { version = "3", default-features = false, features = ["json"], optional = true }
 zeroize     = "1"
+
+[features]
+# Gates `test_client` and `test_harness` (and the `ureq` dependency they need).
+# A consumer's integration tests enable this in their own `[dev-dependencies]`
+# entry for this crate; it must never be on for the normal dependency, or a
+# release build ships the test client and the loopback-serving harness.
+test-util = ["dep:ureq"]
+
+# `router_integration.rs` drives the router through `test_client::McpClient`,
+# which only exists behind `test-util`.
+[[test]]
+name = "router_integration"
+required-features = ["test-util"]
 
 [dev-dependencies]
 # Test-only: `test-util` exposes audit capture helpers. It must NOT be enabled
 # on the normal dependency above — that ships test scaffolding in production
 # binaries and widens the attack surface for no runtime benefit. Cargo unifies
 # features per build, so `cargo test` gets it and `cargo build` does not.
-mecmcp-audit = { version = "0.23.1", path = "../mecmcp-audit", features = ["test-util"] }
+mecmcp-audit = { version = "0.24.1", path = "../mecmcp-audit", features = ["test-util"] }
+# Test-only: proves that `mecmcp-secret`'s `AuthFailureTracker::probe` — built
+# with no dependency on this crate, by closure shape alone — actually flips
+# `/readyz` when registered as a `ReadinessCheck`. Not a normal dependency:
+# `mecmcp-transport` must not depend on `mecmcp-secret` for anything but this
+# integration test (MEC-539).
+mecmcp-secret = { version = "0.24.1", path = "../mecmcp-secret" }
 # Test-only: rmcp's `EventStore` is an `#[async_trait]` trait, so the fake store
 # that proves `LimitedSessionManager` forwards `event_store()` needs the macro.
 async-trait = { workspace = true }
@@ -71,7 +98,11 @@ rustls      = { version = "0.23", default-features = false, features = ["ring"] 
 tempfile    = "3"
 # Test-only: CallerCtx carries a per-request correlation ID (mecmcp#269).
 uuid        = { workspace = true }
-tokio       = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+tokio       = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }
+# Test-only: drives a real client/server TLS handshake so the mTLS test proves
+# rustls actually rejects a clientless handshake, not just that `load_with_client_auth`
+# builds a `ServerConfig` without error.
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
 tower       = { version = "0.5", features = ["util"] }
 # Test-only: guards that the pre-0.9.0 constructors, which allowed an
 # unauthenticated config with no recorded decision, stay removed (mecmcp#273).

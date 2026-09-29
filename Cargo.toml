@@ -1,13 +1,13 @@
 [workspace]
-members  = ["crates/mecmcp-auth", "crates/mecmcp-audit", "crates/mecmcp-changeset", "crates/mecmcp-scp", "crates/mecmcp-transport", "crates/mecmcp-runtime", "crates/mecmcp-policy", "crates/mecmcp-inventory", "crates/mecmcp-device", "crates/mecmcp-secret", "crates/mecmcp-http", "crates/mecmcp-job", "crates/mecmcp-openapi", "crates/mecmcp-server"]
+members  = ["crates/mecmcp-auth", "crates/mecmcp-audit", "crates/mecmcp-changeset", "crates/mecmcp-scp", "crates/mecmcp-transport", "crates/mecmcp-runtime", "crates/mecmcp-policy", "crates/mecmcp-inventory", "crates/mecmcp-device", "crates/mecmcp-secret", "crates/mecmcp-http", "crates/mecmcp-job", "crates/mecmcp-openapi", "crates/mecmcp-oidc", "crates/mecmcp-redact", "crates/mecmcp-server"]
 resolver = "2"
 
 [workspace.package]
-version      = "0.23.1"
+version      = "0.24.1"
 edition      = "2024"
 rust-version = "1.89"
 license      = "MIT"
-repository   = "https://github.com/fastrevmd-lab/mecmcp"
+repository   = "https://github.com/mechubsec/mecmcp"
 authors      = ["fastrevmd-lab"]
 
 [workspace.dependencies]
@@ -21,10 +21,13 @@ globset    = "0.4"
 hmac       = "0.13"
 metrics    = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
+quick-xml  = "0.41"
 # Require russh >=0.63 for two reasons:
 # 1. CVE-2026-68930 mitigation (SSH handshake vulnerability in 0.62.0-0.62.4)
 # 2. PublicKeyOrCertificate API required by the host-key verification handler (added in 0.63)
-# Do not relax the floor — Cargo.lock is gitignored and cannot protect downstream consumers.
+# Do not relax the floor — Cargo.lock is committed, but that only pins already-resolved
+# builds; anyone who runs `cargo update` picks this floor right back up, so the bound here
+# is the real protection.
 russh      = { version = ">=0.63, <0.64", default-features = false, features = ["flate2", "aws-lc-rs"] }
 rustix     = { version = "1", features = ["fs", "process"] }
 serde      = { version = "1", features = ["derive"] }

@@ -23,6 +23,7 @@ use crate::evidence::{
     ApplyIntentRecord, ApprovalRecord, ChainSegment, ClosedSegment, EvidenceRecord, ProposalRecord,
     ResultReceipt, append, close,
 };
+use crate::signing::{SigningKey, encode_signature, sign_head};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
@@ -216,6 +217,16 @@ pub struct EvidenceRecorder {
     /// thread's fsync, only flushes must queue behind each other. Taking
     /// `state` for the duration would serialise recording as well, for no gain.
     flushing: Mutex<()>,
+    /// Signs every segment's head at the moment it closes, when configured.
+    ///
+    /// Optional for the same reason `spool` is: a deployment that has not
+    /// provisioned a signing key keeps producing unsigned segments, rather
+    /// than being blocked on key material it may not have a distribution
+    /// story for yet. When present, [`roll`](Self::roll) is the single place
+    /// every closed segment passes through, so it is the one place signing has
+    /// to happen for it to be automatic rather than a step a caller can forget
+    /// (MEC-457).
+    signing_key: Option<SigningKey>,
 }
 
 struct RecorderState {
@@ -280,6 +291,7 @@ impl EvidenceRecorder {
             config,
             spool: None,
             flushing: Mutex::new(()),
+            signing_key: None,
         }
     }
 
@@ -313,6 +325,50 @@ impl EvidenceRecorder {
     #[must_use]
     pub fn spooling_to(self, sink: std::sync::Arc<crate::SsdfSink>) -> Self {
         self.with_spool(move |segment| spool_outcome(sink.spool(segment)))
+    }
+
+    /// As [`spooling_to`](Self::spooling_to), plus a second, best-effort
+    /// destination for the same segment.
+    ///
+    /// `forward` failures do not affect the return value: SSDF stays the
+    /// chain of record, and this recorder's caller (`apply_intent`) is
+    /// fail-closed on *that* spool, not on a second copy going somewhere
+    /// else. A forward-sink failure is logged and the segment stays in
+    /// *that* sink's own outbox for its own retry -- it does not touch the
+    /// SSDF outbox or ledger at all.
+    #[must_use]
+    pub fn spooling_to_with_forward(
+        self,
+        sink: std::sync::Arc<crate::SsdfSink>,
+        forward: Option<std::sync::Arc<crate::sinks::forward::ForwardSink>>,
+    ) -> Self {
+        self.with_spool(move |segment| {
+            let outcome = spool_outcome(sink.spool(segment.clone()));
+            if let Some(forward) = &forward
+                && let Err(error) = forward.spool(segment)
+            {
+                tracing::warn!(
+                    target: "audit",
+                    %error,
+                    "forward audit sink spool failed; SSDF remains the durable record"
+                );
+            }
+            outcome
+        })
+    }
+
+    /// Sign every segment's head automatically as it closes.
+    ///
+    /// Before this, [`sign_head`] existed only as a function a caller had to
+    /// remember to invoke as a separate step after closing a segment — nothing
+    /// called it outside tests, so a deployed server produced unsigned
+    /// evidence even with a key on disk. This attaches signing to the one
+    /// place every segment closes, `roll`, so a configured key
+    /// signs every segment with no further action (MEC-457).
+    #[must_use]
+    pub fn with_signing_key(mut self, key: SigningKey) -> Self {
+        self.signing_key = Some(key);
+        self
     }
 
     /// A change was proposed.
@@ -650,7 +706,29 @@ impl EvidenceRecorder {
             String::new(),
         );
         let finished = std::mem::replace(&mut state.current, successor);
-        let closed = close(finished).ok()?;
+        let mut closed = close(finished).ok()?;
+        if let Some(key) = &self.signing_key {
+            // `head_hash` is produced by `close` immediately above as
+            // `sha256:<64 lowercase hex>`, the only shape `sign_head` rejects
+            // on -- so failure here is not a reachable input-dependent case,
+            // only a broken invariant. Signing is additive to a segment that
+            // is already valid evidence on its own, so a failure here is
+            // logged and the segment still closes unsigned rather than
+            // dropping evidence the crash-safety this recorder exists for was
+            // meant to preserve.
+            match sign_head(&closed, key) {
+                Ok(signature) => closed.signature = Some(encode_signature(&signature)),
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        server_id = %closed.server_id,
+                        run_id = %closed.run_id,
+                        segment_seq = closed.segment_seq,
+                        "could not sign evidence segment head; segment closes unsigned"
+                    );
+                }
+            }
+        }
         state.prev_head = closed.head_hash.clone();
         state.current.prev_hash = state.prev_head.clone();
         state.next_seq += 1;

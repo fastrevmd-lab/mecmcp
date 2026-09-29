@@ -374,6 +374,52 @@ pub struct EvidenceArgs {
     /// Records per segment before one is closed and spooled.
     #[arg(long, default_value_t = 64)]
     pub ssdf_audit_records_per_segment: usize,
+
+    /// Ed25519 signing key for evidence segments. Must be 0600.
+    ///
+    /// Optional: a deployment that has not provisioned a key produces
+    /// unsigned segments rather than failing to start. When given, every
+    /// segment is signed as it closes with no further operator step
+    /// (MEC-457) -- there is no separate "sign" step to remember or forget.
+    #[arg(long)]
+    pub ssdf_audit_signing_key: Option<PathBuf>,
+
+    /// HTTPS (or loopback HTTP) endpoint for a second, best-effort audit
+    /// destination beyond SSDF -- a SIEM, a log collector, an object-lock
+    /// bucket's HTTP front end. Enables the forward sink.
+    ///
+    /// This ships the same hash-chained [`ClosedSegment`] the SSDF sink
+    /// ships, `prev_hash`/`head_hash` intact -- it is not the unchained
+    /// syslog path `docs/AUDIT-FORWARDING-STANDARD.md` rejected. See
+    /// [`mecmcp_audit::sinks::forward`] for why that distinction holds.
+    /// Independent of `--ssdf-audit-endpoint`: SSDF's own delivery is
+    /// unaffected whether or not this is set.
+    ///
+    /// [`ClosedSegment`]: mecmcp_audit::ClosedSegment
+    #[arg(long)]
+    pub audit_forward_endpoint: Option<String>,
+
+    /// File holding a bearer token for the forward endpoint's `Authorization`
+    /// header. Optional: some collectors authenticate at the network layer
+    /// instead. Must be 0600, like every other credential file here.
+    #[arg(long)]
+    pub audit_forward_token_file: Option<PathBuf>,
+
+    /// PEM trust anchor for the forward endpoint's certificate, if it is not
+    /// signed by a publicly trusted CA.
+    #[arg(long)]
+    pub audit_forward_ca_file: Option<PathBuf>,
+
+    /// Durable outbox for the forward sink. Required when
+    /// `--audit-forward-endpoint` is set. Undefaulted for the same
+    /// `ProtectSystem=strict` reason as `--ssdf-audit-outbox`.
+    #[arg(long)]
+    pub audit_forward_outbox: Option<PathBuf>,
+
+    /// Delivery ledger for the forward sink. Required when
+    /// `--audit-forward-endpoint` is set.
+    #[arg(long)]
+    pub audit_forward_ledger: Option<PathBuf>,
 }
 
 impl EvidenceArgs {
@@ -398,6 +444,16 @@ impl EvidenceArgs {
     /// pipeline spools evidence it can never deliver.
     pub fn into_config(&self) -> Result<Option<mecmcp_audit::EvidenceConfig>, EvidenceArgsError> {
         let Some(endpoint) = self.ssdf_audit_endpoint.clone() else {
+            // The forward sink rides alongside the SSDF pipeline -- the
+            // recorder, chain identity and resume logic all anchor on SSDF --
+            // so an operator who set `--audit-forward-endpoint` alone asked
+            // for something this cannot build. Returning `Ok(None)` here
+            // would silently drop a destination they explicitly configured,
+            // which is exactly what issue #158's fix to the audit-file sink
+            // exists to avoid elsewhere in this crate.
+            if self.audit_forward_endpoint.is_some() {
+                return Err(EvidenceArgsError::ForwardWithoutSsdf);
+            }
             return Ok(None);
         };
         let server_id = self
@@ -411,6 +467,14 @@ impl EvidenceArgs {
         // `mecmcp-verify` cannot disagree about it.
         mecmcp_audit::evidence::validate_server_id(&server_id)
             .map_err(EvidenceArgsError::InvalidServerId)?;
+        // Refuses http:// to a non-loopback host, exactly as the transport does
+        // on every send. Checking it here too, rather than leaving it to the
+        // first delivery attempt, is the difference between a server that
+        // refuses to start and one that starts, spools every segment to the
+        // outbox, and fails every delivery forever: a server that starts with a
+        // half-configured pipeline spools evidence it can never deliver.
+        mecmcp_audit::sinks::ssdf::split_endpoint(&endpoint)
+            .map_err(|error| EvidenceArgsError::InvalidEndpoint(error.to_string()))?;
         if endpoint.starts_with("https://") && self.ssdf_audit_ca_file.is_none() {
             return Err(EvidenceArgsError::MissingTrustAnchor);
         }
@@ -435,6 +499,7 @@ impl EvidenceArgs {
             self.ssdf_audit_verify_password_file.as_deref(),
             "--ssdf-audit-verify-password-file",
         )?;
+        let forward_sink = self.forward_config()?;
 
         Ok(Some(mecmcp_audit::EvidenceConfig {
             server_id,
@@ -453,6 +518,55 @@ impl EvidenceArgs {
                 initial_backoff: std::time::Duration::from_secs(1),
                 max_backoff: std::time::Duration::from_secs(60),
             },
+            signing_key_path: self.ssdf_audit_signing_key.clone(),
+            forward_sink,
+        }))
+    }
+
+    /// The trust anchor to give the forward sink's transport, if one was
+    /// configured. Separate from [`ca_file`](Self::ca_file): the forward
+    /// endpoint is a different host with its own certificate, typically not
+    /// issued by SSDF's private CA.
+    #[must_use]
+    pub fn forward_ca_file(&self) -> Option<&Path> {
+        self.audit_forward_ca_file.as_deref()
+    }
+
+    /// Build the forward-sink config, or `None` when no endpoint was given.
+    fn forward_config(&self) -> Result<Option<mecmcp_audit::ForwardSinkConfig>, EvidenceArgsError> {
+        let Some(endpoint) = self.audit_forward_endpoint.clone() else {
+            return Ok(None);
+        };
+        mecmcp_audit::sinks::ssdf::split_endpoint(&endpoint)
+            .map_err(|error| EvidenceArgsError::InvalidEndpoint(error.to_string()))?;
+        let outbox_path =
+            self.audit_forward_outbox
+                .clone()
+                .ok_or(EvidenceArgsError::MissingPath {
+                    flag: "--audit-forward-outbox",
+                })?;
+        let ledger_path =
+            self.audit_forward_ledger
+                .clone()
+                .ok_or(EvidenceArgsError::MissingPath {
+                    flag: "--audit-forward-ledger",
+                })?;
+        // Unlike the SSDF password files, a bearer token is optional here:
+        // some collectors authenticate at the network layer instead of at
+        // the application layer.
+        let bearer_token = self
+            .audit_forward_token_file
+            .as_deref()
+            .map(|path| mecmcp_secret::load_from_file(path, mecmcp_secret::SecretLimits::default()))
+            .transpose()?;
+
+        Ok(Some(mecmcp_audit::ForwardSinkConfig {
+            endpoint,
+            bearer_token,
+            outbox_path,
+            ledger_path,
+            initial_backoff: std::time::Duration::from_secs(1),
+            max_backoff: std::time::Duration::from_secs(60),
         }))
     }
 }
@@ -501,9 +615,18 @@ pub enum EvidenceArgsError {
     /// The chain identity is empty or holds characters that cannot key a chain.
     #[error("--ssdf-audit-server-id is not usable: {0}")]
     InvalidServerId(String),
+    /// The endpoint is malformed, or uses `http://` to a non-loopback host.
+    #[error("--ssdf-audit-endpoint is not usable: {0}")]
+    InvalidEndpoint(String),
     /// A credential file failed its checks — wrong mode, wrong owner, symlink.
     #[error("credential file rejected (must be a regular file, 0600, owned by this user): {0}")]
     Credential(#[from] mecmcp_secret::SecretError),
+    /// `--audit-forward-endpoint` was set without `--ssdf-audit-endpoint`.
+    #[error(
+        "--audit-forward-endpoint requires --ssdf-audit-endpoint: the forward sink ships \
+         alongside the SSDF evidence pipeline, not instead of it"
+    )]
+    ForwardWithoutSsdf,
 }
 
 /// Read a password file through the workspace's canonical secret loader.
@@ -515,10 +638,13 @@ pub enum EvidenceArgsError {
 /// UTF-8 conversion would silently substitute replacement characters -- both
 /// surfacing later as an authentication failure that looks like a wrong
 /// password rather than a mangled one.
-fn read_password(path: Option<&Path>, flag: &'static str) -> Result<String, EvidenceArgsError> {
+fn read_password(
+    path: Option<&Path>,
+    flag: &'static str,
+) -> Result<mecmcp_secret::OutboundSecret, EvidenceArgsError> {
     let path = path.ok_or(EvidenceArgsError::MissingPassword { flag })?;
     let secret = mecmcp_secret::load_from_file(path, mecmcp_secret::SecretLimits::default())?;
-    Ok(secret.expose().to_owned())
+    Ok(secret)
 }
 
 /// A fresh run identifier for this process lifetime.
@@ -630,6 +756,25 @@ pub struct Cli {
     #[arg(long)]
     pub audit_journald: bool,
 
+    /// Base OTLP/HTTP endpoint for optional trace export, e.g.
+    /// `http://127.0.0.1:4318`. Inert unless set -- off by default, like
+    /// every other sink here. `http://` to a loopback IP literal only: this
+    /// build does not carry its own TLS stack (decision D4), so a remote
+    /// collector is reached through a loopback TLS-terminating proxy, not by
+    /// pointing this at `https://` or a non-loopback host directly -- both
+    /// are refused at startup, since plaintext OTLP off-loopback puts span
+    /// attributes and event bodies on the wire in the clear. Requires
+    /// `mecmcp-audit`'s `otel` Cargo feature at build time; set with no
+    /// feature enabled, startup fails rather than silently dropping the
+    /// export. See `mecmcp_audit::otel`.
+    #[arg(long)]
+    pub otel_endpoint: Option<String>,
+
+    /// The `service.name` resource attribute for OTel export. Ignored unless
+    /// `--otel-endpoint` is set.
+    #[arg(long, default_value = "mecmcp")]
+    pub otel_service_name: String,
+
     /// SSDF evidence pipeline. Inert unless `--ssdf-audit-endpoint` is given.
     #[command(flatten)]
     pub evidence: EvidenceArgs,
@@ -644,6 +789,20 @@ pub struct Cli {
     /// when audit-redact requests hmac. Path only; the key is never a flag/env value.
     #[arg(long)]
     pub audit_hmac_key_file: Option<PathBuf>,
+
+    /// File containing the HMAC key for the change-set approval digest.
+    ///
+    /// Path only, like `--audit-hmac-key-file`: this crate does not depend on
+    /// `mecmcp-changeset`, so it does not load the key itself. A server that
+    /// uses change-set approvals should load this path with
+    /// `mecmcp_changeset::ApprovalDigestKey::load_from_file` and pass the
+    /// result to `ChangesetCoordinator::load_with_key` (not also to
+    /// `with_approval_digest_key` -- `load_with_key` already stores it on the
+    /// returned coordinator; passing it to both just risks the two drifting).
+    /// Omitted, a deployment keeps signing and accepting the unkeyed v5
+    /// approval digest (MEC-457).
+    #[arg(long)]
+    pub approval_digest_key_file: Option<PathBuf>,
 }
 
 /// Top-level management commands.
@@ -848,6 +1007,26 @@ mod tests {
 
         let enabled = Cli::parse_from(["test-server", "--audit-journald"]);
         assert!(enabled.audit_journald);
+    }
+
+    #[test]
+    fn otel_endpoint_defaults_off_and_parses() {
+        let default_cli = Cli::parse_from(["test-server"]);
+        assert!(default_cli.otel_endpoint.is_none());
+        assert_eq!(default_cli.otel_service_name, "mecmcp");
+
+        let enabled = Cli::parse_from([
+            "test-server",
+            "--otel-endpoint",
+            "http://127.0.0.1:4318",
+            "--otel-service-name",
+            "rustjunosmcp",
+        ]);
+        assert_eq!(
+            enabled.otel_endpoint.as_deref(),
+            Some("http://127.0.0.1:4318")
+        );
+        assert_eq!(enabled.otel_service_name, "rustjunosmcp");
     }
 }
 

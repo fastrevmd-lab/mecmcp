@@ -10,6 +10,7 @@ use crate::{
     transaction::DeviceTransaction,
 };
 use mecmcp_audit::Attribution;
+use mecmcp_redact::Untrusted;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
@@ -254,6 +255,22 @@ impl ChangesetCoordinator {
                 return Err(CoordinatorError::new(
                     "change_set_id",
                     "approval record must contain either an approver or a waiver",
+                ));
+            }
+            // A waiver digest is unkeyed (compute_waiver_digest_v3 needs no
+            // key), so it verifies on its own hash regardless of whether this
+            // deployment currently runs in lab mode. Someone with write access
+            // to the state file could write a well-formed waiver record for a
+            // change set that was never actually waived under lab mode, and
+            // loading it would treat it as a valid approval. `waive_approval`
+            // already refuses to create a waiver outside lab mode; re-check it
+            // here too, since lab mode can be toggled off (or the record can be
+            // moved to a deployment where it never was on) between waiving and
+            // applying (MEC-457 review, finding 1, "also check").
+            if approval.waived.is_some() && !self.lab_mode() {
+                return Err(CoordinatorError::new(
+                    "change_set_id",
+                    "change set was approved by a lab-mode waiver, but lab mode is not enabled on this deployment",
                 ));
             }
         } else {
@@ -563,9 +580,17 @@ impl ChangesetCoordinator {
                 // Return the first error we encountered
                 changeset_update_result?;
 
+                // `error` is the vendor transaction's own words (a NETCONF
+                // reply, a PAN-OS API error body), not something this process
+                // composed — wrap it as untrusted so it stays visibly marked
+                // once a tool result carries `CoordinatorError`'s message to
+                // the model (mecmcp-server's `tool_error` renders whatever
+                // `Display` gives it verbatim).
+                let tagged_error =
+                    Untrusted::new(error.to_string()).render_tagged("device.stage_error");
                 return Err(CoordinatorError::new(
                     "device",
-                    format!("staging failed: {error}"),
+                    format!("staging failed: {tagged_error}"),
                 ));
             }
         };
@@ -582,10 +607,16 @@ impl ChangesetCoordinator {
                 //
                 // Mark the operation as Indeterminate FIRST, before updating the change set,
                 // so if the change-set update fails we still have the operation state recorded.
+                // Same as the stage error above: `error` is the device's own
+                // words, tagged once and reused for both the persisted
+                // operation record and the returned `CoordinatorError`.
+                let tagged_error =
+                    Untrusted::new(error.to_string()).render_tagged("device.fingerprint_error");
+
                 let mut record = self.record(&operation_id, &owner, &device).await?;
                 record.state = LifecycleState::Indeterminate;
                 record.details = Some(format!(
-                    "fingerprint read failed after staging: {error}; staged changes remain on device"
+                    "fingerprint read failed after staging: {tagged_error}; staged changes remain on device"
                 ));
                 self.update(record).await?;
 
@@ -597,7 +628,7 @@ impl ChangesetCoordinator {
                 return Err(CoordinatorError::new(
                     "device",
                     format!(
-                        "fingerprint read failed after staging: {error}; operation is indeterminate"
+                        "fingerprint read failed after staging: {tagged_error}; operation is indeterminate"
                     ),
                 ));
             }

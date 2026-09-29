@@ -14,20 +14,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Secret scan: the shared mechubsec workflow (pinned gitleaks binary; no
+  # license needed, unlike gitleaks-action on org repos).
   secrets:
-    name: gitleaks
+    uses: mechubsec/.github/.github/workflows/gitleaks.yml@fb1a159c596bf2c57b9f6f1ff99f546463a6a84a
+
+  # Each vendor rule in .gitleaks-vendor.toml has a positive/negative sample
+  # pair under tests/gitleaks-rules/; this proves the rule still matches (and
+  # doesn't over-match) instead of only being checked by hand at review time.
+  gitleaks-rule-samples:
+    name: gitleaks rule samples
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: gitleaks (secrets)
-        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+      # Same pinned version + checksum as mechubsec/.github's gitleaks.yml,
+      # so the rule samples are verified against the exact binary CI scans
+      # with.
+      - name: Install gitleaks
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          curl -sSfL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          rm -f gitleaks.tar.gz gitleaks
+      - name: Run rule sample tests
+        run: bash tests/gitleaks-rules/run.sh
 
   cargo:
     name: cargo-audit + cargo-deny
@@ -36,11 +54,6 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Cargo.lock is gitignored here — this is a library, and the consuming
-      # binaries pin transitively through their own lockfiles. Generate one so
-      # the audit has something to scan.
-      - name: Ensure Cargo.lock exists
-        run: test -f Cargo.lock || cargo generate-lockfile
       - name: cargo-audit (RUSTSEC advisories)
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
@@ -54,5 +67,71 @@ jobs:
       # crates.io, which the job already needs. Matches rustpanosmcp.
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
-      - name: cargo-deny (licenses + bans + sources)
-        run: cargo deny check licenses bans sources
+      - name: cargo-deny (advisories + licenses + bans + sources)
+        run: cargo deny check advisories licenses bans sources
+
+  sbom:
+    name: Generate and validate CycloneDX SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Version-pinned, matching the cargo-deny job's reasoning above (no
+      # Docker Hub dependency, only crates.io) and RELEASE-ARTIFACTS.md's
+      # SBOM standard: the generator version is pinned because the SBOM is
+      # not byte-for-byte reproducible (timestamps, serial numbers), but the
+      # *component set* must be stable across runs.
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+      # One SBOM per workspace crate: mecmcp ships as a family of library
+      # crates consumed by six other repos, not as a single release binary,
+      # so there is no one artifact to attach a single SBOM to. Each
+      # consumer's own release pipeline (see RELEASE-ARTIFACTS.md) generates
+      # the binary-level SBOM for its shipped archive; this is the check that
+      # every crate in the family a consumer might pull in has one that
+      # validates.
+      - name: Generate SBOMs
+        run: cargo cyclonedx --format json --all
+      - name: Validate SBOM shape
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          sboms=(crates/*/*.cdx.json)
+          if [[ ${#sboms[@]} -eq 0 ]]; then
+            echo "no SBOM files were generated" >&2
+            exit 1
+          fi
+          for sbom in "${sboms[@]}"; do
+            echo "validating $sbom"
+            crate_dir=$(basename "$(dirname "$sbom")")
+            format=$(jq -r '.bomFormat' "$sbom")
+            [[ "$format" == "CycloneDX" ]] || {
+              echo "$sbom: bomFormat is '$format', not CycloneDX" >&2
+              exit 1
+            }
+            component_name=$(jq -r '.metadata.component.name' "$sbom")
+            [[ "$component_name" == "$crate_dir" ]] || {
+              echo "$sbom: metadata.component.name is '$component_name', expected '$crate_dir'" >&2
+              exit 1
+            }
+            component_count=$(jq '.components | length' "$sbom")
+            [[ "$component_count" -gt 0 ]] || {
+              echo "$sbom: components array is empty" >&2
+              exit 1
+            }
+            # A nested checkout, worktree, or the build machine's own layout
+            # leaking into the SBOM means it was scanned from an absolute
+            # path rather than the crate root -- same failure mode
+            # RELEASE-ARTIFACTS.md documents for the per-repo binary SBOM.
+            if grep -Eq '"/(home|workspace|workspaces|runner|tmp)/' "$sbom"; then
+              echo "$sbom contains an absolute build-machine path" >&2
+              exit 1
+            fi
+          done
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mecmcp-sboms
+          path: crates/*/*.cdx.json
+          retention-days: 90

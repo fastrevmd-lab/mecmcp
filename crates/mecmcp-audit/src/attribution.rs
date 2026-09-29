@@ -113,7 +113,7 @@ impl AgentIdentity {
     ///
     /// Format: `{provider}-{tier}, {model_id}, {skills}, {user}`
     ///
-    /// Example: `"anthropic-public, claude-opus-5, none, fastrevmd@gmail.com"`
+    /// Example: `"anthropic-public, claude-opus-5, none, dev@example.com"`
     ///
     /// The provider name comes from the `provider` field (explicit data, not inferred).
     /// Skills render as space-separated names, or "none" if the list is empty.
@@ -536,8 +536,8 @@ mod tests {
             skills_used: vec![],
         };
         assert_eq!(
-            agent.provenance_string(Some("fastrevmd@gmail.com")),
-            "anthropic-public, claude-opus-5, none, fastrevmd@gmail.com"
+            agent.provenance_string(Some("dev@example.com")),
+            "anthropic-public, claude-opus-5, none, dev@example.com"
         );
     }
 
@@ -552,8 +552,8 @@ mod tests {
             skills_used: vec!["srx-nat".into(), "srx-policy".into(), "srx-mnha".into()],
         };
         assert_eq!(
-            agent.provenance_string(Some("fastrevmd@gmail.com")),
-            "anthropic-public, claude-opus-5, srx-nat srx-policy srx-mnha, fastrevmd@gmail.com"
+            agent.provenance_string(Some("dev@example.com")),
+            "anthropic-public, claude-opus-5, srx-nat srx-policy srx-mnha, dev@example.com"
         );
     }
 
@@ -690,7 +690,7 @@ mod tests {
             grant: None,
             provider: Some("anthropic".into()),
             provider_tier: Some(mecmcp_auth::Tier::Public),
-            on_behalf_of: Some("fastrevmd@gmail.com".into()),
+            on_behalf_of: Some("dev@example.com".into()),
             actor_type: mecmcp_auth::ActorType::Agent,
             client_name: None,
             model_id: None,
@@ -703,7 +703,7 @@ mod tests {
         assert_eq!(a.actor_type, ActorType::Agent);
         assert_eq!(
             a.on_behalf_of.as_deref(),
-            Some("fastrevmd@gmail.com"),
+            Some("dev@example.com"),
             "on_behalf_of must flow from token entry"
         );
 

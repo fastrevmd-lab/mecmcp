@@ -1,7 +1,19 @@
 # Audit forwarding standard
 
-**Status:** emission rules are **normative now**. Transport is **specified but
-not yet implemented** — see [#292](https://github.com/fastrevmd-lab/mecmcp/issues/292).
+**Status:** emission rules are **normative now**. Transport is **implemented**
+— the direct hash-chained ClickHouse (SSDF) sink described in Part 2 first
+shipped in mecmcp **0.14.0** (2026-08-23; see
+[`CHANGELOG.md`](../CHANGELOG.md)) — see
+[#292](https://github.com/mechubsec/mecmcp/issues/292) for the
+implementation history. It carries the change-lifecycle evidence records
+(proposal, approval, apply intent, receipt); the per-call tool audit stream
+(Part 1's `audit.jsonl`) is not forwarded and stays on the host. SSDF is the
+chain of record for those records; an optional, additive
+[forward sink](#a-second-destination-the-generic-forward-sink) (MEC-459) can
+ship the same chained records to a second off-host destination alongside it.
+Syslog forwarding was designed, staged and rejected — see
+[Why not syslog](#why-not-syslog-to-the-existing-collector) below. See
+[Enabling it](#enabling-it) to turn it on for a server.
 
 ## Why this exists
 
@@ -32,18 +44,66 @@ These rules are transport-independent and hold under any of the options below.
 **Decision: direct ClickHouse sink, hash-chained.** SSDF is the schema steward;
 the contract is theirs:
 
-- [`audit-evidence-contract-v1.md`](https://github.com/fastrevmd-lab/SSDF/blob/main/docs/audit-evidence-contract-v1.md)
-- [`audit-evidence-ingestion.md`](https://github.com/fastrevmd-lab/SSDF/blob/main/docs/audit-evidence-ingestion.md)
+- [`audit-evidence-contract-v1.md`](https://github.com/mechubsec/ssdf/blob/main/docs/audit-evidence-contract-v1.md)
+- [`audit-evidence-ingestion.md`](https://github.com/mechubsec/ssdf/blob/main/docs/audit-evidence-ingestion.md)
 
 Records are written by `mecmcp-audit` directly into `ssdf.audit` over the
 ClickHouse HTTP interface, carrying `prev_hash`/`row_hash` so that deletion or
 modification of a row is detectable.
 
-Implementation, open questions and design requirements are tracked in
-[#292](https://github.com/fastrevmd-lab/mecmcp/issues/292). Two are unresolved
-and block coding: the contract's dedup guard requires `SELECT` that its own write
-identity is specified not to have, and it is not yet agreed whether the per-call
-audit stream ships alongside the change-lifecycle evidence records.
+Implementation history and design requirements are tracked in
+[#292](https://github.com/mechubsec/mecmcp/issues/292). The dedup guard
+question — the contract's `INSERT … WHERE NOT EXISTS (SELECT …)` cannot run
+under the write identity, which SSDF grants INSERT-only on purpose — is
+resolved: the sink reads a high-water mark under a separate, SELECT-only
+identity instead (ssdf#47; see
+[`sinks/ssdf.rs`](../crates/mecmcp-audit/src/sinks/ssdf.rs)).
+
+The sink ships `ClosedSegment`s from the evidence recorder
+([`recorder.rs`](../crates/mecmcp-audit/src/recorder.rs)) — the four
+change-lifecycle record types. It does not carry the per-call tool audit
+stream from Part 1: nothing feeds `audit.jsonl` into `SsdfSink` today, so
+those records stay on the MCP host.
+
+### Enabling it
+
+Off by default and inert unless configured. Pass `--ssdf-audit-endpoint
+<url>` — for example on rustjunosmcp — plus the paired credential and
+identity flags (`EvidenceArgs` in
+[`mecmcp-runtime/src/cli.rs`](../crates/mecmcp-runtime/src/cli.rs) has the
+full set); a server started without `--ssdf-audit-endpoint` runs its evidence
+pipeline as a no-op. The sink itself lives in
+[`crates/mecmcp-audit/src/sinks/ssdf.rs`](../crates/mecmcp-audit/src/sinks/ssdf.rs).
+
+### A second destination: the generic forward sink
+
+SSDF stays the schema steward and the chain of record, but a deployment that
+wants a copy of the same evidence trail somewhere else off-host — a SIEM, a
+log collector, an object-lock bucket's HTTP front end — can enable
+`ForwardSink` (MEC-459) alongside it: `--audit-forward-endpoint <url>` plus
+`--audit-forward-outbox`/`--audit-forward-ledger` (`--audit-forward-token-file`
+for a bearer token; see `EvidenceArgs` in
+[`mecmcp-runtime/src/cli.rs`](../crates/mecmcp-runtime/src/cli.rs)). It
+requires `--ssdf-audit-endpoint` to also be set — the forward sink rides on
+the same recorder and chain identity — and is refused otherwise.
+
+SSDF and the forward endpoint are usually different hosts with different
+trust anchors, so a deployment enabling both over `https://` should start the
+pipeline with `EvidenceService::start_with_transports`, giving the SSDF
+transport `EvidenceArgs::ca_file()` and the forward transport
+`EvidenceArgs::forward_ca_file()`. `start_with_transport` (singular) shares
+one transport between both sinks and exists for the loopback-`http://`,
+same-trust-anchor, and test cases where that is fine.
+
+This is **not** the syslog path rejected below: it ships the same
+hash-chained `ClosedSegment` SSDF ships, `prev_hash`/`head_hash` intact, as a
+single JSON POST per segment rather than an unchained line in a table anyone
+with write access can edit undetectably. It is additive and best-effort — a
+forward-sink failure is logged and never affects SSDF's own delivery or
+`EvidenceService::delivery_degraded`. See
+[`crates/mecmcp-audit/src/sinks/forward.rs`](../crates/mecmcp-audit/src/sinks/forward.rs)
+for the full reasoning and the local-ledger-only dedup caveat versus SSDF's
+own high-water-mark guarantee.
 
 ### Why not syslog to the existing collector
 
@@ -169,13 +229,21 @@ JSONL sinks get the equivalent through logrotate: `daily`, `rotate 14`,
 
 ## Known gaps
 
-- **No native sink yet.** That is #292. Central forwarding
-  (`systemd-journal-upload`/rsyslog) is deliberately **not** configured: the
-  destination this family wants is the hash-chained SSDF sink, and standing up
-  a second, unchained forwarding path first would be the thing #292 exists to
-  avoid.
+- **Central forwarding via `systemd-journal-upload`/rsyslog is deliberately
+  not configured.** The destination this family wants is the hash-chained
+  SSDF sink (shipped in 0.14.0, #292; see [Enabling it](#enabling-it)), and
+  standing up a second, unchained forwarding path beside it is the thing
+  [Why not syslog](#why-not-syslog-to-the-existing-collector) exists to avoid.
+  A deployment that wants a second, off-host copy of the same chained
+  records can enable
+  [the generic forward sink](#a-second-destination-the-generic-forward-sink)
+  (MEC-459) instead.
+- **The per-call audit stream is not forwarded off-host.** Only
+  change-lifecycle evidence (proposal, approval, apply intent, receipt)
+  reaches `ssdf.audit`; Part 1's `audit.jsonl` — the per-call tool-call
+  trail — stays on the MCP host with no chained off-host copy.
 - **The device-side record omits the approver.** A two-person apply commits
   naming only the applier — see
-  [rustjunosmcp#307](https://github.com/fastrevmd-lab/rustjunosmcp/issues/307).
+  [rustjunosmcp#307](https://github.com/mechubsec/rustjunosmcp/issues/307).
 - **Retention and journald sealing** are done — see Part 3
-  ([rustjunosmcp#299](https://github.com/fastrevmd-lab/rustjunosmcp/issues/299)).
+  ([rustjunosmcp#299](https://github.com/mechubsec/rustjunosmcp/issues/299)).

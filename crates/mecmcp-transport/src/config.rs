@@ -68,6 +68,21 @@ pub struct LimitsConfig {
         alias = "max_inflight_requests_per_target"
     )]
     pub max_inflight_requests_per_device: usize,
+    /// CIDR ranges permitted to set `X-Forwarded-For` for per-IP rate limiting.
+    ///
+    /// Empty by default. Without an explicit entry here, the header is never
+    /// trusted and the per-IP rate limit key is always the TCP peer address —
+    /// trusting `X-Forwarded-For` from an unlisted peer would let any client
+    /// spoof its way around its own per-IP limit by setting the header on its
+    /// own request. Only when the immediate peer's address falls inside one of
+    /// these ranges (a known reverse proxy or load balancer) is
+    /// `X-Forwarded-For` consulted: the rightmost entry not itself inside
+    /// `trusted_proxies` is used as the rate-limit key instead of the peer
+    /// address. List only proxies that append or overwrite this header for
+    /// every request they forward — a CIDR that also covers an untrusted host
+    /// lets that host spoof its rate-limit key.
+    #[serde(default)]
+    pub trusted_proxies: Vec<ipnet::IpNet>,
     /// Max concurrent MCP sessions. `0` disables.
     pub max_sessions: usize,
     /// Max concurrent MCP sessions per bearer token. `0` disables.
@@ -84,10 +99,20 @@ impl Default for LimitsConfig {
             max_request_body_bytes: 10 * 1024 * 1024,
             max_inflight_requests: 64,
             max_inflight_requests_per_token: 16,
-            max_requests_per_second_per_ip: 0,
-            max_request_burst_per_ip: 0,
-            max_requests_per_second_per_token: 0,
-            max_request_burst_per_token: 0,
+            // A fresh install gets rate limiting without operator action. An
+            // unmetered listener is a request-flood surface the moment a bearer
+            // token leaks or a client misbehaves; `0` (disabled) should be an
+            // opt-out an operator makes deliberately, not the shape a server
+            // ships in. IP limits sit above token limits because one address
+            // can host several tokens behind a NAT or proxy.
+            max_requests_per_second_per_ip: 50,
+            max_request_burst_per_ip: 100,
+            max_requests_per_second_per_token: 20,
+            max_request_burst_per_token: 40,
+            // No trusted proxies by default: X-Forwarded-For is never honored
+            // until an operator explicitly names the reverse proxy or load
+            // balancer allowed to set it.
+            trusted_proxies: Vec::new(),
             max_inflight_requests_per_device: 4,
             max_sessions: 128,
             max_sessions_per_token: 16,
@@ -161,6 +186,7 @@ impl LimitsConfig {
             max_request_burst_per_ip = self.max_request_burst_per_ip,
             max_requests_per_second_per_token = self.max_requests_per_second_per_token,
             max_request_burst_per_token = self.max_request_burst_per_token,
+            trusted_proxies = self.trusted_proxies.len(),
             max_inflight_requests_per_device = self.max_inflight_requests_per_device,
             max_sessions = self.max_sessions,
             max_sessions_per_token = self.max_sessions_per_token,
@@ -225,6 +251,8 @@ mod tests {
         assert_eq!(c.max_sessions_per_token, 16);
         assert_eq!(c.idle_timeout(), Some(Duration::from_secs(300)));
         assert_eq!(c.max_lifetime(), Some(Duration::from_secs(3600)));
+        assert!(c.ip_rate_limit_enabled());
+        assert!(c.token_rate_limit_enabled());
     }
 
     #[test]
@@ -239,14 +267,14 @@ mod tests {
     }
 
     #[test]
-    fn rate_limits_default_disabled_and_valid() {
+    fn rate_limits_default_enabled_and_valid() {
         let config = LimitsConfig::default();
-        assert_eq!(config.max_requests_per_second_per_ip, 0);
-        assert_eq!(config.max_request_burst_per_ip, 0);
-        assert_eq!(config.max_requests_per_second_per_token, 0);
-        assert_eq!(config.max_request_burst_per_token, 0);
-        assert!(!config.ip_rate_limit_enabled());
-        assert!(!config.token_rate_limit_enabled());
+        assert_eq!(config.max_requests_per_second_per_ip, 50);
+        assert_eq!(config.max_request_burst_per_ip, 100);
+        assert_eq!(config.max_requests_per_second_per_token, 20);
+        assert_eq!(config.max_request_burst_per_token, 40);
+        assert!(config.ip_rate_limit_enabled());
+        assert!(config.token_rate_limit_enabled());
         assert_eq!(config.validate(), Ok(()));
     }
 

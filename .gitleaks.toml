@@ -1,0 +1,12 @@
+title = "mecmcp gitleaks config"
+
+# Inherit every upstream rule (gitleaks defaults, transitively via
+# .gitleaks-vendor.toml's own useDefault = true) plus the shared vendor
+# rules; add nothing global here. Test fixtures that are intentionally
+# secret-shaped (mecmcp-redact's PEM/denylist detectors need real-looking
+# markers to test against) are allowlisted per-line with an inline
+# `gitleaks:allow` comment next to the fixture, not here — that keeps the
+# allowance scoped to the exact line instead of a file or a repo-wide regex
+# that could also hide a real leaked secret.
+[extend]
+path = ".gitleaks-vendor.toml"

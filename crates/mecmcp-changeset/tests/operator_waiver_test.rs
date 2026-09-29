@@ -478,7 +478,7 @@ fn test_attribution(principal: &str) -> Attribution {
             provider_tier: mecmcp_audit::Tier::Public,
             skills_used: vec![],
         }),
-        on_behalf_of: Some("fastrevmd@gmail.com".into()),
+        on_behalf_of: Some("dev@example.com".into()),
         change_ref: Some("CHG0012345".into()),
         request_id: Uuid::new_v4(),
         token_verified_fields: mecmcp_audit::TokenVerifiedFields::none(),
@@ -601,7 +601,11 @@ async fn an_expired_waiver_does_not_authorize_apply() {
 
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
 
-    // Reload coordinator to pick up the modified state
+    // Reload coordinator to pick up the modified state. Drop the harness's
+    // coordinator first: it holds the state file's single-writer lock for
+    // its whole lifetime (MEC-540), which this reload would otherwise be
+    // refused against.
+    drop(harness.coordinator);
     let limits = OperationLimits {
         max_operations: 1024,
         max_change_sets: 1024,
@@ -644,6 +648,106 @@ async fn an_expired_waiver_does_not_authorize_apply() {
         "the refusal must name expiry, not report a generic missing approval — \
          an operator sent looking for the wrong problem loses the time the \
          message was supposed to save: {message}"
+    );
+}
+
+/// `compute_waiver_digest_v3` needs no key -- it is a plain hash, not a MAC --
+/// so it verifies on its own bytes regardless of whether this deployment
+/// currently runs in lab mode. A valid, unexpired waiver record must still be
+/// refused at apply time once lab mode is off, or write access to the state
+/// file (without ever running with lab mode enabled) would be enough to forge
+/// an approval (MEC-457 review, finding 1, "also check").
+///
+/// Sabotage-verify: remove the `!self.lab_mode()` check added alongside this
+/// test in `apply.rs` and confirm this test fails.
+#[tokio::test]
+async fn lab_mode_disabled_after_waiver_does_not_authorize_apply() {
+    let harness = planned_change_set_harness().await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_secs();
+
+    let waiver = WaiverRecord {
+        kind: WaiverKind::LabMode,
+        reason: "lab-mode".to_owned(),
+        expires_at_unix: None,
+        ticket: None,
+    };
+
+    let waiver_digest = compute_waiver_digest_v3(
+        &harness.change_set_id,
+        &harness.digest,
+        &harness.owner,
+        now,
+        &waiver,
+    );
+
+    let state_path = harness._temp_dir.path().join("state.json");
+    let mut state = read_state(&state_path, 8 * 1024 * 1024).expect("read state");
+
+    let change_set = state
+        .change_sets
+        .get_mut(&harness.change_set_id)
+        .expect("change set exists");
+
+    change_set.state = ChangeSetState::Approved;
+    change_set.approval = Some(ApprovalRecord {
+        approver: None,
+        approved_at_unix: now,
+        digest: waiver_digest,
+        digest_version: 4,
+        waived: Some(waiver),
+    });
+
+    write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
+
+    // Reload with lab_mode=false, as if the waiver were forged directly into
+    // the state file on a deployment that never ran with lab mode enabled.
+    // Drop the harness's coordinator first: it holds the state file's
+    // single-writer lock for its whole lifetime (MEC-540), which this reload
+    // would otherwise be refused against.
+    drop(harness.coordinator);
+    let limits = OperationLimits {
+        max_operations: 1024,
+        max_change_sets: 1024,
+        max_actions_per_set: 64,
+        max_state_bytes: 8 * 1024 * 1024,
+        max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
+    };
+    let approval_ttl = Duration::from_secs(15 * 60);
+    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false)
+        .expect("reload coordinator with lab mode disabled");
+
+    let fingerprint = harness
+        .transaction
+        .fingerprint()
+        .await
+        .expect("fingerprint");
+    let error = coordinator
+        .apply_change_set(
+            harness.change_set_id.clone(),
+            harness.device.clone(),
+            "https://test-device.example.com".to_string(),
+            harness.owner.clone(),
+            harness.digest.clone(),
+            fingerprint,
+            &harness.transaction,
+            "set",
+            None,
+            None,
+            &test_attribution("alice"),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a lab-mode waiver must not authorize apply when lab mode is disabled");
+
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("lab mode"),
+        "the refusal must name lab mode, not report a generic missing approval: {message}"
     );
 }
 
@@ -692,7 +796,10 @@ async fn pre_guard_waiver_expiry_check_fails_without_blocking() {
     });
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
 
-    // Reload coordinator
+    // Reload coordinator. Drop the harness's coordinator first: it holds
+    // the state file's single-writer lock for its whole lifetime (MEC-540),
+    // which this reload would otherwise be refused against.
+    drop(harness.coordinator);
     let limits = OperationLimits {
         max_operations: 1024,
         max_change_sets: 1024,
@@ -793,7 +900,11 @@ async fn post_guard_waiver_expiry_check_detects_toctou_rewrite() {
     });
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
 
-    // Reload coordinator and wrap in Arc for sharing between tasks
+    // Reload coordinator and wrap in Arc for sharing between tasks. Drop
+    // the harness's coordinator first: it holds the state file's
+    // single-writer lock for its whole lifetime (MEC-540), which this
+    // reload would otherwise be refused against.
+    drop(harness.coordinator);
     let limits = OperationLimits {
         max_operations: 1024,
         max_change_sets: 1024,
@@ -954,7 +1065,10 @@ async fn waiver_at_exact_expiry_instant_is_expired() {
     });
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
 
-    // Reload coordinator
+    // Reload coordinator. Drop the harness's coordinator first: it holds
+    // the state file's single-writer lock for its whole lifetime (MEC-540),
+    // which this reload would otherwise be refused against.
+    drop(harness.coordinator);
     let limits = OperationLimits {
         max_operations: 1024,
         max_change_sets: 1024,

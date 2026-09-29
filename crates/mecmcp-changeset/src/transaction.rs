@@ -400,7 +400,7 @@ pub trait DeviceTransaction: Send + Sync {
     ///
     /// The comment format is implementation-defined but must make the linkage
     /// explicit. Example (Junos):
-    /// `"Confirming commit <operation_id>: CHG0012345 by alice via anthropic-public, claude-opus-5, none, fastrevmd@gmail.com"`
+    /// `"Confirming commit <operation_id>: CHG0012345 by alice via anthropic-public, claude-opus-5, none, dev@example.com"`
     ///
     /// # PAN-OS behavior
     ///
