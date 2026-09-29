@@ -68,6 +68,21 @@ git push origin v0.25.0
 
 This requires a GPG or SSH signing key registered to your GitHub account (Settings → SSH and GPG keys) — not a repo secret, and not something CI provisions for you. `.github/workflows/verify-release-tag.yml` runs on every `v*` tag push and fails closed, visibly, if the tag is lightweight or its signature does not verify against a key on the pusher's account (the same check behind the "Verified" badge on a commit or tag in the GitHub UI). It cannot stop the push from landing — GitHub has no pre-push ref protection for tags the way it does for branches — but an unsigned release tag will not go unnoticed.
 
+### Verifying a release tag offline
+
+The CI check above proves a tag was signed by *a* key registered to *some* GitHub account — it says nothing about whether that account belongs to an authorised release maintainer, and it requires hitting GitHub's API. To verify a tag against the specific keys this project's release maintainers use, without any network call, this repo publishes those keys in [`allowed_signers`](allowed_signers) at the repo root, in the format `git verify-tag` and `ssh-keygen -Y verify` both understand (one line per key: `<maintainer-email> <key-type> <base64-key>`).
+
+To verify a tag offline against it:
+
+```sh
+git config gpg.ssh.allowedSignersFile allowed_signers
+git verify-tag v0.25.0
+```
+
+`git config` (without `--global`) scopes the allowed-signers file to this clone only. If the tag was signed with GPG instead of SSH, import the maintainer's GPG public key into your local keyring first (`gpg --import <maintainer-key>.asc`), then run the same `git verify-tag` — `allowed_signers` only covers SSH-signed tags.
+
+`allowed_signers` lists the keys release maintainers currently sign with; it is not an enforcement mechanism and does not restrict who can push a `v*` tag — that is tracked separately as a repository-ruleset decision. Treat a tag whose signer isn't in this file as unverified, the same as an unsigned one.
+
 ## Commit and PR conventions
 
 - Keep PRs focused on one change. A bug fix doesn't need a drive-by refactor riding along.

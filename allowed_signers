@@ -1,0 +1,10 @@
+# SSH public keys of mecmcp's authorised release maintainers, in the format
+# `git verify-tag` / `ssh-keygen -Y verify` expect via `gpg.ssh.allowedSignersFile`:
+#   <maintainer-email> <key-type> <base64-key>
+# See CONTRIBUTING.md's "Verifying a release tag offline" section for how to use this file.
+#
+# GPG-signed tags are not covered here — import the signer's GPG public key into your
+# local keyring instead (`gpg --import <maintainer-key>.asc`).
+#
+# PENDING (MEC-791): no maintainer keys have been added yet. Do not treat the presence of
+# this file as proof any tag has been reviewed against it until entries land here.
