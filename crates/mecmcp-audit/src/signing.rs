@@ -46,6 +46,19 @@ impl Drop for SigningKey {
     }
 }
 
+impl SigningKey {
+    /// Derive the corresponding verifying (public) key.
+    ///
+    /// Lets a caller that only holds a `SigningKey` (e.g. a signing binary
+    /// that never loaded a separate verifying-key file) compute a `key_id`
+    /// or otherwise publish the public half without a second key file.
+    pub fn verifying_key(&self) -> VerifyingKey {
+        VerifyingKey {
+            inner: self.inner.verifying_key(),
+        }
+    }
+}
+
 /// Ed25519 verification key.
 #[derive(Clone)]
 pub struct VerifyingKey {
@@ -207,6 +220,29 @@ fn decode_head_hash(head_hash: &str) -> Result<[u8; 32], SigningError> {
     Ok(bytes)
 }
 
+/// Sign a `sha256:<hex>` digest string.
+///
+/// This is the primitive both [`sign_head`] (segment heads) and
+/// `mecmcp_audit::checkpoint::sign_checkpoint` (ssdf.audit chain checkpoints)
+/// build on: both sign the raw 32-byte digest, never the formatted string.
+pub fn sign_digest(digest: &str, key: &SigningKey) -> Result<DetachedSignature, SigningError> {
+    let digest_bytes = decode_head_hash(digest)?;
+    let signature = key.inner.sign(&digest_bytes);
+    Ok(DetachedSignature { inner: signature })
+}
+
+/// Verify a signature over a `sha256:<hex>` digest string.
+pub fn verify_digest(
+    digest: &str,
+    signature: &DetachedSignature,
+    key: &VerifyingKey,
+) -> Result<(), SigningError> {
+    let digest_bytes = decode_head_hash(digest)?;
+    key.inner
+        .verify(&digest_bytes, &signature.inner)
+        .map_err(|_| SigningError::VerificationFailed)
+}
+
 /// Sign a closed segment's head hash.
 ///
 /// Returns a detached signature over the raw 32-byte SHA-256 digest.
@@ -214,9 +250,7 @@ pub fn sign_head(
     closed: &ClosedSegment,
     key: &SigningKey,
 ) -> Result<DetachedSignature, SigningError> {
-    let head_bytes = decode_head_hash(&closed.head_hash)?;
-    let signature = key.inner.sign(&head_bytes);
-    Ok(DetachedSignature { inner: signature })
+    sign_digest(&closed.head_hash, key)
 }
 
 /// Verify a signature over a closed segment's head hash.
@@ -225,10 +259,7 @@ pub fn verify_head(
     signature: &DetachedSignature,
     key: &VerifyingKey,
 ) -> Result<(), SigningError> {
-    let head_bytes = decode_head_hash(&closed.head_hash)?;
-    key.inner
-        .verify(&head_bytes, &signature.inner)
-        .map_err(|_| SigningError::VerificationFailed)
+    verify_digest(&closed.head_hash, signature, key)
 }
 
 /// Encode a signature as base64.
@@ -373,12 +404,7 @@ mod tests {
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
 
         let signing_key = load_signing_key(&key_path).expect("RFC 8032 key should load");
-
-        // No public accessor derives a VerifyingKey from a SigningKey; this test
-        // lives in the same module, so it reaches the wrapped key directly.
-        let verifying_key = VerifyingKey {
-            inner: signing_key.inner.verifying_key(),
-        };
+        let verifying_key = signing_key.verifying_key();
 
         assert_eq!(
             encode_verifying_key(&verifying_key),
