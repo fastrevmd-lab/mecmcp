@@ -13,9 +13,11 @@ who already has console access" from "safe to hand to a model with no duty of
 confidentiality." This crate is the shared place that distinction gets made,
 applied the same way by every server, rather than five ad hoc attempts at it.
 
-This crate builds the mechanism. Wiring it into each vendor server's tool
-handlers is separate work (tracked as H1b/H1c) — this repo has no vendor MCP
-servers in it to wire into.
+This crate builds the mechanism. Wiring redaction into each vendor server's
+tool handlers is separate work (tracked as H1b/H1c) — this repo has no vendor
+MCP servers in it to wire into. The trust-boundary marking below is wired one
+level higher, into `mecmcp-server`'s shared `tool_error`/`tool_result` path
+every vendor server already calls — see [Marking untrusted content](#marking-untrusted-content).
 
 ## Two strategies
 
@@ -42,6 +44,39 @@ mecmcp server's `mecmcp_audit::init_tracing` subscriber both prints that to
 the console and, when an audit file or journald sink is configured, records
 it there. There is no tool-facing parameter on any redaction entry point that
 could reach this state — the only lever is the operator flag.
+
+## Marking untrusted content
+
+Redaction decides *what* a model may see. [`trust::Untrusted`] decides how
+what's left is *told apart* once it does — a device's hostname, description,
+or error body is no more trustworthy than a tool argument, but until this
+type existed nothing marked it as such once it landed in a `String`.
+
+Construct `Untrusted::new(value)` where a vendor response is parsed, and
+render it with [`Untrusted::render_tagged`] wherever it reaches a tool result
+or any other model-facing string:
+
+```rust
+use mecmcp_redact::Untrusted;
+
+let hostname = Untrusted::new(device_response.hostname.clone());
+let tagged = hostname.render_tagged("device.hostname");
+// tagged: "<untrusted-device-content id=\"a1b2c3d4e5f60789\" source=\"device.hostname\">...\n<hostname>\n</untrusted-device-content id=\"a1b2c3d4e5f60789\">"
+```
+
+`mecmcp-server::tool_error_with_untrusted_detail` is the sanctioned entry
+point for a tool handler's error path — see `crates/mecmcp-changeset/src/apply.rs`
+for a worked example of tagging a vendor transaction error before it becomes
+part of a `CoordinatorError` message. `render_tagged` entity-escapes `&`, `<`
+and `>` in the content and the `source` label, so no tag-shaped text of any
+spelling can appear inside the block, and pairs each rendering with a random
+id shared by its open and close tags, so device text cannot forge a matching
+closing tag even in escaped form.
+
+This is a visibility mechanism, not a sandbox: a model that ignores the
+delimiter entirely is a prompting and policy problem downstream of this
+crate, not one tagging text can solve by itself. It exists to support the
+house rule, not replace it — deterministic code still decides.
 
 ## Fingerprints survive redaction
 
