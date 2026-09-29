@@ -31,17 +31,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **mecmcp-audit: optional OpenTelemetry export, and a generic HTTPS/JSON
-  forward sink for closed evidence segments** (MEC-459). Two independent,
-  off-by-default additions:
+- **mecmcp-audit: optional OpenTelemetry trace export, and a generic
+  HTTPS/JSON forward sink for closed evidence segments** (MEC-459). Two
+  independent, off-by-default additions:
   - `AuditConfig::otel` (`--otel-endpoint`/`--otel-service-name` at the CLI
-    layer) exports spans and metrics over OTLP/HTTP when set. Building the
-    exporter needs `mecmcp-audit`'s new `otel` Cargo feature (~90 extra
-    crates, so it is not a default dependency); setting `AuditConfig::otel`
-    without that feature fails startup loudly rather than silently dropping
-    the export, matching the existing `--audit-log-file` rule (#158). The
-    OTLP client only speaks plain `http://` -- see `mecmcp-audit::otel` for
-    why that is deliberate (decision D4).
+    layer) exports spans over OTLP/HTTP when set -- traces only, not
+    metrics: this workspace records metrics through the `metrics` crate, not
+    the OpenTelemetry metrics API, so an OTel meter provider would export on
+    a timer with nothing ever recorded to it. Building the exporter needs
+    `mecmcp-audit`'s new `otel` Cargo feature (~90 extra crates, so it is not
+    a default dependency); setting `AuditConfig::otel` without that feature
+    fails startup loudly rather than silently dropping the export, matching
+    the existing `--audit-log-file` rule (#158). The OTLP client only speaks
+    plain `http://` **to a loopback IP literal** -- a non-loopback host or a
+    hostname (even one that would resolve to loopback) is refused at
+    export-setup time, the same rule `SsdfSinkConfig`/`ForwardSinkConfig`
+    apply to their own endpoints, and for the same reason: this sits outside
+    `AuditRedaction`'s reach, so a plaintext endpoint reachable off-host would
+    leak span attributes and event bodies to anyone on the path. The layer
+    also carries its own filter, defaulting to `info` and overridable only
+    via `MECMCP_OTEL_FILTER` (never `RUST_LOG`, since turning up local
+    debug logging must not also turn up what leaves the host over OTLP), with
+    exporter-client traffic (`opentelemetry*`, `hyper`, `reqwest`, `h2`)
+    always suppressed to avoid an export feedback loop. See
+    `mecmcp-audit::otel` for the full reasoning (decision D4).
   - `EvidenceConfig::forward_sink` (`--audit-forward-endpoint` and friends)
     ships the same hash-chained `ClosedSegment` SSDF ships to a second,
     best-effort destination -- a SIEM, a log collector, an object-lock
@@ -50,9 +63,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     travel with every record, so a receiver can still detect a dropped or
     altered one. SSDF stays the chain of record; a forward-sink failure is
     logged and never affects `EvidenceService::delivery_degraded` or
-    `shutdown`'s result.
+    `shutdown`'s result. Retry backoff is non-blocking -- a segment not yet
+    due for retry is skipped rather than slept out -- since this sink shares
+    a thread with the SSDF drain loop and an in-line sleep would delay SSDF's
+    own next delivery pass behind it. `EvidenceService::start_with_transports`
+    lets SSDF and the forward sink use independent transports, since the two
+    endpoints are typically different hosts with different trust anchors
+    (`EvidenceArgs::ca_file` vs. `EvidenceArgs::forward_ca_file`);
+    `start_with_transport` (singular) still exists and shares one transport
+    for the cases where that is fine.
   Both are `None`/off by default, so existing SSDF-only and non-OTel
   deployments are unaffected.
+  - **Breaking (source, not binary):** `AuditConfig` gained an `otel` field
+    and `EvidenceConfig` gained a `forward_sink` field; neither struct is
+    `#[non_exhaustive]` or `Default`, so any struct literal constructing
+    either needs a new field (`None` preserves prior behavior). A downstream
+    server wiring up `--otel-endpoint` must map it into `AuditConfig::otel`
+    itself -- nothing in this repo does that automatically.
 
 - **redact: `Untrusted<T>` marks device/controller-sourced content before it
   reaches a model** (MEC-511). Device text (hostnames, descriptions, error

@@ -756,14 +756,17 @@ pub struct Cli {
     #[arg(long)]
     pub audit_journald: bool,
 
-    /// Base OTLP/HTTP endpoint for optional trace/metric export, e.g.
+    /// Base OTLP/HTTP endpoint for optional trace export, e.g.
     /// `http://127.0.0.1:4318`. Inert unless set -- off by default, like
-    /// every other sink here. `http://` only: this build does not carry its
-    /// own TLS stack (decision D4), so a remote collector is reached through
-    /// a loopback TLS-terminating proxy, not by pointing this at `https://`
-    /// directly. Requires `mecmcp-audit`'s `otel` Cargo feature at build
-    /// time; set with no feature enabled, startup fails rather than silently
-    /// dropping the export. See `mecmcp_audit::otel`.
+    /// every other sink here. `http://` to a loopback IP literal only: this
+    /// build does not carry its own TLS stack (decision D4), so a remote
+    /// collector is reached through a loopback TLS-terminating proxy, not by
+    /// pointing this at `https://` or a non-loopback host directly -- both
+    /// are refused at startup, since plaintext OTLP off-loopback puts span
+    /// attributes and event bodies on the wire in the clear. Requires
+    /// `mecmcp-audit`'s `otel` Cargo feature at build time; set with no
+    /// feature enabled, startup fails rather than silently dropping the
+    /// export. See `mecmcp_audit::otel`.
     #[arg(long)]
     pub otel_endpoint: Option<String>,
 

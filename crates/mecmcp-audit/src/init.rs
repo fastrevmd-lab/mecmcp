@@ -73,6 +73,31 @@ pub fn shutdown_otel() {
     }
 }
 
+/// The otel layer's own filter, deliberately separate from `RUST_LOG`.
+///
+/// The otel layer sits outside [`crate::redact::AuditRedaction`]: it sees
+/// every span's attributes and every event's fields, not just `target:
+/// "audit"` records, and it exports whatever level is active. Reusing
+/// `RUST_LOG` for it means an operator turning up logging for local
+/// debugging -- the ordinary way to chase a bug in one crate -- also turns up
+/// what leaves the host over OTLP, including `debug!`/`trace!` bodies that
+/// routinely carry device names, hostnames, or full RPC payloads. This filter
+/// defaults to `info` and is overridable only through `MECMCP_OTEL_FILTER`,
+/// never `RUST_LOG`.
+///
+/// It also always suppresses the exporter's own HTTP client traffic
+/// (`opentelemetry*`, `hyper`, `reqwest`, `h2`): without that, exporting a
+/// span produces a client span, which this same layer then tries to export,
+/// a feedback loop that never settles.
+#[cfg(feature = "otel")]
+fn otel_filter() -> EnvFilter {
+    let directives = std::env::var("MECMCP_OTEL_FILTER").unwrap_or_else(|_| "info".to_string());
+    let directives = format!(
+        "{directives},opentelemetry=off,opentelemetry_sdk=off,opentelemetry_otlp=off,hyper=off,reqwest=off,h2=off"
+    );
+    EnvFilter::try_new(directives).unwrap_or_else(|_| EnvFilter::new("info"))
+}
+
 #[cfg(feature = "otel")]
 fn build_otel_layer<S>(cfg: &AuditConfig) -> io::Result<Option<Box<dyn Layer<S> + Send + Sync>>>
 where
@@ -87,7 +112,7 @@ where
     // first one to reach here in practice (init_tracing is documented
     // idempotent, not concurrent).
     let _ = OTEL_GUARD.set(guard);
-    Ok(Some(layer))
+    Ok(Some(layer.with_filter(otel_filter()).boxed()))
 }
 
 #[cfg(not(feature = "otel"))]
@@ -684,5 +709,79 @@ mod tests {
         };
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(error.to_string(), "journal unavailable");
+    }
+}
+
+/// Regression tests for a review finding (MEC-459): the otel layer had no
+/// filter of its own, so every `debug!`/`trace!` event from every crate --
+/// including RPC/config bodies a downstream crate logs at `debug!` -- was
+/// exported as a span event, and `AuditRedaction` never sees span attributes
+/// or non-audit events, so it could not help. Gated on `feature = "otel"`
+/// since [`otel_filter`] only exists there.
+#[cfg(all(test, feature = "otel"))]
+#[allow(clippy::unwrap_used)]
+mod otel_filter_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct RecordingLayer {
+        names: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for RecordingLayer {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            self.names
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(event.metadata().name());
+        }
+    }
+
+    #[test]
+    fn default_otel_filter_drops_debug_but_keeps_info() {
+        let recorder = RecordingLayer::default();
+        let subscriber =
+            tracing_subscriber::registry().with(recorder.clone().with_filter(otel_filter()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("tool_call", device = "fw-edge-01");
+            let _entered = span.enter();
+            tracing::info!(target: "rustnetconf", "connected");
+            tracing::debug!(
+                target: "rustnetconf",
+                body = "pre-shared-key ascii-text CANARY-PSK",
+                "raw rpc body"
+            );
+        });
+
+        let names = recorder.names.lock().unwrap();
+        assert_eq!(
+            names.len(),
+            1,
+            "a debug event must not reach the otel layer at the default filter: {names:?}"
+        );
+    }
+
+    #[test]
+    fn otel_filter_always_suppresses_exporter_client_traffic() {
+        // Prevents an export feedback loop: exporting a span produces a
+        // reqwest/hyper/h2 span, which the same layer would otherwise try
+        // to export again.
+        let recorder = RecordingLayer::default();
+        let subscriber =
+            tracing_subscriber::registry().with(recorder.clone().with_filter(otel_filter()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "hyper::client", "connecting");
+            tracing::info!(target: "opentelemetry_sdk", "exporting batch");
+            tracing::info!(target: "reqwest", "sending request");
+        });
+
+        assert!(
+            recorder.names.lock().unwrap().is_empty(),
+            "exporter client traffic must never reach the otel layer, regardless of level"
+        );
     }
 }

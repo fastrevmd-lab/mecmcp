@@ -1,4 +1,10 @@
-//! Optional OpenTelemetry tracing/metrics export.
+//! Optional OpenTelemetry trace export.
+//!
+//! Traces only, not metrics: this workspace records metrics through the
+//! `metrics` crate, not the OpenTelemetry metrics API, and an OTel meter
+//! provider nothing ever records to is a silent no-op export, not a working
+//! pipeline. Bridging `metrics` into OTel export is future work, not in
+//! scope here.
 //!
 //! Off by default and inert unless configured, matching every other sink in
 //! this crate. Two things distinguish it from the audit sinks:
@@ -22,24 +28,27 @@
 //!   ClickHouse is reached without `mecmcp-transport`: through a loopback
 //!   TLS-terminating proxy, not by this crate speaking TLS itself.
 
-/// How to export traces and metrics.
+/// How to export traces.
 ///
 /// Always compiled, whether or not the `otel` feature is enabled, so a
 /// server's CLI parsing does not need to be feature-gated too -- only the
 /// `otel` feature's `build` function is.
 ///
-/// Export cadence is the SDK's own default (a few seconds for traces, 60s for
-/// metrics) rather than a field here -- exposing it added two more flags for
-/// every server without a deployment yet asking to tune it.
+/// Export cadence is the SDK's own default (a few seconds) rather than a
+/// field here -- exposing it added a flag for every server without a
+/// deployment yet asking to tune it.
 #[derive(Debug, Clone)]
 pub struct OtelConfig {
     /// Base OTLP/HTTP endpoint, e.g. `http://127.0.0.1:4318`. Traces are
-    /// exported to `{endpoint}/v1/traces`, metrics to `{endpoint}/v1/metrics`.
+    /// exported to `{endpoint}/v1/traces`.
     ///
-    /// `http://` only -- see the module docs for why. A `https://` value is
-    /// refused at export-setup time rather than silently sent in the clear.
+    /// `http://` to a loopback IP literal only -- see the module docs for
+    /// why. A `https://` value, a non-loopback host, or a hostname (even one
+    /// that would resolve to loopback) is refused at export-setup time
+    /// rather than silently sent in the clear or trusted on a DNS-rebinding
+    /// TOCTOU.
     pub endpoint: String,
-    /// The `service.name` resource attribute every span and metric carries.
+    /// The `service.name` resource attribute every span carries.
     pub service_name: String,
 }
 
@@ -79,41 +88,44 @@ mod enabled {
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_otlp::WithExportConfig as _;
     use opentelemetry_sdk::Resource;
-    use opentelemetry_sdk::metrics::SdkMeterProvider;
     use opentelemetry_sdk::trace::SdkTracerProvider;
     use tracing_subscriber::Layer;
     use tracing_subscriber::registry::LookupSpan;
 
-    /// Holds the providers alive for the process lifetime and flushes them on
-    /// shutdown.
+    /// Holds the tracer provider alive for the process lifetime and flushes
+    /// it on shutdown.
+    ///
+    /// Traces only, not metrics: this crate's workspace records metrics
+    /// through the `metrics` crate, not the OpenTelemetry metrics API, so an
+    /// `SdkMeterProvider` here would sit unconnected to anything that ever
+    /// records to it -- an empty periodic export on a timer, not a working
+    /// metrics pipeline. Bridging `metrics` into OTel metrics export is a
+    /// separate, larger piece of work than "give traces an export path";
+    /// this stays traces-only until that is scoped.
     ///
     /// Dropping this without calling [`OtelGuard::shutdown`] still flushes
-    /// eventually -- both providers export on their own interval -- but an
+    /// eventually -- the provider exports on its own batch interval -- but an
     /// orderly shutdown should call it, the same way [`crate::EvidenceService::shutdown`]
     /// flushes its sinks rather than relying on the next interval firing.
     pub struct OtelGuard {
         tracer_provider: SdkTracerProvider,
-        meter_provider: SdkMeterProvider,
     }
 
     impl OtelGuard {
-        /// Flush and shut down both providers, best-effort.
+        /// Flush and shut down the tracer provider, best-effort.
         pub fn shutdown(&self) {
             if let Err(error) = self.tracer_provider.shutdown() {
                 tracing::warn!(%error, "otel trace provider shutdown failed");
             }
-            if let Err(error) = self.meter_provider.shutdown() {
-                tracing::warn!(%error, "otel meter provider shutdown failed");
-            }
         }
     }
 
-    /// Build the tracing layer and the guard that owns the exporters.
+    /// Build the tracing layer and the guard that owns the exporter.
     ///
     /// # Errors
     ///
-    /// Returns [`OtelError`] if the endpoint is not `http://`, or if either
-    /// exporter fails to construct.
+    /// Returns [`OtelError`] if the endpoint is not `http://` to a loopback
+    /// host, or if the exporter fails to construct.
     pub fn build<S>(
         cfg: &OtelConfig,
     ) -> Result<(Box<dyn Layer<S> + Send + Sync>, OtelGuard), OtelError>
@@ -121,6 +133,22 @@ mod enabled {
         S: tracing::Subscriber + for<'a> LookupSpan<'a> + Send + Sync,
     {
         if !cfg.endpoint.starts_with("http://") {
+            return Err(OtelError::NotPlainHttp(cfg.endpoint.clone()));
+        }
+        // `http://` alone is not "trusted network". The same rule
+        // `SsdfSinkConfig`/`ForwardSinkConfig` apply to their endpoints
+        // applies here for the same reason: plaintext OTLP carries span
+        // attributes and event bodies (device names, tool args, and whatever
+        // a downstream crate's `debug!` puts in scope) on the wire in the
+        // clear, so a non-loopback host is a data leak to anyone on the path.
+        // `split_endpoint` refuses that, and refuses hostnames rather than
+        // resolving them, closing the same DNS-rebinding TOCTOU it closes for
+        // SSDF. It cannot return `tls == true` here since a `https://`
+        // endpoint was already refused above; the check exists so this stays
+        // correct if that ordering ever changes.
+        let (tls, ..) = crate::sinks::ssdf::split_endpoint(&cfg.endpoint)
+            .map_err(|error| OtelError::Setup(error.to_string()))?;
+        if tls {
             return Err(OtelError::NotPlainHttp(cfg.endpoint.clone()));
         }
 
@@ -136,30 +164,13 @@ mod enabled {
             .map_err(|error| OtelError::Setup(error.to_string()))?;
         let tracer_provider = SdkTracerProvider::builder()
             .with_batch_exporter(span_exporter)
-            .with_resource(resource.clone())
-            .build();
-
-        let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
-            .with_http()
-            .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
-            .with_endpoint(format!("{}/v1/metrics", cfg.endpoint.trim_end_matches('/')))
-            .build()
-            .map_err(|error| OtelError::Setup(error.to_string()))?;
-        let meter_provider = SdkMeterProvider::builder()
-            .with_periodic_exporter(metric_exporter)
             .with_resource(resource)
             .build();
 
         let tracer = tracer_provider.tracer(cfg.service_name.clone());
         let layer = tracing_opentelemetry::layer().with_tracer(tracer).boxed();
 
-        Ok((
-            layer,
-            OtelGuard {
-                tracer_provider,
-                meter_provider,
-            },
-        ))
+        Ok((layer, OtelGuard { tracer_provider }))
     }
 }
 
@@ -182,6 +193,43 @@ mod tests {
             Ok(_) => panic!("an https:// endpoint must be refused"),
         };
         assert!(matches!(error, OtelError::NotPlainHttp(_)));
+    }
+
+    #[test]
+    fn a_plain_http_endpoint_to_a_non_loopback_host_is_refused() {
+        // Regression test for a review finding (MEC-459): `http://` alone was
+        // being accepted regardless of host, so a configured collector on the
+        // network sent every span and metric -- including whatever attributes
+        // and bodies a downstream crate attached -- in the clear to anyone on
+        // the path.
+        let cfg = OtelConfig {
+            endpoint: "http://10.9.9.9:4318".to_string(),
+            service_name: "test".to_string(),
+        };
+        let error = match build::<tracing_subscriber::Registry>(&cfg) {
+            Err(error) => error,
+            Ok(_) => panic!("a plain-http endpoint to a non-loopback host must be refused"),
+        };
+        assert!(
+            error.to_string().contains("non-loopback"),
+            "must name the refusal reason: {error}"
+        );
+    }
+
+    #[test]
+    fn a_plain_http_endpoint_to_a_hostname_is_refused() {
+        // A hostname is refused even when it would resolve to loopback:
+        // resolving it to decide trust is a DNS-rebinding TOCTOU, the same
+        // reasoning `split_endpoint` documents for SSDF and the forward sink.
+        let cfg = OtelConfig {
+            endpoint: "http://localhost:4318".to_string(),
+            service_name: "test".to_string(),
+        };
+        let error = match build::<tracing_subscriber::Registry>(&cfg) {
+            Err(error) => error,
+            Ok(_) => panic!("a hostname endpoint must be refused"),
+        };
+        assert!(error.to_string().contains("non-loopback"));
     }
 
     #[test]

@@ -81,26 +81,22 @@ impl EvidenceService {
     /// alternative is starting a second root, which produces a fork that
     /// verifies as two valid chains and is therefore invisible downstream.
     pub fn start(config: EvidenceConfig) -> Result<Self, SsdfSinkError> {
-        let stop = new_stop();
-        let sink = Arc::new(SsdfSink::new_with_transport(
-            config.sink.clone(),
+        Self::start_with_transports(
+            config,
             Arc::new(crate::sinks::ssdf::StdHttpTransport),
-            interruptible_sleep(&stop),
-        )?);
-        let forward = Self::build_forward(
-            &config,
             Arc::new(crate::sinks::ssdf::StdHttpTransport),
-            &stop,
-        )?;
-        Self::from_sink(config, sink, forward, stop)
+        )
     }
 
-    /// Start a pipeline against a supplied transport, for tests.
+    /// Start a pipeline where the SSDF sink and the forward sink share one
+    /// transport, for tests.
     ///
-    /// The same transport instance is used for the forward sink, when one is
-    /// configured -- both are `Arc`s over the same trait object, so this costs
-    /// nothing when `forward_sink` is `None`, which every caller of this
-    /// function before this field existed already is.
+    /// Production callers with a configured forward sink should prefer
+    /// [`start_with_transports`](Self::start_with_transports): SSDF and the
+    /// forward endpoint are typically different hosts with different trust
+    /// anchors (SSDF's private CA vs. the forward collector's own -- see
+    /// `mecmcp-runtime`'s `EvidenceArgs::forward_ca_file`), and a shared
+    /// transport can only trust one of them.
     ///
     /// # Errors
     ///
@@ -109,31 +105,47 @@ impl EvidenceService {
         config: EvidenceConfig,
         transport: Arc<dyn HttpTransport>,
     ) -> Result<Self, SsdfSinkError> {
+        Self::start_with_transports(config, Arc::clone(&transport), transport)
+    }
+
+    /// Start a pipeline with independent transports for the SSDF sink and the
+    /// forward sink.
+    ///
+    /// Separate transports exist because the two destinations are typically
+    /// different hosts with different trust anchors: SSDF's transport trusts
+    /// SSDF's private CA (`--ssdf-audit-ca-file`), while a forward collector
+    /// needs its own (`--audit-forward-ca-file`). Reusing SSDF's transport for
+    /// the forward sink makes every `https://` forward delivery fail its TLS
+    /// handshake unless the two happen to share a CA, with nothing but a
+    /// `warn!` log to say why.
+    ///
+    /// # Errors
+    ///
+    /// As [`start`](Self::start).
+    pub fn start_with_transports(
+        config: EvidenceConfig,
+        ssdf_transport: Arc<dyn HttpTransport>,
+        forward_transport: Arc<dyn HttpTransport>,
+    ) -> Result<Self, SsdfSinkError> {
         let stop = new_stop();
         let sink = Arc::new(SsdfSink::new_with_transport(
             config.sink.clone(),
-            Arc::clone(&transport),
+            ssdf_transport,
             interruptible_sleep(&stop),
         )?);
-        let forward = Self::build_forward(&config, transport, &stop)?;
+        let forward = Self::build_forward(&config, forward_transport)?;
         Self::from_sink(config, sink, forward, stop)
     }
 
     fn build_forward(
         config: &EvidenceConfig,
         transport: Arc<dyn HttpTransport>,
-        stop: &Arc<(Mutex<bool>, Condvar)>,
     ) -> Result<Option<Arc<ForwardSink>>, SsdfSinkError> {
         config
             .forward_sink
             .clone()
             .map(|forward_config| {
-                ForwardSink::new_with_transport(
-                    forward_config,
-                    transport,
-                    interruptible_sleep(stop),
-                )
-                .map(Arc::new)
+                ForwardSink::new_with_transport(forward_config, transport).map(Arc::new)
             })
             .transpose()
     }

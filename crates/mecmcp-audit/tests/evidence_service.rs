@@ -583,6 +583,91 @@ fn a_configured_forward_sink_receives_the_same_segments_as_ssdf() {
     assert_eq!(forwarded.server_id, "junos-950");
 }
 
+/// A transport that records every request it sees and nothing else -- used
+/// on one leg of `start_with_transports` so a test can assert the *other*
+/// leg never touched it.
+#[derive(Default)]
+struct RecordingTransport {
+    requests: Mutex<Vec<String>>,
+}
+
+impl HttpTransport for RecordingTransport {
+    fn send(&self, request: &HttpRequest) -> Result<String, SsdfSinkError> {
+        self.requests.lock().unwrap().push(request.url.clone());
+        if request.url.contains("SELECT") {
+            return Ok("0\t0\n".to_string());
+        }
+        Ok(String::new())
+    }
+}
+
+/// Regression test for a review finding (MEC-459): `start_with_transport`
+/// (singular) forced SSDF and the forward sink to share one transport, so an
+/// `https://` forward endpoint with a CA different from SSDF's failed every
+/// delivery with nothing but a `warn!` to explain why.
+/// `start_with_transports` gives each sink its own transport; this proves
+/// SSDF traffic never reaches the forward transport and vice versa.
+#[test]
+fn start_with_transports_keeps_ssdf_and_forward_traffic_on_separate_transports() {
+    let dir = tempfile::tempdir().unwrap();
+    let ssdf_transport = Arc::new(RecordingTransport::default());
+    let forward_transport = Arc::new(RecordingTransport::default());
+    let service = EvidenceService::start_with_transports(
+        EvidenceConfig {
+            server_id: "junos-950".to_string(),
+            run_id: "run-1".to_string(),
+            records_per_segment: 1,
+            delivery_interval: Duration::from_millis(20),
+            sink: sink_config(dir.path()),
+            signing_key_path: None,
+            forward_sink: Some(forward_sink_config(dir.path())),
+        },
+        ssdf_transport.clone(),
+        forward_transport.clone(),
+    )
+    .unwrap();
+
+    service
+        .recorder()
+        .apply_intent("req-1", "cs-1", "vsrx-ci", "alice")
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while ssdf_transport.requests.lock().unwrap().is_empty()
+        && forward_transport.requests.lock().unwrap().is_empty()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    service.shutdown().unwrap();
+
+    let ssdf_requests = ssdf_transport.requests.lock().unwrap();
+    assert!(
+        ssdf_requests.iter().any(|url| url.contains("ch.example")),
+        "the SSDF transport must have carried ClickHouse traffic: {ssdf_requests:?}"
+    );
+    assert!(
+        ssdf_requests
+            .iter()
+            .all(|url| !url.contains("collector.example")),
+        "the forward endpoint must never be reached through the SSDF transport: {ssdf_requests:?}"
+    );
+
+    let forward_requests = forward_transport.requests.lock().unwrap();
+    assert!(
+        forward_requests
+            .iter()
+            .any(|url| url.contains("collector.example")),
+        "the forward transport must have carried the forward POST: {forward_requests:?}"
+    );
+    assert!(
+        forward_requests
+            .iter()
+            .all(|url| !url.contains("ch.example")),
+        "ClickHouse traffic must never be reached through the forward transport: {forward_requests:?}"
+    );
+}
+
 /// The pipeline behaves exactly as before this field existed when
 /// `forward_sink` is left `None` -- no forward outbox or ledger file is even
 /// created.

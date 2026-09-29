@@ -87,6 +87,14 @@ for a bearer token; see `EvidenceArgs` in
 requires `--ssdf-audit-endpoint` to also be set — the forward sink rides on
 the same recorder and chain identity — and is refused otherwise.
 
+SSDF and the forward endpoint are usually different hosts with different
+trust anchors, so a deployment enabling both over `https://` should start the
+pipeline with `EvidenceService::start_with_transports`, giving the SSDF
+transport `EvidenceArgs::ca_file()` and the forward transport
+`EvidenceArgs::forward_ca_file()`. `start_with_transport` (singular) shares
+one transport between both sinks and exists for the loopback-`http://`,
+same-trust-anchor, and test cases where that is fine.
+
 This is **not** the syslog path rejected below: it ships the same
 hash-chained `ClosedSegment` SSDF ships, `prev_hash`/`head_hash` intact, as a
 single JSON POST per segment rather than an unchained line in a table anyone

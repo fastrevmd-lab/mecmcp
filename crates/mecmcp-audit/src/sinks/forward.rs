@@ -91,7 +91,6 @@ pub struct ForwardSink {
     outbox: Arc<Mutex<OutboxState>>,
     ledger: Arc<Mutex<DeliveryLedger>>,
     transport: Arc<dyn HttpTransport>,
-    sleep_fn: Arc<dyn Fn(Duration) + Send + Sync>,
 }
 
 struct OutboxState {
@@ -100,7 +99,7 @@ struct OutboxState {
 }
 
 impl ForwardSink {
-    /// Create a new forward sink with a custom transport and sleep function.
+    /// Create a new forward sink with a custom transport.
     ///
     /// The transport decides TLS: `StdHttpTransport` (from
     /// [`crate::sinks::ssdf`]) refuses anything but loopback HTTP, so a real
@@ -108,13 +107,19 @@ impl ForwardSink {
     /// `mecmcp-transport`'s `EvidenceHttpTransport`, which already implements
     /// [`HttpTransport`] and is reused unchanged here.
     ///
+    /// Unlike [`SsdfSink`](crate::sinks::ssdf::SsdfSink), this sink never
+    /// blocks a delivery pass on backoff: it shares a thread with the SSDF
+    /// drain loop (see `service::drain_until_stopped`), and a
+    /// sleeping forward pass would delay the next SSDF attempt behind it.
+    /// [`attempt_delivery`](Self::attempt_delivery) instead skips a segment
+    /// whose backoff has not yet elapsed and revisits it on the next pass.
+    ///
     /// # Errors
     ///
     /// Returns [`ForwardSinkError`] if the outbox or ledger cannot be opened.
     pub fn new_with_transport(
         config: ForwardSinkConfig,
         transport: Arc<dyn HttpTransport>,
-        sleep_fn: Arc<dyn Fn(Duration) + Send + Sync>,
     ) -> Result<Self, ForwardSinkError> {
         let outbox_path = std::path::absolute(&config.outbox_path)?;
         let ledger_path = std::path::absolute(&config.ledger_path)?;
@@ -143,7 +148,6 @@ impl ForwardSink {
             outbox,
             ledger,
             transport,
-            sleep_fn,
         })
     }
 
@@ -215,9 +219,26 @@ impl ForwardSink {
                 Some(DeliveryStatus::Failed { attempts, .. }) => *attempts,
                 _ => 0,
             };
-            if attempts > 0 {
-                let delay = self.compute_backoff(attempts);
-                (self.sleep_fn)(delay);
+            // Non-blocking backoff: a segment whose last failure has not aged
+            // past its backoff window is left for the next pass rather than
+            // sleeping here. This sink shares a thread with the SSDF drain
+            // loop, so a `sleep` here would delay SSDF's own next delivery
+            // attempt behind however many forward segments are backed off.
+            if let Some(DeliveryStatus::Failed { failed_at, .. }) = &status {
+                let due = chrono::DateTime::parse_from_rfc3339(failed_at)
+                    .map(|failed_at| {
+                        let backoff = chrono::Duration::from_std(self.compute_backoff(attempts))
+                            .unwrap_or_else(|_| chrono::Duration::zero());
+                        chrono::Utc::now().signed_duration_since(failed_at) >= backoff
+                    })
+                    // An unparsable timestamp cannot prove the backoff has
+                    // elapsed, but must not wedge the segment forever either
+                    // -- attempt it and let a fresh failure record a fresh,
+                    // parsable timestamp.
+                    .unwrap_or(true);
+                if !due {
+                    continue;
+                }
             }
 
             match self.deliver_segment(&segment) {
@@ -401,10 +422,6 @@ mod tests {
         close(seg).unwrap()
     }
 
-    fn no_sleep() -> Arc<dyn Fn(Duration) + Send + Sync> {
-        Arc::new(|_| {})
-    }
-
     #[test]
     fn debug_never_prints_the_bearer_token() {
         let dir = TempDir::new().unwrap();
@@ -419,7 +436,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = make_test_config(&dir, "http://127.0.0.1:9/audit");
         let transport = Arc::new(MockTransport::new());
-        let sink = ForwardSink::new_with_transport(config.clone(), transport, no_sleep()).unwrap();
+        let sink = ForwardSink::new_with_transport(config.clone(), transport).unwrap();
 
         let segment = make_test_segment(0);
         sink.spool(segment.clone()).unwrap();
@@ -433,8 +450,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = make_test_config(&dir, "http://127.0.0.1:9/audit");
         let transport = Arc::new(MockTransport::new());
-        let sink =
-            ForwardSink::new_with_transport(config.clone(), transport.clone(), no_sleep()).unwrap();
+        let sink = ForwardSink::new_with_transport(config.clone(), transport.clone()).unwrap();
 
         let segment = make_test_segment(0);
         sink.spool(segment.clone()).unwrap();
@@ -468,8 +484,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = make_test_config(&dir, "http://127.0.0.1:9/audit");
         let transport = Arc::new(MockTransport::new());
-        let sink =
-            ForwardSink::new_with_transport(config.clone(), transport.clone(), no_sleep()).unwrap();
+        let sink = ForwardSink::new_with_transport(config.clone(), transport.clone()).unwrap();
 
         sink.spool(make_test_segment(0)).unwrap();
         assert_eq!(sink.attempt_delivery().unwrap().delivered, 1);
@@ -486,7 +501,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = make_test_config(&dir, "http://127.0.0.1:9/audit");
         let transport = Arc::new(MockTransport::failing());
-        let sink = ForwardSink::new_with_transport(config, transport, no_sleep()).unwrap();
+        let sink = ForwardSink::new_with_transport(config, transport).unwrap();
 
         sink.spool(make_test_segment(0)).unwrap();
         let report = sink.attempt_delivery().unwrap();
@@ -503,13 +518,52 @@ mod tests {
         // the chain of record, so both segments must still be attempted in
         // the same pass even though delivery fails for both.
         let failing = Arc::new(MockTransport::failing());
-        let sink = ForwardSink::new_with_transport(config, failing, no_sleep()).unwrap();
+        let sink = ForwardSink::new_with_transport(config, failing).unwrap();
         sink.spool(make_test_segment(0)).unwrap();
         sink.spool(make_test_segment(1)).unwrap();
         let report = sink.attempt_delivery().unwrap();
         assert_eq!(
             report.failed, 2,
             "both segments must be attempted, not just the first"
+        );
+    }
+
+    #[test]
+    fn backed_off_segments_are_skipped_without_blocking() {
+        // Regression test for a review finding (MEC-459): attempt_delivery
+        // used to sleep out each segment's backoff in-line, and this sink
+        // shares a thread with the SSDF drain loop (drain_until_stopped), so
+        // a large batch of backed-off segments delayed the next SSDF
+        // delivery pass behind them. A long backoff (60s) makes any
+        // remaining in-line sleep obvious: the second pass below must return
+        // in well under that, proving segments not yet due are skipped
+        // rather than waited out.
+        let dir = TempDir::new().unwrap();
+        let mut config = make_test_config(&dir, "http://127.0.0.1:9/audit");
+        config.initial_backoff = Duration::from_secs(60);
+        config.max_backoff = Duration::from_secs(60);
+        let failing = Arc::new(MockTransport::failing());
+        let sink = ForwardSink::new_with_transport(config, failing).unwrap();
+
+        for seq in 0..10 {
+            sink.spool(make_test_segment(seq)).unwrap();
+        }
+
+        let first = sink.attempt_delivery().unwrap();
+        assert_eq!(first.failed, 10, "every segment gets a first attempt");
+
+        let started = std::time::Instant::now();
+        let second = sink.attempt_delivery().unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            second.delivered + second.failed,
+            0,
+            "no segment is due for retry yet, so none should be re-attempted"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a pass over segments still within their backoff window must not block: took {elapsed:?}"
         );
     }
 }
