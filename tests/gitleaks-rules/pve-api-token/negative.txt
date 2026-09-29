@@ -1,0 +1,1 @@
+Proxmox API tokens use the form PVEAPIToken=user@pve!tokenid=short, which is far too short to be a real secret.
