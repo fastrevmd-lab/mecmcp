@@ -76,6 +76,12 @@ required-features = ["test-util"]
 # binaries and widens the attack surface for no runtime benefit. Cargo unifies
 # features per build, so `cargo test` gets it and `cargo build` does not.
 mecmcp-audit = { version = "0.24.1", path = "../mecmcp-audit", features = ["test-util"] }
+# Test-only: proves that `mecmcp-secret`'s `AuthFailureTracker::probe` — built
+# with no dependency on this crate, by closure shape alone — actually flips
+# `/readyz` when registered as a `ReadinessCheck`. Not a normal dependency:
+# `mecmcp-transport` must not depend on `mecmcp-secret` for anything but this
+# integration test (MEC-539).
+mecmcp-secret = { version = "0.24.1", path = "../mecmcp-secret" }
 # Test-only: rmcp's `EventStore` is an `#[async_trait]` trait, so the fake store
 # that proves `LimitedSessionManager` forwards `event_store()` needs the macro.
 async-trait = { workspace = true }
