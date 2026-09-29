@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **DOCKER-STANDARD template examples now use mechubsec image names** —
+  updated from `ghcr.io/fastrevmd-lab/<binary>` to `ghcr.io/mechubsec/<reponame>`
+  to match the org migration.
+
+### Changed
+
 - **Raised MSRV to 1.89** and removed the `aes` pin from the CI msrv job that PR #344 added. All six consumer repos are moving to 1.89 in parallel PRs, so the objection that blocked raising the floor in #344 no longer stands.
 
 ## [0.23.1] - 2026-09-05

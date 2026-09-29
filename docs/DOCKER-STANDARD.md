@@ -58,7 +58,7 @@ Every README has a **Docker** section documenting the complete first-run workflo
 ```markdown
 ## Docker
 
-Prebuilt images are published to `ghcr.io/fastrevmd-lab/<binary>` on every release tag.
+Prebuilt images are published to `ghcr.io/mechubsec/<reponame>` on every release tag.
 
 ### Prerequisites
 
@@ -96,7 +96,7 @@ docker run --rm -i \
   -p 127.0.0.1:30031:30031 \
   -v "$PWD/config:/etc/<binary>:ro" \
   -v "$PWD/state:/var/lib/<binary>" \
-  ghcr.io/fastrevmd-lab/<binary>:latest \
+  ghcr.io/mechubsec/<reponame>:latest \
   --device-mapping /etc/<binary>/devices.json \
   --transport streamable-http \
   --host 0.0.0.0 \
@@ -127,7 +127,7 @@ docker run --rm -i \
   -p 0.0.0.0:30031:30031 \
   -v "$PWD/config:/etc/<binary>:ro" \
   -v "$PWD/state:/var/lib/<binary>" \
-  ghcr.io/fastrevmd-lab/<binary>:latest \
+  ghcr.io/mechubsec/<reponame>:latest \
   --device-mapping /etc/<binary>/devices.json \
   --transport streamable-http \
   --host 0.0.0.0 \
@@ -149,7 +149,7 @@ docker run --rm -i \
 ```yaml
 services:
   <binary>:
-    image: ghcr.io/fastrevmd-lab/<binary>:latest
+    image: ghcr.io/mechubsec/<reponame>:latest
     container_name: <binary>
     user: "65532:65532"
     read_only: true
@@ -209,7 +209,7 @@ But this cannot be in the Dockerfile for distroless — put it in a monitoring s
 **Apple Silicon (M-series):** Images are built for `linux/amd64` only. They run under emulation on Apple Silicon. Add `--platform linux/amd64` to both `pull` and `run` commands if you hit a platform-mismatch warning:
 
 ```bash
-docker pull --platform linux/amd64 ghcr.io/fastrevmd-lab/<binary>:latest
+docker pull --platform linux/amd64 ghcr.io/mechubsec/<reponame>:latest
 docker run --platform linux/amd64 --rm -i ...
 ```
 
