@@ -11,6 +11,15 @@ authors.workspace      = true
 [lints]
 workspace = true
 
+[features]
+# Gates HttpRequest::from_absolute_url. Off by default: a vendor MCP server
+# building REST calls from a device- or model-supplied id must go through
+# HttpRequest::with_base_and_path, where the path component is a
+# mecmcp_openapi::ExpandedPath and cannot be a hand-assembled string. Enable
+# this only for callers that genuinely need a full, non-path-templated URL
+# (OIDC discovery/JWKS documents point wherever the issuer's metadata says).
+absolute-url = []
+
 [dependencies]
 mecmcp-openapi = { version = "0.24.1", path = "../mecmcp-openapi" }
 mecmcp-secret = { version = "0.24.1", path = "../mecmcp-secret" }

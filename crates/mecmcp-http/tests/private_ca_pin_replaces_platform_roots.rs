@@ -36,6 +36,7 @@
 #![allow(clippy::unwrap_used, reason = "test code")]
 
 use mecmcp_http::{HttpClient, HttpClientConfig, HttpRequest, Method};
+use mecmcp_openapi::expand_path;
 use rustls::pki_types::CertificateDer;
 use std::process::{Command, Output};
 use std::sync::Arc;
@@ -164,8 +165,13 @@ fn run_child() {
             ..Default::default()
         };
         let client = HttpClient::new(config).expect("client construction must succeed");
-        let request = HttpRequest::new(Method::Get, &format!("https://localhost:{port}/"))
-            .expect("request construction must succeed");
+        let path = expand_path("/", &[]).expect("static path template always expands");
+        let request = HttpRequest::with_base_and_path(
+            Method::Get,
+            &format!("https://localhost:{port}"),
+            &path,
+        )
+        .expect("request construction must succeed");
         let result = client.send(request).await;
 
         if is_pinned {
