@@ -1,0 +1,1 @@
+root-authentication { encrypted-password "$5$mK2pQxRz$Vb9nLkTs4Wc8HuFdEa6oIu3PzMz1GxWyRjNqB4Yc"; }  // gitleaks:allow
