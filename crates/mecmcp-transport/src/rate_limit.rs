@@ -38,7 +38,10 @@ static X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 /// without special-casing. If an entry fails to parse, or every entry is
 /// trusted, the walk falls back to `peer` rather than skipping the bad entry
 /// — an unparsable value is exactly where a spoofed one would hide.
-fn resolve_rate_limit_ip(
+/// Only `pub` (not `pub(crate)`) because `fuzz/` is a separate crate outside
+/// this workspace and needs a public path to reach it; the `#[doc(hidden)]`
+/// re-export in `lib.rs` keeps it out of the crate's documented API.
+pub fn resolve_rate_limit_ip(
     peer: IpAddr,
     headers: &http::HeaderMap,
     trusted_proxies: &[IpNet],

@@ -2,7 +2,8 @@
 
 No-panic targets for the parsers in this workspace that consume bytes chosen
 by something other than this server: a caller-presented bearer token, an
-IdP's discovery/JWKS response, or a device/controller's tool-output body.
+IdP's discovery/JWKS response, a device/controller's tool-output body, or a
+reverse proxy's `X-Forwarded-For` header.
 None of these carry an independent oracle (unlike rustnetconf's
 `fragment_embeds_cleanly`, which checks a *property* of the parse) -- they
 assert only that the function returns instead of aborting, because a panic
@@ -20,9 +21,10 @@ cargo +nightly fuzz run oidc_discovery_parse_is_total     -- -max_total_time=120
 cargo +nightly fuzz run redact_text_never_panics          -- -max_total_time=120
 cargo +nightly fuzz run redact_json_never_panics          -- -max_total_time=120
 cargo +nightly fuzz run redact_xml_never_panics           -- -max_total_time=120
+cargo +nightly fuzz run xff_parse                         -- -max_total_time=120
 ```
 
-`cargo fuzz list` from this directory enumerates all six.
+`cargo fuzz list` from this directory enumerates all seven.
 
 ## `oidc_token_verify_never_panics`
 
@@ -51,3 +53,16 @@ these targets are the coarse "does not abort mid-redaction" property. Which
 secrets get caught is a unit-test question (see the crate's own denylist and
 shape tests), not a fuzz-target one -- a fuzzer has no oracle for "this
 redaction was correct", only "this call returned".
+
+## `xff_parse`
+
+`mecmcp-transport::rate_limit::resolve_rate_limit_ip` (mecmcp#410, MEC-49)
+splits a trusted proxy's `X-Forwarded-For` header on commas, trims each
+entry, and parses it as an `IpAddr` to find the per-IP rate-limit bucket key.
+The header value is client-influenced -- deployed proxies append the real
+client to whatever the client itself sent -- and does not have to be valid
+UTF-8. The target fixes `peer` and `trusted_proxies` so the "untrusted peer"
+fast path never short-circuits the walk, builds a `HeaderValue` straight from
+the fuzz bytes via `from_bytes` (accepting the same opaque-byte values a
+proxy can put on the wire, unlike a `&str`-typed target), and asserts only
+that the split/trim/parse walk returns instead of panicking.
