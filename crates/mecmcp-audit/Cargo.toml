@@ -39,6 +39,36 @@ tracing-journald = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid        = { workspace = true }
 
+# Optional: only pulled in when a consumer enables the `otel` feature. This
+# family is ~90 extra crates, so a server that never sets `--otel-endpoint`
+# must not carry them -- see `otel.rs` for the offline-first / D4 reasoning.
+# `default-features = false` on `opentelemetry-otlp` with only "http-proto" +
+# "reqwest-blocking-client" pulls reqwest with no TLS backend at all: it can
+# only reach plain `http://`, so this never becomes a second place to make
+# decision D4's rustls-provider choice (see mecmcp-transport's Cargo.toml).
+# A remote OTLP collector is reached the same way a remote ClickHouse is —
+# through a loopback TLS-terminating proxy, not by this crate speaking TLS.
+opentelemetry = { version = "0.33", optional = true }
+opentelemetry_sdk = { version = "0.33", optional = true }
+opentelemetry-otlp = { version = "0.33", optional = true, default-features = false, features = [
+    "http-proto",
+    "reqwest-blocking-client",
+    "trace",
+    "metrics",
+] }
+tracing-opentelemetry = { version = "0.34", optional = true }
+
+[features]
+test-util = []
+# Off by default: OpenTelemetry export is an offline-first opt-in, not a
+# default dependency of every mecmcp server. See `otel.rs`.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+
 [dev-dependencies]
 # Test-only: the exporter is used solely to render metrics in unit tests.
 # It must NOT be a normal dependency — its default features pull an HTTP
@@ -46,9 +76,6 @@ uuid        = { workspace = true }
 # conflicts with a consumer that pins `ring`. That broke TLS in a downstream
 # server. Keep it here, and keep default-features off.
 metrics-exporter-prometheus = { workspace = true }
-
-[features]
-test-util = []
 
 # `testutil` is gated behind `test-util`, and an integration target does not get
 # `cfg(test)` on the library — so without this, `cargo test -p mecmcp-audit`

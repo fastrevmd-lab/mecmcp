@@ -37,6 +37,7 @@ fn a_pre_existing_log_logger_does_not_cost_the_rotation_handle() {
         audit_log_file: Some(audit_log.clone()),
         redaction: None,
         journald: false,
+        otel: None,
     })
     .expect("installation must succeed");
 

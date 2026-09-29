@@ -31,6 +31,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **mecmcp-audit: optional OpenTelemetry export, and a generic HTTPS/JSON
+  forward sink for closed evidence segments** (MEC-459). Two independent,
+  off-by-default additions:
+  - `AuditConfig::otel` (`--otel-endpoint`/`--otel-service-name` at the CLI
+    layer) exports spans and metrics over OTLP/HTTP when set. Building the
+    exporter needs `mecmcp-audit`'s new `otel` Cargo feature (~90 extra
+    crates, so it is not a default dependency); setting `AuditConfig::otel`
+    without that feature fails startup loudly rather than silently dropping
+    the export, matching the existing `--audit-log-file` rule (#158). The
+    OTLP client only speaks plain `http://` -- see `mecmcp-audit::otel` for
+    why that is deliberate (decision D4).
+  - `EvidenceConfig::forward_sink` (`--audit-forward-endpoint` and friends)
+    ships the same hash-chained `ClosedSegment` SSDF ships to a second,
+    best-effort destination -- a SIEM, a log collector, an object-lock
+    bucket's HTTP front end. This is not the unchained syslog path
+    `docs/AUDIT-FORWARDING-STANDARD.md` rejected: `prev_hash`/`head_hash`
+    travel with every record, so a receiver can still detect a dropped or
+    altered one. SSDF stays the chain of record; a forward-sink failure is
+    logged and never affects `EvidenceService::delivery_degraded` or
+    `shutdown`'s result.
+  Both are `None`/off by default, so existing SSDF-only and non-OTel
+  deployments are unaffected.
+
 - **redact: `Untrusted<T>` marks device/controller-sourced content before it
   reaches a model** (MEC-511). Device text (hostnames, descriptions, error
   bodies) previously flowed into tool output with nothing distinguishing it

@@ -45,6 +45,7 @@ fn run_as_child(audit_log: &Path) {
         audit_log_file: Some(audit_log.to_path_buf()),
         redaction: None,
         journald: false,
+        otel: None,
     })
     .expect("installation must succeed");
     assert!(sink.is_some(), "the rotation handle must be returned");

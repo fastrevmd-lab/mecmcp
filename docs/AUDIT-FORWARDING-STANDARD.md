@@ -8,8 +8,10 @@ shipped in mecmcp **0.14.0** (2026-08-23; see
 implementation history. It carries the change-lifecycle evidence records
 (proposal, approval, apply intent, receipt); the per-call tool audit stream
 (Part 1's `audit.jsonl`) is not forwarded and stays on the host. SSDF is the
-only supported off-host transport today for the records it does carry;
-syslog forwarding was designed, staged and rejected — see
+chain of record for those records; an optional, additive
+[forward sink](#a-second-destination-the-generic-forward-sink) (MEC-459) can
+ship the same chained records to a second off-host destination alongside it.
+Syslog forwarding was designed, staged and rejected — see
 [Why not syslog](#why-not-syslog-to-the-existing-collector) below. See
 [Enabling it](#enabling-it) to turn it on for a server.
 
@@ -72,6 +74,28 @@ identity flags (`EvidenceArgs` in
 full set); a server started without `--ssdf-audit-endpoint` runs its evidence
 pipeline as a no-op. The sink itself lives in
 [`crates/mecmcp-audit/src/sinks/ssdf.rs`](../crates/mecmcp-audit/src/sinks/ssdf.rs).
+
+### A second destination: the generic forward sink
+
+SSDF stays the schema steward and the chain of record, but a deployment that
+wants a copy of the same evidence trail somewhere else off-host — a SIEM, a
+log collector, an object-lock bucket's HTTP front end — can enable
+`ForwardSink` (MEC-459) alongside it: `--audit-forward-endpoint <url>` plus
+`--audit-forward-outbox`/`--audit-forward-ledger` (`--audit-forward-token-file`
+for a bearer token; see `EvidenceArgs` in
+[`mecmcp-runtime/src/cli.rs`](../crates/mecmcp-runtime/src/cli.rs)). It
+requires `--ssdf-audit-endpoint` to also be set — the forward sink rides on
+the same recorder and chain identity — and is refused otherwise.
+
+This is **not** the syslog path rejected below: it ships the same
+hash-chained `ClosedSegment` SSDF ships, `prev_hash`/`head_hash` intact, as a
+single JSON POST per segment rather than an unchained line in a table anyone
+with write access can edit undetectably. It is additive and best-effort — a
+forward-sink failure is logged and never affects SSDF's own delivery or
+`EvidenceService::delivery_degraded`. See
+[`crates/mecmcp-audit/src/sinks/forward.rs`](../crates/mecmcp-audit/src/sinks/forward.rs)
+for the full reasoning and the local-ledger-only dedup caveat versus SSDF's
+own high-water-mark guarantee.
 
 ### Why not syslog to the existing collector
 
@@ -202,6 +226,10 @@ JSONL sinks get the equivalent through logrotate: `daily`, `rotate 14`,
   SSDF sink (shipped in 0.14.0, #292; see [Enabling it](#enabling-it)), and
   standing up a second, unchained forwarding path beside it is the thing
   [Why not syslog](#why-not-syslog-to-the-existing-collector) exists to avoid.
+  A deployment that wants a second, off-host copy of the same chained
+  records can enable
+  [the generic forward sink](#a-second-destination-the-generic-forward-sink)
+  (MEC-459) instead.
 - **The per-call audit stream is not forwarded off-host.** Only
   change-lifecycle evidence (proposal, approval, apply intent, receipt)
   reaches `ssdf.audit`; Part 1's `audit.jsonl` — the per-call tool-call

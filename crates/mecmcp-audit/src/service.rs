@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use crate::recorder::{EvidenceRecorder, RecorderConfig, resume_head};
 use crate::signing::load_signing_key;
+use crate::sinks::forward::{ForwardSink, ForwardSinkConfig};
 use crate::sinks::ssdf::{HttpTransport, SsdfSink, SsdfSinkConfig, SsdfSinkError};
 use std::path::PathBuf;
 
@@ -45,12 +46,24 @@ pub struct EvidenceConfig {
     /// signed automatically as it closes (MEC-457); there is no separate
     /// step to remember.
     pub signing_key_path: Option<PathBuf>,
+    /// A second, best-effort destination for the same closed segments --
+    /// a SIEM, a collector, an object-lock bucket -- beyond SSDF.
+    ///
+    /// `None` (the default) is the pipeline exactly as it existed before this
+    /// field was added: SSDF only, no second sink built, no extra thread work.
+    /// Its failures never affect [`EvidenceService::shutdown`]'s result or
+    /// [`EvidenceService::delivery_degraded`], which both continue to describe
+    /// the SSDF sink alone -- see [`crate::sinks::forward`] for why a second,
+    /// weaker-guarantee sink is safe to add here without touching the chain of
+    /// record.
+    pub forward_sink: Option<ForwardSinkConfig>,
 }
 
 /// A running evidence pipeline: recorder, sink, and the drain between them.
 pub struct EvidenceService {
     recorder: Arc<EvidenceRecorder>,
     sink: Arc<SsdfSink>,
+    forward: Option<Arc<ForwardSink>>,
     stop: Arc<(Mutex<bool>, Condvar)>,
     worker: Option<JoinHandle<()>>,
     /// Set when the drain hits an error, so shutdown can report that delivery
@@ -74,10 +87,20 @@ impl EvidenceService {
             Arc::new(crate::sinks::ssdf::StdHttpTransport),
             interruptible_sleep(&stop),
         )?);
-        Self::from_sink(config, sink, stop)
+        let forward = Self::build_forward(
+            &config,
+            Arc::new(crate::sinks::ssdf::StdHttpTransport),
+            &stop,
+        )?;
+        Self::from_sink(config, sink, forward, stop)
     }
 
     /// Start a pipeline against a supplied transport, for tests.
+    ///
+    /// The same transport instance is used for the forward sink, when one is
+    /// configured -- both are `Arc`s over the same trait object, so this costs
+    /// nothing when `forward_sink` is `None`, which every caller of this
+    /// function before this field existed already is.
     ///
     /// # Errors
     ///
@@ -89,15 +112,36 @@ impl EvidenceService {
         let stop = new_stop();
         let sink = Arc::new(SsdfSink::new_with_transport(
             config.sink.clone(),
-            transport,
+            Arc::clone(&transport),
             interruptible_sleep(&stop),
         )?);
-        Self::from_sink(config, sink, stop)
+        let forward = Self::build_forward(&config, transport, &stop)?;
+        Self::from_sink(config, sink, forward, stop)
+    }
+
+    fn build_forward(
+        config: &EvidenceConfig,
+        transport: Arc<dyn HttpTransport>,
+        stop: &Arc<(Mutex<bool>, Condvar)>,
+    ) -> Result<Option<Arc<ForwardSink>>, SsdfSinkError> {
+        config
+            .forward_sink
+            .clone()
+            .map(|forward_config| {
+                ForwardSink::new_with_transport(
+                    forward_config,
+                    transport,
+                    interruptible_sleep(stop),
+                )
+                .map(Arc::new)
+            })
+            .transpose()
     }
 
     fn from_sink(
         config: EvidenceConfig,
         sink: Arc<SsdfSink>,
+        forward: Option<Arc<ForwardSink>>,
         stop: Arc<(Mutex<bool>, Condvar)>,
     ) -> Result<Self, SsdfSinkError> {
         // **Replay first, then read the tail.** A segment still in flight when
@@ -118,7 +162,7 @@ impl EvidenceService {
             resume_from: resume_head(remote, local),
             records_per_segment: config.records_per_segment,
         })
-        .spooling_to(Arc::clone(&sink));
+        .spooling_to_with_forward(Arc::clone(&sink), forward.clone());
         if let Some(key_path) = &config.signing_key_path {
             let key = load_signing_key(key_path)?;
             recorder_builder = recorder_builder.with_signing_key(key);
@@ -128,18 +172,22 @@ impl EvidenceService {
         let degraded = Arc::new(AtomicBool::new(false));
         let worker = {
             let sink = Arc::clone(&sink);
+            let forward = forward.clone();
             let stop = Arc::clone(&stop);
             let degraded = Arc::clone(&degraded);
             let interval = config.delivery_interval;
             std::thread::Builder::new()
                 .name("evidence-delivery".to_owned())
-                .spawn(move || drain_until_stopped(&sink, &stop, &degraded, interval))
+                .spawn(move || {
+                    drain_until_stopped(&sink, forward.as_deref(), &stop, &degraded, interval)
+                })
                 .map_err(SsdfSinkError::OutboxIo)?
         };
 
         Ok(Self {
             recorder,
             sink,
+            forward,
             stop,
             worker: Some(worker),
             degraded,
@@ -173,8 +221,32 @@ impl EvidenceService {
         // get through, the chain would land with a missing predecessor -- a
         // hole that still verifies as a chain.
         let sink = Arc::clone(&self.sink);
-        let outcome = spool_everything(&self.recorder, |segment| sink.spool(segment));
+        let forward = self.forward.clone();
+        let outcome = spool_everything(&self.recorder, move |segment| {
+            let result = sink.spool(segment.clone());
+            if let Some(forward) = &forward
+                && let Err(error) = forward.spool(segment)
+            {
+                // Best-effort, as everywhere else this sink appears: SSDF is
+                // the chain of record, and `outcome` below reports on it
+                // alone.
+                tracing::warn!(
+                    target: "audit",
+                    %error,
+                    "forward audit sink spool failed at shutdown; SSDF remains the durable record"
+                );
+            }
+            result
+        });
         let flushed = self.sink.shutdown_flush();
+        if let Some(forward) = &self.forward {
+            // Best-effort: a forward-delivery failure at shutdown does not
+            // change what this call reports, matching `delivery_degraded`
+            // above, which also describes SSDF alone.
+            if let Err(error) = forward.shutdown_flush() {
+                tracing::warn!(target: "audit", %error, "forward audit sink flush failed at shutdown");
+            }
+        }
         outcome.and(flushed)
     }
 
@@ -307,6 +379,7 @@ fn interruptible_sleep(stop: &Arc<(Mutex<bool>, Condvar)>) -> Arc<dyn Fn(Duratio
 /// Deliver on an interval until told to stop.
 fn drain_until_stopped(
     sink: &SsdfSink,
+    forward: Option<&ForwardSink>,
     stop: &(Mutex<bool>, Condvar),
     degraded: &AtomicBool,
     interval: Duration,
@@ -347,6 +420,31 @@ fn drain_until_stopped(
                     %error,
                     "evidence delivery pass failed; segments stay spooled and will be retried"
                 );
+            }
+        }
+
+        // Best-effort, and deliberately not folded into `degraded`: that flag
+        // describes the SSDF chain of record, which `delivery_degraded` is
+        // documented to report alone. A struggling forward destination is
+        // worth a log line, not a signal that changes how an operator reads
+        // the pipeline's health.
+        if let Some(forward) = forward {
+            match forward.attempt_delivery() {
+                Ok(report) if report.degraded() => {
+                    tracing::warn!(
+                        delivered = report.delivered,
+                        failed = report.failed,
+                        "some segments were refused by the forward audit sink; they stay \
+                         spooled there for retry"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "forward audit sink delivery pass failed; segments stay spooled there"
+                    );
+                }
             }
         }
 

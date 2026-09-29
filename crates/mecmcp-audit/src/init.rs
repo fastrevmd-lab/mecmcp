@@ -42,6 +42,63 @@ pub struct AuditConfig {
     pub redaction: Option<crate::redact::AuditRedaction>,
     /// When true, `target="audit"` events are also sent to journald natively.
     pub journald: bool,
+    /// When set, spans and metrics are also exported over OpenTelemetry.
+    ///
+    /// Always compiled -- see [`crate::otel`] for why -- but building the
+    /// exporter requires the `otel` Cargo feature. Setting this without that
+    /// feature enabled fails [`init_tracing`] rather than silently dropping
+    /// the requested export, the same rule #158 applies to `audit_log_file`.
+    pub otel: Option<crate::otel::OtelConfig>,
+}
+
+/// Holds the process-lifetime OpenTelemetry provider handles, when
+/// [`AuditConfig::otel`] was set and this call installed the subscriber.
+///
+/// Set at most once, by whichever [`init_tracing`] call actually installs the
+/// global subscriber -- `init_tracing` is idempotent, and a later call's otel
+/// providers would export from exporters nothing reads from, the same
+/// reasoning [`AuditFileSink`] already applies to the audit file handle.
+#[cfg(feature = "otel")]
+static OTEL_GUARD: std::sync::OnceLock<crate::otel::OtelGuard> = std::sync::OnceLock::new();
+
+/// Flush and shut down the OpenTelemetry exporters installed by
+/// [`init_tracing`], if any were configured.
+///
+/// Best-effort and a no-op when no `otel` config was set, when this build
+/// lacks the `otel` feature, or when nothing has called `init_tracing` yet.
+pub fn shutdown_otel() {
+    #[cfg(feature = "otel")]
+    if let Some(guard) = OTEL_GUARD.get() {
+        guard.shutdown();
+    }
+}
+
+#[cfg(feature = "otel")]
+fn build_otel_layer<S>(cfg: &AuditConfig) -> io::Result<Option<Box<dyn Layer<S> + Send + Sync>>>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
+{
+    let Some(otel_cfg) = &cfg.otel else {
+        return Ok(None);
+    };
+    let (layer, guard) = crate::otel::build(otel_cfg).map_err(io::Error::other)?;
+    // Ignore a second set(): only the call that goes on to install the
+    // subscriber owns providers anything reads from, and that call is the
+    // first one to reach here in practice (init_tracing is documented
+    // idempotent, not concurrent).
+    let _ = OTEL_GUARD.set(guard);
+    Ok(Some(layer))
+}
+
+#[cfg(not(feature = "otel"))]
+fn build_otel_layer<S>(cfg: &AuditConfig) -> io::Result<Option<Box<dyn Layer<S> + Send + Sync>>>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    if cfg.otel.is_some() {
+        return Err(io::Error::other(crate::otel::OtelError::NotCompiled));
+    }
+    Ok(None)
 }
 
 /// A cloneable append writer over a shared file handle.
@@ -251,7 +308,9 @@ impl AuditFileSink {
 /// # Errors
 ///
 /// Returns an error when the explicitly enabled journald layer cannot be
-/// constructed, **or when a configured audit file cannot be opened**.
+/// constructed, when a configured audit file cannot be opened, or when
+/// [`AuditConfig::otel`] is set but this build does not have the `otel`
+/// feature enabled -- see [`crate::otel`].
 ///
 /// That second case used to be swallowed with `.ok()`: startup succeeded
 /// without the requested audit file and without a warning, so an operator could
@@ -310,11 +369,13 @@ pub fn init_tracing(cfg: &AuditConfig) -> io::Result<Option<AuditFileSink>> {
     let file_layer = file_handle.clone().map(audit_file_layer);
     let journald_layer =
         make_journald_layer_with(cfg.journald, tracing_journald::layer)?.map(audit_journald_layer);
+    let otel_layer = build_otel_layer(cfg)?;
 
     let subscriber = tracing_subscriber::registry()
         .with(stderr)
         .with(file_layer)
-        .with(journald_layer);
+        .with(journald_layer)
+        .with(otel_layer);
 
     // `set_global_default` directly, rather than `try_init`.
     //
@@ -407,6 +468,7 @@ mod tests {
             audit_log_file: Some(unusable.clone()),
             redaction: None,
             journald: false,
+            otel: None,
         };
         let error = init_tracing(&cfg).unwrap_err();
         assert!(
@@ -431,8 +493,47 @@ mod tests {
             audit_log_file: None,
             redaction: None,
             journald: false,
+            otel: None,
         };
         assert!(init_tracing(&cfg).unwrap().is_none());
+    }
+
+    /// Off by default: no `otel` config means `init_tracing` behaves exactly
+    /// as it did before `AuditConfig::otel` existed, whether or not this
+    /// build has the `otel` feature.
+    #[test]
+    fn no_otel_config_is_not_an_error() {
+        let cfg = AuditConfig {
+            format: AuditFormat::Json,
+            audit_log_file: None,
+            redaction: None,
+            journald: false,
+            otel: None,
+        };
+        assert!(init_tracing(&cfg).is_ok());
+    }
+
+    /// A build without the `otel` feature must refuse a configured otel
+    /// export rather than silently drop it -- the same #158 rule
+    /// `audit_log_file` already follows.
+    #[cfg(not(feature = "otel"))]
+    #[test]
+    fn otel_config_without_the_feature_is_an_error() {
+        let cfg = AuditConfig {
+            format: AuditFormat::Json,
+            audit_log_file: None,
+            redaction: None,
+            journald: false,
+            otel: Some(crate::otel::OtelConfig {
+                endpoint: "http://127.0.0.1:4318".to_string(),
+                service_name: "test".to_string(),
+            }),
+        };
+        let error = init_tracing(&cfg).unwrap_err();
+        assert!(
+            error.to_string().contains("otel"),
+            "the error must say why: {error}"
+        );
     }
 
     /// Reopen must follow the path, not the inode — that is what makes

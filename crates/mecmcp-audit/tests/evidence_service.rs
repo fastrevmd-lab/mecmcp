@@ -83,6 +83,7 @@ fn spooled_evidence_is_delivered_by_the_service() {
             delivery_interval: Duration::from_millis(20),
             sink: sink_config(dir.path()),
             signing_key_path: None,
+            forward_sink: None,
         },
         transport.clone(),
     )
@@ -129,6 +130,7 @@ fn shutdown_delivers_what_is_still_pending() {
             delivery_interval: Duration::from_secs(3600),
             sink: sink_config(dir.path()),
             signing_key_path: None,
+            forward_sink: None,
         },
         transport.clone(),
     )
@@ -175,6 +177,7 @@ fn the_tail_is_read_after_replay_not_before() {
                 delivery_interval: Duration::from_secs(3600),
                 sink: sink_config(dir.path()),
                 signing_key_path: None,
+                forward_sink: None,
             },
             failing,
         )
@@ -207,6 +210,7 @@ fn the_tail_is_read_after_replay_not_before() {
             delivery_interval: Duration::from_secs(3600),
             sink: sink_config(dir.path()),
             signing_key_path: None,
+            forward_sink: None,
         },
         transport.clone(),
     )
@@ -252,6 +256,7 @@ fn segments_rolled_without_a_flush_survive_shutdown() {
             delivery_interval: Duration::from_secs(3600),
             sink: sink_config(dir.path()),
             signing_key_path: None,
+            forward_sink: None,
         },
         transport.clone(),
     )
@@ -302,6 +307,7 @@ fn a_failing_delivery_is_reported_as_degraded() {
             delivery_interval: Duration::from_millis(20),
             sink: sink_config(dir.path()),
             signing_key_path: None,
+            forward_sink: None,
         },
         transport.clone(),
     )
@@ -349,6 +355,7 @@ fn shutdown_does_not_wait_out_backoff() {
             delivery_interval: Duration::from_millis(20),
             sink,
             signing_key_path: None,
+            forward_sink: None,
         },
         transport.clone(),
     )
@@ -409,6 +416,7 @@ fn signing_key_signs_every_segment_produced_by_the_service() {
             delivery_interval: Duration::from_millis(20),
             sink,
             signing_key_path: Some(key_path),
+            forward_sink: None,
         },
         transport.clone(),
     )
@@ -459,6 +467,7 @@ fn no_signing_key_leaves_segments_unsigned() {
             delivery_interval: Duration::from_millis(20),
             sink,
             signing_key_path: None,
+            forward_sink: None,
         },
         transport.clone(),
     )
@@ -481,5 +490,132 @@ fn no_signing_key_leaves_segments_unsigned() {
     assert!(
         closed.signature.is_none(),
         "no key was configured; the segment must not carry a signature"
+    );
+}
+
+/// A single transport that answers both the SSDF sink's ClickHouse traffic
+/// (query-string GETs/POSTs against `ch.example`) and the forward sink's
+/// plain JSON POSTs (against `collector.example`), counting each separately.
+#[derive(Default)]
+struct SplitTransport {
+    ssdf_inserts: AtomicUsize,
+    forward_posts: Mutex<Vec<Vec<u8>>>,
+}
+
+impl HttpTransport for SplitTransport {
+    fn send(&self, request: &HttpRequest) -> Result<String, SsdfSinkError> {
+        if request.url.contains("collector.example") {
+            self.forward_posts
+                .lock()
+                .unwrap()
+                .push(request.body.clone());
+            return Ok(String::new());
+        }
+        let url = urlencoding::decode(&request.url)
+            .unwrap_or_default()
+            .into_owned();
+        if url.contains("SELECT") {
+            return Ok("0\t0\n".to_string());
+        }
+        self.ssdf_inserts.fetch_add(1, Ordering::SeqCst);
+        Ok(String::new())
+    }
+}
+
+fn forward_sink_config(dir: &std::path::Path) -> mecmcp_audit::ForwardSinkConfig {
+    mecmcp_audit::ForwardSinkConfig {
+        endpoint: "http://collector.example/audit".to_string(),
+        bearer_token: None,
+        outbox_path: dir.join("forward-outbox.ndjson"),
+        ledger_path: dir.join("forward-ledger.json"),
+        initial_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(2),
+    }
+}
+
+/// A configured forward sink receives the same closed segments as SSDF,
+/// without anyone calling its `attempt_delivery` by hand -- and the SSDF
+/// path keeps working exactly as it did with no forward sink configured.
+#[test]
+fn a_configured_forward_sink_receives_the_same_segments_as_ssdf() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(SplitTransport::default());
+    let service = EvidenceService::start_with_transport(
+        EvidenceConfig {
+            server_id: "junos-950".to_string(),
+            run_id: "run-1".to_string(),
+            records_per_segment: 1,
+            delivery_interval: Duration::from_millis(20),
+            sink: sink_config(dir.path()),
+            signing_key_path: None,
+            forward_sink: Some(forward_sink_config(dir.path())),
+        },
+        transport.clone(),
+    )
+    .unwrap();
+
+    service
+        .recorder()
+        .apply_intent("req-1", "cs-1", "vsrx-ci", "alice")
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while transport.ssdf_inserts.load(Ordering::SeqCst) == 0
+        && transport.forward_posts.lock().unwrap().is_empty()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    service.shutdown().unwrap();
+
+    assert!(
+        transport.ssdf_inserts.load(Ordering::SeqCst) > 0,
+        "SSDF delivery must be unaffected by a configured forward sink"
+    );
+    let forward_posts = transport.forward_posts.lock().unwrap();
+    assert_eq!(
+        forward_posts.len(),
+        1,
+        "the forward sink must have received the one closed segment"
+    );
+    let forwarded: mecmcp_audit::evidence::ClosedSegment =
+        serde_json::from_slice(&forward_posts[0]).unwrap();
+    assert_eq!(forwarded.server_id, "junos-950");
+}
+
+/// The pipeline behaves exactly as before this field existed when
+/// `forward_sink` is left `None` -- no forward outbox or ledger file is even
+/// created.
+#[test]
+fn no_forward_sink_configured_means_no_forward_files_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(CountingTransport::default());
+    let service = EvidenceService::start_with_transport(
+        EvidenceConfig {
+            server_id: "junos-950".to_string(),
+            run_id: "run-1".to_string(),
+            records_per_segment: 1,
+            delivery_interval: Duration::from_millis(20),
+            sink: sink_config(dir.path()),
+            signing_key_path: None,
+            forward_sink: None,
+        },
+        transport.clone(),
+    )
+    .unwrap();
+
+    service
+        .recorder()
+        .apply_intent("req-1", "cs-1", "vsrx-ci", "alice")
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while transport.inserts.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    service.shutdown().unwrap();
+
+    assert!(
+        !dir.path().join("forward-outbox.ndjson").exists(),
+        "no forward sink was configured; it must not create a file anyway"
     );
 }
