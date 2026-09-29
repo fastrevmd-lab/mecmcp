@@ -100,7 +100,8 @@
 //!
 //! let client = HttpClient::new(config)?;
 //!
-//! let request = HttpRequest::new(Method::Get, "https://api.example.com/status")?
+//! let path = mecmcp_openapi::expand_path("/status", &[])?;
+//! let request = HttpRequest::with_base_and_path(Method::Get, "https://api.example.com", &path)?
 //!     .header("Accept", "application/json")?;
 //!
 //! let response = client.send(request).await?;
@@ -207,6 +208,38 @@ impl Default for HttpClientConfig {
     }
 }
 
+/// Shared checks between [`HttpRequest::from_absolute_url`] and
+/// [`HttpRequest::with_base_and_path`]: HTTPS-only, a host, and no embedded
+/// credentials.
+fn validate_request_url(parsed: reqwest::Url) -> Result<reqwest::Url, HttpError> {
+    // Userinfo is checked FIRST, before the scheme and host checks. Both of
+    // those errors embed the URL, so testing them earlier would leak the
+    // password for something as ordinary as `http://user:pass@host/` —
+    // exactly the disclosure this check exists to prevent.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(HttpError::UrlHasEmbeddedCredentials {
+            host: parsed.host_str().unwrap_or_default().to_owned(),
+        });
+    }
+
+    if parsed.scheme() != "https" {
+        return Err(HttpError::InsecureScheme {
+            url: SafeUrl::from_parsed(&parsed),
+            scheme: parsed.scheme().to_owned(),
+        });
+    }
+
+    // `url` rejects an empty host for special schemes such as https, so this
+    // is a defensive backstop rather than the primary check.
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(HttpError::MissingHost {
+            url: SafeUrl::from_parsed(&parsed),
+        });
+    }
+
+    Ok(parsed)
+}
+
 /// An HTTP request ready to be sent.
 ///
 /// `Clone` exists for [`HttpClient::send_get_with_backoff`], which must
@@ -221,7 +254,7 @@ pub struct HttpRequest {
 }
 
 impl HttpRequest {
-    /// Create a new HTTP request.
+    /// Create a new HTTP request from a full, already-assembled URL.
     ///
     /// The URL must use the `https://` scheme, must contain a host, and must not
     /// embed credentials. All three are enforced at construction so a bad URL
@@ -231,6 +264,18 @@ impl HttpRequest {
     /// URL is echoed in error messages and traces, which would leak the password
     /// on every failure. Pass credentials through [`HttpRequest::bearer_auth`] or
     /// [`HttpRequest::secret_header`] instead — those mark the value sensitive.
+    ///
+    /// This is gated behind the `absolute-url` feature, off by default. A URL
+    /// built this way is not checked against any template, so a vendor MCP
+    /// server that builds this from a device- or model-supplied value (for
+    /// example `format!("https://{base}/v1/devices/{id}")`) can be steered to
+    /// a different path on the same host, with no error. Callers that have a
+    /// path component to fill in must use
+    /// [`HttpRequest::with_base_and_path`] instead, which takes a
+    /// [`mecmcp_openapi::ExpandedPath`] and cannot accept a hand-written
+    /// string. Reach for this constructor only when there is genuinely no
+    /// path template — an OIDC discovery document or JWKS URI, for instance,
+    /// which points wherever the issuer's own metadata says.
     ///
     /// # Errors
     /// Returns [`HttpError::InvalidUrl`] if the URL is malformed,
@@ -242,10 +287,11 @@ impl HttpRequest {
     /// ```
     /// use mecmcp_http::{HttpRequest, Method};
     ///
-    /// let request = HttpRequest::new(Method::Get, "https://api.example.com/v1/status")?;
+    /// let request = HttpRequest::from_absolute_url(Method::Get, "https://api.example.com/v1/status")?;
     /// # Ok::<(), mecmcp_http::HttpError>(())
     /// ```
-    pub fn new(method: Method, url: &str) -> Result<Self, HttpError> {
+    #[cfg(any(test, feature = "absolute-url"))]
+    pub fn from_absolute_url(method: Method, url: &str) -> Result<Self, HttpError> {
         // Redacted even on the parse-failure path: a URL too malformed to parse
         // can still carry a readable password, and this error embeds the raw
         // string because there is nothing structured left to report.
@@ -254,30 +300,101 @@ impl HttpRequest {
             detail: error.to_string(),
         })?;
 
-        // Userinfo is checked FIRST, before the scheme and host checks. Both of
-        // those errors embed the URL, so testing them earlier would leak the
-        // password for something as ordinary as `http://user:pass@host/` —
-        // exactly the disclosure this check exists to prevent.
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(HttpError::UrlHasEmbeddedCredentials {
-                host: parsed.host_str().unwrap_or_default().to_owned(),
+        let parsed = validate_request_url(parsed)?;
+
+        Ok(Self {
+            method: method.into(),
+            url: parsed,
+            headers: Vec::new(),
+            body: None,
+        })
+    }
+
+    /// Create a new HTTP request by joining an [`mecmcp_openapi::ExpandedPath`]
+    /// onto a trusted base URL.
+    ///
+    /// This is the typed alternative to `HttpRequest::from_absolute_url` (behind the
+    /// `absolute-url` feature) for vendor REST
+    /// calls: `base` is the operator-configured endpoint (already trusted, the
+    /// way a device inventory entry or a config file value is), and `path` can
+    /// only have come from a successful `mecmcp_openapi::expand_path` call —
+    /// there is no way to construct that type from a hand-written string. A
+    /// caller that tries to pass `&str`/`String` for `path` gets a compile
+    /// error instead of a request built from an unvalidated, string-concatenated
+    /// path.
+    ///
+    /// `base` must not itself carry a path, query, or fragment — a
+    /// prefix such as Proxmox's `/api2/json` or UniFi's `/proxy/network`
+    /// belongs in `path`'s template, where it is visible in the call site
+    /// that builds the `ExpandedPath`, not silently discarded here. A `base`
+    /// that does carry one is rejected rather than repaired, so a
+    /// misconfigured endpoint fails loudly instead of sending requests to
+    /// the wrong resource on the right host.
+    ///
+    /// # Errors
+    /// Returns [`HttpError::InvalidUrl`] if `base` is malformed or carries a
+    /// path, query, or fragment, [`HttpError::InsecureScheme`] if its scheme
+    /// is not `https://`, [`HttpError::MissingHost`] if it has no host
+    /// component, or [`HttpError::UrlHasEmbeddedCredentials`] if it carries
+    /// userinfo.
+    ///
+    /// # Examples
+    /// ```
+    /// use mecmcp_http::{HttpRequest, Method};
+    /// use mecmcp_openapi::expand_path;
+    ///
+    /// let path = expand_path("/v1/devices/{id}", &[("id", "fw-01")])?;
+    /// let request = HttpRequest::with_base_and_path(Method::Get, "https://api.example.com", &path)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// A hand-written path does not type check — this is the point:
+    /// ```compile_fail,E0308
+    /// use mecmcp_http::{HttpRequest, Method};
+    ///
+    /// let request =
+    ///     HttpRequest::with_base_and_path(Method::Get, "https://api.example.com", "/v1/devices/fw-01");
+    /// ```
+    ///
+    /// The pre-MEC-510 stringly-typed constructor no longer exists:
+    /// ```compile_fail,E0599
+    /// use mecmcp_http::{HttpRequest, Method};
+    ///
+    /// let id = "fw-01";
+    /// let request =
+    ///     HttpRequest::new(Method::Get, &format!("https://api.example.com/v1/devices/{id}"));
+    /// ```
+    ///
+    #[cfg_attr(
+        not(feature = "absolute-url"),
+        doc = "Without the `absolute-url` feature `HttpRequest::from_absolute_url` does not exist, so vendor code cannot fall back to a raw URL:\n\
+               ```compile_fail,E0599\n\
+               use mecmcp_http::{HttpRequest, Method};\n\
+               let request = HttpRequest::from_absolute_url(Method::Get, \"https://api.example.com/v1\");\n\
+               ```"
+    )]
+    pub fn with_base_and_path(
+        method: Method,
+        base: &str,
+        path: &mecmcp_openapi::ExpandedPath,
+    ) -> Result<Self, HttpError> {
+        let parsed = reqwest::Url::parse(base).map_err(|error| HttpError::InvalidUrl {
+            url: SafeUrl::from_unparsed(base),
+            detail: error.to_string(),
+        })?;
+
+        let mut parsed = validate_request_url(parsed)?;
+
+        if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err(HttpError::InvalidUrl {
+                url: SafeUrl::from_parsed(&parsed),
+                detail: "base URL must not carry a path, query, or fragment; put the prefix in \
+                          the path template instead"
+                    .to_owned(),
             });
         }
 
-        if parsed.scheme() != "https" {
-            return Err(HttpError::InsecureScheme {
-                url: SafeUrl::from_parsed(&parsed),
-                scheme: parsed.scheme().to_owned(),
-            });
-        }
-
-        // `url` rejects an empty host for special schemes such as https, so this
-        // is a defensive backstop rather than the primary check.
-        if parsed.host_str().is_none_or(str::is_empty) {
-            return Err(HttpError::MissingHost {
-                url: SafeUrl::from_parsed(&parsed),
-            });
-        }
+        parsed.set_path(path.as_str());
 
         Ok(Self {
             method: method.into(),
@@ -301,7 +418,8 @@ impl HttpRequest {
     /// ```
     /// use mecmcp_http::{HttpRequest, Method};
     ///
-    /// let request = HttpRequest::new(Method::Get, "https://api.example.com/")?
+    /// let path = mecmcp_openapi::expand_path("/", &[]).unwrap();
+    /// let request = HttpRequest::with_base_and_path(Method::Get, "https://api.example.com", &path)?
     ///     .header("Accept", "application/json")?;
     /// # Ok::<(), mecmcp_http::HttpError>(())
     /// ```
@@ -335,7 +453,8 @@ impl HttpRequest {
     ///     secret_path,
     ///     mecmcp_secret::SecretLimits::default()
     /// )?;
-    /// let request = HttpRequest::new(Method::Get, "https://api.example.com/")?
+    /// let path = mecmcp_openapi::expand_path("/", &[])?;
+    /// let request = HttpRequest::with_base_and_path(Method::Get, "https://api.example.com", &path)?
     ///     .secret_header("X-API-Key", &secret)?;
     /// # Ok(())
     /// # }
@@ -370,7 +489,8 @@ impl HttpRequest {
     ///     token_path,
     ///     mecmcp_secret::SecretLimits::default()
     /// )?;
-    /// let request = HttpRequest::new(Method::Get, "https://api.example.com/")?
+    /// let path = mecmcp_openapi::expand_path("/", &[])?;
+    /// let request = HttpRequest::with_base_and_path(Method::Get, "https://api.example.com", &path)?
     ///     .bearer_auth(&token)?;
     /// # Ok(())
     /// # }
@@ -408,7 +528,8 @@ impl HttpRequest {
     /// ```
     /// use mecmcp_http::{HttpRequest, Method};
     ///
-    /// let request = HttpRequest::new(Method::Put, "https://api.example.com/thing")?
+    /// let path = mecmcp_openapi::expand_path("/thing", &[]).unwrap();
+    /// let request = HttpRequest::with_base_and_path(Method::Put, "https://api.example.com", &path)?
     ///     .header_bytes("If-Match", b"\"opaque-etag\"")?;
     /// # Ok::<(), mecmcp_http::HttpError>(())
     /// ```
@@ -432,7 +553,8 @@ impl HttpRequest {
     /// use mecmcp_http::{HttpRequest, Method};
     ///
     /// let body = b"{\"key\":\"value\"}".to_vec();
-    /// let request = HttpRequest::new(Method::Post, "https://api.example.com/data")?
+    /// let path = mecmcp_openapi::expand_path("/data", &[]).unwrap();
+    /// let request = HttpRequest::with_base_and_path(Method::Post, "https://api.example.com", &path)?
     ///     .header("Content-Type", "application/json")?
     ///     .body(body);
     /// # Ok::<(), mecmcp_http::HttpError>(())
@@ -484,7 +606,9 @@ impl std::fmt::Debug for HttpRequest {
 /// # Examples
 /// ```
 /// # use mecmcp_http::{HttpRequest, Method, HttpError};
-/// let error = HttpRequest::new(Method::Get, "https://u:pw@host/?api_key=SEKRIT")
+/// # use mecmcp_openapi::expand_path;
+/// let path = expand_path("/status", &[]).unwrap();
+/// let error = HttpRequest::with_base_and_path(Method::Get, "https://u:pw@host/?api_key=SEKRIT", &path)
 ///     .unwrap_err();
 /// assert!(!error.to_string().contains("SEKRIT"));
 /// ```
@@ -1040,7 +1164,8 @@ impl HttpClient {
     ///
     /// # async fn example() -> Result<(), mecmcp_http::HttpError> {
     /// let client = HttpClient::new(HttpClientConfig::default())?;
-    /// let request = HttpRequest::new(Method::Get, "https://api.example.com/status")?;
+    /// let path = mecmcp_openapi::expand_path("/status", &[]).unwrap();
+    /// let request = HttpRequest::with_base_and_path(Method::Get, "https://api.example.com", &path)?;
     /// let response = client.send(request).await?;
     /// println!("Status: {}", response.status());
     /// # Ok(())
@@ -1163,9 +1288,10 @@ impl HttpClient {
     /// ```
     /// use mecmcp_http::{HttpClient, HttpClientConfig, HttpRequest, Method, RetryPolicy};
     ///
-    /// # async fn example() -> Result<(), mecmcp_http::HttpError> {
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let client = HttpClient::new(HttpClientConfig::default())?;
-    /// let request = HttpRequest::new(Method::Get, "https://api.example.com/status")?;
+    /// let path = mecmcp_openapi::expand_path("/status", &[])?;
+    /// let request = HttpRequest::with_base_and_path(Method::Get, "https://api.example.com", &path)?;
     /// let response = client
     ///     .send_get_with_backoff(request, &RetryPolicy::default())
     ///     .await?;
@@ -1600,10 +1726,11 @@ mod tests {
         );
 
         let client = client_trusting(cert_pem);
-        let request = HttpRequest::new(Method::Get, &format!("https://localhost:{port}/test"))
-            .unwrap()
-            .header("Accept", "application/json")
-            .unwrap();
+        let request =
+            HttpRequest::from_absolute_url(Method::Get, &format!("https://localhost:{port}/test"))
+                .unwrap()
+                .header("Accept", "application/json")
+                .unwrap();
 
         let response = client.send(request).await.unwrap();
         assert_eq!(response.status(), 200);
@@ -1637,11 +1764,14 @@ mod tests {
         }
 
         let client = client_trusting(cert_pem);
-        let request = HttpRequest::new(Method::Post, &format!("https://localhost:{port}/submit"))
-            .unwrap()
-            .header("Content-Type", "application/json")
-            .unwrap()
-            .body(PAYLOAD.to_vec());
+        let request = HttpRequest::from_absolute_url(
+            Method::Post,
+            &format!("https://localhost:{port}/submit"),
+        )
+        .unwrap()
+        .header("Content-Type", "application/json")
+        .unwrap()
+        .body(PAYLOAD.to_vec());
 
         let response = client.send(request).await.unwrap();
         assert_eq!(response.status(), 204);
@@ -1663,7 +1793,9 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let request = HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap();
+        let request =
+            HttpRequest::from_absolute_url(Method::Get, &format!("https://localhost:{port}/"))
+                .unwrap();
 
         let error = client.send(request).await.unwrap_err();
         assert!(
@@ -1691,7 +1823,9 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let request = HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap();
+        let request =
+            HttpRequest::from_absolute_url(Method::Get, &format!("https://localhost:{port}/"))
+                .unwrap();
 
         assert!(
             client.send(request).await.is_err(),
@@ -1722,7 +1856,9 @@ mod tests {
         );
 
         let client = client_trusting(configured_ca_pem);
-        let request = HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap();
+        let request =
+            HttpRequest::from_absolute_url(Method::Get, &format!("https://localhost:{port}/"))
+                .unwrap();
 
         assert!(
             client.send(request).await.is_err(),
@@ -1744,8 +1880,11 @@ mod tests {
         );
 
         let client = client_trusting(cert_pem);
-        let request =
-            HttpRequest::new(Method::Get, &format!("https://localhost:{port}/redirect")).unwrap();
+        let request = HttpRequest::from_absolute_url(
+            Method::Get,
+            &format!("https://localhost:{port}/redirect"),
+        )
+        .unwrap();
 
         let response = client.send(request).await.unwrap();
         assert_eq!(response.status(), 302);
@@ -1780,7 +1919,8 @@ mod tests {
         .unwrap();
 
         let request =
-            HttpRequest::new(Method::Get, &format!("https://localhost:{port}/hang")).unwrap();
+            HttpRequest::from_absolute_url(Method::Get, &format!("https://localhost:{port}/hang"))
+                .unwrap();
 
         let error = client.send(request).await.unwrap_err();
         assert!(
@@ -1833,14 +1973,14 @@ mod tests {
             let url = url.clone();
             async move {
                 client
-                    .send(HttpRequest::new(Method::Get, &url).unwrap())
+                    .send(HttpRequest::from_absolute_url(Method::Get, &url).unwrap())
                     .await
             }
         });
         // Let the first request take the only permit before the second queues.
         tokio::time::sleep(Duration::from_millis(50)).await;
         let second = client
-            .send(HttpRequest::new(Method::Get, &url).unwrap())
+            .send(HttpRequest::from_absolute_url(Method::Get, &url).unwrap())
             .await;
 
         let error = second.unwrap_err();
@@ -1907,7 +2047,7 @@ mod tests {
             let url = format!("https://localhost:{port}/test");
             handles.push(tokio::spawn(async move {
                 client
-                    .send(HttpRequest::new(Method::Get, &url).unwrap())
+                    .send(HttpRequest::from_absolute_url(Method::Get, &url).unwrap())
                     .await
                     .unwrap()
                     .status()
@@ -1928,14 +2068,14 @@ mod tests {
 
     #[test]
     fn plaintext_url_rejected() {
-        let error = HttpRequest::new(Method::Get, "http://example.com/").unwrap_err();
+        let error = HttpRequest::from_absolute_url(Method::Get, "http://example.com/").unwrap_err();
         assert!(matches!(error, HttpError::InsecureScheme { .. }));
         assert!(error.to_string().contains("only https://"));
     }
 
     #[test]
     fn non_http_scheme_rejected() {
-        let error = HttpRequest::new(Method::Get, "file:///etc/passwd").unwrap_err();
+        let error = HttpRequest::from_absolute_url(Method::Get, "file:///etc/passwd").unwrap_err();
         assert!(matches!(error, HttpError::InsecureScheme { .. }));
     }
 
@@ -1948,7 +2088,7 @@ mod tests {
         // Note "https:///path" is deliberately NOT here: `url` parses it as host
         // "path", not as a hostless URL. Measured, not assumed.
         for candidate in ["https:", "https://"] {
-            let error = HttpRequest::new(Method::Get, candidate).unwrap_err();
+            let error = HttpRequest::from_absolute_url(Method::Get, candidate).unwrap_err();
             assert!(
                 matches!(
                     error,
@@ -1961,13 +2101,80 @@ mod tests {
 
     #[test]
     fn url_with_embedded_credentials_rejected_without_echoing_them() {
-        let error = HttpRequest::new(Method::Get, &format!("https://user:{CANARY}@example.com/"))
-            .unwrap_err();
+        let error = HttpRequest::from_absolute_url(
+            Method::Get,
+            &format!("https://user:{CANARY}@example.com/"),
+        )
+        .unwrap_err();
         assert!(matches!(error, HttpError::UrlHasEmbeddedCredentials { .. }));
         let rendered = error.to_string();
         assert!(!rendered.contains(CANARY), "password leaked: {rendered}");
         assert!(!rendered.contains("user"), "username leaked: {rendered}");
         assert!(rendered.contains("example.com"));
+    }
+
+    #[test]
+    fn with_base_and_path_joins_the_expanded_path_onto_the_base() {
+        let path = mecmcp_openapi::expand_path("/v1/devices/{id}", &[("id", "fw-01")]).unwrap();
+        let request =
+            HttpRequest::with_base_and_path(Method::Get, "https://api.example.com", &path).unwrap();
+        assert_eq!(
+            request.url.as_str(),
+            "https://api.example.com/v1/devices/fw-01"
+        );
+    }
+
+    /// A base URL's own path, query, and fragment are discarded — `path` is the
+    /// whole path, matching what `expand_path` promises about its own output.
+    #[test]
+    fn with_base_and_path_rejects_a_base_carrying_its_own_path_query_or_fragment() {
+        let path = mecmcp_openapi::expand_path("/v1/health", &[]).unwrap();
+        for base in [
+            "https://api.example.com/old/path",
+            "https://api.example.com/?q=1",
+            "https://api.example.com/#frag",
+        ] {
+            let error = HttpRequest::with_base_and_path(Method::Get, base, &path).unwrap_err();
+            assert!(
+                matches!(error, HttpError::InvalidUrl { .. }),
+                "base {base:?} should have been rejected, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_base_and_path_accepts_a_base_with_no_path_query_or_fragment() {
+        let path = mecmcp_openapi::expand_path("/v1/health", &[]).unwrap();
+        let request =
+            HttpRequest::with_base_and_path(Method::Get, "https://api.example.com", &path).unwrap();
+        assert_eq!(request.url.as_str(), "https://api.example.com/v1/health");
+
+        // A trailing slash and no path are equivalent bases.
+        let request =
+            HttpRequest::with_base_and_path(Method::Get, "https://api.example.com/", &path)
+                .unwrap();
+        assert_eq!(request.url.as_str(), "https://api.example.com/v1/health");
+    }
+
+    #[test]
+    fn with_base_and_path_rejects_an_insecure_base() {
+        let path = mecmcp_openapi::expand_path("/v1/health", &[]).unwrap();
+        let error = HttpRequest::with_base_and_path(Method::Get, "http://api.example.com", &path)
+            .unwrap_err();
+        assert!(matches!(error, HttpError::InsecureScheme { .. }));
+    }
+
+    #[test]
+    fn with_base_and_path_rejects_embedded_credentials_in_the_base() {
+        let path = mecmcp_openapi::expand_path("/v1/health", &[]).unwrap();
+        let error = HttpRequest::with_base_and_path(
+            Method::Get,
+            &format!("https://user:{CANARY}@example.com"),
+            &path,
+        )
+        .unwrap_err();
+        assert!(matches!(error, HttpError::UrlHasEmbeddedCredentials { .. }));
+        assert!(!error.to_string().contains(CANARY));
     }
 
     /// No rejection path may echo a URL password, whichever check fires.
@@ -2000,7 +2207,7 @@ mod tests {
         ];
 
         for candidate in candidates {
-            let error = HttpRequest::new(Method::Get, &candidate).unwrap_err();
+            let error = HttpRequest::from_absolute_url(Method::Get, &candidate).unwrap_err();
             let rendered = error.to_string();
             assert!(
                 !rendered.contains(CANARY),
@@ -2076,7 +2283,7 @@ mod tests {
     #[test]
     fn request_debug_omits_body_and_header_values() {
         let secret = secret_holding(CANARY);
-        let request = HttpRequest::new(Method::Post, "https://example.com/token")
+        let request = HttpRequest::from_absolute_url(Method::Post, "https://example.com/token")
             .unwrap()
             .bearer_auth(&secret)
             .unwrap()
@@ -2137,7 +2344,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let request = HttpRequest::new(
+        let request = HttpRequest::from_absolute_url(
             Method::Get,
             &format!("https://localhost:{port}/v1/resource?api_key={CANARY}#frag={CANARY}"),
         )
@@ -2170,7 +2377,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let request = HttpRequest::new(
+        let request = HttpRequest::from_absolute_url(
             Method::Get,
             &format!("https://localhost:{port}/hang?token={CANARY}"),
         )
@@ -2186,7 +2393,7 @@ mod tests {
 
     #[test]
     fn request_debug_does_not_leak_query_credentials() {
-        let request = HttpRequest::new(
+        let request = HttpRequest::from_absolute_url(
             Method::Get,
             &format!("https://example.com/v1?api_key={CANARY}"),
         )
@@ -2248,7 +2455,9 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let request = HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap();
+        let request =
+            HttpRequest::from_absolute_url(Method::Get, &format!("https://localhost:{port}/"))
+                .unwrap();
 
         let error = client.send(request).await.unwrap_err();
         let rendered = error.to_string();
@@ -2274,7 +2483,9 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let request = HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap();
+        let request =
+            HttpRequest::from_absolute_url(Method::Get, &format!("https://localhost:{port}/"))
+                .unwrap();
 
         let rendered = client.send(request).await.unwrap_err().to_string();
         let lowered = rendered.to_lowercase();
@@ -2303,7 +2514,10 @@ mod tests {
 
         let client = client_trusting(cert_pem);
         let response = client
-            .send(HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap())
+            .send(
+                HttpRequest::from_absolute_url(Method::Get, &format!("https://localhost:{port}/"))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -2364,7 +2578,8 @@ mod tests {
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
             client.send(
-                HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap(),
+                HttpRequest::from_absolute_url(Method::Get, &format!("https://localhost:{port}/"))
+                    .unwrap(),
             ),
         )
         .await
@@ -2419,7 +2634,10 @@ mod tests {
         .unwrap();
 
         let error = client
-            .send(HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap())
+            .send(
+                HttpRequest::from_absolute_url(Method::Get, &format!("https://localhost:{port}/"))
+                    .unwrap(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -2475,7 +2693,10 @@ mod tests {
         .unwrap();
 
         let response = client
-            .send(HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap())
+            .send(
+                HttpRequest::from_absolute_url(Method::Get, &format!("https://localhost:{port}/"))
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -2522,7 +2743,10 @@ mod tests {
         .unwrap();
 
         let error = client
-            .send(HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap())
+            .send(
+                HttpRequest::from_absolute_url(Method::Get, &format!("https://localhost:{port}/"))
+                    .unwrap(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -2588,7 +2812,7 @@ mod tests {
             let url = format!("https://localhost:{port}/");
             handles.push(tokio::spawn(async move {
                 client
-                    .send(HttpRequest::new(Method::Get, &url).unwrap())
+                    .send(HttpRequest::from_absolute_url(Method::Get, &url).unwrap())
                     .await
                     .unwrap()
                     .body()
@@ -2626,7 +2850,10 @@ mod tests {
 
         let client = client_trusting(cert_pem);
         let response = client
-            .send(HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap())
+            .send(
+                HttpRequest::from_absolute_url(Method::Get, &format!("https://localhost:{port}/"))
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -2699,7 +2926,10 @@ mod tests {
 
         let client = client_trusting(cert_pem);
         let response = client
-            .send(HttpRequest::new(Method::Get, &format!("https://localhost:{port}/")).unwrap())
+            .send(
+                HttpRequest::from_absolute_url(Method::Get, &format!("https://localhost:{port}/"))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -2762,7 +2992,7 @@ mod tests {
         let url = format!("https://localhost:{port}/thing");
 
         let first = client
-            .send(HttpRequest::new(Method::Get, &url).unwrap())
+            .send(HttpRequest::from_absolute_url(Method::Get, &url).unwrap())
             .await
             .unwrap();
         let received = first.header("etag").expect("ETag present").to_vec();
@@ -2770,7 +3000,7 @@ mod tests {
 
         let second = client
             .send(
-                HttpRequest::new(Method::Put, &url)
+                HttpRequest::from_absolute_url(Method::Put, &url)
                     .unwrap()
                     .header_bytes("If-Match", &received)
                     .unwrap(),
@@ -2883,7 +3113,7 @@ mod tests {
     #[test]
     fn framing_headers_are_rejected() {
         for name in ["Content-Length", "content-length", "Transfer-Encoding"] {
-            let error = HttpRequest::new(Method::Post, "https://example.com/")
+            let error = HttpRequest::from_absolute_url(Method::Post, "https://example.com/")
                 .unwrap()
                 .header(name, "999999")
                 .unwrap_err();
@@ -2895,7 +3125,7 @@ mod tests {
 
         // A secret header must not be a way around it either.
         let secret = secret_holding("12345");
-        let error = HttpRequest::new(Method::Post, "https://example.com/")
+        let error = HttpRequest::from_absolute_url(Method::Post, "https://example.com/")
             .unwrap()
             .secret_header("Content-Length", &secret)
             .unwrap_err();
@@ -2903,7 +3133,7 @@ mod tests {
 
         // Ordinary headers still work.
         assert!(
-            HttpRequest::new(Method::Post, "https://example.com/")
+            HttpRequest::from_absolute_url(Method::Post, "https://example.com/")
                 .unwrap()
                 .header("Content-Type", "application/json")
                 .is_ok()
@@ -2912,7 +3142,7 @@ mod tests {
 
     #[test]
     fn invalid_header_name_rejected_at_construction() {
-        let error = HttpRequest::new(Method::Get, "https://example.com/")
+        let error = HttpRequest::from_absolute_url(Method::Get, "https://example.com/")
             .unwrap()
             .header("Not A Header", "value")
             .unwrap_err();
@@ -2926,7 +3156,7 @@ mod tests {
         // strips at most one *trailing* newline, so this one survives to be
         // rejected by HeaderValue.
         let secret = secret_holding(&format!("{CANARY}\nsecond-line"));
-        let error = HttpRequest::new(Method::Get, "https://example.com/")
+        let error = HttpRequest::from_absolute_url(Method::Get, "https://example.com/")
             .unwrap()
             .secret_header("X-API-Key", &secret)
             .unwrap_err();
@@ -2944,7 +3174,7 @@ mod tests {
     #[test]
     fn bearer_auth_error_does_not_contain_the_token() {
         let token = secret_holding(&format!("{CANARY}\nsecond-line"));
-        let error = HttpRequest::new(Method::Get, "https://example.com/")
+        let error = HttpRequest::from_absolute_url(Method::Get, "https://example.com/")
             .unwrap()
             .bearer_auth(&token)
             .unwrap_err();
@@ -2957,7 +3187,7 @@ mod tests {
     #[test]
     fn secret_header_value_is_marked_sensitive() {
         let secret = secret_holding(CANARY);
-        let request = HttpRequest::new(Method::Get, "https://example.com/")
+        let request = HttpRequest::from_absolute_url(Method::Get, "https://example.com/")
             .unwrap()
             .secret_header("X-API-Key", &secret)
             .unwrap()
@@ -2966,12 +3196,13 @@ mod tests {
             .header("Accept", "application/json")
             .unwrap();
 
-        for (name, value) in &request.headers {
+        // Messages below deliberately interpolate nothing derived from the
+        // request: its headers carry a secret, and a panic message is a log sink.
+        for (index, (name, value)) in request.headers.iter().enumerate() {
             let sensitive_expected = name != "accept";
-            assert_eq!(
-                value.is_sensitive(),
-                sensitive_expected,
-                "{name} sensitivity flag is wrong"
+            assert!(
+                value.is_sensitive() == sensitive_expected,
+                "sensitivity flag is wrong for header #{index}"
             );
         }
 
@@ -2980,7 +3211,7 @@ mod tests {
         let rendered = format!("{request:?}");
         assert!(
             !rendered.contains(CANARY),
-            "secret leaked via Debug: {rendered}"
+            "secret leaked via Debug of HttpRequest"
         );
     }
 
@@ -3268,7 +3499,7 @@ mod tests {
             let url = url.clone();
             handles.push(tokio::spawn(async move {
                 client
-                    .send(HttpRequest::new(Method::Get, &url).unwrap())
+                    .send(HttpRequest::from_absolute_url(Method::Get, &url).unwrap())
                     .await
             }));
         }
@@ -3278,7 +3509,7 @@ mod tests {
 
         // The next one must return QueueFull immediately
         let overflow = client
-            .send(HttpRequest::new(Method::Get, &url).unwrap())
+            .send(HttpRequest::from_absolute_url(Method::Get, &url).unwrap())
             .await;
         assert!(
             matches!(overflow, Err(HttpError::QueueFull)),
@@ -3376,7 +3607,7 @@ mod tests {
             let url = url.clone();
             handles.push(tokio::spawn(async move {
                 client
-                    .send(HttpRequest::new(Method::Get, &url).unwrap())
+                    .send(HttpRequest::from_absolute_url(Method::Get, &url).unwrap())
                     .await
             }));
         }
@@ -3443,7 +3674,7 @@ mod tests {
             let url = url.clone();
             background.push(tokio::spawn(async move {
                 client
-                    .send(HttpRequest::new(Method::Get, &url).unwrap())
+                    .send(HttpRequest::from_absolute_url(Method::Get, &url).unwrap())
                     .await
             }));
         }
@@ -3455,7 +3686,7 @@ mod tests {
         let mut rejected = 0usize;
         for _ in 0..10 {
             match client
-                .send(HttpRequest::new(Method::Get, &url).unwrap())
+                .send(HttpRequest::from_absolute_url(Method::Get, &url).unwrap())
                 .await
             {
                 Err(HttpError::QueueFull) => rejected += 1,
@@ -3558,8 +3789,11 @@ mod tests {
         );
 
         let client = client_trusting(cert_pem);
-        let request =
-            HttpRequest::new(Method::Get, &format!("https://localhost:{port}/status")).unwrap();
+        let request = HttpRequest::from_absolute_url(
+            Method::Get,
+            &format!("https://localhost:{port}/status"),
+        )
+        .unwrap();
 
         let response = client
             .send_get_with_backoff(request, &fast_retry_policy(4))
@@ -3580,8 +3814,11 @@ mod tests {
         );
 
         let client = client_trusting(cert_pem);
-        let request =
-            HttpRequest::new(Method::Get, &format!("https://localhost:{port}/status")).unwrap();
+        let request = HttpRequest::from_absolute_url(
+            Method::Get,
+            &format!("https://localhost:{port}/status"),
+        )
+        .unwrap();
 
         let response = client
             .send_get_with_backoff(request, &fast_retry_policy(3))
@@ -3614,8 +3851,11 @@ mod tests {
         );
 
         let client = client_trusting(cert_pem);
-        let request =
-            HttpRequest::new(Method::Get, &format!("https://localhost:{port}/status")).unwrap();
+        let request = HttpRequest::from_absolute_url(
+            Method::Get,
+            &format!("https://localhost:{port}/status"),
+        )
+        .unwrap();
 
         let response = client
             .send_get_with_backoff(request, &fast_retry_policy(4))
@@ -3638,9 +3878,10 @@ mod tests {
         drop(listener);
 
         let client = build_client(HttpClientConfig::default()).unwrap();
-        let request = HttpRequest::new(Method::Post, &format!("https://localhost:{port}/set"))
-            .unwrap()
-            .body(b"payload".to_vec());
+        let request =
+            HttpRequest::from_absolute_url(Method::Post, &format!("https://localhost:{port}/set"))
+                .unwrap()
+                .body(b"payload".to_vec());
 
         let error = client
             .send_get_with_backoff(request, &fast_retry_policy(4))

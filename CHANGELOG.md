@@ -93,6 +93,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device-transaction error formatting (`apply.rs`) is migrated as the
   reference example.
 
+### Changed
+
+- **BREAKING — http/openapi: request paths are typed; the raw-URL
+  constructor is feature-gated** (MEC-510). `mecmcp-openapi::expand_path` now
+  returns `ExpandedPath` instead of `String` — a type with no public
+  constructor other than a successful expansion, so `let s: String =
+  expand_path(..)?` no longer compiles (use `.as_str()` or `.to_string()`).
+  `mecmcp-http` gains `HttpRequest::with_base_and_path(method, base,
+  &ExpandedPath)`, which joins the path onto an operator-configured base and
+  rejects a base that carries its own path, query, or fragment (put a prefix
+  such as `/api2/json` in the template instead). `HttpRequest::new(method,
+  &str)` is renamed `HttpRequest::from_absolute_url` and is only available
+  behind the non-default `absolute-url` feature, for full URLs that are not
+  path-templated (OIDC discovery/JWKS); `mecmcp-oidc` enables it. Vendor
+  servers should migrate REST calls to `with_base_and_path` and should not
+  enable `absolute-url`.
+
 ## [0.24.1] - 2026-09-28
 
 > **Upgrade note.** This patch release changes a default: servers that relied
