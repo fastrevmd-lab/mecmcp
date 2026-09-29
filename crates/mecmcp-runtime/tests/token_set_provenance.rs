@@ -263,8 +263,12 @@ fn a_refused_clear_is_now_audited_as_denied() {
         "got {captured}"
     );
     assert!(
-        captured.contains("devices=fleet"),
+        captured.contains("token=fleet"),
         "the token name is the audited target: {captured}"
+    );
+    assert!(
+        captured.contains("device_count=0"),
+        "this call touches no device: {captured}"
     );
     assert!(captured.contains("authorization=denied"), "{captured}");
     assert!(captured.contains("result=denied"), "{captured}");
@@ -299,7 +303,11 @@ fn a_successful_provenance_change_emits_the_canonical_audit_shape() {
         captured.contains("tool=token_set_provenance"),
         "got {captured}"
     );
-    assert!(captured.contains("devices=fleet"), "{captured}");
+    assert!(captured.contains("token=fleet"), "{captured}");
+    assert!(
+        captured.contains("device_count=0"),
+        "this call touches no device: {captured}"
+    );
     assert!(captured.contains("authorization=no_auth"), "{captured}");
     assert!(captured.contains("result=ok"), "{captured}");
 }

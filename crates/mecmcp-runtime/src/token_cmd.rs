@@ -342,7 +342,15 @@ where
             // exists in the same shape and stream even though the change is
             // made by a CLI rather than through the served API, and means a
             // refusal below is recorded rather than silent.
-            let mut scope = AuditScope::stdio("token_set_scopes", "set_scopes", vec![name.clone()]);
+            //
+            // The token name goes in `meta`, not `devices`: `devices` is a
+            // redactable field (an operator can install a `devices=drop` or
+            // `devices=hmac` policy), and this call touches no device, so
+            // redacting it would erase the identity of the token whose
+            // privileges just changed. `token` is not a redactable key, so
+            // the name survives any installed policy.
+            let mut scope = AuditScope::stdio("token_set_scopes", "set_scopes", Vec::new());
+            scope.meta("token", name.clone());
             scope.meta("widening", widening);
 
             println!("token: {name}");
@@ -450,8 +458,13 @@ where
             // right — recorded here, through the same `AuditScope` a served
             // handler would use, because the change is made by a CLI rather
             // than through the served API.
-            let mut scope =
-                AuditScope::stdio("token_set_provenance", "set_provenance", vec![name.clone()]);
+            //
+            // As in `set_scopes`, the token name goes in `meta`, not
+            // `devices`: this call touches no device, and `devices` can be
+            // redacted by operator policy, which would erase which token's
+            // provenance just changed. `token` is not a redactable key.
+            let mut scope = AuditScope::stdio("token_set_provenance", "set_provenance", Vec::new());
+            scope.meta("token", name.clone());
             scope.meta("cleared", cleared.join("|"));
 
             println!("token: {name}");
