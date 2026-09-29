@@ -33,6 +33,20 @@ const SPEC_KEYS: &[(&str, &str, &str)] = &[
     ("token", "token", "QWZX7714900011"),
     ("authentication-key", "authentication_key", "QWZX7714900012"),
     ("password", "password", "QWZX7714900013"),
+    // MEC-711: Mist OpenAPI secret fields missed by the denylist at the
+    // rustmistmcp#137 pinned rev.
+    ("auth_key", "auth_key", "QWZX7714900014"),
+    ("auth_keys", "auth_keys", "QWZX7714900015"),
+    ("keywrap_kek", "keywrap_kek", "QWZX7714900016"),
+    ("keywrap_mack", "keywrap_mack", "QWZX7714900017"),
+    ("partner_key", "partner_key", "QWZX7714900018"),
+    ("account_key", "account_key", "QWZX7714900019"),
+    ("ldap_client_key", "ldap_client_key", "QWZX7714900020"),
+    (
+        "openroaming_wba_client_key",
+        "openroaming_wba_client_key",
+        "QWZX7714900021",
+    ),
 ];
 
 #[test]
