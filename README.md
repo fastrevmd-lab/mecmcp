@@ -19,7 +19,7 @@ and is consumed by every vendor server.
 
 Today two servers independently reimplement all of it:
 
-| | [rustjunosmcp](https://github.com/fastrevmd-lab/rustjunosmcp) | [rustpanosmcp](https://github.com/fastrevmd-lab/rustpanosmcp) |
+| | [rustjunosmcp](https://github.com/mechubsec/rustjunosmcp) | [rustpanosmcp](https://github.com/mechubsec/rustpanosmcp) |
 |---|---|---|
 | Vendor | Juniper Junos / SRX | Palo Alto PAN-OS |
 | Device transport | NETCONF over SSH (`rustnetconf`) | HTTPS XML-API (`reqwest`) |
@@ -703,7 +703,7 @@ asserted. An unchained final hop would discard that guarantee at the point an
 auditor relies on it.
 
 Emission rules are normative today; the sink is tracked in
-[#292](https://github.com/fastrevmd-lab/mecmcp/issues/292). The standard —
+[#292](https://github.com/mechubsec/mecmcp/issues/292). The standard —
 including why the cheaper syslog path was rejected — is in
 [`docs/AUDIT-FORWARDING-STANDARD.md`](docs/AUDIT-FORWARDING-STANDARD.md).
 

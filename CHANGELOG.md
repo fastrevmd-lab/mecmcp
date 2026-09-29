@@ -29,6 +29,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **redact: `Untrusted<T>` marks device/controller-sourced content before it
+  reaches a model** (MEC-511). Device text (hostnames, descriptions, error
+  bodies) previously flowed into tool output with nothing distinguishing it
+  from operator input or this codebase's own text. `Untrusted::new` wraps a
+  value at the point it's read from a vendor response; `render_tagged`
+  delimits it for inclusion in a tool result, neutralizing any attempt by the
+  content itself to forge a matching closing delimiter.
+  `mecmcp-server::tool_error_with_untrusted_detail` is the new sanctioned
+  entry point for a tool handler's error path, and `mecmcp-changeset`'s
+  device-transaction error formatting (`apply.rs`) is migrated as the
+  reference example.
+
 ## [0.24.1] - 2026-09-28
 
 > **Upgrade note.** This patch release changes a default: servers that relied
