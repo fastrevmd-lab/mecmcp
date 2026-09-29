@@ -4,7 +4,7 @@
 — the direct hash-chained ClickHouse (SSDF) sink described in Part 2 first
 shipped in mecmcp **0.14.0** (2026-08-23; see
 [`CHANGELOG.md`](../CHANGELOG.md)) — see
-[#292](https://github.com/fastrevmd-lab/mecmcp/issues/292) for the
+[#292](https://github.com/mechubsec/mecmcp/issues/292) for the
 implementation history. It carries the change-lifecycle evidence records
 (proposal, approval, apply intent, receipt); the per-call tool audit stream
 (Part 1's `audit.jsonl`) is not forwarded and stays on the host. SSDF is the
@@ -42,15 +42,15 @@ These rules are transport-independent and hold under any of the options below.
 **Decision: direct ClickHouse sink, hash-chained.** SSDF is the schema steward;
 the contract is theirs:
 
-- [`audit-evidence-contract-v1.md`](https://github.com/fastrevmd-lab/SSDF/blob/main/docs/audit-evidence-contract-v1.md)
-- [`audit-evidence-ingestion.md`](https://github.com/fastrevmd-lab/SSDF/blob/main/docs/audit-evidence-ingestion.md)
+- [`audit-evidence-contract-v1.md`](https://github.com/mechubsec/ssdf/blob/main/docs/audit-evidence-contract-v1.md)
+- [`audit-evidence-ingestion.md`](https://github.com/mechubsec/ssdf/blob/main/docs/audit-evidence-ingestion.md)
 
 Records are written by `mecmcp-audit` directly into `ssdf.audit` over the
 ClickHouse HTTP interface, carrying `prev_hash`/`row_hash` so that deletion or
 modification of a row is detectable.
 
 Implementation history and design requirements are tracked in
-[#292](https://github.com/fastrevmd-lab/mecmcp/issues/292). The dedup guard
+[#292](https://github.com/mechubsec/mecmcp/issues/292). The dedup guard
 question — the contract's `INSERT … WHERE NOT EXISTS (SELECT …)` cannot run
 under the write identity, which SSDF grants INSERT-only on purpose — is
 resolved: the sink reads a high-water mark under a separate, SELECT-only
@@ -208,6 +208,6 @@ JSONL sinks get the equivalent through logrotate: `daily`, `rotate 14`,
   trail — stays on the MCP host with no chained off-host copy.
 - **The device-side record omits the approver.** A two-person apply commits
   naming only the applier — see
-  [rustjunosmcp#307](https://github.com/fastrevmd-lab/rustjunosmcp/issues/307).
+  [rustjunosmcp#307](https://github.com/mechubsec/rustjunosmcp/issues/307).
 - **Retention and journald sealing** are done — see Part 3
-  ([rustjunosmcp#299](https://github.com/fastrevmd-lab/rustjunosmcp/issues/299)).
+  ([rustjunosmcp#299](https://github.com/mechubsec/rustjunosmcp/issues/299)).

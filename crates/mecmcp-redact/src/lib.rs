@@ -33,6 +33,16 @@
 //! their signatures a tool argument could thread through even if a handler
 //! tried.
 //!
+//! # Redaction removes bytes; `Untrusted` marks the rest
+//!
+//! Everything above is about *what* a model may see. [`Untrusted`] is about
+//! *how it's told apart* once it does: it wraps a device/controller-sourced
+//! value so it cannot reach [`Untrusted::render_tagged`]'s delimited
+//! rendering — the sanctioned way to fold device text into a tool result —
+//! without first being marked as untrusted at the point it left the vendor
+//! response. See the [`trust`] module docs for what that wrapping does and
+//! does not guarantee.
+//!
 //! # Fingerprints are computed before redaction, and keyed
 //!
 //! [`redact_and_digest`] computes an HMAC-SHA256 fingerprint over the
@@ -49,9 +59,11 @@ pub mod policy;
 pub mod projection;
 pub mod shape;
 mod text;
+pub mod trust;
 mod xml;
 
 pub use policy::{RedactionPolicy, active, install};
+pub use trust::Untrusted;
 
 /// A tool-output body's wire format, so [`redact_and_digest`] knows which
 /// unstructured redactor to run.

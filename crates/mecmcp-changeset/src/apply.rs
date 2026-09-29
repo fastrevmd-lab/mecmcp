@@ -10,6 +10,7 @@ use crate::{
     transaction::DeviceTransaction,
 };
 use mecmcp_audit::Attribution;
+use mecmcp_redact::Untrusted;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
@@ -579,9 +580,17 @@ impl ChangesetCoordinator {
                 // Return the first error we encountered
                 changeset_update_result?;
 
+                // `error` is the vendor transaction's own words (a NETCONF
+                // reply, a PAN-OS API error body), not something this process
+                // composed — wrap it as untrusted so it stays visibly marked
+                // once a tool result carries `CoordinatorError`'s message to
+                // the model (mecmcp-server's `tool_error` renders whatever
+                // `Display` gives it verbatim).
+                let tagged_error =
+                    Untrusted::new(error.to_string()).render_tagged("device.stage_error");
                 return Err(CoordinatorError::new(
                     "device",
-                    format!("staging failed: {error}"),
+                    format!("staging failed: {tagged_error}"),
                 ));
             }
         };
@@ -598,10 +607,16 @@ impl ChangesetCoordinator {
                 //
                 // Mark the operation as Indeterminate FIRST, before updating the change set,
                 // so if the change-set update fails we still have the operation state recorded.
+                // Same as the stage error above: `error` is the device's own
+                // words, tagged once and reused for both the persisted
+                // operation record and the returned `CoordinatorError`.
+                let tagged_error =
+                    Untrusted::new(error.to_string()).render_tagged("device.fingerprint_error");
+
                 let mut record = self.record(&operation_id, &owner, &device).await?;
                 record.state = LifecycleState::Indeterminate;
                 record.details = Some(format!(
-                    "fingerprint read failed after staging: {error}; staged changes remain on device"
+                    "fingerprint read failed after staging: {tagged_error}; staged changes remain on device"
                 ));
                 self.update(record).await?;
 
@@ -613,7 +628,7 @@ impl ChangesetCoordinator {
                 return Err(CoordinatorError::new(
                     "device",
                     format!(
-                        "fingerprint read failed after staging: {error}; operation is indeterminate"
+                        "fingerprint read failed after staging: {tagged_error}; operation is indeterminate"
                     ),
                 ));
             }
