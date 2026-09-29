@@ -125,7 +125,7 @@ concurrency**, because `bearer_preflight_middleware` drops its `AuditScope`
 before calling `next.run`, so it cannot carry the outcome of anything inside it.
 That used to mean a request shed by target concurrency was recorded as a call
 preflight *allowed* with `result=ok`, and nothing recorded the refusal —
-[#370](https://github.com/fastrevmd-lab/mecmcp/issues/370). The boundary now
+[#370](https://github.com/mechubsec/mecmcp/issues/370). The boundary now
 emits a second terminal event whenever the response is a 4xx or 5xx
 (`refused_after_preflight`, `layer=post_dispatch`, plus the status), leaving the
 preflight event and its `duration_ms` untouched.

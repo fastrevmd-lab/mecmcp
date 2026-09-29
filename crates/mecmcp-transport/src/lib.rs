@@ -77,4 +77,4 @@ pub use server::{
 };
 pub use session::{LimitedSessionManager, LimitedSessionManagerError, SessionTracker};
 pub use target::{TargetLimiter, extract_targets};
-pub use tls::{TlsError, load as load_tls};
+pub use tls::{TlsError, load as load_tls, load_with_client_auth as load_tls_with_client_auth};
