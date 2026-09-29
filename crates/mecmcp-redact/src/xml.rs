@@ -12,9 +12,11 @@
 use crate::RedactError;
 use crate::denylist::is_denylisted_key;
 use crate::shape::looks_like_secret_value;
+use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
+use std::borrow::Cow;
 use std::io::Cursor;
 
 const PLACEHOLDER: &[u8] = b"[REDACTED]";
@@ -81,8 +83,7 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
                     .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
             }
             Event::CData(e) => {
-                let text = e.into_inner();
-                let decoded = String::from_utf8_lossy(&text).into_owned();
+                let decoded = e.into_inner().into_owned();
                 let ancestor_is_secret = any_ancestor_denylisted(&tag_stack);
                 let out = if ancestor_is_secret || looks_like_secret_value(&decoded) {
                     quick_xml::events::BytesCData::new(
@@ -103,10 +104,11 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
                     .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
             }
             Event::Comment(e) => {
-                let text = String::from_utf8_lossy(&e).into_owned();
-                let redacted = redact_comment(&text);
+                let redacted = redact_comment(&e);
                 writer
-                    .write_event(Event::Comment(BytesText::new(&redacted)))
+                    .write_event(Event::Comment(BytesText::from_escaped(escape_text(
+                        &redacted,
+                    ))))
                     .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
             }
             other => {
@@ -122,7 +124,7 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
 }
 
 fn local_name(name: QName<'_>) -> Vec<u8> {
-    name.local_name().as_ref().to_vec()
+    name.local_name().as_ref().as_bytes().to_vec()
 }
 
 /// Validate that `input` is well-formed XML — every element opened is closed
@@ -176,7 +178,7 @@ fn redact_attributes<'a>(
     tag_stack: &[Vec<u8>],
 ) -> Result<BytesStart<'a>, RedactError> {
     let ancestor_is_secret = any_ancestor_denylisted(tag_stack);
-    let mut out = BytesStart::new(String::from_utf8_lossy(start.name().as_ref()).into_owned());
+    let mut out = BytesStart::new(start.name().as_ref().to_owned());
     for attr in start.attributes() {
         let attr = attr.map_err(|e| RedactError::InvalidXml(e.to_string()))?;
         let key = String::from_utf8_lossy(local_name(attr.key).as_slice()).into_owned();
@@ -190,10 +192,12 @@ fn redact_attributes<'a>(
             } else {
                 value
             };
-        out.push_attribute((
-            String::from_utf8_lossy(attr.key.as_ref()).as_ref(),
-            redacted_value.as_str(),
-        ));
+        // Built directly rather than via `(&str, &str).into()`, which since
+        // quick-xml 0.42 also escapes `\r`/`\n`/`\t` — see [`escape_text`].
+        out.push_attribute(Attribute {
+            key: attr.key,
+            value: Cow::Owned(escape_text(&redacted_value)),
+        });
     }
     Ok(out)
 }
@@ -202,20 +206,52 @@ fn redact_text_bytes<'a>(
     text: &BytesText<'a>,
     ancestor_is_secret: bool,
 ) -> Result<BytesText<'static>, RedactError> {
-    let raw = text
-        .decode()
-        .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
-    let decoded = quick_xml::escape::unescape(&raw)
+    // quick-xml 0.42 stores text as `str`: deref yields the raw, still-escaped
+    // content (no EOL normalization), which is what 0.41's `decode()`
+    // returned for a `Reader::from_str` source.
+    let raw: &str = text;
+    let decoded = quick_xml::escape::unescape(raw)
         .map_err(|e| RedactError::InvalidXml(e.to_string()))?
         .into_owned();
     if ancestor_is_secret || looks_like_secret_value(&decoded) {
-        Ok(BytesText::new(&String::from_utf8_lossy(PLACEHOLDER)).into_owned())
+        Ok(
+            BytesText::from_escaped(escape_text(&String::from_utf8_lossy(PLACEHOLDER)))
+                .into_owned(),
+        )
     } else {
         // Same reasoning as the CDATA branch above (N5): scan every text
         // node's body, not only ones that already look like an embedded
         // blob.
-        Ok(BytesText::new(&crate::text::redact(&decoded)).into_owned())
+        Ok(BytesText::from_escaped(escape_text(&crate::text::redact(&decoded))).into_owned())
     }
+}
+
+/// Escape `<`, `>`, `&`, `'` and `"` — exactly the set quick-xml 0.41's
+/// `escape` (used by `BytesText::new` and `Attribute::from((&str, &str))`)
+/// replaced.
+///
+/// quick-xml 0.42 widened that set to also turn `\r` into `&#13;` (text and
+/// attributes) and `\n`/`\t` into `&#10;`/`&#9;` (attributes). Pinning the
+/// old set keeps this crate's output byte-identical across the upgrade: a
+/// CRLF text node passes through as CRLF rather than gaining `&#13;`, which
+/// would change what a downstream parser reads. Only the escaping of
+/// *output* is affected; what gets redacted is decided before this runs.
+fn escape_text(raw: &str) -> String {
+    if !raw.contains(['<', '>', '&', '\'', '"']) {
+        return raw.to_owned();
+    }
+    let mut out = String::with_capacity(raw.len() + 8);
+    for ch in raw.chars() {
+        match ch {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '\'' => out.push_str("&apos;"),
+            '"' => out.push_str("&quot;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn redact_comment(text: &str) -> String {
@@ -347,5 +383,29 @@ another line</output>"#;
         let got = redact(xml).unwrap();
         assert!(!got.contains("QQvalue9"), "got: {got}");
         assert!(got.contains("user login"), "got: {got}");
+    }
+
+    // --- quick-xml 0.42 widened its output escaping (`\r` in text,
+    // `\r`/`\n`/`\t` in attributes). Output must stay byte-identical to the
+    // 0.41-era behaviour pinned here. ---
+
+    #[test]
+    fn crlf_text_and_comment_pass_through_unescaped() {
+        let xml = "<?xml version=\"1.0\"?>\r\n<!-- a < b\r\n --><a>line1\r\nline2</a>";
+        let got = redact(xml).unwrap();
+        assert_eq!(
+            got,
+            "<?xml version=\"1.0\"?>\r\n<!-- a &lt; b\r\n --><a>line1\r\nline2</a>"
+        );
+    }
+
+    #[test]
+    fn attribute_whitespace_char_refs_are_not_re_escaped() {
+        let xml = r#"<a x="v&#10;w" y="t&#9;u" z="c&#13;d" q="&amp;&lt;&gt;&quot;&apos;"/>"#;
+        let got = redact(xml).unwrap();
+        assert_eq!(
+            got,
+            "<a x=\"v\nw\" y=\"t\tu\" z=\"c\rd\" q=\"&amp;&lt;&gt;&quot;&apos;\"/>"
+        );
     }
 }

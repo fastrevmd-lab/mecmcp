@@ -21,7 +21,7 @@ globset    = "0.4"
 hmac       = "0.13"
 metrics    = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
-quick-xml  = "0.41"
+quick-xml  = "0.42"
 # Require russh >=0.63 for two reasons:
 # 1. CVE-2026-68930 mitigation (SSH handshake vulnerability in 0.62.0-0.62.4)
 # 2. PublicKeyOrCertificate API required by the host-key verification handler (added in 0.63)
