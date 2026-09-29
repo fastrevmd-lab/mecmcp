@@ -1,6 +1,6 @@
 # Contributing to mecmcp
 
-Thanks for considering a contribution. `mecmcp` is the vendor-neutral Rust foundation shared by mechub's per-vendor network-security MCP servers (today [rustjunosmcp](https://github.com/fastrevmd-lab/rustjunosmcp) for Junos/SRX and [rustpanosmcp](https://github.com/fastrevmd-lab/rustpanosmcp) for PAN-OS, with more vendors expected to build on it). See [README.md](README.md) for what the crate family does and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) / [docs/CRATE-MAP.md](docs/CRATE-MAP.md) for how it's put together.
+Thanks for considering a contribution. `mecmcp` is the vendor-neutral Rust foundation shared by mechub's per-vendor network-security MCP servers (today [rustjunosmcp](https://github.com/mechubsec/rustjunosmcp) for Junos/SRX and [rustpanosmcp](https://github.com/mechubsec/rustpanosmcp) for PAN-OS, with more vendors expected to build on it). See [README.md](README.md) for what the crate family does and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) / [docs/CRATE-MAP.md](docs/CRATE-MAP.md) for how it's put together.
 
 ## Before you start
 

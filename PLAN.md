@@ -49,7 +49,7 @@ Every phase inherits these. Copied verbatim into each per-phase plan.
   standard). Crate names take the `mecmcp-` prefix; Rust crate names keep
   dashes, which the naming rule does not govern.
 - **Consumed as a git dependency pinned by tag**, e.g.
-  `mecmcp-auth = { git = "https://github.com/fastrevmd-lab/mecmcp", tag = "auth-v0.1.0" }`.
+  `mecmcp-auth = { git = "https://github.com/mechubsec/mecmcp", tag = "auth-v0.1.0" }`.
 
 ### The rule these phases keep learning the hard way
 
