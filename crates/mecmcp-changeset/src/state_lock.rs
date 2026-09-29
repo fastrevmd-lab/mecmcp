@@ -32,8 +32,11 @@ pub(crate) struct StateFileLock {
 }
 
 impl StateFileLock {
-    /// Blocks until the lock on `state_path`'s sibling lock file is
+    /// Blocks until the lock on `state_path`'s sibling `.lock` file is
     /// acquired.
+    ///
+    /// This is the read-modify-write lock: short-lived, held only for the
+    /// duration of a single read-modify-write cycle against the state file.
     ///
     /// # Errors
     ///
@@ -41,7 +44,7 @@ impl StateFileLock {
     /// parent directory does not exist or is not writable) or the `flock`
     /// syscall itself fails.
     pub(crate) fn acquire(state_path: &Path) -> Result<Self, PersistenceError> {
-        let lock_path = lock_path_for(state_path);
+        let lock_path = lock_path_with_suffix(state_path, "lock");
         let file = open_lock_file(&lock_path)?;
         lock_exclusive(&file).map_err(|error| {
             PersistenceError::new(format!(
@@ -50,6 +53,38 @@ impl StateFileLock {
             ))
         })?;
         Ok(Self { file })
+    }
+
+    /// Tries, without blocking, to take the lock on `state_path`'s sibling
+    /// `.owner` file.
+    ///
+    /// This is the single-writer lock: a live server holds it for the whole
+    /// time it has `state_path` loaded, distinct from and never taken at the
+    /// same time in the same process as the short-lived `.lock` file above.
+    /// Offline resolution (`resolve_persisted_operation`) uses this to refuse
+    /// to run while a server is up, rather than serializing behind it and
+    /// silently reverting whatever the server persists next (MEC-540 review,
+    /// finding 2).
+    ///
+    /// Returns `Ok(None)` rather than blocking when another process already
+    /// holds the lock — offline resolution and server startup both need to
+    /// fail fast and say so, not hang waiting for the other side to exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock file cannot be opened, or the `flock`
+    /// syscall itself fails for a reason other than the lock being held.
+    pub(crate) fn try_acquire_owner(state_path: &Path) -> Result<Option<Self>, PersistenceError> {
+        let lock_path = lock_path_with_suffix(state_path, "owner");
+        let file = open_lock_file(&lock_path)?;
+        match try_lock_exclusive(&file) {
+            Ok(true) => Ok(Some(Self { file })),
+            Ok(false) => Ok(None),
+            Err(error) => Err(PersistenceError::new(format!(
+                "locking changeset state owner '{}': {error}",
+                lock_path.display()
+            ))),
+        }
     }
 }
 
@@ -62,12 +97,13 @@ impl Drop for StateFileLock {
     }
 }
 
-fn lock_path_for(state_path: &Path) -> PathBuf {
+fn lock_path_with_suffix(state_path: &Path, suffix: &str) -> PathBuf {
     let mut name = state_path
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
         .unwrap_or_default();
-    name.push(".lock");
+    name.push(".");
+    name.push(suffix);
     state_path.with_file_name(name)
 }
 
@@ -101,6 +137,18 @@ fn lock_exclusive(file: &File) -> std::io::Result<()> {
     // short duration of a read-modify-write, not across long-lived server
     // operation.
     flock(file, FlockOperation::LockExclusive).map_err(std::io::Error::from)
+}
+
+/// Returns `Ok(true)` if the lock was taken, `Ok(false)` if another holder
+/// already has it, and `Err` for any other failure.
+fn try_lock_exclusive(file: &File) -> std::io::Result<bool> {
+    use rustix::fs::{FlockOperation, flock};
+
+    match flock(file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::WOULDBLOCK) => Ok(false),
+        Err(error) => Err(std::io::Error::from(error)),
+    }
 }
 
 fn unlock(file: &File) -> std::io::Result<()> {
@@ -151,5 +199,58 @@ mod tests {
         let state_path = dir.path().join("state.json");
         let _lock = StateFileLock::acquire(&state_path).unwrap();
         assert!(dir.path().join("state.json.lock").exists());
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn owner_lock_path_is_a_sibling_of_the_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let _owner = StateFileLock::try_acquire_owner(&state_path)
+            .unwrap()
+            .unwrap();
+        assert!(dir.path().join("state.json.owner").exists());
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn try_acquire_owner_refuses_while_another_holder_has_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+
+        let first = StateFileLock::try_acquire_owner(&state_path)
+            .unwrap()
+            .expect("first acquirer should get the owner lock");
+
+        assert!(
+            StateFileLock::try_acquire_owner(&state_path)
+                .unwrap()
+                .is_none(),
+            "a second acquirer must not get the owner lock while the first holds it"
+        );
+
+        drop(first);
+
+        assert!(
+            StateFileLock::try_acquire_owner(&state_path)
+                .unwrap()
+                .is_some(),
+            "the owner lock must become available once the first holder releases it"
+        );
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn owner_lock_and_rmw_lock_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+
+        let _owner = StateFileLock::try_acquire_owner(&state_path)
+            .unwrap()
+            .unwrap();
+        // The short-lived RMW lock must still be acquirable while the
+        // long-lived owner lock is held by the same or another process --
+        // they guard different things and must not contend with each other.
+        let _rmw = StateFileLock::acquire(&state_path).unwrap();
     }
 }

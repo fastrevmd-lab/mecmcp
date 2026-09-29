@@ -140,14 +140,48 @@ pub fn resolve_persisted_operation(
         ));
     }
 
-    // Hold the cross-process state lock for the whole read-modify-write
-    // cycle below, not just the final write. Two operators (or an operator
-    // racing a still-running server) resolving different operations at the
-    // same time each take a read of the file before either has written back;
-    // without this lock, whichever finishes last silently reverts the
-    // other's resolution because its write is a full snapshot taken before
-    // the first write landed (MEC-540).
+    // Hold the cross-process RMW lock for the whole read-modify-write cycle
+    // below, not just the final write. Two offline operators resolving
+    // different operations at the same time each take a read of the file
+    // before either has written back; without this lock, whichever finishes
+    // last silently reverts the other's resolution because its write is a
+    // full snapshot taken before the first write landed (MEC-540).
+    //
+    // Taken before the owner-lock probe just below, not after: a coordinator
+    // starting up takes the owner lock first and only then waits (blocking)
+    // on this same RMW lock before it reads. Probing the owner lock only
+    // while already holding this one means a server that starts concurrently
+    // either loses the owner-lock race to us -- in which case it blocks here
+    // until we are done and then reads our finished write -- or wins it, in
+    // which case our probe below sees it and we refuse before touching the
+    // file. Either order is safe; the reverse order (probe first, lock
+    // second) would leave a window between the two where a server could
+    // start unnoticed.
     let _state_lock = StateFileLock::acquire(path)?;
+
+    // Refuse outright if a server currently owns this state file. This
+    // repair runs against the server's in-memory `ChangesetState`, not the
+    // file, from the server's point of view: whatever this function writes,
+    // the server's own next persist overwrites with its own in-memory copy,
+    // silently reverting the "reconciliation" this call just told the
+    // operator succeeded. The precondition ("run only while the server is
+    // stopped") was previously documented but not enforced (MEC-540 review,
+    // finding 2).
+    //
+    // A probe, not a hold: this takes and immediately releases the owner
+    // lock rather than keeping it. Keeping it would make two concurrent
+    // *offline* resolutions (no server involved at all, and the case this
+    // module's own two-process test exercises) spuriously refuse each other,
+    // which is not the hazard this guards against -- the RMW lock above
+    // already serializes those correctly. Only an actual, independently-held
+    // owner lock -- meaning some other process's live coordinator -- must
+    // refuse this call.
+    if StateFileLock::try_acquire_owner(path)?.is_none() {
+        return Err(CoordinatorError::new(
+            "state",
+            "a running server holds this state file; stop it before offline resolution",
+        ));
+    }
 
     // Load the state file. The size limit is the caller's, not a default: a
     // deployment that raised `max_state_bytes` would otherwise have a running

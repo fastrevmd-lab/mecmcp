@@ -232,6 +232,15 @@ pub struct ChangesetCoordinator {
     /// configured should not be forced to build chains nothing will read. When
     /// absent, every emission point is a no-op (mecmcp#292).
     evidence: Option<Arc<EvidenceRecorder>>,
+    /// The single-writer lock on `<state_path>.owner`, held for as long as this
+    /// coordinator has `state_path` loaded.
+    ///
+    /// `None` when `state_path` is `None` (in-memory only, nothing to own).
+    /// Its only job is to be alive: nothing reads it after construction.
+    /// Dropping it releases the lock, which is why it must live exactly as
+    /// long as the coordinator does rather than as a local in `load`
+    /// (MEC-540 review, finding 2).
+    _owner_lock: Option<StateFileLock>,
     /// HMAC key for the v6 (keyed) approval digest, when a deployment has one
     /// configured.
     ///
@@ -297,6 +306,7 @@ impl Default for ChangesetCoordinator {
             evidence: None,
             lab_mode: false,
             approval_digest_key: None,
+            _owner_lock: None,
         }
     }
 }
@@ -439,6 +449,7 @@ impl ChangesetCoordinator {
                 lab_mode,
                 evidence: None,
                 approval_digest_key,
+                _owner_lock: None,
             });
         };
 
@@ -448,6 +459,39 @@ impl ChangesetCoordinator {
                 "changeset state path must be absolute",
             ));
         }
+
+        // Claim single-writer ownership of this state file before reading it,
+        // and hold the claim for the coordinator's whole lifetime. Without
+        // this, a second server pointed at the same file (or a live server
+        // plus an offline `resolve_persisted_operation` repair) is a lost
+        // update no lock scoped to one RMW cycle can catch: each side reads
+        // its own consistent snapshot, and whichever writes last wins,
+        // silently discarding the other's change. Fails fast rather than
+        // blocking, because there is nothing productive to wait for -- the
+        // other holder is not expected to exit on its own (MEC-540 review,
+        // finding 2).
+        let owner_lock = StateFileLock::try_acquire_owner(path)?.ok_or_else(|| {
+            CoordinatorError::new(
+                "state",
+                "another process already holds this state file (an existing server, or an \
+                 offline resolution in progress); stop it before starting a second one against \
+                 the same path",
+            )
+        })?;
+
+        // Hold the RMW lock across the read too, not just the recovery write
+        // below. A reader that skips the lock can still see a consistent
+        // snapshot -- `write_state`'s rename guarantees that -- but a
+        // consistent snapshot is not the same as an up-to-date one: an
+        // offline repair's write landing between this read and the recovery
+        // write further down would be silently reverted when that write
+        // lands, even though the owner lock above stops a second *server*
+        // from doing the same (MEC-540 review, finding 1).
+        let _state_lock = if path.exists() {
+            Some(StateFileLock::acquire(path)?)
+        } else {
+            None
+        };
 
         let mut state = if path.exists() {
             read_state_with_key(path, limits.max_state_bytes, approval_digest_key.as_deref())?
@@ -530,15 +574,12 @@ impl ChangesetCoordinator {
             }
         }
 
-        // Persist recovery only if we changed something. Locked for the same
-        // reason `persist_locked` is: this write must not land in the middle
-        // of another process's read-modify-write cycle against the same
-        // file, for example an offline `resolve_persisted_operation` repair
-        // racing server startup (MEC-540). Not required around the read
-        // above: `write_state`'s atomic rename means a reader always sees a
-        // complete, valid snapshot regardless of what else is writing.
+        // Persist recovery only if we changed something. Covered by the same
+        // `_state_lock` taken before the read above, so the read-modify-write
+        // is one atomic cycle from another process's point of view -- for
+        // example against an offline `resolve_persisted_operation` repair
+        // racing server startup (MEC-540).
         if recovered {
-            let _state_lock = StateFileLock::acquire(path)?;
             write_state(path, &state, limits.max_state_bytes)?;
         }
 
@@ -551,6 +592,7 @@ impl ChangesetCoordinator {
             approval_ttl,
             lab_mode,
             approval_digest_key,
+            _owner_lock: Some(owner_lock),
         })
     }
 

@@ -320,6 +320,11 @@ async fn staged_recovery_policy_decides_whether_a_restart_demotes_an_operation()
         "the file must match what the API reports"
     );
 
+    // Drop the coordinator before reloading: it holds the state file's
+    // single-writer lock for its whole lifetime (MEC-540), which the next
+    // `load_with_recovery` call below would otherwise be refused against.
+    drop(discarded);
+
     // Put it back to Staged and reload with Retain.
     let mut state = read_state(&path, limits.max_state_bytes).unwrap();
     state.operations.get_mut(&out.operation_id).unwrap().state = LifecycleState::Staged;
