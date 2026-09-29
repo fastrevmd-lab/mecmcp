@@ -52,7 +52,7 @@ impl HttpKeySource {
     }
 
     async fn get_json_bytes(&self, url: &str, what: &'static str) -> Result<Vec<u8>, FetchError> {
-        let request = HttpRequest::new(Method::Get, url)
+        let request = HttpRequest::from_absolute_url(Method::Get, url)
             .map_err(|source| FetchError::Transport { what, source })?
             .header("Accept", "application/json")
             .map_err(|source| FetchError::Transport { what, source })?;
