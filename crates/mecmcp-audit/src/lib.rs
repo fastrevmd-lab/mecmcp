@@ -6,6 +6,7 @@
 
 mod attribution;
 pub mod canonical;
+pub mod checkpoint;
 pub mod device_log;
 pub mod direct_commit;
 pub mod evidence;
@@ -21,6 +22,9 @@ pub mod testutil;
 
 pub use attribution::{
     ActorType, AgentIdentity, Attribution, Principal, Tier, TokenVerifiedFields,
+};
+pub use checkpoint::{
+    Checkpoint, CheckpointError, checkpoint_digest, key_id, sign_checkpoint, verify_checkpoint,
 };
 pub use direct_commit::{DIRECT_COMMIT_DENIED_REASON, DirectCommitPolicy, DirectCommitRefused};
 pub use evidence::{
