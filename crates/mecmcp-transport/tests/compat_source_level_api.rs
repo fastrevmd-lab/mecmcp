@@ -60,6 +60,7 @@ fn new_api_compiles() {
         max_requests_per_second_per_token: 0,
         max_request_burst_per_token: 0,
         max_inflight_requests_per_device: 4, // <-- NEW NAME
+        trusted_proxies: Vec::new(),
         max_sessions: 128,
         max_sessions_per_token: 16,
         session_idle_timeout_secs: 300,

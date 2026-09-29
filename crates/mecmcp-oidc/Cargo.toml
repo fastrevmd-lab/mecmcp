@@ -44,5 +44,5 @@ tracing      = { workspace = true }
 # `jsonwebtoken::jwk::Jwk::from_encoding_key`). Never used outside
 # `#[cfg(test)]` code, and no key it produces is ever persisted.
 aws-lc-rs    = "1"
-pem          = "3"
+pem          = "4"
 tokio        = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }

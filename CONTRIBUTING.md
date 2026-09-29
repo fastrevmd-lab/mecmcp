@@ -1,12 +1,13 @@
 # Contributing to mecmcp
 
-Thanks for considering a contribution. `mecmcp` is the vendor-neutral Rust foundation shared by mechub's per-vendor network-security MCP servers (today [rustjunosmcp](https://github.com/fastrevmd-lab/rustjunosmcp) for Junos/SRX and [rustpanosmcp](https://github.com/fastrevmd-lab/rustpanosmcp) for PAN-OS, with more vendors expected to build on it). See [README.md](README.md) for what the crate family does and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) / [docs/CRATE-MAP.md](docs/CRATE-MAP.md) for how it's put together.
+Thanks for considering a contribution. `mecmcp` is the vendor-neutral Rust foundation shared by mechub's per-vendor network-security MCP servers (today [rustjunosmcp](https://github.com/mechubsec/rustjunosmcp) for Junos/SRX and [rustpanosmcp](https://github.com/mechubsec/rustpanosmcp) for PAN-OS, with more vendors expected to build on it). See [README.md](README.md) for what the crate family does and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) / [docs/CRATE-MAP.md](docs/CRATE-MAP.md) for how it's put together.
 
 ## Before you start
 
 - Check open issues and PRs first — someone may already be working on it.
 - For anything larger than a small fix, open an issue to discuss the approach before writing code. It saves everyone a rewrite.
 - This project follows one hard rule across the whole mechub fleet: **deterministic code decides, a model may explain, a human approves.** Nothing contributed here should let an LLM or other model output directly drive a device action (a commit, a set, a config push, an approval). Models may draft, summarize, or explain; deterministic code — the policy engine, the change-set state machine, the auth boundary — decides.
+- **Wrap device-sourced text in `Untrusted` before it reaches a model.** A hostname, description, error body, or CLI output that came from a device or controller response is no more trustworthy than a tool argument — it crossed the same boundary a compromised or misconfigured device controls. Construct `mecmcp_redact::Untrusted::new(value)` at the point the vendor response is parsed, and render it with `.render_tagged(source)` (or `mecmcp_server::tool_error_with_untrusted_detail` for an error path) wherever it lands in a tool result or other model-facing string, so it stays visibly distinct from operator input and this codebase's own text. See `crates/mecmcp-redact/src/trust.rs` for what the wrapper does and does not guarantee, and `crates/mecmcp-changeset/src/apply.rs` (search `Untrusted::new`) for a worked example. This is additive to the redaction rule above, not a replacement for it — untrusted and secret are orthogonal; a value can be either, both, or neither.
 - `mecmcp` is a *foundation* crate, not a leaf. A change here doesn't just affect this repo — it ripples into every vendor server that depends on it. See "Downstream impact" below before touching public API.
 
 ## Workspace layout

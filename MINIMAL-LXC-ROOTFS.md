@@ -1,7 +1,7 @@
 # Minimal LXC rootfs for a mecmcp-family server
 
-Result of the spike in [#347](https://github.com/fastrevmd-lab/mecmcp/issues/347),
-which followed [#320](https://github.com/fastrevmd-lab/mecmcp/issues/320) closing
+Result of the spike in [#347](https://github.com/mechubsec/mecmcp/issues/347),
+which followed [#320](https://github.com/mechubsec/mecmcp/issues/320) closing
 the static-musl route as answered **no**.
 
 Build with [`packaging/lxc/build-minimal-rootfs.sh`](packaging/lxc/build-minimal-rootfs.sh),
