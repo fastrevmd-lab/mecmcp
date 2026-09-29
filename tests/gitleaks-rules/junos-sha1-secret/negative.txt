@@ -1,0 +1,1 @@
+This changelog references the $sha1$ encrypted-password family without a real hash.
