@@ -32,7 +32,7 @@ is shaped correctly, not that the seccomp posture works.
       - name: Build the image          # only needed for R6
         run: docker build -t <image>:conformance .
 
-      - uses: fastrevmd-lab/mecmcp/packaging/conformance@<pinned-sha>
+      - uses: mechubsec/mecmcp/packaging/conformance@<pinned-sha>
         with:
           staging: staging
           manifest: staging/conformance.toml

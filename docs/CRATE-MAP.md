@@ -162,7 +162,7 @@ enforces the order, because each position is load-bearing.
   the request — its `duration_ms` is preflight time, and holding the scope
   across the handler would both inflate that and emit it after the handler's own
   event. It therefore precedes target concurrency, so it cannot describe what
-  that last gate did. Until [#370](https://github.com/fastrevmd-lab/mecmcp/issues/370)
+  that last gate did. Until [#370](https://github.com/mechubsec/mecmcp/issues/370)
   that was the whole story, and a request shed by target concurrency left one
   event saying preflight *allowed* it with `result=ok` — a success it never had.
   The boundary now emits a second, terminal event on any 4xx or 5xx:

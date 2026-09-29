@@ -7,7 +7,7 @@ version      = "0.24.1"
 edition      = "2024"
 rust-version = "1.89"
 license      = "MIT"
-repository   = "https://github.com/fastrevmd-lab/mecmcp"
+repository   = "https://github.com/mechubsec/mecmcp"
 authors      = ["fastrevmd-lab"]
 
 [workspace.dependencies]

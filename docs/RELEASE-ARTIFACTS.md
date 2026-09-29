@@ -1,6 +1,6 @@
 # Release artifact standard for mechub MCP servers
 
-**Part of [#6](https://github.com/fastrevmd-lab/mecmcp/issues/6).**
+**Part of [#6](https://github.com/mechubsec/mecmcp/issues/6).**
 
 ## Problem
 

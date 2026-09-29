@@ -7,7 +7,7 @@ It exists because the two shipping servers had drifted apart — each had what t
 other lacked — and two more (`rustproxmoxmcp`, `rustunifimcp`) are starting.
 Settling it once is cheaper than reconciling four repos later.
 
-Tracked in [#6](https://github.com/fastrevmd-lab/mecmcp/issues/6).
+Tracked in [#6](https://github.com/mechubsec/mecmcp/issues/6).
 
 **See also:**
 - [FILESYSTEM-LAYOUT.md](FILESYSTEM-LAYOUT.md) — directory structure, config vs state split, service naming (#28)
@@ -520,7 +520,7 @@ For a new repo, or one being brought into line:
       clobber state, does not install a non-bootable config
 - [ ] A config example ships **inside** the release archive
 - [ ] README has complete LXC and Docker sections, verified against a real archive
-- [ ] CI gates the repo — see [#7](https://github.com/fastrevmd-lab/mecmcp/issues/7)
+- [ ] CI gates the repo — see [#7](https://github.com/mechubsec/mecmcp/issues/7)
       for the check set
 
 **LXC and observability (§2):**
