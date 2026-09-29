@@ -71,7 +71,17 @@ pub fn resolve_rate_limit_ip(
     }
 
     for entry in entries.into_iter().rev() {
-        let Ok(addr) = entry.trim().parse::<IpAddr>() else {
+        // Canonicalize each parsed entry for the same reason `peer` is
+        // canonicalized above: a trusted proxy on a dual-stack socket can
+        // write its own address as `::ffff:a.b.c.d`, which would otherwise
+        // both dodge the `trusted_proxies` match (letting a trusted hop's own
+        // address leak through as the "client") and produce a rate-limit key
+        // that differs from the same host's IPv4 form.
+        let Ok(addr) = entry
+            .trim()
+            .parse::<IpAddr>()
+            .map(|addr| addr.to_canonical())
+        else {
             return peer;
         };
         if !trusted_proxies
@@ -1177,6 +1187,35 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+    }
+
+    /// F2 regression: an IPv4-mapped (`::ffff:a.b.c.d`) entry must resolve to
+    /// the same rate-limit key as its plain-IPv4 form, both when it is the
+    /// trusted proxy's own address (must be skipped, not returned as the
+    /// "client") and when it is the client address itself (must not open a
+    /// second bucket for the same host).
+    #[test]
+    fn forwarded_for_entries_are_canonicalized() {
+        let trusted: IpNet = "10.0.0.0/8".parse().unwrap();
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let expected: IpAddr = "203.0.113.7".parse().unwrap();
+
+        let headers = {
+            let mut map = http::HeaderMap::new();
+            map.insert(
+                "x-forwarded-for",
+                "203.0.113.7, ::ffff:10.0.0.9".parse().unwrap(),
+            );
+            map
+        };
+        assert_eq!(resolve_rate_limit_ip(peer, &headers, &[trusted]), expected);
+
+        let headers = {
+            let mut map = http::HeaderMap::new();
+            map.insert("x-forwarded-for", "::ffff:203.0.113.7".parse().unwrap());
+            map
+        };
+        assert_eq!(resolve_rate_limit_ip(peer, &headers, &[trusted]), expected);
     }
 
     /// F1 regression: a client behind a trusted proxy cannot evade its bucket
