@@ -1966,7 +1966,7 @@ dependencies = [
  "aws-lc-rs",
  "jsonwebtoken",
  "mecmcp-http",
- "pem 3.0.6",
+ "pem 4.0.0",
  "serde",
  "serde_json",
  "thiserror",
