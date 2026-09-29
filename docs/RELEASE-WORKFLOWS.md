@@ -1,6 +1,6 @@
 # Shared release workflows
 
-**Part of [#417](https://github.com/fastrevmd-lab/mecmcp/issues/417).**
+**Part of [#417](https://github.com/mechubsec/mecmcp/issues/417).**
 
 ## Problem
 
@@ -44,7 +44,7 @@ rustmistmcp, and rustproxmoxmcp — not newly guessed pins.
 
 Consumer repos keep their own trigger (`on: push: tags:`, `on:
 workflow_dispatch`, `on: release: published`) and call the shared job with
-`uses: fastrevmd-lab/mecmcp/.github/workflows/reusable-release-image.yml@<mecmcp-ref>`.
+`uses: mechubsec/mecmcp/.github/workflows/reusable-release-image.yml@<mecmcp-ref>`.
 Pin `<mecmcp-ref>` to a released mecmcp tag, the same way consumer repos
 already pin their `mecmcp` crate dependency — a floating `@main` reference
 would let an unreviewed mecmcp change silently alter every consumer's
@@ -75,9 +75,9 @@ jobs:
       contents: read
       packages: write
       id-token: write
-    uses: fastrevmd-lab/mecmcp/.github/workflows/reusable-release-image.yml@v0.8.1
+    uses: mechubsec/mecmcp/.github/workflows/reusable-release-image.yml@v0.8.1
     with:
-      image: ghcr.io/fastrevmd-lab/rust-junosmcp
+      image: ghcr.io/mechubsec/rust-junosmcp
       version: ${{ github.event.inputs.version }}
       ref: ${{ github.event.inputs.ref }}
       smoke-test-command: ./packaging/tests/container-scp-smoke.sh
@@ -101,7 +101,7 @@ jobs:
     permissions:
       contents: write
       id-token: write
-    uses: fastrevmd-lab/mecmcp/.github/workflows/reusable-sign-release-tarball.yml@v0.8.1
+    uses: mechubsec/mecmcp/.github/workflows/reusable-sign-release-tarball.yml@v0.8.1
 ```
 
 ## Reference migration: rustjunosmcp

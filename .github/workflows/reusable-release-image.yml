@@ -20,7 +20,7 @@ on:
   workflow_call:
     inputs:
       image:
-        description: 'Full GHCR image path, e.g. ghcr.io/fastrevmd-lab/rust-junosmcp'
+        description: 'Full GHCR image path, e.g. ghcr.io/mechubsec/rust-junosmcp'
         required: true
         type: string
       version:
