@@ -335,19 +335,15 @@ async fn test_discard_persists_before_rollback() {
         .await
         .unwrap();
 
-    // Start a discard operation in the background
-    let coord_clone = ChangesetCoordinator::load(
-        Some(&path),
-        OperationLimits::default(),
-        Duration::from_secs(900),
-        false,
-    )
-    .unwrap();
+    // Start a discard operation in the background, reusing the same
+    // coordinator rather than loading a second one against the same path: a
+    // second live coordinator on the same path is refused, because it holds
+    // the state file's single-writer lock for its whole lifetime (MEC-540).
     let op_id = output.operation_id.clone();
     let after_fp = output.after_fingerprint.clone();
 
     let discard_task = tokio::spawn(async move {
-        coord_clone
+        coordinator
             .discard_operation(
                 &op_id,
                 "device1",
@@ -633,7 +629,11 @@ async fn test_stage_device_touched_after_lock_persist() {
         "error should indicate stage failure"
     );
 
-    // Clean up - verify we can find and resolve this operation
+    // Clean up - verify we can find and resolve this operation. Drop the
+    // first coordinator first: it holds the state file's single-writer lock
+    // for its whole lifetime (MEC-540), which a second live coordinator on
+    // the same path would otherwise be refused.
+    drop(coordinator);
     let coord2 = ChangesetCoordinator::load(
         Some(&path),
         OperationLimits::default(),

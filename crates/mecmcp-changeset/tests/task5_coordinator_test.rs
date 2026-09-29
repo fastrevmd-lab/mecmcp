@@ -259,19 +259,23 @@ async fn test_persist_failure_rolls_back_insert() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state_path = temp_dir.path().join("state.json");
 
-    // Create a read-only directory to force persist failure
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(temp_dir.path()).unwrap();
-        std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
-    }
-
     let limits = OperationLimits::default();
     let approval_ttl = Duration::from_secs(900);
 
     let coordinator =
         ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false).unwrap();
+
+    // Make the directory read-only to force persist failure, after loading
+    // the coordinator rather than before: load itself now needs to create
+    // the state file's owner lock (MEC-540), so a directory that is already
+    // read-only at load time fails construction, not just the write this
+    // test means to exercise.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    }
+
     let operation = make_operation_record(
         "0000000000000000000000000000000000000000000000000000000000000001",
         "test_device",
