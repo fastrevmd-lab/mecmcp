@@ -18,6 +18,16 @@ libfuzzer-sys = "0.4"
 serde_json = "1"
 tokio = { version = "1", features = ["rt"] }
 
+# Same header-map type `resolve_rate_limit_ip` takes; needed to build a
+# `HeaderValue` straight from arbitrary fuzz bytes via `from_bytes`, which
+# (unlike the `&str` conversion) accepts the same opaque-byte header values a
+# reverse proxy can actually put on the wire.
+http = "1"
+
+# CIDR matching for the xff_parse target's fixed `trusted_proxies` list, same
+# crate mecmcp-transport itself uses for this.
+ipnet = "2"
+
 # Same backend choice as mecmcp-oidc itself (see that crate's Cargo.toml):
 # aws_lc_rs, never the rust_crypto feature, because that pulls in the
 # RustCrypto `rsa` crate and RUSTSEC-2023-0071.
@@ -28,6 +38,9 @@ path = "../crates/mecmcp-oidc"
 
 [dependencies.mecmcp-redact]
 path = "../crates/mecmcp-redact"
+
+[dependencies.mecmcp-transport]
+path = "../crates/mecmcp-transport"
 
 # Only used to mint the one fixed signing key the token-verification target
 # signs nothing else with. Never used outside the fuzz target, and no key it
@@ -76,6 +89,13 @@ bench = false
 [[bin]]
 name = "redact_xml_never_panics"
 path = "fuzz_targets/redact_xml_never_panics.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xff_parse"
+path = "fuzz_targets/xff_parse.rs"
 test = false
 doc = false
 bench = false

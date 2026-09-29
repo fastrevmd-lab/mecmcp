@@ -1,0 +1,8 @@
+# libFuzzer dictionary for xff_parse -- tokens that make IPv4-mapped
+# (`::ffff:a.b.c.d`, the F2 canonicalization case) and multi-line
+# `X-Forwarded-For` inputs vastly more likely than uniform random mutation.
+"::ffff:"
+","
+"::"
+"."
+"\x0a"
