@@ -1288,9 +1288,10 @@ impl HttpClient {
     /// ```
     /// use mecmcp_http::{HttpClient, HttpClientConfig, HttpRequest, Method, RetryPolicy};
     ///
-    /// # async fn example() -> Result<(), mecmcp_http::HttpError> {
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let client = HttpClient::new(HttpClientConfig::default())?;
-    /// let request = HttpRequest::new(Method::Get, "https://api.example.com/status")?;
+    /// let path = mecmcp_openapi::expand_path("/status", &[])?;
+    /// let request = HttpRequest::with_base_and_path(Method::Get, "https://api.example.com", &path)?;
     /// let response = client
     ///     .send_get_with_backoff(request, &RetryPolicy::default())
     ///     .await?;
@@ -3195,12 +3196,13 @@ mod tests {
             .header("Accept", "application/json")
             .unwrap();
 
-        for (name, value) in &request.headers {
+        // Messages below deliberately interpolate nothing derived from the
+        // request: its headers carry a secret, and a panic message is a log sink.
+        for (index, (name, value)) in request.headers.iter().enumerate() {
             let sensitive_expected = name != "accept";
-            assert_eq!(
-                value.is_sensitive(),
-                sensitive_expected,
-                "{name} sensitivity flag is wrong"
+            assert!(
+                value.is_sensitive() == sensitive_expected,
+                "sensitivity flag is wrong for header #{index}"
             );
         }
 
@@ -3209,7 +3211,7 @@ mod tests {
         let rendered = format!("{request:?}");
         assert!(
             !rendered.contains(CANARY),
-            "secret leaked via Debug: {rendered}"
+            "secret leaked via Debug of HttpRequest"
         );
     }
 
@@ -3787,8 +3789,11 @@ mod tests {
         );
 
         let client = client_trusting(cert_pem);
-        let request =
-            HttpRequest::new(Method::Get, &format!("https://localhost:{port}/status")).unwrap();
+        let request = HttpRequest::from_absolute_url(
+            Method::Get,
+            &format!("https://localhost:{port}/status"),
+        )
+        .unwrap();
 
         let response = client
             .send_get_with_backoff(request, &fast_retry_policy(4))
@@ -3809,8 +3814,11 @@ mod tests {
         );
 
         let client = client_trusting(cert_pem);
-        let request =
-            HttpRequest::new(Method::Get, &format!("https://localhost:{port}/status")).unwrap();
+        let request = HttpRequest::from_absolute_url(
+            Method::Get,
+            &format!("https://localhost:{port}/status"),
+        )
+        .unwrap();
 
         let response = client
             .send_get_with_backoff(request, &fast_retry_policy(3))
@@ -3843,8 +3851,11 @@ mod tests {
         );
 
         let client = client_trusting(cert_pem);
-        let request =
-            HttpRequest::new(Method::Get, &format!("https://localhost:{port}/status")).unwrap();
+        let request = HttpRequest::from_absolute_url(
+            Method::Get,
+            &format!("https://localhost:{port}/status"),
+        )
+        .unwrap();
 
         let response = client
             .send_get_with_backoff(request, &fast_retry_policy(4))
@@ -3867,9 +3878,10 @@ mod tests {
         drop(listener);
 
         let client = build_client(HttpClientConfig::default()).unwrap();
-        let request = HttpRequest::new(Method::Post, &format!("https://localhost:{port}/set"))
-            .unwrap()
-            .body(b"payload".to_vec());
+        let request =
+            HttpRequest::from_absolute_url(Method::Post, &format!("https://localhost:{port}/set"))
+                .unwrap()
+                .body(b"payload".to_vec());
 
         let error = client
             .send_get_with_backoff(request, &fast_retry_policy(4))
