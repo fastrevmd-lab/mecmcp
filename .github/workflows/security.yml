@@ -19,6 +19,34 @@ jobs:
   secrets:
     uses: mechubsec/.github/.github/workflows/gitleaks.yml@fb1a159c596bf2c57b9f6f1ff99f546463a6a84a
 
+  # Each vendor rule in .gitleaks-vendor.toml has a positive/negative sample
+  # pair under tests/gitleaks-rules/; this proves the rule still matches (and
+  # doesn't over-match) instead of only being checked by hand at review time.
+  gitleaks-rule-samples:
+    name: gitleaks rule samples
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Same pinned version + checksum as mechubsec/.github's gitleaks.yml,
+      # so the rule samples are verified against the exact binary CI scans
+      # with.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          curl -sSfL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          rm -f gitleaks.tar.gz gitleaks
+      - name: Run rule sample tests
+        run: bash tests/gitleaks-rules/run.sh
+
   cargo:
     name: cargo-audit + cargo-deny
     runs-on: ubuntu-latest
