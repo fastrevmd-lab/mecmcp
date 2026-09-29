@@ -838,7 +838,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: all scripts from Tasks 1-6.
-- Produces: a composite action at `fastrevmd-lab/mecmcp/packaging/conformance@<sha>`
+- Produces: a composite action at `mechubsec/mecmcp/packaging/conformance@<sha>`
   with inputs `staging` (required), `manifest` (required), `image` (optional,
   default `''`), `overrides` (optional, default `--host 0.0.0.0`).
 
@@ -1035,7 +1035,7 @@ mecmcp commit that merged Task 7:
         # adopter should not need the note.
         run: docker build -t rust-proxmoxmcp:conformance .
       - name: Conformance
-        uses: fastrevmd-lab/mecmcp/packaging/conformance@<SHA>
+        uses: mechubsec/mecmcp/packaging/conformance@<SHA>
         with:
           staging: staging
           manifest: staging/conformance.toml

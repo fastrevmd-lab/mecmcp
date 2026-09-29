@@ -232,7 +232,7 @@ cd ~/Projects/mecmcp
 git add Cargo.toml
 git commit -m "chore: release 0.18.0"
 git push -u origin fix/324-serialise-capture
-gh pr create --repo fastrevmd-lab/mecmcp --base main --head fix/324-serialise-capture \
+gh pr create --repo mechubsec/mecmcp --base main --head fix/324-serialise-capture \
   --title "fix(testutil): serialise run_with_capture; release 0.18.0" \
   --body "Fixes the shared capture race behind #324 and rustjunosmcp#339. Closes #324."
 ```
@@ -338,7 +338,7 @@ longer needs --test-threads=1.
 
 Closes #339"
 git push -u origin fix/339-mecmcp-018
-gh pr create --repo fastrevmd-lab/RustJunosMCP --base main --head fix/339-mecmcp-018 \
+gh pr create --repo mechubsec/rustjunosmcp --base main --head fix/339-mecmcp-018 \
   --title "chore(deps): mecmcp 0.18.0 — fixes flaky audit captures (#339)" \
   --body "Closes #339. No test changes; the fix is in the shared helper."
 ```
@@ -416,7 +416,7 @@ MSRV floor (rustpanosmcp#126).
 
 Refs #338"
 git push -u origin fix/338-dependabot
-gh pr create --repo fastrevmd-lab/RustJunosMCP --base main --head fix/338-dependabot \
+gh pr create --repo mechubsec/rustjunosmcp --base main --head fix/338-dependabot \
   --title "ci: add Dependabot (repo had none)" --body "Refs #338."
 ```
 
@@ -617,7 +617,7 @@ Then prove the drift branch fires: temporarily edit the Dockerfile digest to `sh
 
 - [ ] **Step 4: Trigger it once for real**
 
-After merging, run `gh workflow run digest-drift.yml --repo fastrevmd-lab/rust-panosmcp`, then confirm the run succeeded and opened no issue. A scheduled workflow nobody has ever run is not known to work.
+After merging, run `gh workflow run digest-drift.yml --repo mechubsec/rustpanosmcp`, then confirm the run succeeded and opened no issue. A scheduled workflow nobody has ever run is not known to work.
 
 - [ ] **Step 5: Commit, PR, merge, close #133**
 
@@ -638,7 +638,7 @@ which is what rustjunosmcp#338 turned out to be.
 
 Closes #133"
 git push -u origin ci/133-digest-drift
-gh pr create --repo fastrevmd-lab/rust-panosmcp --base main --head ci/133-digest-drift \
+gh pr create --repo mechubsec/rustpanosmcp --base main --head ci/133-digest-drift \
   --title "ci: weekly advisory digest-drift check" --body "Closes #133."
 ```
 
