@@ -1922,6 +1922,7 @@ dependencies = [
 name = "mecmcp-http"
 version = "0.24.1"
 dependencies = [
+ "mecmcp-openapi",
  "mecmcp-secret",
  "rcgen",
  "reqwest",

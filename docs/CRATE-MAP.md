@@ -120,17 +120,17 @@ Reaching the far side, and running as a service.
 
 | Crate | Lines | Depends on | What it owns |
 |---|---:|---|---|
-| `mecmcp-http` | 3,260 | secret | HTTPS-only outbound client: no redirects, no proxy autodiscovery, bounded concurrency, whole-request deadlines. Trust is additive only — there is **no API** to disable verification. Response caps are enforced against the running total, never the `Content-Length` a peer claims. |
+| `mecmcp-http` | 3,260 | openapi, secret | HTTPS-only outbound client: no redirects, no proxy autodiscovery, bounded concurrency, whole-request deadlines. Trust is additive only — there is **no API** to disable verification. Response caps are enforced against the running total, never the `Content-Length` a peer claims. `HttpRequest::with_base_and_path` takes `mecmcp-openapi`'s `ExpandedPath` rather than a string, so a hand-assembled request path is a compile error. |
 | `mecmcp-scp` | 6,661 | secret | SCP1 over SSH exec channels, for devices like Junos that disable the SFTP subsystem. Key auth only, never passwords; honours `@revoked` in known_hosts; streams in chunks so an image is never buffered whole. |
 | `mecmcp-job` | 962 | device | The wait, when a management plane answers "start this deployment" with a job id. Immediate first probe, capped backoff, cooperative cancellation. Cancellation, deadline and probe failure are three variants that are never collapsed. |
 | `mecmcp-openapi` | 911 | — | Path expansion and bounded pagination, governed by one principle: **reject rather than repair**. Nothing clamps or fixes input. `max_from` exists because deep-offset scanning is how a read endpoint becomes a denial of service. |
 | `mecmcp-runtime` | 2,958 | audit, auth, secret | CLI parsing with provenance — which flags the operator actually typed, not merely the resolved values — plus TLS bootstrap, SIGHUP reload, graceful shutdown and the token subcommands. |
 
 ```
-mecmcp-http      HttpClient · HttpClientConfig · HttpRequest::secret_header · SafeUrl
+mecmcp-http      HttpClient · HttpClientConfig · HttpRequest::with_base_and_path · SafeUrl
 mecmcp-scp       ScpClient · SshConfig · HostKeyVerification · ScpOutcome
 mecmcp-job       poll_until_ready · Probe<T> · PollConfig · PollError<E>
-mecmcp-openapi   expand_path · page · PageLimits · PathError
+mecmcp-openapi   expand_path · ExpandedPath · page · PageLimits · PathError
 mecmcp-runtime   parse_with_provenance · GracefulShutdown · install_hup_handler · token_cmd::run
 ```
 

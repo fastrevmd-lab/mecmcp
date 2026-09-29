@@ -12,6 +12,7 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
+mecmcp-openapi = { version = "0.24.1", path = "../mecmcp-openapi" }
 mecmcp-secret = { version = "0.24.1", path = "../mecmcp-secret" }
 # "rustls-no-provider", NOT "rustls". Decision D4: the provider is a parameter
 # the consumer picks, and reqwest's "rustls" feature would enable

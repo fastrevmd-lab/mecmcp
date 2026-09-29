@@ -192,6 +192,38 @@ impl Default for HttpClientConfig {
     }
 }
 
+/// Shared checks between [`HttpRequest::new`] and
+/// [`HttpRequest::with_base_and_path`]: HTTPS-only, a host, and no embedded
+/// credentials.
+fn validate_request_url(parsed: reqwest::Url) -> Result<reqwest::Url, HttpError> {
+    // Userinfo is checked FIRST, before the scheme and host checks. Both of
+    // those errors embed the URL, so testing them earlier would leak the
+    // password for something as ordinary as `http://user:pass@host/` —
+    // exactly the disclosure this check exists to prevent.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(HttpError::UrlHasEmbeddedCredentials {
+            host: parsed.host_str().unwrap_or_default().to_owned(),
+        });
+    }
+
+    if parsed.scheme() != "https" {
+        return Err(HttpError::InsecureScheme {
+            url: SafeUrl::from_parsed(&parsed),
+            scheme: parsed.scheme().to_owned(),
+        });
+    }
+
+    // `url` rejects an empty host for special schemes such as https, so this
+    // is a defensive backstop rather than the primary check.
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(HttpError::MissingHost {
+            url: SafeUrl::from_parsed(&parsed),
+        });
+    }
+
+    Ok(parsed)
+}
+
 /// An HTTP request ready to be sent.
 pub struct HttpRequest {
     method: reqwest::Method,
@@ -234,30 +266,69 @@ impl HttpRequest {
             detail: error.to_string(),
         })?;
 
-        // Userinfo is checked FIRST, before the scheme and host checks. Both of
-        // those errors embed the URL, so testing them earlier would leak the
-        // password for something as ordinary as `http://user:pass@host/` —
-        // exactly the disclosure this check exists to prevent.
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(HttpError::UrlHasEmbeddedCredentials {
-                host: parsed.host_str().unwrap_or_default().to_owned(),
-            });
-        }
+        let parsed = validate_request_url(parsed)?;
 
-        if parsed.scheme() != "https" {
-            return Err(HttpError::InsecureScheme {
-                url: SafeUrl::from_parsed(&parsed),
-                scheme: parsed.scheme().to_owned(),
-            });
-        }
+        Ok(Self {
+            method: method.into(),
+            url: parsed,
+            headers: Vec::new(),
+            body: None,
+        })
+    }
 
-        // `url` rejects an empty host for special schemes such as https, so this
-        // is a defensive backstop rather than the primary check.
-        if parsed.host_str().is_none_or(str::is_empty) {
-            return Err(HttpError::MissingHost {
-                url: SafeUrl::from_parsed(&parsed),
-            });
-        }
+    /// Create a new HTTP request by joining an [`mecmcp_openapi::ExpandedPath`]
+    /// onto a trusted base URL.
+    ///
+    /// This is the typed alternative to [`HttpRequest::new`] for vendor REST
+    /// calls: `base` is the operator-configured endpoint (already trusted, the
+    /// way a device inventory entry or a config file value is), and `path` can
+    /// only have come from a successful `mecmcp_openapi::expand_path` call —
+    /// there is no way to construct that type from a hand-written string. A
+    /// caller that tries to pass `&str`/`String` for `path` gets a compile
+    /// error instead of a request built from an unvalidated, string-concatenated
+    /// path.
+    ///
+    /// Any path, query, or fragment already present on `base` is discarded:
+    /// `path` becomes the whole path, and there is no query or fragment,
+    /// matching what `expand_path` guarantees about its own output.
+    ///
+    /// # Errors
+    /// Returns [`HttpError::InvalidUrl`] if `base` is malformed,
+    /// [`HttpError::InsecureScheme`] if its scheme is not `https://`,
+    /// [`HttpError::MissingHost`] if it has no host component, or
+    /// [`HttpError::UrlHasEmbeddedCredentials`] if it carries userinfo.
+    ///
+    /// # Examples
+    /// ```
+    /// use mecmcp_http::{HttpRequest, Method};
+    /// use mecmcp_openapi::expand_path;
+    ///
+    /// let path = expand_path("/v1/devices/{id}", &[("id", "fw-01")])?;
+    /// let request = HttpRequest::with_base_and_path(Method::Get, "https://api.example.com", &path)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// A hand-written path does not type check — this is the point:
+    /// ```compile_fail
+    /// use mecmcp_http::{HttpRequest, Method};
+    ///
+    /// let request =
+    ///     HttpRequest::with_base_and_path(Method::Get, "https://api.example.com", "/v1/devices/fw-01");
+    /// ```
+    pub fn with_base_and_path(
+        method: Method,
+        base: &str,
+        path: &mecmcp_openapi::ExpandedPath,
+    ) -> Result<Self, HttpError> {
+        let parsed = reqwest::Url::parse(base).map_err(|error| HttpError::InvalidUrl {
+            url: SafeUrl::from_unparsed(base),
+            detail: error.to_string(),
+        })?;
+
+        let mut parsed = validate_request_url(parsed)?;
+        parsed.set_path(path.as_str());
+        parsed.set_query(None);
+        parsed.set_fragment(None);
 
         Ok(Self {
             method: method.into(),
@@ -1807,6 +1878,52 @@ mod tests {
         assert!(!rendered.contains(CANARY), "password leaked: {rendered}");
         assert!(!rendered.contains("user"), "username leaked: {rendered}");
         assert!(rendered.contains("example.com"));
+    }
+
+    #[test]
+    fn with_base_and_path_joins_the_expanded_path_onto_the_base() {
+        let path = mecmcp_openapi::expand_path("/v1/devices/{id}", &[("id", "fw-01")]).unwrap();
+        let request =
+            HttpRequest::with_base_and_path(Method::Get, "https://api.example.com", &path).unwrap();
+        assert_eq!(
+            request.url.as_str(),
+            "https://api.example.com/v1/devices/fw-01"
+        );
+    }
+
+    /// A base URL's own path, query, and fragment are discarded — `path` is the
+    /// whole path, matching what `expand_path` promises about its own output.
+    #[test]
+    fn with_base_and_path_discards_the_bases_own_path_query_and_fragment() {
+        let path = mecmcp_openapi::expand_path("/v1/health", &[]).unwrap();
+        let request = HttpRequest::with_base_and_path(
+            Method::Get,
+            "https://api.example.com/old/path?q=1#frag",
+            &path,
+        )
+        .unwrap();
+        assert_eq!(request.url.as_str(), "https://api.example.com/v1/health");
+    }
+
+    #[test]
+    fn with_base_and_path_rejects_an_insecure_base() {
+        let path = mecmcp_openapi::expand_path("/v1/health", &[]).unwrap();
+        let error = HttpRequest::with_base_and_path(Method::Get, "http://api.example.com", &path)
+            .unwrap_err();
+        assert!(matches!(error, HttpError::InsecureScheme { .. }));
+    }
+
+    #[test]
+    fn with_base_and_path_rejects_embedded_credentials_in_the_base() {
+        let path = mecmcp_openapi::expand_path("/v1/health", &[]).unwrap();
+        let error = HttpRequest::with_base_and_path(
+            Method::Get,
+            &format!("https://user:{CANARY}@example.com"),
+            &path,
+        )
+        .unwrap_err();
+        assert!(matches!(error, HttpError::UrlHasEmbeddedCredentials { .. }));
+        assert!(!error.to_string().contains(CANARY));
     }
 
     /// No rejection path may echo a URL password, whichever check fires.

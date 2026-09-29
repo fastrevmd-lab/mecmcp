@@ -85,6 +85,57 @@ pub enum PathError {
     MalformedTemplate,
 }
 
+/// A path produced by [`expand_path`], safe to hand to an HTTP client as the
+/// path component of a request.
+///
+/// The only way to obtain one is a successful call to `expand_path` — there is
+/// no public constructor from an arbitrary string. That is the whole point: a
+/// consumer that needs to send a request can require this type instead of
+/// `&str`/`String`, which turns a hand-assembled or string-concatenated path
+/// into a compile error rather than a runtime risk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpandedPath(String);
+
+impl ExpandedPath {
+    /// Borrow the expanded path as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for ExpandedPath {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ExpandedPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for ExpandedPath {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for ExpandedPath {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<ExpandedPath> for str {
+    fn eq(&self, other: &ExpandedPath) -> bool {
+        self == other.0
+    }
+}
+
 /// Expand `{placeholder}` parameters into a path template.
 ///
 /// Each value occupies exactly one segment. Anything that would change the
@@ -111,7 +162,7 @@ pub enum PathError {
 /// assert!(expand_path("/v1/devices/{id}", &[("id", "a/b")]).is_err());
 /// # Ok::<(), mecmcp_openapi::PathError>(())
 /// ```
-pub fn expand_path(template: &str, params: &[(&str, &str)]) -> Result<String, PathError> {
+pub fn expand_path(template: &str, params: &[(&str, &str)]) -> Result<ExpandedPath, PathError> {
     let mut out = String::with_capacity(template.len());
     let mut used = vec![false; params.len()];
     let mut expansions: Vec<Expansion> = Vec::new();
@@ -180,7 +231,7 @@ pub fn expand_path(template: &str, params: &[(&str, &str)]) -> Result<String, Pa
         return Err(error);
     }
 
-    Ok(out)
+    Ok(ExpandedPath(out))
 }
 
 /// Where one expanded value landed in the rendered path.
