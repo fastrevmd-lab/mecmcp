@@ -4,6 +4,7 @@
 //! SIGHUP hot-reload signalling via rustix.
 
 use crate::cli::TokenAction;
+use mecmcp_audit::AuditScope;
 use mecmcp_auth::{KnownNames, NoGrant, ScopeSet, StoredGrant, TokenStoreFile};
 use std::io::Write;
 use std::path::Path;
@@ -336,6 +337,22 @@ where
                     || is_widening(ScopeField::Tools, &before_tools, tools_scope.as_ref())
                     || new_grant.is_some();
 
+            // A scope change is a security event. Auditing here — through the
+            // same `AuditScope` a served handler would use — means the record
+            // exists in the same shape and stream even though the change is
+            // made by a CLI rather than through the served API, and means a
+            // refusal below is recorded rather than silent.
+            //
+            // The token name goes in `meta`, not `devices`: `devices` is a
+            // redactable field (an operator can install a `devices=drop` or
+            // `devices=hmac` policy), and this call touches no device, so
+            // redacting it would erase the identity of the token whose
+            // privileges just changed. `token` is not a redactable key, so
+            // the name survives any installed policy.
+            let mut scope = AuditScope::stdio("token_set_scopes", "set_scopes", Vec::new());
+            scope.meta("token", name.clone());
+            scope.meta("widening", widening);
+
             println!("token: {name}");
             println!("  devices: {before_devices:?}");
             if let Some(next) = devices_scope.as_ref() {
@@ -362,32 +379,25 @@ where
             }
 
             if widening && !yes {
+                scope.deny("scope_widening_requires_yes");
                 return Err(TokenCommandError::InvalidArgument(
                     "this widens a scope, which is a privilege escalation; re-run with --yes"
                         .to_owned(),
                 ));
             }
 
-            TokenStoreFile::<G>::set_scopes(
+            if let Err(error) = TokenStoreFile::<G>::set_scopes(
                 &tokens_file,
                 &name,
                 devices_scope,
                 tools_scope,
                 new_grant,
                 &known,
-            )?;
-
-            // A scope change is a security event. Emitting it here means the
-            // record exists even though the change is made by a CLI rather than
-            // through the served API.
-            tracing::info!(
-                target: "audit",
-                tool = "token_set_scopes",
-                action = "set_scopes",
-                result = "ok",
-                metadata = format!("token={name} widening={widening}"),
-                "token scopes changed",
-            );
+            ) {
+                scope.fail(&error);
+                return Err(error.into());
+            }
+            scope.succeed();
 
             signal_reload(server_pid)?;
             Ok(())
@@ -443,6 +453,20 @@ where
                 cleared.push("actor_type");
             }
 
+            // Provenance decides how every subsequent action by this token is
+            // attributed, so a change to it is an audit event in its own
+            // right — recorded here, through the same `AuditScope` a served
+            // handler would use, because the change is made by a CLI rather
+            // than through the served API.
+            //
+            // As in `set_scopes`, the token name goes in `meta`, not
+            // `devices`: this call touches no device, and `devices` can be
+            // redacted by operator policy, which would erase which token's
+            // provenance just changed. `token` is not a redactable key.
+            let mut scope = AuditScope::stdio("token_set_provenance", "set_provenance", Vec::new());
+            scope.meta("token", name.clone());
+            scope.meta("cleared", cleared.join("|"));
+
             println!("token: {name}");
             println!(
                 "  provider:      {:?} -> {:?}",
@@ -463,6 +487,7 @@ where
             );
 
             if !cleared.is_empty() && !yes {
+                scope.deny("provenance_clear_requires_yes");
                 return Err(TokenCommandError::InvalidArgument(format!(
                     "this clears {} — every field is replaced on each call, so an omitted \
                      flag drops the value it names; restate it, or re-run with --yes",
@@ -470,27 +495,18 @@ where
                 )));
             }
 
-            TokenStoreFile::<G>::set_provenance(
+            if let Err(error) = TokenStoreFile::<G>::set_provenance(
                 &tokens_file,
                 &name,
                 provenance.provider,
                 provenance.provider_tier,
                 provenance.on_behalf_of,
                 provenance.actor_type,
-            )?;
-
-            // Provenance decides how every subsequent action by this token is
-            // attributed, so a change to it is an audit event in its own right —
-            // recorded here because the change is made by a CLI rather than
-            // through the served API.
-            tracing::info!(
-                target: "audit",
-                tool = "token_set_provenance",
-                action = "set_provenance",
-                result = "ok",
-                metadata = format!("token={name} cleared={}", cleared.join("|")),
-                "token provenance changed",
-            );
+            ) {
+                scope.fail(&error);
+                return Err(error.into());
+            }
+            scope.succeed();
 
             signal_reload(server_pid)?;
             Ok(())

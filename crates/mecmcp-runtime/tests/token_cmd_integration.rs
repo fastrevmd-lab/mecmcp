@@ -983,6 +983,170 @@ mod set_scopes {
         assert!(error.to_string().contains("--yes"), "got {error}");
     }
 
+    /// Regression test: a refused widening used to leave no trace at all — the
+    /// hand-rolled `tracing::info!` sat after the confirmation gate, so a
+    /// refusal returned early and emitted nothing. Routing this call site
+    /// through `AuditScope` means the refusal itself is now on the audit
+    /// trail as a `denied` outcome, same as a served handler's authorization
+    /// denial (mecmcp#415).
+    #[test]
+    fn a_refused_widening_is_now_audited_as_denied() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        run_with_grant::<mecmcp_auth::NoGrant>(
+            TokenAction::Add {
+                tokens_file: tokens_file.clone(),
+                name: "reader".to_owned(),
+                devices: vec!["device1".to_owned()],
+                tools: vec!["get_config".to_owned()],
+                provider: None,
+                provider_tier: None,
+                on_behalf_of: None,
+                actor_type: None,
+                server_pid: None,
+            },
+            &["device1".to_owned(), "device2".to_owned()],
+            KNOWN_TOOLS,
+            None,
+        )
+        .unwrap();
+
+        let captured = mecmcp_audit::testutil::run_with_capture(|| {
+            let _ = run_with_grant::<mecmcp_auth::NoGrant>(
+                TokenAction::SetScopes {
+                    tokens_file: tokens_file.clone(),
+                    name: "reader".to_owned(),
+                    devices: Some(vec!["device1".to_owned(), "device2".to_owned()]),
+                    tools: None,
+                    yes: false,
+                    server_pid: None,
+                },
+                &["device1".to_owned(), "device2".to_owned()],
+                KNOWN_TOOLS,
+                None,
+            );
+        });
+
+        assert!(captured.contains("tool=token_set_scopes"), "got {captured}");
+        assert!(
+            captured.contains("token=reader"),
+            "the token name is the audited target: {captured}"
+        );
+        assert!(
+            captured.contains("device_count=0"),
+            "this call touches no device: {captured}"
+        );
+        assert!(captured.contains("authorization=denied"), "{captured}");
+        assert!(captured.contains("result=denied"), "{captured}");
+        assert!(
+            captured.contains("reason=scope_widening_requires_yes"),
+            "{captured}"
+        );
+    }
+
+    /// A successful scope change is audited with the same canonical shape a
+    /// served handler's tool call gets — `AuditScope`'s single `Drop` impl,
+    /// not a bespoke `metadata="token=... widening=..."` string.
+    #[test]
+    fn a_successful_scope_change_emits_the_canonical_audit_shape() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        run_with_grant::<mecmcp_auth::NoGrant>(
+            TokenAction::Add {
+                tokens_file: tokens_file.clone(),
+                name: "reader".to_owned(),
+                devices: vec!["*".to_owned()],
+                tools: vec!["get_config".to_owned()],
+                provider: None,
+                provider_tier: None,
+                on_behalf_of: None,
+                actor_type: None,
+                server_pid: None,
+            },
+            &["device1".to_owned()],
+            KNOWN_TOOLS,
+            None,
+        )
+        .unwrap();
+
+        let captured = mecmcp_audit::testutil::run_with_capture(|| {
+            run_with_grant::<mecmcp_auth::NoGrant>(
+                TokenAction::SetScopes {
+                    tokens_file: tokens_file.clone(),
+                    name: "reader".to_owned(),
+                    devices: Some(vec!["device1".to_owned()]),
+                    tools: None,
+                    yes: false,
+                    server_pid: None,
+                },
+                &["device1".to_owned()],
+                KNOWN_TOOLS,
+                None,
+            )
+            .unwrap();
+        });
+
+        assert!(captured.contains("tool=token_set_scopes"), "got {captured}");
+        assert!(captured.contains("token=reader"), "{captured}");
+        assert!(
+            captured.contains("device_count=0"),
+            "this call touches no device: {captured}"
+        );
+        assert!(captured.contains("authorization=no_auth"), "{captured}");
+        assert!(captured.contains("result=ok"), "{captured}");
+        assert!(captured.contains("widening=false"), "{captured}");
+    }
+
+    /// A store failure past the `--yes` gate is audited as `result=error`, not
+    /// silently swallowed. The refusal path and the success path were already
+    /// covered; this is the third outcome the issue's acceptance criteria name
+    /// (success, failure, refused) and the one still missing at review time.
+    #[test]
+    fn a_store_failure_past_the_yes_gate_is_audited_as_error() {
+        let (_dir, tokens_file) = temp_tokens_file();
+        run_with_grant::<mecmcp_auth::NoGrant>(
+            TokenAction::Add {
+                tokens_file: tokens_file.clone(),
+                name: "reader".to_owned(),
+                devices: vec!["device1".to_owned()],
+                tools: vec!["get_config".to_owned()],
+                provider: None,
+                provider_tier: None,
+                on_behalf_of: None,
+                actor_type: None,
+                server_pid: None,
+            },
+            &["device1".to_owned()],
+            KNOWN_TOOLS,
+            None,
+        )
+        .unwrap();
+
+        // `ghost` is not in the known-devices list passed below, so the store's
+        // `validate_references` rejects it after the `--yes` gate has already
+        // passed and the `AuditScope` already exists.
+        let captured = mecmcp_audit::testutil::run_with_capture(|| {
+            let error = run_with_grant::<mecmcp_auth::NoGrant>(
+                TokenAction::SetScopes {
+                    tokens_file: tokens_file.clone(),
+                    name: "reader".to_owned(),
+                    devices: Some(vec!["device1".to_owned(), "ghost".to_owned()]),
+                    tools: None,
+                    yes: true,
+                    server_pid: None,
+                },
+                &["device1".to_owned()],
+                KNOWN_TOOLS,
+                None,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("unknown device"), "got {error}");
+        });
+
+        assert!(captured.contains("tool=token_set_scopes"), "got {captured}");
+        assert!(captured.contains("token=reader"), "{captured}");
+        assert!(captured.contains("result=error"), "{captured}");
+        assert!(captured.contains("error_kind=error"), "{captured}");
+    }
+
     /// Narrowing does not need confirmation — it cannot grant anything.
     #[test]
     fn narrowing_needs_no_confirmation() {
