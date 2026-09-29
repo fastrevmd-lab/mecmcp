@@ -4,6 +4,7 @@ use crate::{
     coordinator::CoordinatorError,
     lifecycle::LifecycleState,
     persistence::{read_state, write_state},
+    state_lock::StateFileLock,
     types::OperationLimits,
 };
 use serde::{Deserialize, Serialize};
@@ -138,6 +139,15 @@ pub fn resolve_persisted_operation(
             "offline resolution requires exact 'RESOLVED <operation-id> AS COMMITTED|DISCARDED' confirmation",
         ));
     }
+
+    // Hold the cross-process state lock for the whole read-modify-write
+    // cycle below, not just the final write. Two operators (or an operator
+    // racing a still-running server) resolving different operations at the
+    // same time each take a read of the file before either has written back;
+    // without this lock, whichever finishes last silently reverts the
+    // other's resolution because its write is a full snapshot taken before
+    // the first write landed (MEC-540).
+    let _state_lock = StateFileLock::acquire(path)?;
 
     // Load the state file. The size limit is the caller's, not a default: a
     // deployment that raised `max_state_bytes` would otherwise have a running

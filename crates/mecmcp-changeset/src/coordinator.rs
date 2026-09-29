@@ -5,6 +5,7 @@ use crate::{
     lifecycle::{ChangeSetState, LifecycleState},
     persistence::{ChangesetState, PersistenceError, read_state_with_key, write_state},
     records::{ChangeSetRecord, OperationRecord},
+    state_lock::StateFileLock,
     types::OperationLimits,
 };
 use mecmcp_audit::recorder::EvidenceRecorder;
@@ -529,8 +530,15 @@ impl ChangesetCoordinator {
             }
         }
 
-        // Persist recovery only if we changed something
+        // Persist recovery only if we changed something. Locked for the same
+        // reason `persist_locked` is: this write must not land in the middle
+        // of another process's read-modify-write cycle against the same
+        // file, for example an offline `resolve_persisted_operation` repair
+        // racing server startup (MEC-540). Not required around the read
+        // above: `write_state`'s atomic rename means a reader always sees a
+        // complete, valid snapshot regardless of what else is writing.
         if recovered {
+            let _state_lock = StateFileLock::acquire(path)?;
             write_state(path, &state, limits.max_state_bytes)?;
         }
 
@@ -1189,6 +1197,12 @@ impl ChangesetCoordinator {
     /// holds the state lock.
     fn persist_locked(&self, state: &ChangesetState) -> Result<(), CoordinatorError> {
         if let Some(path) = &self.state_path {
+            // Cross-process, not just in-process: without this, this write
+            // can land in the middle of another process's read-modify-write
+            // cycle (offline recovery, most commonly) — not corrupting the
+            // file itself, since `write_state`'s rename is already atomic,
+            // but racing which of the two writes' snapshots wins (MEC-540).
+            let _state_lock = StateFileLock::acquire(path)?;
             write_state(path, state, self.limits.max_state_bytes)?;
         }
         Ok(())
