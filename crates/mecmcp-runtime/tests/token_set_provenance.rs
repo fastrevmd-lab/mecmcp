@@ -229,6 +229,81 @@ fn clearing_a_populated_field_requires_yes() {
     );
 }
 
+/// Regression test: a refused clear used to leave no audit trace at all — the
+/// hand-rolled `tracing::info!` sat after the confirmation gate, so refusing
+/// returned early and emitted nothing. Routing this call site through
+/// `AuditScope` means the refusal is now a `denied` outcome on the audit
+/// trail, same shape a served handler's authorization denial gets (mecmcp#415).
+#[test]
+fn a_refused_clear_is_now_audited_as_denied() {
+    let (_dir, tokens_file) = temp_tokens_file();
+    add_token(
+        &tokens_file,
+        "fleet",
+        Some("anthropic"),
+        Some("public"),
+        Some("mharman"),
+        Some("agent"),
+    );
+
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        let _ = set_provenance(
+            &tokens_file,
+            "fleet",
+            Some("anthropic"),
+            Some("public"),
+            None,
+            Some("agent"),
+            false,
+        );
+    });
+
+    assert!(
+        captured.contains("tool=token_set_provenance"),
+        "got {captured}"
+    );
+    assert!(
+        captured.contains("devices=fleet"),
+        "the token name is the audited target: {captured}"
+    );
+    assert!(captured.contains("authorization=denied"), "{captured}");
+    assert!(captured.contains("result=denied"), "{captured}");
+    assert!(
+        captured.contains("reason=provenance_clear_requires_yes"),
+        "{captured}"
+    );
+}
+
+/// A successful provenance change is audited with the same canonical shape a
+/// served handler's tool call gets — `AuditScope`'s single `Drop` impl, not a
+/// bespoke `metadata="token=... cleared=..."` string.
+#[test]
+fn a_successful_provenance_change_emits_the_canonical_audit_shape() {
+    let (_dir, tokens_file) = temp_tokens_file();
+    add_token(&tokens_file, "fleet", None, None, None, None);
+
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        set_provenance(
+            &tokens_file,
+            "fleet",
+            Some("anthropic"),
+            Some("public"),
+            Some("mharman"),
+            Some("agent"),
+            false,
+        )
+        .unwrap();
+    });
+
+    assert!(
+        captured.contains("tool=token_set_provenance"),
+        "got {captured}"
+    );
+    assert!(captured.contains("devices=fleet"), "{captured}");
+    assert!(captured.contains("authorization=no_auth"), "{captured}");
+    assert!(captured.contains("result=ok"), "{captured}");
+}
+
 /// Adding a value is not destruction, so it is not confirmed.
 #[test]
 fn setting_a_field_that_was_empty_needs_no_confirmation() {
