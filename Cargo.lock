@@ -2083,6 +2083,7 @@ dependencies = [
  "ipnet",
  "mecmcp-audit",
  "mecmcp-auth",
+ "mecmcp-secret",
  "metrics",
  "metrics-exporter-prometheus",
  "rcgen",
