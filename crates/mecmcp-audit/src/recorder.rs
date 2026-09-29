@@ -327,6 +327,36 @@ impl EvidenceRecorder {
         self.with_spool(move |segment| spool_outcome(sink.spool(segment)))
     }
 
+    /// As [`spooling_to`](Self::spooling_to), plus a second, best-effort
+    /// destination for the same segment.
+    ///
+    /// `forward` failures do not affect the return value: SSDF stays the
+    /// chain of record, and this recorder's caller (`apply_intent`) is
+    /// fail-closed on *that* spool, not on a second copy going somewhere
+    /// else. A forward-sink failure is logged and the segment stays in
+    /// *that* sink's own outbox for its own retry -- it does not touch the
+    /// SSDF outbox or ledger at all.
+    #[must_use]
+    pub fn spooling_to_with_forward(
+        self,
+        sink: std::sync::Arc<crate::SsdfSink>,
+        forward: Option<std::sync::Arc<crate::sinks::forward::ForwardSink>>,
+    ) -> Self {
+        self.with_spool(move |segment| {
+            let outcome = spool_outcome(sink.spool(segment.clone()));
+            if let Some(forward) = &forward
+                && let Err(error) = forward.spool(segment)
+            {
+                tracing::warn!(
+                    target: "audit",
+                    %error,
+                    "forward audit sink spool failed; SSDF remains the durable record"
+                );
+            }
+            outcome
+        })
+    }
+
     /// Sign every segment's head automatically as it closes.
     ///
     /// Before this, [`sign_head`] existed only as a function a caller had to

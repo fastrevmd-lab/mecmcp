@@ -1,0 +1,1 @@
+This changelog references the $1$ (MD5 crypt) family without a real hash.

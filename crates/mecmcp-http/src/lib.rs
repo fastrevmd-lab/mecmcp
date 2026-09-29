@@ -16,9 +16,24 @@
 //!
 //! The transport posture is shared; everything vendor-shaped stays with the
 //! product. This crate has no opinion about endpoint catalogs, header names,
-//! payload schemas, authentication flows, terminal job states, or retry and
-//! backoff policy — a consumer builds those on top. Nothing here should ever
-//! grow vendor vocabulary.
+//! payload schemas, authentication flows, or terminal job states — a
+//! consumer builds those on top. Nothing here should ever grow vendor
+//! vocabulary.
+//!
+//! Retry and backoff are a narrow exception, and only for GET:
+//! [`HttpClient::send`] still makes exactly one wire attempt no matter what
+//! it is called with, but [`HttpClient::send_get_with_backoff`] layers
+//! retry-with-backoff on top for GET. A mutating request (`POST`/`PUT`/
+//! `PATCH`/`DELETE`) never gets automatic retry — see that method's docs.
+//!
+//! GET is necessary, not sufficient: the caller asserts the endpoint is
+//! read-only. Several vendor APIs execute mutations over GET — the PAN-OS
+//! XML API's `type=op`/`type=commit`/`type=config&action=set` query strings,
+//! Junos REST's `/rpc/<rpc>` — and this crate has no way to detect that from
+//! the method alone. Never route those through
+//! [`HttpClient::send_get_with_backoff`]. A whole-request
+//! [`HttpError::Timeout`] is also retried even though the server may already
+//! have acted on the request that timed out.
 //!
 //! ## Security guarantees
 //!
@@ -226,6 +241,11 @@ fn validate_request_url(parsed: reqwest::Url) -> Result<reqwest::Url, HttpError>
 }
 
 /// An HTTP request ready to be sent.
+///
+/// `Clone` exists for [`HttpClient::send_get_with_backoff`], which must
+/// replay the same request on retry; ordinary single-attempt callers never
+/// need it.
+#[derive(Clone)]
 pub struct HttpRequest {
     method: reqwest::Method,
     url: reqwest::Url,
@@ -860,6 +880,50 @@ fn parse_header_name(name: &str) -> Result<HeaderName, HttpError> {
     Ok(parsed)
 }
 
+/// Backoff policy for [`HttpClient::send_get_with_backoff`].
+///
+/// Deliberately has no field to opt a mutating method into retry — see the
+/// note on that method. This only governs how a GET is retried, not whether.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// Maximum number of attempts, including the first. Clamped to at least
+    /// one, so a misconfigured `0` degrades to a single attempt rather than
+    /// sending nothing.
+    pub max_attempts: u32,
+    /// Delay before the second attempt. Doubles after each further retry, up
+    /// to `max_backoff`.
+    pub initial_backoff: Duration,
+    /// Ceiling on any single delay between attempts.
+    pub max_backoff: Duration,
+    /// Ceiling on total wall-clock time across the whole call, measured from
+    /// the first attempt. Covers time spent both sending (including a
+    /// timed-out attempt) and sleeping between attempts — not sleeping
+    /// alone — so this is the caller's real total-wait budget regardless of
+    /// how slow individual attempts are. A delay that would cross this
+    /// budget is skipped and the most recent outcome is returned instead.
+    pub max_total_wait: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 4,
+            initial_backoff: Duration::from_millis(200),
+            max_backoff: Duration::from_secs(5),
+            max_total_wait: Duration::from_secs(15),
+        }
+    }
+}
+
+/// Whether an HTTP status is one of the transient conditions
+/// [`HttpClient::send_get_with_backoff`] retries: `429` (rate limited) or a
+/// `5xx` (server-side failure). A `4xx` other than `429` is the caller's
+/// request being wrong, and retrying it unchanged would just fail the same
+/// way again.
+fn is_transient_status(status: u16) -> bool {
+    status == 429 || (500..=599).contains(&status)
+}
+
 /// An HTTP client with hardened defaults.
 #[derive(Debug)]
 pub struct HttpClient {
@@ -1191,6 +1255,95 @@ impl HttpClient {
             }),
         }
     }
+
+    /// Send a GET request, retrying transient failures with exponential
+    /// backoff.
+    ///
+    /// "Transient" is narrow on purpose: a whole-request [`HttpError::Timeout`]
+    /// or a `429`/`5xx` response. Anything else — a successful non-retryable
+    /// status, a connect failure, a malformed response — is returned on the
+    /// first attempt, because retrying it would not plausibly change the
+    /// outcome.
+    ///
+    /// GET only, enforced at the top of this method rather than left to
+    /// caller discipline: retrying a `POST`/`PUT`/`PATCH`/`DELETE` here would
+    /// resend it behind the caller's back, and only the caller knows whether
+    /// its handler on the other end is idempotent. Call [`HttpClient::send`]
+    /// directly for those and build retry into the caller's own state
+    /// machine if the specific operation supports it.
+    ///
+    /// The GET check is necessary, not sufficient: it cannot prove the
+    /// endpoint is actually read-only. Several vendor APIs run mutations
+    /// over GET (PAN-OS XML API `type=op`/`commit`/`config&action=set`,
+    /// Junos REST `/rpc`) — never call this method for those. A whole-request
+    /// [`HttpError::Timeout`] is retried even though the server may already
+    /// have acted on the timed-out request.
+    ///
+    /// # Errors
+    /// Returns [`HttpError::RetryRequiresGet`] if `request` is not a GET.
+    /// Otherwise returns whatever the last attempt returned — see
+    /// [`HttpClient::send`] for the full error set.
+    ///
+    /// # Examples
+    /// ```
+    /// use mecmcp_http::{HttpClient, HttpClientConfig, HttpRequest, Method, RetryPolicy};
+    ///
+    /// # async fn example() -> Result<(), mecmcp_http::HttpError> {
+    /// let client = HttpClient::new(HttpClientConfig::default())?;
+    /// let request = HttpRequest::new(Method::Get, "https://api.example.com/status")?;
+    /// let response = client
+    ///     .send_get_with_backoff(request, &RetryPolicy::default())
+    ///     .await?;
+    /// println!("Status: {}", response.status());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn send_get_with_backoff(
+        &self,
+        request: HttpRequest,
+        policy: &RetryPolicy,
+    ) -> Result<HttpResponse, HttpError> {
+        if request.method != reqwest::Method::GET {
+            return Err(HttpError::RetryRequiresGet);
+        }
+
+        let max_attempts = policy.max_attempts.max(1);
+        let mut backoff = policy.initial_backoff.min(policy.max_backoff);
+        let mut attempt = 0u32;
+        let start = tokio::time::Instant::now();
+
+        loop {
+            attempt += 1;
+            let outcome = self.send(request.clone()).await;
+
+            let is_retryable = match &outcome {
+                Ok(response) => is_transient_status(response.status),
+                Err(error) => matches!(error, HttpError::Timeout { .. }),
+            };
+
+            if !is_retryable || attempt >= max_attempts {
+                return outcome;
+            }
+
+            // A delay that would blow the total wall-clock budget — time
+            // already spent sending plus the sleep about to happen — is
+            // skipped entirely — returning the most recent outcome now is a
+            // caller's wall-clock promise, the same reasoning `send`'s own
+            // deadline uses.
+            let Some(elapsed_after) = start.elapsed().checked_add(backoff) else {
+                return outcome;
+            };
+            if elapsed_after > policy.max_total_wait {
+                return outcome;
+            }
+
+            tokio::time::sleep(backoff).await;
+            backoff = backoff
+                .checked_mul(2)
+                .unwrap_or(policy.max_backoff)
+                .min(policy.max_backoff);
+        }
+    }
 }
 
 /// An HTTP response.
@@ -1417,6 +1570,14 @@ pub enum HttpError {
         /// Detail about the failure.
         detail: String,
     },
+    /// [`HttpClient::send_get_with_backoff`] was called with a non-GET
+    /// request.
+    ///
+    /// Retry is opt-in per method, not per call: only GET is safe to repeat
+    /// without knowing whether the far end treats the operation as
+    /// idempotent.
+    #[error("send_get_with_backoff requires a GET request")]
+    RetryRequiresGet,
 }
 
 #[cfg(test)]
@@ -3538,5 +3699,182 @@ mod tests {
         for handle in background {
             let _ = handle.await;
         }
+    }
+
+    /// Serve one canned response per accepted connection, in order.
+    ///
+    /// Each response gets `Connection: close`, so — same as [`serve`] — every
+    /// attempt from the client opens a fresh connection and consumes the next
+    /// entry in `responses`.
+    fn serve_sequence(
+        listener: tokio::net::TcpListener,
+        server_config: rustls::ServerConfig,
+        responses: Vec<&'static str>,
+    ) {
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    read_request_head(&mut tls).await;
+                    let _ = tls.write_all(response.as_bytes()).await;
+                    let _ = tls.flush().await;
+                });
+            }
+        });
+    }
+
+    /// A short, fixed policy so retry tests do not spend real wall-clock time
+    /// waiting out the crate's production defaults.
+    fn fast_retry_policy(max_attempts: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(5),
+            max_total_wait: Duration::from_secs(5),
+        }
+    }
+
+    /// Same as [`serve`], but also counts how many connections were
+    /// accepted — so a retry test can assert the client actually retried,
+    /// not just that the final status happened to match.
+    fn serve_counting(
+        listener: tokio::net::TcpListener,
+        server_config: rustls::ServerConfig,
+        response: &'static str,
+        connections: usize,
+    ) -> Arc<AtomicUsize> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_task = Arc::clone(&counter);
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        tokio::spawn(async move {
+            for _ in 0..connections {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                counter_for_task.fetch_add(1, Ordering::SeqCst);
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    read_request_head(&mut tls).await;
+                    let _ = tls.write_all(response.as_bytes()).await;
+                    let _ = tls.flush().await;
+                });
+            }
+        });
+        counter
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_then_success_is_retried_to_success() {
+        let (cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+        serve_sequence(
+            listener,
+            server_config,
+            vec![
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ],
+        );
+
+        let client = client_trusting(cert_pem);
+        let request =
+            HttpRequest::new(Method::Get, &format!("https://localhost:{port}/status")).unwrap();
+
+        let response = client
+            .send_get_with_backoff(request, &fast_retry_policy(4))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn retry_gives_up_after_max_attempts() {
+        let (cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+        let attempts = serve_counting(
+            listener,
+            server_config,
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            3,
+        );
+
+        let client = client_trusting(cert_pem);
+        let request =
+            HttpRequest::new(Method::Get, &format!("https://localhost:{port}/status")).unwrap();
+
+        let response = client
+            .send_get_with_backoff(request, &fast_retry_policy(3))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            429,
+            "the last attempt's outcome is returned once max_attempts is exhausted"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "must actually retry up to max_attempts, not just happen to match on one try"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_transient_status_is_not_retried() {
+        let (cert_pem, server_config) = tls_material();
+        let (listener, port) = bind_local().await;
+        // Only one connection is served; a second attempt would hang waiting
+        // for a connection that never arrives, which is exactly what this
+        // test wants to catch.
+        let attempts = serve_counting(
+            listener,
+            server_config,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            1,
+        );
+
+        let client = client_trusting(cert_pem);
+        let request =
+            HttpRequest::new(Method::Get, &format!("https://localhost:{port}/status")).unwrap();
+
+        let response = client
+            .send_get_with_backoff(request, &fast_retry_policy(4))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a non-transient status must not trigger a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_post_request_is_rejected_without_being_sent() {
+        // An unbound port: if this were sent at all, it would fail as
+        // `Connect`, not as `RetryRequiresGet` — so getting the latter proves
+        // the method never touched the network.
+        let (listener, port) = bind_local().await;
+        drop(listener);
+
+        let client = build_client(HttpClientConfig::default()).unwrap();
+        let request = HttpRequest::new(Method::Post, &format!("https://localhost:{port}/set"))
+            .unwrap()
+            .body(b"payload".to_vec());
+
+        let error = client
+            .send_get_with_backoff(request, &fast_retry_policy(4))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HttpError::RetryRequiresGet));
     }
 }

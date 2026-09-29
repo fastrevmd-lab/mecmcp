@@ -1,0 +1,1 @@
+The FortiOS docs explain that ENC is the prefix used for obfuscated values.
