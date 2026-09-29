@@ -23,9 +23,17 @@
 //! Retry and backoff are a narrow exception, and only for GET:
 //! [`HttpClient::send`] still makes exactly one wire attempt no matter what
 //! it is called with, but [`HttpClient::send_get_with_backoff`] layers
-//! retry-with-backoff on top for the one method this crate can call safely
-//! idempotent. A mutating request never gets automatic retry — see that
-//! method's docs.
+//! retry-with-backoff on top for GET. A mutating request (`POST`/`PUT`/
+//! `PATCH`/`DELETE`) never gets automatic retry — see that method's docs.
+//!
+//! GET is necessary, not sufficient: the caller asserts the endpoint is
+//! read-only. Several vendor APIs execute mutations over GET — the PAN-OS
+//! XML API's `type=op`/`type=commit`/`type=config&action=set` query strings,
+//! Junos REST's `/rpc/<rpc>` — and this crate has no way to detect that from
+//! the method alone. Never route those through
+//! [`HttpClient::send_get_with_backoff`]. A whole-request
+//! [`HttpError::Timeout`] is also retried even though the server may already
+//! have acted on the request that timed out.
 //!
 //! ## Security guarantees
 //!
@@ -763,11 +771,13 @@ pub struct RetryPolicy {
     pub initial_backoff: Duration,
     /// Ceiling on any single delay between attempts.
     pub max_backoff: Duration,
-    /// Ceiling on total time spent sleeping between attempts, across the
-    /// whole call. A delay that would cross this budget is skipped and the
-    /// most recent outcome is returned instead — this bounds a caller's
-    /// total wait even when `max_attempts` is generous.
-    pub max_total_backoff: Duration,
+    /// Ceiling on total wall-clock time across the whole call, measured from
+    /// the first attempt. Covers time spent both sending (including a
+    /// timed-out attempt) and sleeping between attempts — not sleeping
+    /// alone — so this is the caller's real total-wait budget regardless of
+    /// how slow individual attempts are. A delay that would cross this
+    /// budget is skipped and the most recent outcome is returned instead.
+    pub max_total_wait: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -776,7 +786,7 @@ impl Default for RetryPolicy {
             max_attempts: 4,
             initial_backoff: Duration::from_millis(200),
             max_backoff: Duration::from_secs(5),
-            max_total_backoff: Duration::from_secs(15),
+            max_total_wait: Duration::from_secs(15),
         }
     }
 }
@@ -1137,6 +1147,13 @@ impl HttpClient {
     /// directly for those and build retry into the caller's own state
     /// machine if the specific operation supports it.
     ///
+    /// The GET check is necessary, not sufficient: it cannot prove the
+    /// endpoint is actually read-only. Several vendor APIs run mutations
+    /// over GET (PAN-OS XML API `type=op`/`commit`/`config&action=set`,
+    /// Junos REST `/rpc`) — never call this method for those. A whole-request
+    /// [`HttpError::Timeout`] is retried even though the server may already
+    /// have acted on the timed-out request.
+    ///
     /// # Errors
     /// Returns [`HttpError::RetryRequiresGet`] if `request` is not a GET.
     /// Otherwise returns whatever the last attempt returned — see
@@ -1167,8 +1184,8 @@ impl HttpClient {
 
         let max_attempts = policy.max_attempts.max(1);
         let mut backoff = policy.initial_backoff.min(policy.max_backoff);
-        let mut waited = Duration::ZERO;
         let mut attempt = 0u32;
+        let start = tokio::time::Instant::now();
 
         loop {
             attempt += 1;
@@ -1183,18 +1200,19 @@ impl HttpClient {
                 return outcome;
             }
 
-            // A delay that would blow the total budget is skipped entirely —
-            // returning the most recent outcome now is a caller's wall-clock
-            // promise, the same reasoning `send`'s own deadline uses.
-            let Some(waited_after) = waited.checked_add(backoff) else {
+            // A delay that would blow the total wall-clock budget — time
+            // already spent sending plus the sleep about to happen — is
+            // skipped entirely — returning the most recent outcome now is a
+            // caller's wall-clock promise, the same reasoning `send`'s own
+            // deadline uses.
+            let Some(elapsed_after) = start.elapsed().checked_add(backoff) else {
                 return outcome;
             };
-            if waited_after > policy.max_total_backoff {
+            if elapsed_after > policy.max_total_wait {
                 return outcome;
             }
 
             tokio::time::sleep(backoff).await;
-            waited = waited_after;
             backoff = backoff
                 .checked_mul(2)
                 .unwrap_or(policy.max_backoff)
@@ -3490,8 +3508,40 @@ mod tests {
             max_attempts,
             initial_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(5),
-            max_total_backoff: Duration::from_secs(5),
+            max_total_wait: Duration::from_secs(5),
         }
+    }
+
+    /// Same as [`serve`], but also counts how many connections were
+    /// accepted — so a retry test can assert the client actually retried,
+    /// not just that the final status happened to match.
+    fn serve_counting(
+        listener: tokio::net::TcpListener,
+        server_config: rustls::ServerConfig,
+        response: &'static str,
+        connections: usize,
+    ) -> Arc<AtomicUsize> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_task = Arc::clone(&counter);
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        tokio::spawn(async move {
+            for _ in 0..connections {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                counter_for_task.fetch_add(1, Ordering::SeqCst);
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    read_request_head(&mut tls).await;
+                    let _ = tls.write_all(response.as_bytes()).await;
+                    let _ = tls.flush().await;
+                });
+            }
+        });
+        counter
     }
 
     #[tokio::test]
@@ -3522,7 +3572,7 @@ mod tests {
     async fn retry_gives_up_after_max_attempts() {
         let (cert_pem, server_config) = tls_material();
         let (listener, port) = bind_local().await;
-        serve(
+        let attempts = serve_counting(
             listener,
             server_config,
             "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -3542,6 +3592,11 @@ mod tests {
             429,
             "the last attempt's outcome is returned once max_attempts is exhausted"
         );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "must actually retry up to max_attempts, not just happen to match on one try"
+        );
     }
 
     #[tokio::test]
@@ -3551,7 +3606,7 @@ mod tests {
         // Only one connection is served; a second attempt would hang waiting
         // for a connection that never arrives, which is exactly what this
         // test wants to catch.
-        serve(
+        let attempts = serve_counting(
             listener,
             server_config,
             "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -3567,6 +3622,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 404);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a non-transient status must not trigger a retry"
+        );
     }
 
     #[tokio::test]
