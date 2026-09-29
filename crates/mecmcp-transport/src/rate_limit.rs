@@ -4,12 +4,83 @@ use crate::config::LimitsConfig;
 use crate::overload::rate_limited_response;
 use axum::Router;
 use axum::extract::{ConnectInfo, Request, State};
+use axum::http::HeaderName;
 use axum::middleware::Next;
 use axum::response::Response;
+use ipnet::IpNet;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Non-standard but de facto universal header a reverse proxy sets to the
+/// original client address. Not in `axum::http::header` because it was never
+/// standardized (`Forwarded` per RFC 7239 is, but no deployed proxy this crate
+/// has to interoperate with emits it).
+static X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+
+/// Resolve the address used as the per-IP rate-limit key.
+///
+/// Returns `peer` unchanged unless `peer` itself is inside `trusted_proxies`
+/// **and** the request carries a well-formed `X-Forwarded-For` header. This
+/// ordering is the entire security property: an untrusted peer's own
+/// `X-Forwarded-For` header is never consulted, so it cannot spoof its way
+/// into a different rate-limit bucket than its real address.
+///
+/// When trusted, every `X-Forwarded-For` header line is collected (a proxy
+/// may add its own header line rather than appending to an existing one),
+/// each line's comma-separated entries are walked **right to left**, and the
+/// first entry that does not itself parse into a `trusted_proxies` address is
+/// used. Deployed reverse proxies (nginx, Traefik, Caddy, ALB) *append* the
+/// real client to any value the client already sent, so the rightmost
+/// untrusted entry — not the leftmost — is the one the trusted proxy actually
+/// recorded. Walking from the right also resolves multi-hop trusted chains
+/// without special-casing. If an entry fails to parse, or every entry is
+/// trusted, the walk falls back to `peer` rather than skipping the bad entry
+/// — an unparsable value is exactly where a spoofed one would hide.
+fn resolve_rate_limit_ip(
+    peer: IpAddr,
+    headers: &http::HeaderMap,
+    trusted_proxies: &[IpNet],
+) -> IpAddr {
+    // Canonicalize first: a dual-stack listener reports an IPv4 peer as
+    // `::ffff:a.b.c.d`, which would never match an IPv4 `trusted_proxies`
+    // CIDR even when the same host is intended. Mirrors the loopback check in
+    // `metrics.rs` (MEC-48).
+    let peer = peer.to_canonical();
+    if !trusted_proxies
+        .iter()
+        .any(|network| network.contains(&peer))
+    {
+        return peer;
+    }
+
+    let mut entries: Vec<&str> = Vec::new();
+    for value in headers.get_all(&X_FORWARDED_FOR) {
+        // A non-visible-ASCII header line is exactly the "unparsable entry"
+        // case the doc above promises to fail closed on: skipping it (rather
+        // than falling back to `peer`) would silently drop it from the
+        // right-to-left walk instead of stopping the walk at it.
+        let Ok(value) = value.to_str() else {
+            return peer;
+        };
+        entries.extend(value.split(','));
+    }
+
+    for entry in entries.into_iter().rev() {
+        let Ok(addr) = entry.trim().parse::<IpAddr>() else {
+            return peer;
+        };
+        if !trusted_proxies
+            .iter()
+            .any(|network| network.contains(&addr))
+        {
+            return addr;
+        }
+    }
+
+    peer
+}
 
 /// Maximum number of per-IP buckets before LRU eviction begins.
 ///
@@ -124,6 +195,7 @@ struct RateLimitState {
     ip_burst: u64,
     token_rate_per_second: u64,
     token_burst: u64,
+    trusted_proxies: Arc<[IpNet]>,
 }
 
 impl RateLimitState {
@@ -144,6 +216,7 @@ impl RateLimitState {
             ip_burst: config.max_request_burst_per_ip,
             token_rate_per_second: config.max_requests_per_second_per_token,
             token_burst: config.max_request_burst_per_token,
+            trusted_proxies: Arc::from(config.trusted_proxies.as_slice()),
         }
     }
 
@@ -210,13 +283,16 @@ async fn rate_limit_middleware(
     // required extractor rejects with 500 when the peer address is absent, and
     // `Option<ConnectInfo<_>>` needs `OptionalFromRequestParts`, which axum does
     // not provide for it. Extensions is where the make-service puts it anyway.
-    let ip = request
+    let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| addr.ip().to_string());
-    if ip.is_none() && state.ip_rate_limit_enabled() {
+        .map(|ConnectInfo(addr)| addr.ip());
+    if peer.is_none() && state.ip_rate_limit_enabled() {
         warn_missing_connect_info_once();
     }
+    let ip = peer
+        .map(|peer| resolve_rate_limit_ip(peer, request.headers(), &state.trusted_proxies))
+        .map(|ip| ip.to_string());
 
     if let Some(ip) = ip.as_deref()
         && let RateDecision::Limited { retry_after_secs } = state.check_ip(ip, now)
@@ -264,13 +340,16 @@ async fn ip_rate_limit_middleware(
 ) -> Response {
     let now = Instant::now();
 
-    let ip = request
+    let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| addr.ip().to_string());
-    if ip.is_none() && state.ip_rate_limit_enabled() {
+        .map(|ConnectInfo(addr)| addr.ip());
+    if peer.is_none() && state.ip_rate_limit_enabled() {
         warn_missing_connect_info_once();
     }
+    let ip = peer
+        .map(|peer| resolve_rate_limit_ip(peer, request.headers(), &state.trusted_proxies))
+        .map(|ip| ip.to_string());
 
     if let Some(ip) = ip.as_deref()
         && let RateDecision::Limited { retry_after_secs } = state.check_ip(ip, now)
@@ -838,6 +917,306 @@ mod tests {
             response.status(),
             axum::http::StatusCode::OK,
             "absent ConnectInfo must skip per-IP limiting, not fail the request"
+        );
+    }
+
+    fn request_with_forwarded_for(addr: SocketAddr, forwarded_for: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/")
+            .extension(ConnectInfo(addr));
+        if let Some(value) = forwarded_for {
+            builder = builder.header("x-forwarded-for", value);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn untrusted_peer_forwarded_for_is_ignored() {
+        let headers = {
+            let mut map = http::HeaderMap::new();
+            map.insert("x-forwarded-for", "10.0.0.99".parse().unwrap());
+            map
+        };
+        let peer: IpAddr = "203.0.113.5".parse().unwrap();
+        // No trusted proxies configured at all: the header must never be consulted.
+        assert_eq!(resolve_rate_limit_ip(peer, &headers, &[]), peer);
+    }
+
+    #[test]
+    fn peer_outside_trusted_proxy_range_is_not_honored() {
+        let headers = {
+            let mut map = http::HeaderMap::new();
+            map.insert("x-forwarded-for", "10.0.0.99".parse().unwrap());
+            map
+        };
+        let peer: IpAddr = "203.0.113.5".parse().unwrap();
+        let trusted: IpNet = "10.0.0.0/24".parse().unwrap();
+        // The header names a trusted-looking CIDR, but the *peer* is not in it.
+        assert_eq!(resolve_rate_limit_ip(peer, &headers, &[trusted]), peer);
+    }
+
+    #[test]
+    fn trusted_proxy_forwarded_for_is_honored() {
+        // "10.0.0.1" is the trusted proxy's own address (it equals `peer`
+        // below), so the walk skips it and uses "198.51.100.7" — the real
+        // client address the proxy recorded — as the rate-limit key.
+        let headers = {
+            let mut map = http::HeaderMap::new();
+            map.insert("x-forwarded-for", "198.51.100.7, 10.0.0.1".parse().unwrap());
+            map
+        };
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted: IpNet = "10.0.0.0/24".parse().unwrap();
+        assert_eq!(
+            resolve_rate_limit_ip(peer, &headers, &[trusted]),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    /// Deployed reverse proxies (nginx `$proxy_add_x_forwarded_for`, Traefik,
+    /// Caddy, ALB) append the real client to whatever value the client itself
+    /// sent — they do not replace it. The leftmost entry is therefore
+    /// attacker-controlled, not the proxy's own record; only the rightmost
+    /// untrusted entry can be relied on.
+    #[test]
+    fn trusted_proxy_single_header_client_appended_is_honored() {
+        let headers = {
+            let mut map = http::HeaderMap::new();
+            map.insert("x-forwarded-for", "1.1.1.1, 203.0.113.9".parse().unwrap());
+            map
+        };
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted: IpNet = "10.0.0.0/24".parse().unwrap();
+        assert_eq!(
+            resolve_rate_limit_ip(peer, &headers, &[trusted]),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    /// HAProxy's `option forwardfor` adds a *second* `X-Forwarded-For` header
+    /// line rather than appending to an existing one. `HeaderMap::get` only
+    /// sees the first line; the resolver must use `get_all` to see both.
+    #[test]
+    fn trusted_proxy_multiple_header_lines_uses_all_of_them() {
+        let headers = {
+            let mut map = http::HeaderMap::new();
+            map.append("x-forwarded-for", "2.2.2.2".parse().unwrap());
+            map.append("x-forwarded-for", "203.0.113.9".parse().unwrap());
+            map
+        };
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted: IpNet = "10.0.0.0/24".parse().unwrap();
+        assert_eq!(
+            resolve_rate_limit_ip(peer, &headers, &[trusted]),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    /// Multi-hop chain: an inner trusted proxy's own entry is skipped, and
+    /// the walk continues past it to the real client further left.
+    #[test]
+    fn trusted_proxy_multi_hop_chain_skips_trusted_inner_hop() {
+        let headers = {
+            let mut map = http::HeaderMap::new();
+            map.insert("x-forwarded-for", "203.0.113.9, 10.0.0.2".parse().unwrap());
+            map
+        };
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted: IpNet = "10.0.0.0/24".parse().unwrap();
+        assert_eq!(
+            resolve_rate_limit_ip(peer, &headers, &[trusted]),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_with_malformed_forwarded_for_falls_back_to_peer() {
+        let headers = {
+            let mut map = http::HeaderMap::new();
+            map.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+            map
+        };
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted: IpNet = "10.0.0.0/24".parse().unwrap();
+        assert_eq!(resolve_rate_limit_ip(peer, &headers, &[trusted]), peer);
+    }
+
+    /// A spoofed entry hiding behind a malformed one must not be skipped over:
+    /// the walk stops and falls back to `peer` at the first unparsable entry.
+    #[test]
+    fn trusted_proxy_malformed_entry_after_real_client_falls_back_to_peer() {
+        let headers = {
+            let mut map = http::HeaderMap::new();
+            map.insert("x-forwarded-for", "203.0.113.9, not-an-ip".parse().unwrap());
+            map
+        };
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted: IpNet = "10.0.0.0/24".parse().unwrap();
+        assert_eq!(resolve_rate_limit_ip(peer, &headers, &[trusted]), peer);
+    }
+
+    /// Acceptance criterion: an untrusted peer's forged `X-Forwarded-For` does
+    /// not let it evade its own per-IP rate-limit bucket.
+    ///
+    /// Without trusted-proxy support the header is inert either way, so the
+    /// meaningful assertion is that two *different* untrusted peers spoofing
+    /// the *same* `X-Forwarded-For` value are still limited independently —
+    /// if the header were honored, they would collide into one bucket and
+    /// only the first would be limited.
+    #[tokio::test]
+    async fn forged_forwarded_for_from_untrusted_peer_does_not_share_a_bucket() {
+        let config = LimitsConfig {
+            max_requests_per_second_per_ip: 1,
+            max_request_burst_per_ip: 1,
+            max_requests_per_second_per_token: 0,
+            max_request_burst_per_token: 0,
+            trusted_proxies: Vec::new(),
+            ..Default::default()
+        };
+        let app = apply_ip_rate_limit(
+            Router::new().route("/", post(|| async { StatusCode::OK })),
+            &config,
+        );
+
+        // Peer A claims to be 9.9.9.9 via a forged header.
+        assert_eq!(
+            app.clone()
+                .oneshot(request_with_forwarded_for(
+                    addr("192.168.1.1"),
+                    Some("9.9.9.9")
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        // Peer A is now rate-limited on its own real address.
+        assert_eq!(
+            app.clone()
+                .oneshot(request_with_forwarded_for(
+                    addr("192.168.1.1"),
+                    Some("9.9.9.9")
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // Peer B, a different real address, also claiming 9.9.9.9, is unaffected
+        // by A's limit — proving the forged header never became the bucket key.
+        assert_eq!(
+            app.clone()
+                .oneshot(request_with_forwarded_for(
+                    addr("192.168.1.2"),
+                    Some("9.9.9.9")
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    /// Acceptance criterion: a configured trusted proxy's forwarded IP does
+    /// drive the per-IP rate-limit bucket.
+    #[tokio::test]
+    async fn trusted_proxy_forwarded_for_drives_the_rate_limit_bucket() {
+        let config = LimitsConfig {
+            max_requests_per_second_per_ip: 1,
+            max_request_burst_per_ip: 1,
+            max_requests_per_second_per_token: 0,
+            max_request_burst_per_token: 0,
+            trusted_proxies: vec!["192.168.1.0/24".parse().unwrap()],
+            ..Default::default()
+        };
+        let app = apply_ip_rate_limit(
+            Router::new().route("/", post(|| async { StatusCode::OK })),
+            &config,
+        );
+
+        // The proxy (192.168.1.1, trusted) forwards two different real clients.
+        assert_eq!(
+            app.clone()
+                .oneshot(request_with_forwarded_for(
+                    addr("192.168.1.1"),
+                    Some("203.0.113.10")
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        // Same forwarded client through the same trusted proxy: limited on the
+        // forwarded address, not the proxy's own (shared) address.
+        assert_eq!(
+            app.clone()
+                .oneshot(request_with_forwarded_for(
+                    addr("192.168.1.1"),
+                    Some("203.0.113.10")
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // A different forwarded client through the same trusted proxy is
+        // unaffected — the bucket key is the forwarded address, isolated per
+        // real client rather than collapsed onto the proxy's address.
+        assert_eq!(
+            app.clone()
+                .oneshot(request_with_forwarded_for(
+                    addr("192.168.1.1"),
+                    Some("203.0.113.11")
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    /// F1 regression: a client behind a trusted proxy cannot evade its bucket
+    /// by rotating the value it prepends to `X-Forwarded-For` — only the
+    /// rightmost, proxy-appended entry is trusted as the rate-limit key.
+    #[tokio::test]
+    async fn trusted_proxy_client_rotating_leftmost_value_still_limited() {
+        let config = LimitsConfig {
+            max_requests_per_second_per_ip: 1,
+            max_request_burst_per_ip: 1,
+            max_requests_per_second_per_token: 0,
+            max_request_burst_per_token: 0,
+            trusted_proxies: vec!["192.168.1.0/24".parse().unwrap()],
+            ..Default::default()
+        };
+        let app = apply_ip_rate_limit(
+            Router::new().route("/", post(|| async { StatusCode::OK })),
+            &config,
+        );
+
+        assert_eq!(
+            app.clone()
+                .oneshot(request_with_forwarded_for(
+                    addr("192.168.1.1"),
+                    Some("1.1.1.1, 203.0.113.9")
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        // Same real client (rightmost entry unchanged), different spoofed
+        // leftmost value: still hits the same bucket and is limited.
+        assert_eq!(
+            app.clone()
+                .oneshot(request_with_forwarded_for(
+                    addr("192.168.1.1"),
+                    Some("9.9.9.9, 203.0.113.9")
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
         );
     }
 }
