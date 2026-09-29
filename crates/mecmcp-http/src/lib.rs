@@ -329,12 +329,30 @@ impl HttpRequest {
     /// ```
     ///
     /// A hand-written path does not type check — this is the point:
-    /// ```compile_fail
+    /// ```compile_fail,E0308
     /// use mecmcp_http::{HttpRequest, Method};
     ///
     /// let request =
     ///     HttpRequest::with_base_and_path(Method::Get, "https://api.example.com", "/v1/devices/fw-01");
     /// ```
+    ///
+    /// The pre-MEC-510 stringly-typed constructor no longer exists:
+    /// ```compile_fail,E0599
+    /// use mecmcp_http::{HttpRequest, Method};
+    ///
+    /// let id = "fw-01";
+    /// let request =
+    ///     HttpRequest::new(Method::Get, &format!("https://api.example.com/v1/devices/{id}"));
+    /// ```
+    ///
+    #[cfg_attr(
+        not(feature = "absolute-url"),
+        doc = "Without the `absolute-url` feature `HttpRequest::from_absolute_url` does not exist, so vendor code cannot fall back to a raw URL:\n\
+               ```compile_fail,E0599\n\
+               use mecmcp_http::{HttpRequest, Method};\n\
+               let request = HttpRequest::from_absolute_url(Method::Get, \"https://api.example.com/v1\");\n\
+               ```"
+    )]
     pub fn with_base_and_path(
         method: Method,
         base: &str,
