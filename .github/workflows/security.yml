@@ -41,3 +41,69 @@ jobs:
         run: cargo install cargo-deny --locked
       - name: cargo-deny (advisories + licenses + bans + sources)
         run: cargo deny check advisories licenses bans sources
+
+  sbom:
+    name: Generate and validate CycloneDX SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Version-pinned, matching the cargo-deny job's reasoning above (no
+      # Docker Hub dependency, only crates.io) and RELEASE-ARTIFACTS.md's
+      # SBOM standard: the generator version is pinned because the SBOM is
+      # not byte-for-byte reproducible (timestamps, serial numbers), but the
+      # *component set* must be stable across runs.
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+      # One SBOM per workspace crate: mecmcp ships as a family of library
+      # crates consumed by six other repos, not as a single release binary,
+      # so there is no one artifact to attach a single SBOM to. Each
+      # consumer's own release pipeline (see RELEASE-ARTIFACTS.md) generates
+      # the binary-level SBOM for its shipped archive; this is the check that
+      # every crate in the family a consumer might pull in has one that
+      # validates.
+      - name: Generate SBOMs
+        run: cargo cyclonedx --format json --all
+      - name: Validate SBOM shape
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          sboms=(crates/*/*.cdx.json)
+          if [[ ${#sboms[@]} -eq 0 ]]; then
+            echo "no SBOM files were generated" >&2
+            exit 1
+          fi
+          for sbom in "${sboms[@]}"; do
+            echo "validating $sbom"
+            crate_dir=$(basename "$(dirname "$sbom")")
+            format=$(jq -r '.bomFormat' "$sbom")
+            [[ "$format" == "CycloneDX" ]] || {
+              echo "$sbom: bomFormat is '$format', not CycloneDX" >&2
+              exit 1
+            }
+            component_name=$(jq -r '.metadata.component.name' "$sbom")
+            [[ "$component_name" == "$crate_dir" ]] || {
+              echo "$sbom: metadata.component.name is '$component_name', expected '$crate_dir'" >&2
+              exit 1
+            }
+            component_count=$(jq '.components | length' "$sbom")
+            [[ "$component_count" -gt 0 ]] || {
+              echo "$sbom: components array is empty" >&2
+              exit 1
+            }
+            # A nested checkout, worktree, or the build machine's own layout
+            # leaking into the SBOM means it was scanned from an absolute
+            # path rather than the crate root -- same failure mode
+            # RELEASE-ARTIFACTS.md documents for the per-repo binary SBOM.
+            if grep -Eq '"/(home|workspace|workspaces|runner|tmp)/' "$sbom"; then
+              echo "$sbom contains an absolute build-machine path" >&2
+              exit 1
+            fi
+          done
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mecmcp-sboms
+          path: crates/*/*.cdx.json
+          retention-days: 90
