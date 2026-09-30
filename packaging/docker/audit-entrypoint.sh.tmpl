@@ -1,0 +1,55 @@
+#!/bin/sh
+# packaging/docker/audit-entrypoint.sh.tmpl
+#
+# Reference container ENTRYPOINT for a mecmcp-family server. Copy this into
+# the vendor repo (e.g. packaging/docker/audit-entrypoint.sh), fill in the
+# two placeholders below, and set it as the image's ENTRYPOINT (exec form):
+#
+#   COPY packaging/docker/audit-entrypoint.sh /audit-entrypoint.sh
+#   ENTRYPOINT ["/audit-entrypoint.sh"]
+#   CMD ["--inventory", "/etc/@SVC@/devices.json"]
+#
+# Why this exists: packaging/lxc/install.sh generates audit-hmac.key when it
+# is absent so every LXC install runs keyed, redacted audit from first boot.
+# The container images did not do the equivalent, so five of six shipped
+# unkeyed audit by default (#376 / MEC-978) while the LXC package of the same
+# binary did not. This script closes that gap the same way: generate the key
+# on first run, then always pass --audit-hmac-key-file. Declare this script's
+# path as `audit_entrypoint` in packaging/conformance.toml so R7
+# (packaging/conformance/verify-package.sh) fails the build if a future edit
+# drops the flag, the generation step, or the final exec.
+#
+# Fill in before use:
+#   @AUDIT_HMAC_KEY_FILE@ -> the target path. Put this under the STATE volume
+#                            (e.g. /var/lib/rust-panosmcp/audit-hmac.key), not
+#                            the config volume: docs/DOCKER-STANDARD.md's
+#                            canonical compose example mounts config `:ro`, so
+#                            a key path under /etc/<svc> can never be
+#                            generated on a fresh container. This is a
+#                            deliberate divergence from the LXC path
+#                            (/etc/<svc>/audit-hmac.key, docs/FILESYSTEM-LAYOUT.md)
+#                            forced by the container's read-only config mount,
+#                            not an oversight -- document it in the vendor
+#                            repo's README next to the volume list.
+#   @AUDIT_REDACT@        -> the default redaction policy, e.g. devices=hmac,host=hmac
+#   @BINARY@              -> the real binary's absolute path, e.g. /usr/local/bin/rust-panosmcp
+set -eu
+
+KEY_FILE="@AUDIT_HMAC_KEY_FILE@"
+
+# -s (not -e): a zero-byte key file is indistinguishable from "never
+# generated" and would make every HMAC output constant. Rewriting it here on
+# an empty file is a repair, not data loss.
+if [ ! -s "$KEY_FILE" ]; then
+  umask 077
+  head -c 32 /dev/urandom > "$KEY_FILE"
+fi
+
+# exec, not a bare call: the real binary must become PID 1 so it receives
+# signals directly, and "$@" must be forwarded so an operator's own override
+# (e.g. --host) still reaches it -- the CMD-vs-ENTRYPOINT lesson from
+# rustmistmcp#78 applies just as much inside a shim as in a Dockerfile.
+exec "@BINARY@" \
+  --audit-hmac-key-file "$KEY_FILE" \
+  --audit-redact "@AUDIT_REDACT@" \
+  "$@"
