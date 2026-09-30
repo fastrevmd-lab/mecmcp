@@ -838,6 +838,22 @@ impl ChangesetCoordinator {
             ));
         }
 
+        // A change set is created unapproved. This insert path doesn't go
+        // through `check_change_set_write`, so a record already carrying an
+        // approval (even a self-consistent one with `approver == owner`)
+        // would otherwise be persisted unchecked. It could never advance,
+        // since invariant 4 blocks the move to `Approved`, but a stored
+        // record with a forged-but-consistent digest is exactly what
+        // `validate_state_with_key` now rejects on reload — taking every
+        // change set in the file down with it.
+        if record.approval.is_some() || record.approver.is_some() {
+            return Err(CoordinatorError::new(
+                "approval",
+                "a change set is created unapproved; approval is granted through \
+                 approve_change_set, not at creation",
+            ));
+        }
+
         let mut state = self.state.lock().await;
 
         // Before anything expires or is evicted, and under the same lock that
@@ -1306,6 +1322,27 @@ fn check_change_set_write(
              Planned through insert_change_set",
         ));
     };
+
+    // 0. A change set's owner, device and plan digest are fixed at creation.
+    //
+    // Invariant 4 below compares `approver` against `next.owner`, not the
+    // owner the record was created with. Without this check a caller can
+    // rewrite `owner` to a co-conspirator's name on one write, then approve
+    // as the original owner on the next: the approver-versus-owner check
+    // passes because both writes individually satisfy it, but the same
+    // principal both created and approved the plan. `digest` binds
+    // `(owner, device, fingerprint, actions)`, so freezing it here also
+    // catches a rewritten owner or device that a stale digest still matches,
+    // and stops the record from failing to reload later in
+    // `validate_state_with_key`, which recomputes and compares the digest.
+    if next.owner != current.owner || next.device != current.device || next.digest != current.digest
+    {
+        return Err(CoordinatorError::new(
+            "change_set_id",
+            "a change set's owner, device and plan digest are fixed at creation; \
+             plan the operation again",
+        ));
+    }
 
     if current.state == ChangeSetState::Approved && next.state == ChangeSetState::Applying {
         if via == WriteVia::ApplyClaim {

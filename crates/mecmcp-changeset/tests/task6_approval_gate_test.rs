@@ -12,7 +12,8 @@
 #![allow(clippy::unwrap_used)]
 
 use mecmcp_changeset::{
-    ApprovalRecord, ChangeSetState, ChangesetCoordinator, OperationLimits,
+    ApprovalRecord, ChangeSetRecord, ChangeSetState, ChangesetCoordinator, OperationLimits,
+    change_set_digest,
     persistence::{read_state, write_state_for_test},
 };
 use std::path::PathBuf;
@@ -644,6 +645,129 @@ async fn test_self_approval_via_direct_update_is_denied() {
         .await
         .expect("read change set");
     assert_eq!(record.state, ChangeSetState::Planned);
+}
+
+/// A rewritten owner would otherwise let two writes each individually satisfy
+/// "approver != owner" while the same principal both created and approved the
+/// plan: rewrite `owner` to a co-conspirator on one write, then approve as the
+/// original owner on the next. Freezing `owner`, `device` and `digest` at
+/// creation (in `check_change_set_write`) closes this at the write that
+/// attempts the rewrite, before any approval is granted.
+#[tokio::test]
+async fn test_owner_rewrite_is_refused_even_though_neither_write_self_approves() {
+    let (_dir, coordinator) = setup_coordinator();
+
+    let actions = vec![TestAction {
+        action: "set".to_string(),
+        target: "/test/path".to_string(),
+    }];
+
+    let created = coordinator
+        .create_change_set(
+            "device-a".to_string(),
+            actions,
+            "alice".to_string(),
+            test_fingerprint(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .expect("create");
+
+    let mut rewritten = coordinator
+        .change_set(&created.change_set_id, "device-a")
+        .await
+        .expect("read change set");
+    assert_eq!(rewritten.owner, "alice");
+    rewritten.owner = "mallory".to_string();
+
+    let result = coordinator
+        .update_change_set_from(ChangeSetState::Planned, rewritten)
+        .await;
+    assert!(
+        result.is_err(),
+        "a change set's owner must be fixed at creation, not rewritable through \
+         an ordinary update"
+    );
+    let error_message = result.unwrap_err().to_string();
+    assert!(
+        error_message.contains("fixed at creation"),
+        "Expected an owner-frozen rejection, got: {error_message}"
+    );
+
+    // The record is untouched: still owned by alice, still Planned, and she
+    // can still legitimately be refused if she tries to approve her own plan.
+    let record = coordinator
+        .change_set(&created.change_set_id, "device-a")
+        .await
+        .expect("read change set");
+    assert_eq!(record.owner, "alice");
+    assert_eq!(record.state, ChangeSetState::Planned);
+}
+
+/// `insert_change_set` doesn't go through `check_change_set_write`, so a
+/// caller handing it a `Planned` record that already carries a
+/// self-consistent approval (forged, but internally consistent, the way
+/// `test_self_consistent_forged_self_approval_digest_is_still_rejected` shows
+/// is possible) would otherwise be stored unchecked. Invariant 4 blocks it
+/// from ever reaching `Approved`, but a stored record like this fails
+/// `validate_state_with_key` on the next reload — taking every change set in
+/// the file down with it. Creation must refuse it outright.
+#[tokio::test]
+async fn test_insert_refuses_a_record_that_already_carries_approval() {
+    let (_dir, coordinator) = setup_coordinator();
+
+    let owner = "alice";
+    let device = "device-a";
+    let fingerprint = test_fingerprint();
+    let actions = vec![serde_json::json!({"action": "set", "target": "/test/path"})];
+    let digest = change_set_digest(owner, device, &fingerprint, &actions).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let record = ChangeSetRecord {
+        id: "1".repeat(64),
+        device: device.to_owned(),
+        owner: owner.to_owned(),
+        digest: digest.clone(),
+        expected_candidate_fingerprint: fingerprint,
+        actions,
+        state: ChangeSetState::Planned,
+        expires_at_unix: u64::MAX,
+        operation_id: None,
+        approver: Some(owner.to_owned()),
+        approval: Some(ApprovalRecord {
+            approver: Some(owner.to_owned()),
+            approved_at_unix: now,
+            digest: mecmcp_changeset::digest::compute_approval_digest_v5(
+                &"1".repeat(64),
+                &digest,
+                None,
+                owner,
+                owner,
+                now,
+            ),
+            digest_version: 5,
+            waived: None,
+        }),
+        policy_signature: "policy-sig".to_owned(),
+        targets: Vec::new(),
+        preview: None,
+        task_id: None,
+        apply_without_handle: false,
+    };
+
+    let result = coordinator.insert_change_set(record).await;
+    assert!(
+        result.is_err(),
+        "a change set must be created unapproved, not with approval attached"
+    );
+    let error_message = result.unwrap_err().to_string();
+    assert!(
+        error_message.contains("created unapproved"),
+        "Expected an unapproved-at-creation rejection, got: {error_message}"
+    );
 }
 
 #[tokio::test]
