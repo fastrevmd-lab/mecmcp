@@ -68,6 +68,29 @@ git push origin v0.25.0
 
 This requires a GPG or SSH signing key registered to your GitHub account (Settings → SSH and GPG keys) — not a repo secret, and not something CI provisions for you. `.github/workflows/verify-release-tag.yml` runs on every `v*` tag push and fails closed, visibly, if the tag is lightweight or its signature does not verify against a key on the pusher's account (the same check behind the "Verified" badge on a commit or tag in the GitHub UI). It cannot stop the push from landing — GitHub has no pre-push ref protection for tags the way it does for branches — but an unsigned release tag will not go unnoticed.
 
+### Verifying a release tag offline
+
+The CI check above proves a tag was signed by *a* key registered to *some* GitHub account — it says nothing about whether that account belongs to an authorised release maintainer, and it requires hitting GitHub's API. To verify a tag against the specific keys this project's release maintainers use, without any network call, this repo publishes those keys in [`allowed_signers`](allowed_signers) at the repo root, in the format `git verify-tag` and `ssh-keygen -Y verify` both understand (one line per key: `<maintainer-email> namespaces="git" <key-type> <base64-key> [comment]`).
+
+**Never trust the `allowed_signers` inside the tag you are verifying.** `git verify-tag` reads `gpg.ssh.allowedSignersFile` from whatever is on disk at the path you configure — if that path points inside the checkout, a malicious tag (or a malicious mirror or fork) can ship its own `allowed_signers` alongside a rogue key and pass its own check. Copy the file from a known-good ref to a path *outside* the repository before trusting it:
+
+```sh
+mkdir -p ~/.config/mecmcp
+git show origin/main:allowed_signers > ~/.config/mecmcp/allowed_signers
+git config gpg.ssh.allowedSignersFile ~/.config/mecmcp/allowed_signers
+git verify-tag v0.25.0
+```
+
+Cross-check the key you copied against an out-of-band source before relying on it — for example the maintainer's SSH **signing** keys, listed at [`https://api.github.com/users/fastrevmd-lab/ssh_signing_keys`](https://api.github.com/users/fastrevmd-lab/ssh_signing_keys), or the fingerprint below, not just `origin/main` from the same clone you're verifying. Note that `github.com/<user>.keys` lists SSH **authentication** keys only and will not contain this key — GitHub keeps the two lists separate.
+
+```
+fastrevmd@gmail.com: SHA256:3K9tuitFu3aA2MX/640tBnrsVupfMJ7eT/w5pH6SbVQ (ed25519)
+```
+
+`git config` (without `--global`) scopes the allowed-signers file to this clone only. If the tag was signed with GPG instead of SSH, import the maintainer's GPG public key into your local keyring first (`gpg --import <maintainer-key>.asc`), then run the same `git verify-tag` — `allowed_signers` only covers SSH-signed tags.
+
+`allowed_signers` lists the keys release maintainers currently sign with; it is not an enforcement mechanism and does not restrict who can push a `v*` tag — that is tracked separately as a repository-ruleset decision. Treat a tag whose signer isn't in this file as unverified, the same as an unsigned one. Releases before the first SSH-signed tag predate this mechanism entirely and cannot be verified with `allowed_signers` — expect `No principal matched` on those, not a sign of tampering.
+
 ## Commit and PR conventions
 
 - Keep PRs focused on one change. A bug fix doesn't need a drive-by refactor riding along.
