@@ -74,6 +74,21 @@ pub fn redact(input: &str) -> String {
             if is_pem_end(trimmed) {
                 in_pem = false;
                 out.push(line.to_string());
+                continue;
+            }
+            // R2 (mecmcp#458 re-review): a closing `</untrusted-device-content
+            // id="...">` tag ends an open PEM body too, even without a
+            // matching END line. Otherwise redacting text that is already
+            // wrapped by `Untrusted::render_tagged` — device text that
+            // contains an unterminated BEGIN line — drops the closing tag
+            // along with the (fake) body, leaving the untrusted block open.
+            // `render_tagged` escapes a forged closing tag inside the body
+            // (`escape_for_tag`), so a literal line in this exact shape can
+            // only be the real tag the wrapper emitted, never device text.
+            if trimmed.starts_with("</untrusted-device-content id=\"") {
+                in_pem = false;
+                out.push(line.to_string());
+                continue;
             }
             // Body lines of an open PEM block are dropped; the single
             // placeholder was already pushed when the block opened.
@@ -648,6 +663,27 @@ mod tests {
         assert!(!got.contains("MoreFakeBase64=="));
         assert!(got.contains("intro line"));
         assert!(got.contains("trailer line"));
+    }
+
+    // R2 (mecmcp#458 re-review): a second redact pass over text already
+    // wrapped by `Untrusted::render_tagged` must not let an unterminated
+    // BEGIN line swallow the closing `</untrusted-device-content id="...">`
+    // tag — the model would then receive an untrusted block with no end.
+    #[test]
+    fn pem_block_stops_at_an_untrusted_content_closing_tag_without_an_end_line() {
+        let block = "<untrusted-device-content id=\"abc123\" source=\"device.stage_error\">\n\
+            This content was returned by a device or controller.\n\
+            error at line 3\n\
+            -----BEGIN RSA PRIVATE KEY-----\n\
+            MIIFAKEBASE64==\n\
+            (truncated)\n\
+            </untrusted-device-content id=\"abc123\">"; // gitleaks:allow -- fabricated base64 body ("FAKE"), not a real key
+        let got = redact(block);
+        assert!(
+            got.contains("</untrusted-device-content id=\"abc123\">"),
+            "closing tag must survive redaction: {got}"
+        );
+        assert!(!got.contains("MIIFAKEBASE64=="), "got: {got}");
     }
 
     #[test]

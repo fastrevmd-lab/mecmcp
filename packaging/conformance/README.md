@@ -70,12 +70,16 @@ Unknown keys are an error, so a typo cannot silently disable a rule.
 | `must_survive_override` | list of strings | yes | Flags R6 requires to survive an operator override. May be empty; the empty case is announced. |
 | `skip_build_env` | `false` or a non-empty string | no | Names the environment variable the packager honours to accept a prebuilt binary. |
 | `placeholders` | table of string → string | no | Test values for the `@TOKEN@` placeholders the units carry. |
+| `audit_entrypoint` | `false` or a non-empty string | no | Path **inside the staging dir** to the container's audit-key-generating entrypoint script (see `packaging/docker/audit-entrypoint.sh.tmpl`). `false` means this repo's container image has not been migrated yet. |
 
 Rejected values, each with exit 2:
 
 - `skip_build_env = true` and `skip_build_env = ""`. `true` is truthy, so it
   satisfied the `build_info` ordering guard while naming no variable — and a
   variable that names nothing is what silently disabled R3's third clause.
+- `audit_entrypoint = true` and `audit_entrypoint = ""`, for the same reason:
+  a bare `true` or empty string would satisfy "the key is present" while
+  naming no script for R7 to actually check.
 - An absolute `binary`, `installer`, or `units` entry. It would be joined onto
   the staging path anyway and report "not found" for a file that exists.
 - Any string containing a newline. The reader emits one value per line and the
@@ -97,6 +101,9 @@ units      = ["packaging/systemd/svc.service"]
 must_survive_override = ["--tokens-file"]
 ```
 
+(`audit_entrypoint` is omitted here since it is optional and defaults to
+`false`, i.e. "not migrated yet, R7 warns".)
+
 ## The rules
 
 | Rule | Status | What it checks |
@@ -107,6 +114,7 @@ must_survive_override = ["--tokens-file"]
 | R4 | warn | The installer creates `/etc/systemd/system/<service>.service.d`. Mentions inside comments do not count. |
 | R5 | fatal | Every declared unit exists, renders with no `@PLACEHOLDER@` left, and `systemd-analyze verify` reports no defect. |
 | R6 | fatal | Every `must_survive_override` flag is still in the container's argv after an operator override. Needs `--image`. |
+| R7 | warn if `audit_entrypoint = false`, else fatal | The declared entrypoint script exists, is executable, passes `--audit-hmac-key-file`, generates the key from `/dev/urandom` when absent, and ends in `exec ... "$@"`. |
 
 ### What can make a rule not run
 
@@ -125,6 +133,10 @@ these announces itself.
 - **`build_info = false`** — R3 still reports, as a warning rather than a
   failure. There is no value that makes a package legitimately
   provenance-free.
+- **`audit_entrypoint = false`** — R7 still reports, as a warning naming
+  `#376`, rather than silently passing. This is the transitional state for a
+  repo that has not shipped its entrypoint script yet; once it does, flipping
+  the manifest to the real path promotes the same check to fatal.
 - **An earlier rule already failed** — R1-R5 run in one step and R6 in another,
   and a failing step would normally skip everything after it. Both R6 steps
   therefore carry `!cancelled()`, so a package with a non-executable installer
@@ -155,6 +167,24 @@ package a CI-built binary cannot produce an honest `BUILD-INFO`, and demanding
 one anyway is what produced the forged file in #355. So the order is: add the
 skip-build path, then set `skip_build_env` to its name, then set
 `build_info = true`.
+
+### Audit entrypoint rollout (R7)
+
+Every family systemd unit runs keyed, redacted audit (`--audit-hmac-key-file`
+plus `--audit-redact`), generating the key on first install if
+`packaging/lxc/install.sh` does not find one. Five of six container images
+did not do either half of that, so an operator running the same binary as a
+container got unkeyed, unredacted audit by default (#376 / MEC-978).
+
+`packaging/docker/audit-entrypoint.sh.tmpl` in this repo is the reference
+fix: copy it into the vendor repo, fill in the three placeholders, wire it in
+as `ENTRYPOINT` (exec form, so it is not lost the way `rustmistmcp#78`'s CMD
+flag was), and declare its staging path as `audit_entrypoint` in that repo's
+`packaging/conformance.toml`. R7 then checks the script itself rather than a
+running container, because an entrypoint shim's `exec` line is invisible to
+`docker inspect` — R6's own commentary calls this out as something it cannot
+see. Until a repo does this, `audit_entrypoint = false` keeps R7 at a warning
+so the gap stays visible without breaking every image's build in one commit.
 
 ## The tests
 

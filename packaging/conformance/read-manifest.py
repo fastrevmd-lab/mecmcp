@@ -12,7 +12,11 @@ REQUIRED = {
     "config_dir": str, "tokens": str,
     "build_info": bool, "units": list, "must_survive_override": list,
 }
-OPTIONAL = {"skip_build_env": (str, bool), "placeholders": dict}
+OPTIONAL = {
+    "skip_build_env": (str, bool),
+    "placeholders": dict,
+    "audit_entrypoint": (str, bool),
+}
 
 # Keys whose value is resolved against the package staging directory by
 # verify-package.sh. An absolute value is silently joined onto $STAGING there,
@@ -122,7 +126,35 @@ def validate(data):
             "way to package a CI-built binary cannot produce an honest BUILD-INFO, "
             "and demanding one is what produced the forged file in #355."
         )
-    return skip_build
+
+    # audit_entrypoint follows the same false-sentinel shape as skip_build_env:
+    # `true` is truthy but names nothing, and an empty string is indistinguishable
+    # from "not set" in a shell eval, so both are rejected rather than silently
+    # accepted as "R7 has nothing to check".
+    audit_entrypoint = data.get("audit_entrypoint", False)
+    if audit_entrypoint is True:
+        die(
+            "audit_entrypoint = true is not a value. It must name the path "
+            "(inside the staging directory) to the container entrypoint script "
+            "that generates the audit HMAC key when absent and always passes "
+            "--audit-hmac-key-file to the binary, or be false when this repo's "
+            "container image has not been migrated yet (R7 warns instead of "
+            "failing until it has, see #376)."
+        )
+    if isinstance(audit_entrypoint, str):
+        if not audit_entrypoint:
+            die(
+                'audit_entrypoint = "" is not a value. Name the entrypoint '
+                "script path, or use false."
+            )
+        check_framing("audit_entrypoint", audit_entrypoint)
+        if audit_entrypoint.startswith("/"):
+            die(
+                "audit_entrypoint must be a path inside the package staging "
+                f"directory, not an absolute path: {audit_entrypoint}"
+            )
+
+    return skip_build, audit_entrypoint
 
 
 def main():
@@ -136,7 +168,7 @@ def main():
     except tomllib.TOMLDecodeError as error:
         die(f"not valid TOML: {error}")
 
-    skip_build = validate(data)
+    skip_build, audit_entrypoint = validate(data)
 
     if len(sys.argv) == 4:
         name = sys.argv[3]
@@ -159,6 +191,7 @@ def main():
         f"CONF_TOKENS={data['tokens']}",
         f"CONF_BUILD_INFO={'true' if data['build_info'] else 'false'}",
         f"CONF_SKIP_BUILD_ENV={skip_build if isinstance(skip_build, str) else ''}",
+        f"CONF_AUDIT_ENTRYPOINT={audit_entrypoint if isinstance(audit_entrypoint, str) else ''}",
     ]))
 
 
