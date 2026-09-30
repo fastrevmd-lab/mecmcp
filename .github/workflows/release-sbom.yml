@@ -64,4 +64,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$TAG" crates/*/*.cdx.json --repo "${{ github.repository }}"
+        # --clobber makes this idempotent: a re-run after a partial failure
+        # (or a manual re-trigger) must be able to re-upload without first
+        # deleting the asset by hand.
+        run: gh release upload "$TAG" crates/*/*.cdx.json --repo "${{ github.repository }}" --clobber
