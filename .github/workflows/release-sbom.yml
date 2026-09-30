@@ -1,0 +1,67 @@
+name: Attach SBOM to release
+
+# mecmcp ships as a family of library crates (see security.yml's sbom job),
+# not a single release binary, so there is one CycloneDX SBOM per workspace
+# crate. security.yml already generates and validates them on every push and
+# PR, but only uploads them as a 90-day CI artifact -- a release tag gets no
+# durable, versioned copy. This regenerates the same SBOMs at the release
+# commit and attaches them as release assets so a consumer can audit exactly
+# what mecmcp v<x> was built from without needing CI retention to still hold
+# the run.
+#
+# Triggered on `release: published`, not the `v*` tag push, because the
+# release (and its asset list) does not exist yet at tag-push time -- see
+# rustjunosmcp's release-sign-tarball.yml for the same reasoning. A release
+# is only published by a maintainer, so this never fires from a PR or an
+# unreviewed tag.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  sbom:
+    name: Generate and attach CycloneDX SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # gh release upload
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      # Pinned version matches security.yml's sbom job -- same reasoning:
+      # the SBOM is not byte-for-byte reproducible (timestamps, serial
+      # numbers), but the component set must be stable.
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+      - name: Generate SBOMs
+        run: cargo cyclonedx --format json --all
+      - name: Validate SBOM shape
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          sboms=(crates/*/*.cdx.json)
+          if [[ ${#sboms[@]} -eq 0 ]]; then
+            echo "no SBOM files were generated" >&2
+            exit 1
+          fi
+          for sbom in "${sboms[@]}"; do
+            format=$(jq -r '.bomFormat' "$sbom")
+            [[ "$format" == "CycloneDX" ]] || {
+              echo "$sbom: bomFormat is '$format', not CycloneDX" >&2
+              exit 1
+            }
+          done
+      - name: Attach SBOMs to the release
+        # Each file's basename is already unique (mecmcp-audit.cdx.json,
+        # mecmcp-server.cdx.json, ...) since cargo-cyclonedx names it after
+        # the crate, and `gh release upload` uses the basename as the asset
+        # name regardless of source path.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" crates/*/*.cdx.json --repo "${{ github.repository }}"
