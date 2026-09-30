@@ -31,6 +31,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **mecmcp-secret: shared naming derivation and single-pass credential-file
+  validation** (MEC-987). Two additions that give the six mechub MCP servers
+  a common source of truth instead of six independent decisions:
+  - `naming::ServerNaming::derive` computes `/etc/<short_name>`,
+    `/var/lib/<short_name>`, and the service-user string from one short name,
+    with `naming::known` fixing the short name for each of the six servers
+    today (`jmcp`, `panosmcp`, `sdcmcp`, `proxmoxmcp`, `mistmcp`,
+    `unifimcp`) and documenting the rule a seventh server follows.
+  - `validate::validate_credential_files` checks every credential-adjacent
+    file a server cares about in one pass and returns every offender
+    together, instead of the existing single-file loaders' fail-on-first
+    behaviour. The required mode per file is data
+    (`validate::CredentialFileRole::required_mode`) the loader owns, not a
+    constant duplicated in each repo's setup docs -- `Secret` requires
+    `0600`, `ConfigNoSecret` (files that are operator-authored and hold no
+    secret material, like `rustsdcmcp`'s `sdc.json`) requires `0640`.
+  Consuming servers are unaffected until they opt in: nothing existing
+  changed, resolve_token_path's `/etc` fallback still governs the
+  tokens.json migration path per server.
+
 - **mecmcp-audit: optional OpenTelemetry trace export, and a generic
   HTTPS/JSON forward sink for closed evidence segments** (MEC-459). Two
   independent, off-by-default additions:
