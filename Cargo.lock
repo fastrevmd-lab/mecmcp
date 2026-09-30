@@ -2074,6 +2074,7 @@ dependencies = [
  "mecmcp-audit",
  "mecmcp-auth",
  "mecmcp-redact",
+ "quick-xml",
  "rmcp",
  "serde",
  "serde_json",

@@ -20,6 +20,10 @@ http         = "1"
 mecmcp-audit  = { version = "0.24.1", path = "../mecmcp-audit" }
 mecmcp-auth   = { version = "0.24.1", path = "../mecmcp-auth" }
 mecmcp-redact = { version = "0.24.1", path = "../mecmcp-redact" }
+# For xml_to_json: same parser family mecmcp-redact already vets for this
+# ecosystem, so a device XML reply is walked with one parser, not two that
+# could disagree about where a tag ends.
+quick-xml   = { workspace = true }
 rmcp        = { version = "3", default-features = false }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
