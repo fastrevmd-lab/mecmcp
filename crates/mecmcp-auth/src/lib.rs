@@ -15,7 +15,7 @@ pub mod token;
 pub mod file;
 
 pub use bearer::{BearerHeaderError, BearerSyntax, parse_bearer_header};
-pub use entry::{ActorType, EntryError, MAX_TOKEN_NAME, Tier, TokenEntry};
+pub use entry::{ActorType, EntryError, MAX_TOKEN_NAME, OidcSubject, Tier, TokenEntry};
 pub use file::{
     FileError, KnownNames, ResolvedTokenPath, TokenStoreFile, resolve_token_path, write_atomic,
 };

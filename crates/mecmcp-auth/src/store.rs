@@ -124,6 +124,9 @@ pub struct CallerCtx<G: Grant = NoGrant> {
     pub on_behalf_of: Option<String>,
     /// Server-verified actor type from the token entry.
     pub actor_type: crate::ActorType,
+    /// The IdP subject this token is bound to, when the token entry declares
+    /// one (MEC-994). Copied straight from [`TokenEntry::oidc_subject`].
+    pub oidc_subject: Option<crate::entry::OidcSubject>,
     /// Client-asserted MCP client name from `initialize` request.
     ///
     /// Captured from the MCP session identified by `Mcp-Session-Id` header.
@@ -171,6 +174,7 @@ impl<G: Grant> From<&TokenEntry<G>> for CallerCtx<G> {
             provider_tier: entry.provider_tier,
             on_behalf_of: entry.on_behalf_of.clone(),
             actor_type: entry.effective_actor_type(),
+            oidc_subject: entry.oidc_subject.clone(),
             client_name: None,
             model_id: None,
             session_id: None,
@@ -247,6 +251,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: crate::ActorType::Human,
+            oidc_subject: None,
         };
         (plaintext, entry)
     }
@@ -321,6 +326,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: crate::ActorType::Human,
+            oidc_subject: None,
             client_name: None,
             model_id: None,
             session_id: None,
@@ -342,6 +348,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: crate::ActorType::Human,
+            oidc_subject: None,
             client_name: None,
             model_id: None,
             session_id: None,
@@ -377,6 +384,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: crate::ActorType::Human,
+            oidc_subject: None,
             client_name: None,
             model_id: None,
             session_id: None,
@@ -399,6 +407,7 @@ mod tests {
             provider_tier: None,
             on_behalf_of: None,
             actor_type: crate::ActorType::Human,
+            oidc_subject: None,
             client_name: None,
             model_id: None,
             session_id: None,

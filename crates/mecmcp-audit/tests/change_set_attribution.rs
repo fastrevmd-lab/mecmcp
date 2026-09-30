@@ -103,6 +103,7 @@ fn from_caller_never_invents_an_approver_or_change_set() {
         provider_tier: None,
         on_behalf_of: None,
         actor_type: mecmcp_auth::ActorType::Agent,
+        oidc_subject: None,
         client_name: None,
         model_id: None,
         session_id: None,

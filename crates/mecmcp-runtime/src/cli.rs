@@ -845,6 +845,14 @@ pub enum TokenAction {
         /// Actor type: "human", "agent", or "unknown". Optional.
         #[arg(long)]
         actor_type: Option<String>,
+        /// IdP issuer URL this token is bound to, for verified-approver
+        /// identity (MEC-994). Required if `--oidc-subject` is set.
+        #[arg(long)]
+        oidc_issuer: Option<String>,
+        /// The IdP's `sub` claim identifying the human this token is bound
+        /// to. Required if `--oidc-issuer` is set.
+        #[arg(long)]
+        oidc_subject: Option<String>,
         /// Send SIGHUP to this pid after writing.
         #[arg(long)]
         server_pid: Option<i32>,
