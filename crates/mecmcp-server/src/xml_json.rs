@@ -56,7 +56,7 @@ pub enum XmlProjectionError {
     /// `input` contains no root element.
     #[error("input has no root element")]
     Empty,
-    /// `input` nests elements deeper than [`MAX_DEPTH`].
+    /// `input` nests elements deeper than the configured limit.
     ///
     /// The parser itself walks an explicit stack, not recursion, so parsing
     /// a deep document cannot overflow the native stack. Building and later
