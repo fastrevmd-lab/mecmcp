@@ -156,6 +156,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would read an untagged block as unbounded. Each piece is now redacted
   exactly once before the tag is built.
 
+- **mecmcp-redact: `redact_text` could still drop a closing trust-boundary
+  tag on a real production path** (MEC-1020, review follow-up on
+  mechubsec/mecmcp#458, R2). Fixing the previous entry moved the redundant
+  redaction pass out of `mecmcp-server`, but `mecmcp-changeset` already tags
+  a device error with `Untrusted::render_tagged` *before* the error reaches
+  `tool_error` (`CoordinatorError`'s message carries the tag), so
+  `tool_error`'s single, now-necessary pass over that string still ran into
+  the same unterminated-`BEGIN` case. `text::redact` now recognizes a
+  `</untrusted-device-content id="...">` closing tag as ending an open PEM
+  block even without a matching `END` line -- the tag's body is escaped by
+  `render_tagged`, so a line in this exact shape can only be the wrapper's
+  own closing tag, never forged device text. No secret leaked; this closes
+  the same fail-safe gap for the call sites that tag before returning an
+  error.
+
 ## [0.24.1] - 2026-09-28
 
 > **Upgrade note.** This patch release changes a default: servers that relied

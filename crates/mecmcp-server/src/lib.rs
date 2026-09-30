@@ -667,6 +667,38 @@ mod tests {
         );
     }
 
+    /// Regression for the review finding on #458 (R2): `mecmcp-changeset`
+    /// tags a device error with `Untrusted::render_tagged` *before* it ever
+    /// reaches `tool_error` (`CoordinatorError`'s message already carries the
+    /// tag). `tool_error` then redacts that already-tagged string, which is
+    /// the same "redact after tagging" shape as R1, just reached through a
+    /// real production call site instead of `tool_error_with_untrusted_detail`.
+    /// An unterminated PEM `BEGIN` line in the device text must not consume
+    /// the closing tag here either.
+    #[test]
+    fn tool_result_closes_the_tag_on_an_already_tagged_error_with_an_unterminated_pem_header() {
+        let tagged_device_error = Untrusted::new(
+            "error at line 3\n-----BEGIN RSA PRIVATE KEY-----\nMIIFAKE\n(truncated)",
+        ) // gitleaks:allow -- fabricated, unterminated PEM header, not a real key
+        .render_tagged("device.stage_error");
+        let coordinator_error = format!("staging failed: {tagged_device_error}");
+        let result = tool_result::<serde_json::Value, _>(
+            Err(coordinator_error),
+            ResultFormat::PrettyJson,
+            ResultLimits {
+                max_text_bytes: 4096,
+                max_json_bytes: 4096,
+            },
+            OutputRedaction::Apply,
+        );
+        let text = text_of(&result);
+        assert!(
+            text.contains("</untrusted-device-content id=\""),
+            "the closing tag must survive redaction: got {text}"
+        );
+        assert!(!text.contains("MIIFAKE"), "got {text}");
+    }
+
     /// The whole point of this crate change: a handler that builds its
     /// result with `tool_result` and never calls `mecmcp-redact` itself still
     /// gets a redacted value back, because `OutputRedaction::Apply` runs
