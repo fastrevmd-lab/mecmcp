@@ -95,6 +95,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — mecmcp-server: `tool_result` takes an `OutputRedaction`
+  argument and redacts every successful value by default** (MEC-1020,
+  closes mechubsec/mecmcp#398). Previously this crate only re-exported
+  `Untrusted`, and a handler had to remember to call `mecmcp-redact` on its
+  own output; a new tool that forgot shipped an unredacted value. `tool_result`
+  now redacts `Ok` values unconditionally unless the caller passes
+  `OutputRedaction::SkipForInternalRead { tool, reason }`, a per-call opt-out
+  (there is no `Default` impl and no process-wide flag) that emits a
+  `target: "audit"` `WARN` naming the tool and reason, for data that never
+  touched a device (e.g. this process's own audit log). `tool_error` and
+  `tool_error_with_untrusted_detail` redact their text unconditionally too,
+  with no opt-out — a device error routinely echoes the config line that
+  triggered it, so the error path needs the same default as the success
+  path. Every existing call site in this crate passes `OutputRedaction::Apply`
+  or `Apply`-equivalent behaviour; the six vendor server repos that already
+  call `mecmcp-redact` on their own paths will need their own follow-up to
+  adopt the new argument next time they bump this crate.
+  **Also note:** `ResultFormat::PrettyJson` now serializes through
+  `serde_json::Value` on its way to the redactor, so struct field order in
+  the rendered JSON is alphabetical rather than declaration order; any
+  golden fixture that asserts exact JSON text will need updating.
+
 - **BREAKING — http/openapi: request paths are typed; the raw-URL
   constructor is feature-gated** (MEC-510). `mecmcp-openapi::expand_path` now
   returns `ExpandedPath` instead of `String` — a type with no public
@@ -109,6 +131,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path-templated (OIDC discovery/JWKS); `mecmcp-oidc` enables it. Vendor
   servers should migrate REST calls to `with_base_and_path` and should not
   enable `absolute-url`.
+
+### Security
+
+- **mecmcp-server: a tool's error path could leak a device secret that a
+  new tool's success path was already protected against** (MEC-1020, part
+  of mechubsec/mecmcp#398's review). Before this change, `tool_error` and
+  `tool_error_with_untrusted_detail` passed their text through unredacted,
+  so a Junos commit-check failure or a PAN-OS API error body that quoted
+  the offending config line (a pre-shared key, an SNMP community string)
+  reached the model verbatim, even though the same value in a success
+  result was already redacted by the `Changed` entry above. Both functions
+  now redact unconditionally.
 
 ## [0.24.1] - 2026-09-28
 

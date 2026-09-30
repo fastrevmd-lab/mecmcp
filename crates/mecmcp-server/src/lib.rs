@@ -251,10 +251,14 @@ pub fn truncate_items<T>(mut items: Vec<T>, max_items: usize) -> TruncatedItems<
 
 /// Build an MCP tool error containing one safe text block.
 ///
-/// The message is whatever `error` renders, so an error type reaching this must
-/// already be safe to show a caller. This crate cannot make an unsafe message
-/// safe; a type that might carry a credential or an internal path should be
-/// redacted at its own boundary, not here.
+/// The message is whatever `error` renders, redacted the same way a
+/// successful [`tool_result`] value is: an error commonly quotes the device's
+/// own words back (a Junos commit-check failure echoes the offending config
+/// line, a PAN-OS API error body echoes the request), so a secret-bearing
+/// line can reach this path exactly as it can reach a success. There is no
+/// opt-out here — [`OutputRedaction::SkipForInternalRead`] only exists for
+/// data that never touched a device, and an error string does not carry that
+/// guarantee.
 ///
 /// The text is **not** bounded. Every caller in this family builds these from
 /// its own short, fixed-shape messages, and silently shortening a diagnostic is
@@ -267,7 +271,8 @@ pub fn truncate_items<T>(mut items: Vec<T>, max_items: usize) -> TruncatedItems<
 /// device's own words stay visibly marked once the model reads them.
 #[must_use]
 pub fn tool_error(error: impl Display) -> rmcp::model::CallToolResult {
-    rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(error.to_string())])
+    let text = redact_text(&error.to_string());
+    rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(text)])
 }
 
 /// Build an MCP tool error whose detail text came from the device or
@@ -302,6 +307,8 @@ pub fn tool_error_with_untrusted_detail(
     detail: Untrusted<&str>,
     source: &str,
 ) -> rmcp::model::CallToolResult {
+    let redacted_detail = redact_text(detail.as_inner());
+    let detail = Untrusted::new(redacted_detail.as_str());
     tool_error(format!("{context}\n{}", detail.render_tagged(source)))
 }
 
@@ -441,15 +448,19 @@ mod tests {
     /// alongside this process's own words.
     #[test]
     fn tool_error_with_untrusted_detail_tags_the_device_text() {
+        // Deliberately free of any word `mecmcp-redact` treats as a
+        // denylisted key (e.g. "session") — this test is about tagging,
+        // not redaction, which has its own coverage in
+        // `tool_error_with_untrusted_detail_redacts_the_device_text`.
         let result = tool_error_with_untrusted_detail(
             "staging failed",
-            Untrusted::new("candidate database locked by another session"),
+            Untrusted::new("candidate database locked by another process"),
             "device.stage_error",
         );
         let text = text_of(&result);
         assert_eq!(result.is_error, Some(true));
         assert!(text.contains("staging failed"));
-        assert!(text.contains("candidate database locked by another session"));
+        assert!(text.contains("candidate database locked by another process"));
         assert!(text.contains("<untrusted-device-content id=\""));
         assert!(text.contains("source=\"device.stage_error\""));
         assert!(text.contains("</untrusted-device-content id=\""));
@@ -578,6 +589,45 @@ mod tests {
         );
         assert_eq!(result.is_error, Some(true));
         assert_eq!(text_of(&result), "device unreachable");
+    }
+
+    /// A device error routinely quotes the offending config statement back
+    /// (a Junos commit-check failure, a PAN-OS API error body), so the
+    /// `Err` branch of `tool_result` must redact exactly as its `Ok` branch
+    /// does. Regression for the review finding on #458: this failed before
+    /// `tool_error` redacted its input.
+    #[test]
+    fn tool_result_redacts_a_secret_bearing_error_by_default() {
+        let device_error = "commit failed: set security ike policy p1 pre-shared-key ascii-text \"$9$FAKEhash\"; ## SECRET-DATA\nsnmp community FAKEcomm4"; // gitleaks:allow -- fabricated $9$ hash ("FAKE"), not a real device secret
+        let result = tool_result::<serde_json::Value, _>(
+            Err(device_error),
+            ResultFormat::PrettyJson,
+            ResultLimits {
+                max_text_bytes: 1024,
+                max_json_bytes: 1024,
+            },
+            OutputRedaction::Apply,
+        );
+        let text = text_of(&result);
+        assert_eq!(result.is_error, Some(true));
+        assert!(!text.contains("FAKEhash"), "got {text}");
+        assert!(!text.contains("FAKEcomm4"), "got {text}");
+    }
+
+    /// Same regression as above, for the detail text carried through
+    /// `tool_error_with_untrusted_detail`: a password inside the untrusted
+    /// tag must be redacted, not merely tagged.
+    #[test]
+    fn tool_error_with_untrusted_detail_redacts_the_device_text() {
+        let result = tool_error_with_untrusted_detail(
+            "stage failed",
+            Untrusted::new("error: password FAKEpw5 rejected"),
+            "dev",
+        );
+        let text = text_of(&result);
+        assert_eq!(result.is_error, Some(true));
+        assert!(!text.contains("FAKEpw5"), "got {text}");
+        assert!(text.contains("<untrusted-device-content id=\""));
     }
 
     /// The whole point of this crate change: a handler that builds its
