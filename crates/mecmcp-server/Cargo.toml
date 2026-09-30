@@ -28,6 +28,7 @@ rmcp        = { version = "3", default-features = false }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 thiserror   = { workspace = true }
+tracing     = { workspace = true }
 
 [dev-dependencies]
 mecmcp-audit = { version = "0.24.1", path = "../mecmcp-audit", features = ["test-util"] }
