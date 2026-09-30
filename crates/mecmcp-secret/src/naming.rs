@@ -22,9 +22,12 @@
 //! now on. It takes a `short_name`, not a crate name: the short name is not a
 //! mechanical strip of the crate name (`rust-junosmcp` folds to `jmcp`, not
 //! `junosmcp`), so this module does not attempt to derive it automatically.
-//! [`known`] is the fixed table for the six servers that exist today. A
-//! seventh server picks its own short name by the same rule described there,
-//! adds a constant to that table, and calls `ServerNaming::derive` with it --
+//! [`known`] is the fixed table for the six servers this module covers today
+//! -- `rustfortimcp` and `rustopnsmcp` also exist in the workspace but are
+//! not yet in this table; adding them is the same one-constant step as any
+//! other new server, not a separate mechanism. A server not yet in `known`
+//! picks its own short name by the same rule described there, adds a
+//! constant to that table, and calls `ServerNaming::derive` with it --
 //! nothing else in this module changes.
 
 use std::path::PathBuf;
@@ -82,7 +85,9 @@ impl ServerNaming {
     }
 }
 
-/// The short name for each of the six mechub MCP servers that exist today.
+/// The short name for each of the six mechub MCP servers this table covers
+/// today. `rustfortimcp` and `rustopnsmcp` also exist in the workspace but
+/// have not yet been assigned a short name here.
 ///
 /// None of these are a mechanical transform of the crate or repo name --
 /// they are the vendor token an operator would actually type, chosen once

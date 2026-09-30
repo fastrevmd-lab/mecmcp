@@ -204,9 +204,21 @@ fn owner_allowed(role: CredentialFileRole, owner: u32, euid: u32) -> bool {
 /// Open with `O_NOFOLLOW`, `fstat`, and check type/owner/mode against `role`
 /// -- everything [`crate::read_hardened_file`] checks except size and
 /// content, since a validation pass has no reason to read the file into
-/// memory. TOCTOU-safe for the same reason: the fd that is stat'd is the fd
-/// that would be opened for the real read, immediately dropped afterward
-/// without ever reading from it.
+/// memory. This fd is dropped immediately afterward without ever reading
+/// from it; the real loader opens its own fd later. That makes this a
+/// point-in-time check, not a TOCTOU-safe guarantee for the later read --
+/// a caller must still use [`crate::read_hardened_file`] to load the file,
+/// not a plain `std::fs::read` on the strength of a passing validate call.
+///
+/// The mode this checks (`mode & !required_mode`, i.e. any bit outside the
+/// role's mask) is stricter than [`crate::read_hardened_file`]'s own check
+/// (`mode & 0o077`, i.e. only group/other bits): a `0700` [`Secret`] file
+/// fails this check but still loads. The two happen to agree for every mode
+/// this codebase currently sets, but they are not the same rule -- treat
+/// this as the stricter, advisory pass and `read_hardened_file` as the one
+/// that gates the actual read.
+///
+/// [`Secret`]: CredentialFileRole::Secret
 fn check_mode(path: &Path, role: CredentialFileRole) -> Result<(), SecretError> {
     use rustix::fs::{FileType, Mode, OFlags, fstat, open};
     use rustix::io::Errno;
