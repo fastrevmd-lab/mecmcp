@@ -330,6 +330,20 @@ pub fn validate_state_with_key(
                 )));
             }
 
+            // A genuine approval digest can only be produced by a caller who
+            // supplies an owner and an approver; if they were ever the same
+            // principal, the digest still verifies cleanly (it was computed
+            // faithfully over the record's own fields), so the digest check
+            // below cannot be the thing that catches a self-approval. Reject
+            // the shape outright before verifying it as evidence of nothing.
+            if let Some(approver) = &approval.approver
+                && approver == &record.owner
+            {
+                return Err(PersistenceError::new(
+                    "changeset state approval record has the same principal as owner and approver",
+                ));
+            }
+
             let expected_approval_digest = if let Some(approver) = &approval.approver {
                 if version >= 4 {
                     // Which rule applies is carried by the record, not the file.
@@ -497,6 +511,17 @@ pub fn validate_state_with_key(
         // We accept these records without approval digest validation, but a future
         // operator examining the state file can distinguish them from tamper-evident
         // approvals by the presence/absence of the `approval` field.
+
+        // Same self-approval rejection as above, for a record whose approver
+        // lives only in the legacy top-level field (no `approval` record at
+        // all, so the check above never ran).
+        if let Some(approver) = record.approver.as_ref()
+            && approver == &record.owner
+        {
+            return Err(PersistenceError::new(
+                "changeset state has the same principal as owner and approver",
+            ));
+        }
     }
 
     Ok(())

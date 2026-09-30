@@ -50,6 +50,14 @@ pub mod tests {
         AuthState, PreflightState, bearer_auth_middleware, bearer_preflight_middleware,
     };
 }
+// Internal function exported only for `fuzz/` (MEC-790): the crate's own
+// unit tests reach `resolve_rate_limit_ip` as a `super::` sibling, but the
+// out-of-workspace fuzz crate can only reach it through a public path. Not
+// part of the crate's real API -- same rationale as `tests` above.
+#[doc(hidden)]
+pub mod fuzz {
+    pub use crate::rate_limit::resolve_rate_limit_ip;
+}
 pub use caller::AuthenticatedToken;
 #[allow(deprecated)]
 pub use concurrency::{

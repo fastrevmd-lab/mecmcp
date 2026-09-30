@@ -7,5 +7,6 @@ build_info = true
 skip_build_env = "SVC_SKIP_BUILD"
 units = ["packaging/systemd/svc.service"]
 must_survive_override = ["--tokens-file"]
+audit_entrypoint = false
 [placeholders]
 "@BIND_ADDRESS@" = "127.0.0.1:30031"

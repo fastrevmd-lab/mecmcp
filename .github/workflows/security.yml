@@ -5,6 +5,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly, independent of any push: catches a CVE disclosed against a
+    # dependency already sitting in Cargo.lock, which a push-only trigger
+    # would never re-check once merged.
+    - cron: '17 4 * * 1'
 
 permissions:
   contents: read
@@ -70,6 +75,42 @@ jobs:
       - name: cargo-deny (advisories + licenses + bans + sources)
         run: cargo deny check advisories licenses bans sources
 
+  trivy-fs:
+    name: trivy (filesystem)
+    # mecmcp ships no container image of its own -- it is a family of
+    # library crates consumed by other repos' images (see the sbom job's
+    # comment below) -- so only the filesystem scanner applies here. Image
+    # scanning belongs to the consumer repos that actually build one, e.g.
+    # rustjunosmcp's security.yml.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Installed from the upstream release binary rather than via
+      # aquasecurity/trivy-action, which runs as a Docker container action
+      # and so pulls aquasec/trivy from Docker Hub at run time -- the same
+      # failure mode documented on the cargo-deny job above. Checksum pinned
+      # against the release's published checksums.txt. Version matches
+      # rustjunosmcp's security.yml for consistency across the org.
+      - name: Install trivy
+        env:
+          TRIVY_VERSION: "0.73.0"
+          TRIVY_SHA256: "2edd39da482bb4e9831962487b68f68e3928ec3137794757f54d00383d79547b"
+        run: |
+          set -euo pipefail
+          curl -sSfL -o trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tar.gz" | sha256sum -c -
+          tar -xzf trivy.tar.gz trivy
+          sudo install -m 0755 trivy /usr/local/bin/trivy
+          rm -f trivy.tar.gz trivy
+      - name: trivy fs (vulnerabilities + secrets)
+        # --secret-config allowlists the one fabricated PEM test fixture in
+        # mecmcp-redact (see trivy-secret.yaml); Trivy does not read
+        # .gitleaksignore.
+        run: trivy fs --scanners vuln,secret --secret-config trivy-secret.yaml --exit-code 1 --severity HIGH,CRITICAL .
+
   sbom:
     name: Generate and validate CycloneDX SBOM
     runs-on: ubuntu-latest
@@ -130,7 +171,7 @@ jobs:
             fi
           done
       - name: Upload SBOMs
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mecmcp-sboms
           path: crates/*/*.cdx.json

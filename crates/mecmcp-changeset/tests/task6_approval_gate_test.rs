@@ -12,7 +12,8 @@
 #![allow(clippy::unwrap_used)]
 
 use mecmcp_changeset::{
-    ChangeSetState, ChangesetCoordinator, OperationLimits,
+    ApprovalRecord, ChangeSetRecord, ChangeSetState, ChangesetCoordinator, OperationLimits,
+    change_set_digest,
     persistence::{read_state, write_state_for_test},
 };
 use std::path::PathBuf;
@@ -475,13 +476,297 @@ async fn test_approval_digest_tamper_detection_swap_approver() {
     // Write the tampered state back
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write tampered state");
 
-    // Attempt to reload — must fail with approval digest mismatch
+    // Attempt to reload — must be refused. The self-approval invariant now
+    // rejects this shape outright, before the digest is even recomputed: a
+    // record with owner == approver is illegal regardless of whether its
+    // digest happens to verify.
     let result = read_state(&state_path, 8 * 1024 * 1024);
     assert!(result.is_err());
     let error_message = result.unwrap_err().to_string();
     assert!(
-        error_message.contains("approval digest mismatch"),
-        "Expected approval digest mismatch, got: {error_message}"
+        error_message.contains("same principal as owner and approver"),
+        "Expected a self-approval rejection, got: {error_message}"
+    );
+}
+
+/// Swapping the approver alone (as above) is caught by the stale digest, which
+/// happens to still name "bob". A tampering party who also re-signs the
+/// digest for the new (owner, owner) pair produces a record that is
+/// internally self-consistent — the digest genuinely verifies what it claims
+/// — and previously reached `apply` unchallenged. `read_state` must refuse it
+/// on the self-approval invariant, not on digest mismatch, because there is
+/// none.
+#[tokio::test]
+async fn test_self_consistent_forged_self_approval_digest_is_still_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state_path = dir.path().join("state.json");
+
+    let limits = OperationLimits {
+        max_operations: 1024,
+        max_change_sets: 1024,
+        max_actions_per_set: 64,
+        max_state_bytes: 8 * 1024 * 1024,
+        max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
+    };
+    let approval_ttl = Duration::from_secs(15 * 60);
+
+    let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false)
+        .expect("coordinator");
+
+    let actions = vec![TestAction {
+        action: "set".to_string(),
+        target: "/test/path".to_string(),
+    }];
+
+    let created = coordinator
+        .create_change_set(
+            "device-a".to_string(),
+            actions,
+            "alice".to_string(),
+            test_fingerprint(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .expect("create");
+
+    let approved = coordinator
+        .approve_change_set(
+            created.change_set_id.clone(),
+            "device-a".to_string(),
+            "bob".to_string(),
+            created.digest.clone(),
+            mecmcp_audit::ActorType::Human,
+        )
+        .await
+        .expect("approve");
+
+    let mut state = read_state(&state_path, 8 * 1024 * 1024).expect("read state");
+    let record = state.change_sets.get_mut(&created.change_set_id).unwrap();
+    if let Some(approval) = &mut record.approval {
+        // Re-sign the digest for a self-approval so it is internally
+        // consistent — this is exactly what `compute_approval_digest_v5`
+        // being a public function lets any caller do.
+        approval.approver = Some("alice".to_string());
+        approval.digest = mecmcp_changeset::digest::compute_approval_digest_v5(
+            &created.change_set_id,
+            &record.digest,
+            record.preview.as_ref().map(|p| p.digest.as_str()),
+            "alice",
+            "alice",
+            approval.approved_at_unix,
+        );
+    }
+    assert_eq!(approved.approver, Some("bob".to_string()));
+
+    write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write forged state");
+
+    let result = read_state(&state_path, 8 * 1024 * 1024);
+    assert!(
+        result.is_err(),
+        "a self-consistent self-approval digest must still be rejected"
+    );
+    let error_message = result.unwrap_err().to_string();
+    assert!(
+        error_message.contains("same principal as owner and approver"),
+        "Expected a self-approval rejection, got: {error_message}"
+    );
+}
+
+/// `approve_change_set` refuses self-approval, but it is not the only public
+/// way to move a change set to `Approved`: `update_change_set_from` writes
+/// any record a caller hands it, gated only by `check_change_set_write`. A
+/// caller that builds an "approved" record directly — never going through
+/// `approve_change_set` at all — must be refused there too, or the owner
+/// check is a property of one call path rather than of the change-set type.
+#[tokio::test]
+async fn test_self_approval_via_direct_update_is_denied() {
+    let (_dir, coordinator) = setup_coordinator();
+
+    let actions = vec![TestAction {
+        action: "set".to_string(),
+        target: "/test/path".to_string(),
+    }];
+
+    let created = coordinator
+        .create_change_set(
+            "device-a".to_string(),
+            actions,
+            "alice".to_string(),
+            test_fingerprint(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .expect("create");
+
+    let mut record = coordinator
+        .change_set(&created.change_set_id, "device-a")
+        .await
+        .expect("read change set");
+    assert_eq!(record.state, ChangeSetState::Planned);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    record.state = ChangeSetState::Approved;
+    record.approver = Some("alice".to_string());
+    record.approval = Some(ApprovalRecord {
+        approver: Some("alice".to_string()),
+        approved_at_unix: now,
+        digest: mecmcp_changeset::digest::compute_approval_digest_v5(
+            &created.change_set_id,
+            &record.digest,
+            record.preview.as_ref().map(|p| p.digest.as_str()),
+            "alice",
+            "alice",
+            now,
+        ),
+        digest_version: 5,
+        waived: None,
+    });
+
+    let result = coordinator
+        .update_change_set_from(ChangeSetState::Planned, record)
+        .await;
+    assert!(
+        result.is_err(),
+        "a self-approved record must not be writable by bypassing approve_change_set"
+    );
+    let error_message = result.unwrap_err().to_string();
+    assert!(
+        error_message.contains("cannot approve their own plan"),
+        "Expected a self-approval rejection, got: {error_message}"
+    );
+
+    // And the change set is still exactly where it was left: Planned.
+    let record = coordinator
+        .change_set(&created.change_set_id, "device-a")
+        .await
+        .expect("read change set");
+    assert_eq!(record.state, ChangeSetState::Planned);
+}
+
+/// A rewritten owner would otherwise let two writes each individually satisfy
+/// "approver != owner" while the same principal both created and approved the
+/// plan: rewrite `owner` to a co-conspirator on one write, then approve as the
+/// original owner on the next. Freezing `owner`, `device` and `digest` at
+/// creation (in `check_change_set_write`) closes this at the write that
+/// attempts the rewrite, before any approval is granted.
+#[tokio::test]
+async fn test_owner_rewrite_is_refused_even_though_neither_write_self_approves() {
+    let (_dir, coordinator) = setup_coordinator();
+
+    let actions = vec![TestAction {
+        action: "set".to_string(),
+        target: "/test/path".to_string(),
+    }];
+
+    let created = coordinator
+        .create_change_set(
+            "device-a".to_string(),
+            actions,
+            "alice".to_string(),
+            test_fingerprint(),
+            "policy-sig".to_string(),
+        )
+        .await
+        .expect("create");
+
+    let mut rewritten = coordinator
+        .change_set(&created.change_set_id, "device-a")
+        .await
+        .expect("read change set");
+    assert_eq!(rewritten.owner, "alice");
+    rewritten.owner = "mallory".to_string();
+
+    let result = coordinator
+        .update_change_set_from(ChangeSetState::Planned, rewritten)
+        .await;
+    assert!(
+        result.is_err(),
+        "a change set's owner must be fixed at creation, not rewritable through \
+         an ordinary update"
+    );
+    let error_message = result.unwrap_err().to_string();
+    assert!(
+        error_message.contains("fixed at creation"),
+        "Expected an owner-frozen rejection, got: {error_message}"
+    );
+
+    // The record is untouched: still owned by alice, still Planned, and she
+    // can still legitimately be refused if she tries to approve her own plan.
+    let record = coordinator
+        .change_set(&created.change_set_id, "device-a")
+        .await
+        .expect("read change set");
+    assert_eq!(record.owner, "alice");
+    assert_eq!(record.state, ChangeSetState::Planned);
+}
+
+/// `insert_change_set` doesn't go through `check_change_set_write`, so a
+/// caller handing it a `Planned` record that already carries a
+/// self-consistent approval (forged, but internally consistent, the way
+/// `test_self_consistent_forged_self_approval_digest_is_still_rejected` shows
+/// is possible) would otherwise be stored unchecked. Invariant 4 blocks it
+/// from ever reaching `Approved`, but a stored record like this fails
+/// `validate_state_with_key` on the next reload — taking every change set in
+/// the file down with it. Creation must refuse it outright.
+#[tokio::test]
+async fn test_insert_refuses_a_record_that_already_carries_approval() {
+    let (_dir, coordinator) = setup_coordinator();
+
+    let owner = "alice";
+    let device = "device-a";
+    let fingerprint = test_fingerprint();
+    let actions = vec![serde_json::json!({"action": "set", "target": "/test/path"})];
+    let digest = change_set_digest(owner, device, &fingerprint, &actions).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let record = ChangeSetRecord {
+        id: "1".repeat(64),
+        device: device.to_owned(),
+        owner: owner.to_owned(),
+        digest: digest.clone(),
+        expected_candidate_fingerprint: fingerprint,
+        actions,
+        state: ChangeSetState::Planned,
+        expires_at_unix: u64::MAX,
+        operation_id: None,
+        approver: Some(owner.to_owned()),
+        approval: Some(ApprovalRecord {
+            approver: Some(owner.to_owned()),
+            approved_at_unix: now,
+            digest: mecmcp_changeset::digest::compute_approval_digest_v5(
+                &"1".repeat(64),
+                &digest,
+                None,
+                owner,
+                owner,
+                now,
+            ),
+            digest_version: 5,
+            waived: None,
+        }),
+        policy_signature: "policy-sig".to_owned(),
+        targets: Vec::new(),
+        preview: None,
+        task_id: None,
+        apply_without_handle: false,
+    };
+
+    let result = coordinator.insert_change_set(record).await;
+    assert!(
+        result.is_err(),
+        "a change set must be created unapproved, not with approval attached"
+    );
+    let error_message = result.unwrap_err().to_string();
+    assert!(
+        error_message.contains("created unapproved"),
+        "Expected an unapproved-at-creation rejection, got: {error_message}"
     );
 }
 

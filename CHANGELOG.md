@@ -29,7 +29,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **docs: close out the filesystem-layout standard across all six vendor
+  servers** (MEC-988, mecmcp#356, follow-on to #28 and #6).
+  `docs/FILESYSTEM-LAYOUT.md` was missing `rustmistmcp` entirely and still
+  carried `rustsdcmcp` as an open "verify and document" TODO. A 2026-09-07
+  rebuild of all twelve MCP test rigs hit the exact `tokens.json`
+  config-vs-state divergence this document exists to prevent, twice
+  (`rustproxmoxmcp` restarted against a path the file wasn't at;
+  `rustmistmcp`'s token store had moved out from under a restored drop-in).
+  Verified against the code in all six repos rather than assumed:
+  `rustjunosmcp`, `rustsdcmcp`, `rustproxmoxmcp`, and `rustmistmcp` resolve
+  their configured token path against their own canonical `/var/lib/<svc>`
+  location with a byte-exact comparison, fall back to the legacy `/etc`
+  path only when that exact canonical path was configured, and fail
+  startup outright for any other missing path — no silent fallback for a
+  typo or a deliberately different store. `rustpanosmcp` has no such
+  resolver: it loads whatever path is configured and only warns (never
+  reads) if an un-migrated legacy store exists elsewhere. `rustunifimcp`
+  shipped `/var/lib`-only from its first release and never had an `/etc`
+  token store to migrate away from. No mutable credential or state file
+  remains under `/etc/<svc>` on any of the six. `rustproxmoxmcp` and
+  `rustunifimcp` also use an abbreviated directory/service-user base
+  (`proxmoxmcp`, `unifimcp`) rather than the full binary name — a documented
+  naming exception, not a compliance gap. Two residual follow-ups, not
+  fixed here: `rustunifimcp` has no dedicated regression test pinning its
+  already-loud failure on a missing token file, and `rustpanosmcp` could
+  adopt the shared `resolve_tokens_with` resolver the other four share.
+
 ### Added
+
+- **mecmcp-secret: shared naming derivation and single-pass credential-file
+  validation** (MEC-987). Two additions that give the six mechub MCP servers
+  a common source of truth instead of six independent decisions:
+  - `naming::ServerNaming::derive` computes `/etc/<short_name>`,
+    `/var/lib/<short_name>`, and the service-user string from one short name,
+    with `naming::known` fixing the short name for each of the six servers
+    today (`jmcp`, `panosmcp`, `sdcmcp`, `proxmoxmcp`, `mistmcp`,
+    `unifimcp`) and documenting the rule a seventh server follows.
+  - `validate::validate_credential_files` checks every credential-adjacent
+    file a server cares about in one pass and returns every offender
+    together, instead of the existing single-file loaders' fail-on-first
+    behaviour. The required mode per file is data
+    (`validate::CredentialFileRole::required_mode`) the loader owns, not a
+    constant duplicated in each repo's setup docs -- `Secret` requires
+    `0600`, `ConfigNoSecret` (files that are operator-authored and hold no
+    secret material, like `rustsdcmcp`'s `sdc.json`) requires `0640`.
+  Consuming servers are unaffected until they opt in: nothing existing
+  changed, resolve_token_path's `/etc` fallback still governs the
+  tokens.json migration path per server.
 
 - **mecmcp-audit: optional OpenTelemetry trace export, and a generic
   HTTPS/JSON forward sink for closed evidence segments** (MEC-459). Two
@@ -92,6 +141,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry point for a tool handler's error path, and `mecmcp-changeset`'s
   device-transaction error formatting (`apply.rs`) is migrated as the
   reference example.
+
+### Changed
+
+- **BREAKING — mecmcp-server: `tool_result` takes an `OutputRedaction`
+  argument and redacts every successful value by default** (MEC-1020,
+  closes mechubsec/mecmcp#398). Previously this crate only re-exported
+  `Untrusted`, and a handler had to remember to call `mecmcp-redact` on its
+  own output; a new tool that forgot shipped an unredacted value. `tool_result`
+  now redacts `Ok` values unconditionally unless the caller passes
+  `OutputRedaction::SkipForInternalRead { tool, reason }`, a per-call opt-out
+  (there is no `Default` impl and no process-wide flag) that emits a
+  `target: "audit"` `WARN` naming the tool and reason, for data that never
+  touched a device (e.g. this process's own audit log). `tool_error` and
+  `tool_error_with_untrusted_detail` redact their text unconditionally too,
+  with no opt-out — a device error routinely echoes the config line that
+  triggered it, so the error path needs the same default as the success
+  path. Every existing call site in this crate passes `OutputRedaction::Apply`
+  or `Apply`-equivalent behaviour; the six vendor server repos that already
+  call `mecmcp-redact` on their own paths will need their own follow-up to
+  adopt the new argument next time they bump this crate.
+  **Also note:** `ResultFormat::PrettyJson` now serializes through
+  `serde_json::Value` on its way to the redactor, so struct field order in
+  the rendered JSON is alphabetical rather than declaration order; any
+  golden fixture that asserts exact JSON text will need updating.
+
+- **BREAKING — http/openapi: request paths are typed; the raw-URL
+  constructor is feature-gated** (MEC-510). `mecmcp-openapi::expand_path` now
+  returns `ExpandedPath` instead of `String` — a type with no public
+  constructor other than a successful expansion, so `let s: String =
+  expand_path(..)?` no longer compiles (use `.as_str()` or `.to_string()`).
+  `mecmcp-http` gains `HttpRequest::with_base_and_path(method, base,
+  &ExpandedPath)`, which joins the path onto an operator-configured base and
+  rejects a base that carries its own path, query, or fragment (put a prefix
+  such as `/api2/json` in the template instead). `HttpRequest::new(method,
+  &str)` is renamed `HttpRequest::from_absolute_url` and is only available
+  behind the non-default `absolute-url` feature, for full URLs that are not
+  path-templated (OIDC discovery/JWKS); `mecmcp-oidc` enables it. Vendor
+  servers should migrate REST calls to `with_base_and_path` and should not
+  enable `absolute-url`.
+
+### Security
+
+- **mecmcp-server: a tool's error path could leak a device secret that a
+  new tool's success path was already protected against** (MEC-1020, part
+  of mechubsec/mecmcp#398's review). Before this change, `tool_error` and
+  `tool_error_with_untrusted_detail` passed their text through unredacted,
+  so a Junos commit-check failure or a PAN-OS API error body that quoted
+  the offending config line (a pre-shared key, an SNMP community string)
+  reached the model verbatim, even though the same value in a success
+  result was already redacted by the `Changed` entry above. Both functions
+  now redact unconditionally.
+
+- **mecmcp-server: `tool_error_with_untrusted_detail` could drop its own
+  closing trust-boundary tag** (MEC-1020, review follow-up on
+  mechubsec/mecmcp#458). The function redacted `detail`, rendered it inside
+  `<untrusted-device-content>` markup, then passed the whole tagged string
+  through `tool_error`, which redacted it a second time. `redact_text`'s PEM
+  handling drops every line after an unterminated `-----BEGIN ... -----`
+  header, so device text containing one consumed everything after it,
+  including the closing tag, on the second pass. No secret leaked -- this
+  failed safe on data -- but a client or model that trusts the tag boundary
+  would read an untagged block as unbounded. Each piece is now redacted
+  exactly once before the tag is built.
+
+- **mecmcp-redact: `redact_text` could still drop a closing trust-boundary
+  tag on a real production path** (MEC-1020, review follow-up on
+  mechubsec/mecmcp#458, R2). Fixing the previous entry moved the redundant
+  redaction pass out of `mecmcp-server`, but `mecmcp-changeset` already tags
+  a device error with `Untrusted::render_tagged` *before* the error reaches
+  `tool_error` (`CoordinatorError`'s message carries the tag), so
+  `tool_error`'s single, now-necessary pass over that string still ran into
+  the same unterminated-`BEGIN` case. `text::redact` now recognizes a
+  `</untrusted-device-content id="...">` closing tag as ending an open PEM
+  block even without a matching `END` line -- the tag's body is escaped by
+  `render_tagged`, so a line in this exact shape can only be the wrapper's
+  own closing tag, never forged device text. No secret leaked; this closes
+  the same fail-safe gap for the call sites that tag before returning an
+  error.
 
 ## [0.24.1] - 2026-09-28
 
@@ -156,6 +283,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/METRICS.md` for the Prometheus scrape config migration, including the
   reverse-proxy caveat.
 - **mecmcp-changeset:** `ChangesetCoordinator::approve_change_set` now takes an `approver_actor_type: mecmcp_audit::ActorType` argument and refuses the approval unless it is `Human`. House rule: deterministic code decides, a human approves — an agent or an unattributed caller (`Agent` or `Unknown`, which is what a stdio session with no caller context carries) could always be blocked from *proposing* a change set's own approval by the pre-existing owner check, but nothing stopped it from standing in as the *second* principal. This is a breaking change for every caller of `approve_change_set`.
+- **DOCKER-STANDARD template examples now use mechubsec image names** —
+  updated from `ghcr.io/fastrevmd-lab/<binary>` to `ghcr.io/mechubsec/<reponame>`
+  to match the org migration.
+
+### Changed
+
 - **Raised MSRV to 1.89** and removed the `aes` pin from the CI msrv job that PR #344 added. All six consumer repos are moving to 1.89 in parallel PRs, so the objection that blocked raising the floor in #344 no longer stands.
 - **`mecmcp-transport`: `test_client` and `test_harness` moved behind a `test-util` feature** (mecmcp#387). Neither is part of the crate's default public API anymore, and the `ureq` dependency they pulled in is no longer part of the normal (non-`test-util`) dependency graph. **Breaking change** for any consumer that used them: add `features = ["test-util"]` to the `mecmcp-transport` dev-dependency entry.
 - **`mecmcp-http`: a configured private CA now replaces the public root store instead of adding to it** (mecmcp#387). `extra_root_certificates`, when non-empty, is passed through `tls_certs_only` rather than `tls_certs_merge`/`add_root_certificate`, matching "private CA means private CA only." **Behaviour change** for any deployment that relied on the previous additive semantics (a private CA trusted *alongside* the public roots): to keep public trust, configure no `extra_root_certificates`.
