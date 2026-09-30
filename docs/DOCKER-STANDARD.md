@@ -49,6 +49,14 @@ The error itself should also name the cause: "journald socket unavailable — `-
 
 rust-junosmcp's `.dockerignore` excludes `target` but not `.claude/`, so agent worktrees under `.claude/worktrees/*/target/` are sent to the build context — tens of gigabytes, enough to make the build impractical. Every repo should exclude `.claude/` and any nested `target/`, and CI should assert the context size stays under a sane bound.
 
+### 5. Unkeyed audit by default (#376 / MEC-978)
+
+Every server's systemd unit runs keyed, redacted audit (`--audit-hmac-key-file` plus `--audit-redact`), and `packaging/lxc/install.sh` generates the key on first install if it is absent. Five of the six container images set neither flag at all, so the same binary run as a container emits unkeyed, unredacted audit by default — same binary, same version, two audit postures depending on how it was deployed.
+
+The fix is `packaging/docker/audit-entrypoint.sh.tmpl` in the `mecmcp` repo: an `ENTRYPOINT` (exec form) that generates the key from `/dev/urandom` on first run if it is not already there, then always `exec`s the real binary with both flags plus `"$@"` — mirroring what the installer already does, so a container gets the same audit posture as an LXC install without an operator having to remember a flag. Put the key under the **state** volume, not config: the canonical compose example below mounts config `:ro`, so a key path under `/etc/<svc>` could never be generated on a fresh container.
+
+`packaging/conformance`'s R7 rule (see that directory's README) statically checks the entrypoint script for exactly this shape — the flag, the generation step, and a final `exec ... "$@"` — once a repo declares `audit_entrypoint` in its `packaging/conformance.toml`. Until it does, R7 warns rather than fails, so this is a WARN in CI until each repo migrates, not yet a merge-blocker.
+
 ## Standard
 
 ### Docker README section structure
@@ -106,6 +114,8 @@ docker run --rm -i \
 ```
 
 **Note:** `--audit-format json` (not `--audit-journald`) is the correct configuration in Docker. There is no journald socket in a container, so `--audit-journald` fails with `No such file or directory`. JSON format emits audit events to stdout for the container runtime to collect.
+
+**Note:** the image's `ENTRYPOINT` also generates `/var/lib/<binary>/audit-hmac.key` on first run if it is not already in the `state` mount, and always runs the binary with `--audit-hmac-key-file` and `--audit-redact` — see [#376 / MEC-978](#5-unkeyed-audit-by-default-376--mec-978). Nothing above needs to change for this; it happens inside the container using the `state` volume already mounted.
 
 ### TLS
 
@@ -367,6 +377,7 @@ the bind-mounted directory is owned by the container's uid (65532):
 - [ ] README has a complete Docker section with all elements above
 - [ ] Ownership requirements (`chown -R 65532:65532`) documented adjacent to the `docker run` command that needs them
 - [ ] `--audit-format json` (not `--audit-journald`) is the documented audit config
+- [ ] Container `ENTRYPOINT` generates the audit HMAC key under the state volume if absent and always passes `--audit-hmac-key-file`/`--audit-redact` (#376 / MEC-978); `packaging/conformance.toml` declares `audit_entrypoint` so R7 checks it
 - [ ] `--allowed-origin` documented for browser-based clients (if applicable)
 - [ ] `compose.example.yaml` includes `read_only: true`, `cap_drop: ALL`, explicit writable mounts
 - [ ] `.dockerignore` excludes `.claude/`, `.worktrees/`, nested `target/`

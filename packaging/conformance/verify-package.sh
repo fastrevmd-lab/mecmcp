@@ -52,6 +52,47 @@ elif [[ ! -x "$binary_path" ]]; then
   fail R2 "binary is not executable ($(stat -c '%a' "$binary_path")): $CONF_BINARY"
 fi
 
+# R7: every container image must run keyed, redacted audit by default, the
+# same way packaging/lxc/install.sh already generates audit-hmac.key when
+# absent (see docs/FILESYSTEM-LAYOUT.md). Five of six repos' Dockerfiles
+# currently omit --audit-hmac-key-file entirely (#376), so a repo that has
+# not migrated yet says so explicitly via `audit_entrypoint = false`, which
+# WARNs rather than fails -- promoted to fatal in each repo once its image
+# ships a real entrypoint, the same rollout R4 used for its own dropin gap.
+if [[ -z "$CONF_AUDIT_ENTRYPOINT" ]]; then
+  warn R7 "audit_entrypoint not set; this repo's container image ships unkeyed, unredacted audit unless the operator supplies --audit-hmac-key-file by hand (see #376)"
+else
+  entrypoint_path="$STAGING/$CONF_AUDIT_ENTRYPOINT"
+  if [[ ! -f "$entrypoint_path" ]]; then
+    fail R7 "audit_entrypoint not found at declared path: $CONF_AUDIT_ENTRYPOINT"
+  elif [[ ! -x "$entrypoint_path" ]]; then
+    fail R7 "audit_entrypoint is not executable ($(stat -c '%a' "$entrypoint_path")): $CONF_AUDIT_ENTRYPOINT"
+  else
+    entrypoint_body="$(grep -vE '^[[:space:]]*#' "$entrypoint_path")"
+    if ! grep -Fq -- "--audit-hmac-key-file" <<<"$entrypoint_body"; then
+      fail R7 "$CONF_AUDIT_ENTRYPOINT never passes --audit-hmac-key-file to the binary; a container built from it ships unkeyed audit"
+    fi
+    if ! grep -Fq -- "/dev/urandom" <<<"$entrypoint_body"; then
+      fail R7 "$CONF_AUDIT_ENTRYPOINT never generates the HMAC key when it is absent (no /dev/urandom read); an operator who forgets to premount one gets HmacKeyUnreadable at startup instead of a keyed default"
+    fi
+    # The flag must reach the REAL binary via exec, not a wrapper that stays
+    # PID 1 (signals would go to the shell, not the process) or that drops
+    # the caller's own arguments -- the CMD-vs-ENTRYPOINT lesson from
+    # rustmistmcp#78 applies just as much inside a shim as it does in a
+    # Dockerfile. Backslash-continued lines are joined first, so a
+    # multi-line `exec foo \` ... `"$@"` invocation -- the natural shape once
+    # --audit-hmac-key-file and --audit-redact are both spelled out -- is
+    # judged as the one logical statement it is, not by its last physical line.
+    joined_body="$(sed -e :a -e '/\\$/N; s/\\\n[[:space:]]*//; ta' <<<"$entrypoint_body")"
+    last_line="$(grep -vE '^[[:space:]]*$' <<<"$joined_body" | tail -1)"
+    if [[ "$last_line" != exec\ * ]]; then
+      fail R7 "$CONF_AUDIT_ENTRYPOINT's last statement is not 'exec ...'; without exec the real binary is not PID 1 and does not receive signals directly"
+    elif [[ "$last_line" != *'"$@"'* ]]; then
+      fail R7 "$CONF_AUDIT_ENTRYPOINT's exec line does not forward \"\$@\"; an operator override (rustmistmcp#78's --host) would be silently dropped"
+    fi
+  fi
+fi
+
 # R3: provenance is mandatory as a destination. build_info records whether
 # this repo has reached it, not whether it is exempt -- the rule reports
 # either way. All three clauses apply wherever it is fatal, because a
