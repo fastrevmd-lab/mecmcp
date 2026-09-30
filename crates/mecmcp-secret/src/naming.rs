@@ -1,22 +1,23 @@
 //! Canonical config/state/service-user layout, derived once per server.
 //!
 //! Each mechub MCP server used to pick its own directory and service-user
-//! names independently. Three of the six already match this module's rule on
-//! disk today -- `rustjunosmcp` (`jmcp`), `rustproxmoxmcp` (`proxmoxmcp`) and
-//! `rustunifimcp` (`unifimcp`). The other three still diverge and have not
-//! yet been migrated: `rustpanosmcp` (`rust-panosmcp`) and `rustmistmcp`
-//! (`rustmistmcp`) carry their full crate name into `/etc` and `/var/lib`,
-//! and `rustsdcmcp` is deployed as `rustsdcmcp` (sysusers entry, `User=` in
-//! its unit, `/etc/rustsdcmcp`, `/var/lib/rustsdcmcp`), not the `sdcmcp`
-//! short name this module assigns it. Wiring `ServerNaming::derive` into any
-//! of these three requires migrating that server's on-disk paths and service
-//! user in the same change, not just calling this function -- otherwise the
-//! server looks for files at a path nothing has ever written to. That
-//! migration is follow-up work, tracked and coordinated with Gareth's deploy
-//! process; this module only fixes the divergence going forward. Getting the
-//! deployed state wrong here is exactly the kind of thing that costs a
-//! rebuild two restarts when an operator assumes the sixth server follows
-//! the same rule as the first five (MEC-987).
+//! names independently. `rustjunosmcp` (`jmcp`), `rustproxmoxmcp`
+//! (`proxmoxmcp`) and `rustunifimcp` (`unifimcp`) already used a short,
+//! derived name. The other three -- `rustpanosmcp`, `rustsdcmcp` and
+//! `rustmistmcp` -- carry their full crate/repo name into `/etc`,
+//! `/var/lib` and the service user in production today. Renaming a live
+//! service's config dir, state dir *and* system user (systemd unit edits,
+//! sysusers edits, re-chowning directories that hold secrets, coordinated
+//! across every deployed LXC) is a bigger, messier operation than the
+//! tokens.json config/state split this module's sibling ([`crate::validate`])
+//! exists to fix, for a cosmetic naming-consistency win with no
+//! operator-facing benefit. Kay's decision (MEC-987, 2026-09-30): **do not
+//! rename production.** Those three keep their currently-deployed names.
+//! [`known`] therefore encodes `PANOS`, `SDC` and `MIST` as explicit,
+//! hand-verified exceptions matching deployed reality, not derivations --
+//! the same pattern already used for `JUNOS`'s `jmcp` contraction, just
+//! three entries instead of one. No path migration, fallback-path logic, or
+//! deploy coordination is needed for these three: nothing on disk changes.
 //!
 //! [`ServerNaming::derive`] is the single place this triple is computed from
 //! now on. It takes a `short_name`, not a crate name: the short name is not a
@@ -89,23 +90,24 @@ impl ServerNaming {
 /// today. `rustfortimcp` and `rustopnsmcp` also exist in the workspace but
 /// have not yet been assigned a short name here.
 ///
-/// None of these are a mechanical transform of the crate or repo name --
-/// they are the vendor token an operator would actually type, chosen once
-/// and fixed here so it cannot drift between packaging, docs, and code. The
-/// `Deployed today` column is the on-disk reality as of this writing, not
-/// this table's target -- `panosmcp`, `sdcmcp` and `mistmcp` are not yet
-/// deployed under their short name and need a migration (tracked as
-/// MEC-987 follow-up) before any server calls `ServerNaming::derive` with
-/// that constant:
+/// Each short name is either derived from the crate name, or an explicit,
+/// documented exception matching the server's actual production deployment.
+/// `JUNOS`, `PROXMOX` and `UNIFI` are derivations -- the vendor token an
+/// operator would actually type, chosen once and fixed here so it cannot
+/// drift between packaging, docs, and code. `PANOS`, `SDC` and `MIST` are
+/// hand-verified exceptions: Kay decided (MEC-987, 2026-09-30) not to rename
+/// those three services in production, so their constant is the name
+/// already deployed everywhere (sysusers entry, unit `User=`, `/etc`,
+/// `/var/lib`), not a derivation:
 ///
-/// | Repo               | Crate            | Short name   | Deployed today  |
-/// |---------------------|-------------------|--------------|-----------------|
-/// | `rustjunosmcp`      | `rust-junosmcp`   | `jmcp`       | `jmcp`          |
-/// | `rustpanosmcp`      | `rust-panosmcp`   | `panosmcp`   | `rust-panosmcp` |
-/// | `rustsdcmcp`        | `rustsdcmcp`      | `sdcmcp`     | `rustsdcmcp`    |
-/// | `rustproxmoxmcp`    | `rust-proxmoxmcp` | `proxmoxmcp` | `proxmoxmcp`    |
-/// | `rustmistmcp`       | `rustmistmcp`     | `mistmcp`    | `rustmistmcp`   |
-/// | `rustunifimcp`      | `rustunifimcp`    | `unifimcp`   | `unifimcp`      |
+/// | Repo               | Crate            | Short name (`known`) | Derived or exception        |
+/// |---------------------|-------------------|-----------------------|------------------------------|
+/// | `rustjunosmcp`      | `rust-junosmcp`   | `jmcp`                | derived                      |
+/// | `rustpanosmcp`      | `rust-panosmcp`   | `rust-panosmcp`       | exception -- matches deployed |
+/// | `rustsdcmcp`        | `rustsdcmcp`      | `rustsdcmcp`          | exception -- matches deployed |
+/// | `rustproxmoxmcp`    | `rust-proxmoxmcp` | `proxmoxmcp`          | derived                      |
+/// | `rustmistmcp`       | `rustmistmcp`     | `rustmistmcp`         | exception -- matches deployed |
+/// | `rustunifimcp`      | `rustunifimcp`    | `unifimcp`            | derived                      |
 ///
 /// A seventh server adds one constant here, following the same rule: drop
 /// the `rust`/`rust-`/`mecmcp` scaffolding, keep the shortest vendor token
@@ -114,19 +116,27 @@ impl ServerNaming {
 /// established in production before this table existed; a new vendor should
 /// not assume the same additional contraction applies to it -- keep the
 /// full vendor token unless there is already a production deployment using
-/// something shorter).
+/// something shorter), *unless* the server is already deployed under a
+/// different name, in which case the constant matches deployment as a
+/// documented exception, the same as `PANOS`, `SDC` and `MIST` here.
 pub mod known {
-    /// `rustjunosmcp` / `rust-junosmcp`.
+    /// `rustjunosmcp` / `rust-junosmcp`. Derived.
     pub const JUNOS: &str = "jmcp";
-    /// `rustpanosmcp` / `rust-panosmcp`.
-    pub const PANOS: &str = "panosmcp";
-    /// `rustsdcmcp`.
-    pub const SDC: &str = "sdcmcp";
-    /// `rustproxmoxmcp` / `rust-proxmoxmcp`.
+    /// `rustpanosmcp` / `rust-panosmcp`. Hand-verified exception: deployed
+    /// everywhere as `rust-panosmcp`, not a derived short name. Do not
+    /// change this without a coordinated on-disk migration.
+    pub const PANOS: &str = "rust-panosmcp";
+    /// `rustsdcmcp`. Hand-verified exception: deployed everywhere as
+    /// `rustsdcmcp`, not a derived short name. Do not change this without a
+    /// coordinated on-disk migration.
+    pub const SDC: &str = "rustsdcmcp";
+    /// `rustproxmoxmcp` / `rust-proxmoxmcp`. Derived.
     pub const PROXMOX: &str = "proxmoxmcp";
-    /// `rustmistmcp`.
-    pub const MIST: &str = "mistmcp";
-    /// `rustunifimcp`.
+    /// `rustmistmcp`. Hand-verified exception: deployed everywhere as
+    /// `rustmistmcp`, not a derived short name. Do not change this without a
+    /// coordinated on-disk migration.
+    pub const MIST: &str = "rustmistmcp";
+    /// `rustunifimcp`. Derived.
     pub const UNIFI: &str = "unifimcp";
 }
 
@@ -178,10 +188,31 @@ mod tests {
     #[test]
     fn known_table_matches_documented_values() {
         assert_eq!(known::JUNOS, "jmcp");
-        assert_eq!(known::PANOS, "panosmcp");
-        assert_eq!(known::SDC, "sdcmcp");
+        assert_eq!(known::PANOS, "rust-panosmcp");
+        assert_eq!(known::SDC, "rustsdcmcp");
         assert_eq!(known::PROXMOX, "proxmoxmcp");
-        assert_eq!(known::MIST, "mistmcp");
+        assert_eq!(known::MIST, "rustmistmcp");
         assert_eq!(known::UNIFI, "unifimcp");
+    }
+
+    #[test]
+    fn panos_sdc_mist_derive_to_their_deployed_paths() {
+        // Regression guard for MEC-987: Kay's decision was not to rename
+        // production, so these three must resolve to the paths and service
+        // user actually deployed today, not a shortened derivation.
+        let panos = ServerNaming::derive(known::PANOS);
+        assert_eq!(panos.config_dir, PathBuf::from("/etc/rust-panosmcp"));
+        assert_eq!(panos.state_dir, PathBuf::from("/var/lib/rust-panosmcp"));
+        assert_eq!(panos.service_user, "rust-panosmcp");
+
+        let sdc = ServerNaming::derive(known::SDC);
+        assert_eq!(sdc.config_dir, PathBuf::from("/etc/rustsdcmcp"));
+        assert_eq!(sdc.state_dir, PathBuf::from("/var/lib/rustsdcmcp"));
+        assert_eq!(sdc.service_user, "rustsdcmcp");
+
+        let mist = ServerNaming::derive(known::MIST);
+        assert_eq!(mist.config_dir, PathBuf::from("/etc/rustmistmcp"));
+        assert_eq!(mist.state_dir, PathBuf::from("/var/lib/rustmistmcp"));
+        assert_eq!(mist.service_user, "rustmistmcp");
     }
 }
