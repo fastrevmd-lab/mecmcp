@@ -81,7 +81,7 @@ git config gpg.ssh.allowedSignersFile ~/.config/mecmcp/allowed_signers
 git verify-tag v0.25.0
 ```
 
-Cross-check the key you copied against an out-of-band source before relying on it — for example [`https://github.com/fastrevmd-lab.keys`](https://github.com/fastrevmd-lab.keys) or the fingerprint below, not just `origin/main` from the same clone you're verifying:
+Cross-check the key you copied against an out-of-band source before relying on it — for example the maintainer's SSH **signing** keys, listed at [`https://api.github.com/users/fastrevmd-lab/ssh_signing_keys`](https://api.github.com/users/fastrevmd-lab/ssh_signing_keys), or the fingerprint below, not just `origin/main` from the same clone you're verifying. Note that `github.com/<user>.keys` lists SSH **authentication** keys only and will not contain this key — GitHub keeps the two lists separate.
 
 ```
 fastrevmd@gmail.com: SHA256:3K9tuitFu3aA2MX/640tBnrsVupfMJ7eT/w5pH6SbVQ (ed25519)
