@@ -257,6 +257,19 @@ impl ChangesetCoordinator {
                     "approval record must contain either an approver or a waiver",
                 ));
             }
+            // Defense in depth: `check_change_set_write` refuses to persist a
+            // self-approved record, but this is the function that actually
+            // executes against the device, so it does not trust that every
+            // record in the store necessarily passed through that gate (a
+            // state file older than that check, for instance).
+            if let Some(approver) = approval.approver.as_ref()
+                && *approver == change_set.owner
+            {
+                return Err(CoordinatorError::new(
+                    "change_set_id",
+                    "change set was approved by its own owner; refusing to apply",
+                ));
+            }
             // A waiver digest is unkeyed (compute_waiver_digest_v3 needs no
             // key), so it verifies on its own hash regardless of whether this
             // deployment currently runs in lab mode. Someone with write access
@@ -279,6 +292,14 @@ impl ChangesetCoordinator {
                 return Err(CoordinatorError::new(
                     "change_set_id",
                     "approved change set missing approval record",
+                ));
+            }
+            if let Some(approver) = change_set.approver.as_ref()
+                && *approver == change_set.owner
+            {
+                return Err(CoordinatorError::new(
+                    "change_set_id",
+                    "change set was approved by its own owner; refusing to apply",
                 ));
             }
         }
