@@ -1,6 +1,6 @@
 //! Vendor-neutral helpers every MCP tool handler in this family needs.
 //!
-//! Two concerns, deliberately kept apart:
+//! Three concerns, deliberately kept apart:
 //!
 //! - **Rendering a result** — [`tool_result`], [`tool_error`], [`bounded_text`].
 //!   A handler's return value is caller-visible and vendor-sized, so it is
@@ -9,6 +9,10 @@
 //!   [`mod@authorize`]. Note the rule stated there: a `None` caller is the
 //!   stdio path and is authorized, so a handler must pass the caller it
 //!   recovered rather than `None` on a lookup miss.
+//! - **Shaping a device response** — [`xml_to_json`] turns device XML into a
+//!   [`serde_json::Value`] tree instead of a string a model has to re-parse
+//!   out of its own escaping. It runs after redaction, not instead of it —
+//!   see its module docs.
 //!
 //! Nothing here knows a vendor's names, paths, headers, models, or statuses.
 //! That is the whole point: three servers were carrying their own copy of this
@@ -30,12 +34,14 @@
 //! explicit marker than refuse the whole call.
 
 pub mod authorize;
+mod xml_json;
 
 pub use authorize::{
     AuthorizationError, audit_scope, authorize_call, authorize_target, authorize_tool,
     caller_from_extensions, filter_tools_for_scope,
 };
 pub use mecmcp_redact::Untrusted;
+pub use xml_json::{XmlProjectionError, xml_to_json};
 
 use serde::Serialize;
 use std::fmt::Display;
