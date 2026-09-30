@@ -62,6 +62,13 @@ pub struct CredentialFileSpec<'a> {
     /// token store"`. Included in the aggregate error so an operator does
     /// not have to guess what `/etc/panosmcp/audit-hmac.key` is for.
     pub description: &'a str,
+    /// Whether this file must exist. A missing optional file (a fresh
+    /// install's `tokens.json`, an unused TLS key) is not a failure; a
+    /// missing required file is reported like any other offender, so a
+    /// caller that passes the canonical path for a file that is still only
+    /// present at a legacy fallback path finds out in this same pass rather
+    /// than validation silently passing over a file that never gets checked.
+    pub required: bool,
 }
 
 /// One file that failed validation.
@@ -100,11 +107,14 @@ fn format_failures(failures: &[CredentialFileFailure]) -> String {
 /// Validate every file in `specs` in a single pass and report every
 /// offender together, instead of stopping at the first.
 ///
-/// A file that does not exist is not a failure here: a fresh install has no
-/// `tokens.json` yet, and an optional file (a TLS key, say) may legitimately
-/// be absent. Whether an absent file is itself a problem is for the caller
-/// that actually needs to open it to decide -- this pass only says whether
-/// every file that *is* present is safe to trust.
+/// A missing file is a failure only if its spec sets
+/// [`required`](CredentialFileSpec::required): a fresh install has no `tokens.json`
+/// yet, and an optional file (a TLS key, say) may legitimately be absent, so
+/// those pass. A required file that is missing -- most commonly because the
+/// caller passed the canonical path while the file is still only present at
+/// a legacy fallback path on an unmigrated install -- is reported here like
+/// any other offender, so this pass cannot silently pass over a file that
+/// the caller actually depends on.
 ///
 /// # Errors
 /// Returns [`CredentialValidationError`] listing every file whose mode,
@@ -122,11 +132,13 @@ fn format_failures(failures: &[CredentialFileFailure]) -> String {
 ///         path: Path::new("/var/lib/panosmcp/tokens.json"),
 ///         role: CredentialFileRole::Secret,
 ///         description: "bearer token store",
+///         required: false,
 ///     },
 ///     CredentialFileSpec {
 ///         path: Path::new("/etc/panosmcp/devices.json"),
 ///         role: CredentialFileRole::ConfigNoSecret,
 ///         description: "device inventory",
+///         required: true,
 ///     },
 /// ];
 ///
@@ -141,10 +153,18 @@ pub fn validate_credential_files(
     let mut failures = Vec::new();
 
     for spec in specs {
-        match check_mode(spec.path, spec.role.required_mode()) {
+        match check_mode(spec.path, spec.role) {
             Ok(()) => {}
-            Err(SecretError::FileIo { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error_is_not_found(&error) && !spec.required => {}
+            Err(error) if error_is_not_found(&error) => failures.push(CredentialFileFailure {
+                path: spec.path.to_path_buf(),
+                description: spec.description.to_owned(),
+                detail: format!(
+                    "required file is missing; if this server was upgraded from an older \
+                     layout, move it here: {}",
+                    spec.path.display()
+                ),
+            }),
             Err(error) => failures.push(CredentialFileFailure {
                 path: spec.path.to_path_buf(),
                 description: spec.description.to_owned(),
@@ -160,13 +180,34 @@ pub fn validate_credential_files(
     }
 }
 
-/// Open with `O_NOFOLLOW`, `fstat`, and check type/owner/mode against
-/// `required_mode` -- everything [`crate::read_hardened_file`] checks except
-/// size and content, since a validation pass has no reason to read the file
-/// into memory. TOCTOU-safe for the same reason: the fd that is stat'd is
-/// the fd that would be opened for the real read, immediately dropped
-/// afterward without ever reading from it.
-fn check_mode(path: &Path, required_mode: u32) -> Result<(), SecretError> {
+fn error_is_not_found(error: &SecretError) -> bool {
+    matches!(
+        error,
+        SecretError::FileIo { source, .. } if source.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// Whether `owner` is an acceptable owner of a file for `role`, given the
+/// process's effective uid `euid`.
+///
+/// Root may own (and read) anything. Otherwise the file must be owned by the
+/// process itself -- except [`CredentialFileRole::ConfigNoSecret`], which may
+/// also be owned by root: that is exactly `rustsdcmcp`'s `sdc.json` layout,
+/// `0640 root:<service group>`, where root authors the file and the service
+/// group can only read it. A [`CredentialFileRole::Secret`] file never gets
+/// that exception -- root ownership of a file the service is supposed to be
+/// the sole owner of would defeat the point of `0600`.
+fn owner_allowed(role: CredentialFileRole, owner: u32, euid: u32) -> bool {
+    euid == 0 || owner == euid || (role == CredentialFileRole::ConfigNoSecret && owner == 0)
+}
+
+/// Open with `O_NOFOLLOW`, `fstat`, and check type/owner/mode against `role`
+/// -- everything [`crate::read_hardened_file`] checks except size and
+/// content, since a validation pass has no reason to read the file into
+/// memory. TOCTOU-safe for the same reason: the fd that is stat'd is the fd
+/// that would be opened for the real read, immediately dropped afterward
+/// without ever reading from it.
+fn check_mode(path: &Path, role: CredentialFileRole) -> Result<(), SecretError> {
     use rustix::fs::{FileType, Mode, OFlags, fstat, open};
     use rustix::io::Errno;
 
@@ -199,6 +240,7 @@ fn check_mode(path: &Path, required_mode: u32) -> Result<(), SecretError> {
         });
     }
 
+    let required_mode = role.required_mode();
     let mode = stat.st_mode & 0o777;
     if mode & !required_mode != 0 {
         return Err(SecretError::FilePermissions {
@@ -214,11 +256,23 @@ fn check_mode(path: &Path, required_mode: u32) -> Result<(), SecretError> {
     }
 
     let effective = rustix::process::geteuid().as_raw();
-    if effective != 0 && stat.st_uid != effective {
-        return Err(SecretError::FileWrongOwner {
+    if !owner_allowed(role, stat.st_uid, effective) {
+        let remedy = match role {
+            // Root-authored, group-readable config: the valid owners are the
+            // service account itself or root, so pointing the operator at
+            // `chown <uid>` (which would hand the service ownership of a
+            // file it should never write) is the wrong fix here.
+            CredentialFileRole::ConfigNoSecret => {
+                format!("chown root:<service group> {}", path.display())
+            }
+            CredentialFileRole::Secret => format!("chown {effective} {}", path.display()),
+        };
+        return Err(SecretError::FilePermissions {
             path: path.to_path_buf(),
-            owner: stat.st_uid,
-            effective,
+            detail: format!(
+                "owner uid {} does not match effective uid {effective}; run: {remedy}",
+                stat.st_uid
+            ),
         });
     }
 
@@ -254,11 +308,13 @@ mod tests {
                 path: &secret,
                 role: CredentialFileRole::Secret,
                 description: "token store",
+                required: false,
             },
             CredentialFileSpec {
                 path: &config,
                 role: CredentialFileRole::ConfigNoSecret,
                 description: "tenant alias",
+                required: false,
             },
         ];
 
@@ -274,6 +330,7 @@ mod tests {
             path: &config,
             role: CredentialFileRole::ConfigNoSecret,
             description: "tenant alias",
+            required: false,
         }];
 
         validate_credential_files(&specs).unwrap();
@@ -288,6 +345,7 @@ mod tests {
             path: &secret,
             role: CredentialFileRole::Secret,
             description: "token store",
+            required: false,
         }];
 
         let error = validate_credential_files(&specs).unwrap_err();
@@ -307,16 +365,19 @@ mod tests {
                 path: &bad_secret,
                 role: CredentialFileRole::Secret,
                 description: "token store",
+                required: false,
             },
             CredentialFileSpec {
                 path: &bad_config,
                 role: CredentialFileRole::ConfigNoSecret,
                 description: "tenant alias",
+                required: false,
             },
             CredentialFileSpec {
                 path: &good,
                 role: CredentialFileRole::Secret,
                 description: "audit key",
+                required: false,
             },
         ];
 
@@ -346,6 +407,7 @@ mod tests {
             path: &missing,
             role: CredentialFileRole::Secret,
             description: "token store",
+            required: false,
         }];
 
         validate_credential_files(&specs).unwrap();
@@ -363,6 +425,7 @@ mod tests {
             path: &link,
             role: CredentialFileRole::Secret,
             description: "token store",
+            required: false,
         }];
 
         let error = validate_credential_files(&specs).unwrap_err();
@@ -374,5 +437,72 @@ mod tests {
     fn required_mode_matches_documented_roles() {
         assert_eq!(CredentialFileRole::Secret.required_mode(), 0o600);
         assert_eq!(CredentialFileRole::ConfigNoSecret.required_mode(), 0o640);
+    }
+
+    // F1 (Percy review of 21a0f70): `ConfigNoSecret` must accept root
+    // ownership, since that is rustsdcmcp's actual `sdc.json` layout (`0640
+    // root:rustsdcmcp`, root-authored, group-readable by the service). A
+    // `Secret` file never gets that exception: root ownership of a file the
+    // service is supposed to solely own would defeat `0600`.
+    #[test]
+    fn owner_allowed_lets_root_own_a_config_no_secret_file() {
+        assert!(owner_allowed(CredentialFileRole::ConfigNoSecret, 0, 1000));
+    }
+
+    #[test]
+    fn owner_allowed_does_not_let_root_own_a_secret_file() {
+        assert!(!owner_allowed(CredentialFileRole::Secret, 0, 1000));
+    }
+
+    #[test]
+    fn owner_allowed_always_permits_the_process_itself() {
+        assert!(owner_allowed(CredentialFileRole::Secret, 1000, 1000));
+        assert!(owner_allowed(
+            CredentialFileRole::ConfigNoSecret,
+            1000,
+            1000
+        ));
+    }
+
+    #[test]
+    fn owner_allowed_permits_anything_when_effective_uid_is_root() {
+        assert!(owner_allowed(CredentialFileRole::Secret, 1000, 0));
+        assert!(owner_allowed(CredentialFileRole::ConfigNoSecret, 1000, 0));
+    }
+
+    // F3 (Percy review of 21a0f70): on an upgrade install, a file that is
+    // still only present at a legacy fallback path is silently skipped if
+    // the caller passes the canonical path and the spec has no way to say
+    // "this one must exist". `required: true` closes that gap.
+    #[test]
+    fn a_missing_required_file_is_reported_as_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.json");
+
+        let specs = [CredentialFileSpec {
+            path: &missing,
+            role: CredentialFileRole::Secret,
+            description: "token store",
+            required: true,
+        }];
+
+        let error = validate_credential_files(&specs).unwrap_err();
+        assert_eq!(error.failures.len(), 1);
+        assert!(error.failures[0].detail.contains("missing"));
+    }
+
+    #[test]
+    fn a_missing_optional_file_still_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.json");
+
+        let specs = [CredentialFileSpec {
+            path: &missing,
+            role: CredentialFileRole::Secret,
+            description: "token store",
+            required: false,
+        }];
+
+        validate_credential_files(&specs).unwrap();
     }
 }

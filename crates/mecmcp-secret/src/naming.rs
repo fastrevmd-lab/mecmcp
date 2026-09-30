@@ -1,13 +1,22 @@
 //! Canonical config/state/service-user layout, derived once per server.
 //!
 //! Each mechub MCP server used to pick its own directory and service-user
-//! names independently. Most converged on the same shape by hand (`jmcp`,
-//! `sdcmcp`, `proxmoxmcp`, `unifimcp`), but not all: `rust-panosmcp` and
-//! `rustmistmcp` still carry their full crate name into `/etc` and
-//! `/var/lib` rather than the short vendor name the others use. That
-//! divergence is exactly the kind of thing that costs a rebuild two restarts
-//! when an operator assumes the sixth server follows the same rule as the
-//! first five (MEC-987).
+//! names independently. Three of the six already match this module's rule on
+//! disk today -- `rustjunosmcp` (`jmcp`), `rustproxmoxmcp` (`proxmoxmcp`) and
+//! `rustunifimcp` (`unifimcp`). The other three still diverge and have not
+//! yet been migrated: `rustpanosmcp` (`rust-panosmcp`) and `rustmistmcp`
+//! (`rustmistmcp`) carry their full crate name into `/etc` and `/var/lib`,
+//! and `rustsdcmcp` is deployed as `rustsdcmcp` (sysusers entry, `User=` in
+//! its unit, `/etc/rustsdcmcp`, `/var/lib/rustsdcmcp`), not the `sdcmcp`
+//! short name this module assigns it. Wiring `ServerNaming::derive` into any
+//! of these three requires migrating that server's on-disk paths and service
+//! user in the same change, not just calling this function -- otherwise the
+//! server looks for files at a path nothing has ever written to. That
+//! migration is follow-up work, tracked and coordinated with Gareth's deploy
+//! process; this module only fixes the divergence going forward. Getting the
+//! deployed state wrong here is exactly the kind of thing that costs a
+//! rebuild two restarts when an operator assumes the sixth server follows
+//! the same rule as the first five (MEC-987).
 //!
 //! [`ServerNaming::derive`] is the single place this triple is computed from
 //! now on. It takes a `short_name`, not a crate name: the short name is not a
@@ -77,16 +86,21 @@ impl ServerNaming {
 ///
 /// None of these are a mechanical transform of the crate or repo name --
 /// they are the vendor token an operator would actually type, chosen once
-/// and fixed here so it cannot drift between packaging, docs, and code:
+/// and fixed here so it cannot drift between packaging, docs, and code. The
+/// `Deployed today` column is the on-disk reality as of this writing, not
+/// this table's target -- `panosmcp`, `sdcmcp` and `mistmcp` are not yet
+/// deployed under their short name and need a migration (tracked as
+/// MEC-987 follow-up) before any server calls `ServerNaming::derive` with
+/// that constant:
 ///
-/// | Repo               | Crate            | Short name   |
-/// |---------------------|-------------------|--------------|
-/// | `rustjunosmcp`      | `rust-junosmcp`   | `jmcp`       |
-/// | `rustpanosmcp`      | `rust-panosmcp`   | `panosmcp`   |
-/// | `rustsdcmcp`        | `rustsdcmcp`      | `sdcmcp`     |
-/// | `rustproxmoxmcp`    | `rust-proxmoxmcp` | `proxmoxmcp` |
-/// | `rustmistmcp`       | `rustmistmcp`     | `mistmcp`    |
-/// | `rustunifimcp`      | `rustunifimcp`    | `unifimcp`   |
+/// | Repo               | Crate            | Short name   | Deployed today  |
+/// |---------------------|-------------------|--------------|-----------------|
+/// | `rustjunosmcp`      | `rust-junosmcp`   | `jmcp`       | `jmcp`          |
+/// | `rustpanosmcp`      | `rust-panosmcp`   | `panosmcp`   | `rust-panosmcp` |
+/// | `rustsdcmcp`        | `rustsdcmcp`      | `sdcmcp`     | `rustsdcmcp`    |
+/// | `rustproxmoxmcp`    | `rust-proxmoxmcp` | `proxmoxmcp` | `proxmoxmcp`    |
+/// | `rustmistmcp`       | `rustmistmcp`     | `mistmcp`    | `rustmistmcp`   |
+/// | `rustunifimcp`      | `rustunifimcp`    | `unifimcp`   | `unifimcp`      |
 ///
 /// A seventh server adds one constant here, following the same rule: drop
 /// the `rust`/`rust-`/`mecmcp` scaffolding, keep the shortest vendor token
