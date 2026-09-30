@@ -271,7 +271,19 @@ pub fn truncate_items<T>(mut items: Vec<T>, max_items: usize) -> TruncatedItems<
 /// device's own words stay visibly marked once the model reads them.
 #[must_use]
 pub fn tool_error(error: impl Display) -> rmcp::model::CallToolResult {
-    let text = redact_text(&error.to_string());
+    error_block(redact_text(&error.to_string()))
+}
+
+/// Build an MCP tool error from text that has already been redacted.
+///
+/// Redacting text a second time is not a no-op: `redact_text`'s PEM handling
+/// keeps a `BEGIN ... PRIVATE KEY` header and drops every line after it until
+/// a matching `END` line, so redacting an already-tagged
+/// [`tool_error_with_untrusted_detail`] block a second time can consume its
+/// closing `</untrusted-device-content>` tag if the device text contains an
+/// unterminated `BEGIN` line. Redact each piece exactly once, then build the
+/// error block directly instead of routing through [`tool_error`] again.
+fn error_block(text: String) -> rmcp::model::CallToolResult {
     rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(text)])
 }
 
@@ -307,9 +319,10 @@ pub fn tool_error_with_untrusted_detail(
     detail: Untrusted<&str>,
     source: &str,
 ) -> rmcp::model::CallToolResult {
+    let context = redact_text(&context.to_string());
     let redacted_detail = redact_text(detail.as_inner());
     let detail = Untrusted::new(redacted_detail.as_str());
-    tool_error(format!("{context}\n{}", detail.render_tagged(source)))
+    error_block(format!("{context}\n{}", detail.render_tagged(source)))
 }
 
 /// Convert a domain result into a bounded MCP tool result.
@@ -628,6 +641,30 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         assert!(!text.contains("FAKEpw5"), "got {text}");
         assert!(text.contains("<untrusted-device-content id=\""));
+    }
+
+    /// Regression for the review finding on #458 (R1): redacting the tagged
+    /// block a second time (once when `tool_error_with_untrusted_detail`
+    /// redacted `detail`, again when it routed the tagged string back through
+    /// `tool_error`) let an unterminated PEM `BEGIN` line in device text
+    /// consume the closing `</untrusted-device-content>` tag, because
+    /// `redact_text`'s PEM handling drops every line after an open `BEGIN`
+    /// until a matching `END` line — including the tag markup appended after
+    /// it. Each piece must be redacted exactly once.
+    #[test]
+    fn tool_error_with_untrusted_detail_closes_its_tag_after_an_unterminated_pem_header() {
+        let result = tool_error_with_untrusted_detail(
+            "staging failed",
+            Untrusted::new(
+                "error at line 3\n-----BEGIN RSA PRIVATE KEY-----\nMIIFAKE\n(truncated)",
+            ), // gitleaks:allow -- fabricated, unterminated PEM header, not a real key
+            "device.stage_error",
+        );
+        let text = text_of(&result);
+        assert!(
+            text.contains("</untrusted-device-content id=\""),
+            "the closing tag must survive redaction: got {text}"
+        );
     }
 
     /// The whole point of this crate change: a handler that builds its

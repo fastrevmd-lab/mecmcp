@@ -144,6 +144,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result was already redacted by the `Changed` entry above. Both functions
   now redact unconditionally.
 
+- **mecmcp-server: `tool_error_with_untrusted_detail` could drop its own
+  closing trust-boundary tag** (MEC-1020, review follow-up on
+  mechubsec/mecmcp#458). The function redacted `detail`, rendered it inside
+  `<untrusted-device-content>` markup, then passed the whole tagged string
+  through `tool_error`, which redacted it a second time. `redact_text`'s PEM
+  handling drops every line after an unterminated `-----BEGIN ... -----`
+  header, so device text containing one consumed everything after it,
+  including the closing tag, on the second pass. No secret leaked -- this
+  failed safe on data -- but a client or model that trusts the tag boundary
+  would read an untagged block as unbounded. Each piece is now redacted
+  exactly once before the tag is built.
+
 ## [0.24.1] - 2026-09-28
 
 > **Upgrade note.** This patch release changes a default: servers that relied
