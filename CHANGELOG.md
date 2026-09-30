@@ -29,6 +29,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **docs: close out the filesystem-layout standard across all six vendor
+  servers** (MEC-988, mecmcp#356, follow-on to #28 and #6).
+  `docs/FILESYSTEM-LAYOUT.md` was missing `rustmistmcp` entirely and still
+  carried `rustsdcmcp` as an open "verify and document" TODO. A 2026-09-07
+  rebuild of all twelve MCP test rigs hit the exact `tokens.json`
+  config-vs-state divergence this document exists to prevent, twice
+  (`rustproxmoxmcp` restarted against a path the file wasn't at;
+  `rustmistmcp`'s token store had moved out from under a restored drop-in).
+  Verified against the code in all six repos rather than assumed: every
+  server but `rustunifimcp` (which shipped `/var/lib`-only from its first
+  release and never had an `/etc` token store to migrate away from) resolves
+  its configured token path against its own canonical `/var/lib/<svc>`
+  location with a byte-exact comparison, falls back to the legacy `/etc`
+  path only when that exact canonical path was configured, and fails
+  startup outright for any other missing path — no silent fallback for a
+  typo or a deliberately different store. No mutable credential or state
+  file remains under `/etc/<svc>` on any of the six. One documented residual
+  gap: `rustunifimcp` has no dedicated regression test pinning its
+  already-loud failure on a missing token file, tracked as a follow-up.
+
 ### Added
 
 - **mecmcp-audit: optional OpenTelemetry trace export, and a generic

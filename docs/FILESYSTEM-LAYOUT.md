@@ -1,6 +1,11 @@
 # Filesystem layout standard for mechub MCP servers
 
-**Part of [#6](https://github.com/mechubsec/mecmcp/issues/6).**
+**Part of [#6](https://github.com/mechubsec/mecmcp/issues/6).** Reconfirmed and
+closed out across all six vendor servers by
+[#356](https://github.com/mechubsec/mecmcp/issues/356), which followed on
+[#28](https://github.com/mechubsec/mecmcp/issues/28) — see
+[Status: all six servers verified compliant](#status-all-six-servers-verified-compliant-356)
+at the bottom.
 
 ## Problem
 
@@ -58,6 +63,7 @@ The current split puts a server-written file under `/etc`, which is why an atomi
 | `rustsdcmcp` | `rustsdcmcp` | `rustsdcmcp` | `/etc/rustsdcmcp` | `/var/lib/rustsdcmcp` |
 | `rustproxmoxmcp` | `rustproxmoxmcp` | `rustproxmoxmcp` | `/etc/rustproxmoxmcp` | `/var/lib/rustproxmoxmcp` |
 | `rustunifimcp` | `rustunifimcp` | `rustunifimcp` | `/etc/rustunifimcp` | `/var/lib/rustunifimcp` |
+| `rustmistmcp` | `rustmistmcp` | `rustmistmcp` | `/etc/rustmistmcp` | `/var/lib/rustmistmcp` |
 
 ## The `jmcp` exception
 
@@ -206,20 +212,42 @@ The existing `/etc/jmcp` and `/var/lib/jmcp` layout is **locked in** and remains
 
 The shipped unit file as of 0.5.0+ must reference `/var/lib/rust-panosmcp/tokens.json` by default. If an older deployment has a drop-in pointing elsewhere, that drop-in will continue to work (it overrides the shipped unit).
 
-### the SDC guest (rustsdcmcp on the hypervisor node) — verify and document
+### the SDC guest (rustsdcmcp on the hypervisor node) — verified compliant
 
-Check the actual layout on the SDC guest:
+Confirmed via #356: `rustsdcmcp` matches the standard (`/etc/rustsdcmcp`,
+`/var/lib/rustsdcmcp`, `tokens.json` in `/var/lib`). `main.rs` resolves the
+configured token path against the canonical `/var/lib/rustsdcmcp/tokens.json`
+with a byte-exact comparison (not `Path` equality, which would normalize away
+a typo'd trailing separator) and falls back to a legacy path only when the
+configured path is exactly the canonical one — an explicit custom path that is
+absent fails outright rather than silently reactivating an unrelated store.
+`scripts/verify-packaging.sh` asserts the unit's `ExecStart`, `ReadOnlyPaths`,
+and `ReadWritePaths` against this layout on every CI run, so a regression
+fails the build instead of surfacing at the next restart.
 
-```bash
-ssh root@node.example.internal "pct exec <sdc-guest> -- ls -la /etc/rustsdcmcp"
-ssh root@node.example.internal "pct exec <sdc-guest> -- ls -la /var/lib/rustsdcmcp"
-```
+### the Mist guest (rustmistmcp) — tokens.json moved between releases, drop-in broke
 
-If it matches the standard (`/etc/rustsdcmcp`, `/var/lib/rustsdcmcp`, tokens in `/var/lib`), document that it is already compliant. If it diverges, apply the same migration rule as rust-panosmcp.
+`rustmistmcp`'s `tokens.json` moved from `/etc/rustmistmcp/` to
+`/var/lib/rustmistmcp/` between releases without a compatibility shim. A
+systemd drop-in restored from an older backup still pointed at the `/etc`
+path, and the service would not start until the path was corrected by hand —
+the same class of failure as the PAN-OS case above, just discovered via a
+restore instead of a fresh install.
+
+`rustmistmcp` now carries the same canonical/legacy resolver as
+`rustsdcmcp` and `rustproxmoxmcp`: the shipped unit's `--tokens-file` points at
+`/var/lib/rustmistmcp/tokens.json`, and if that canonical path is what was
+configured but the file isn't there yet, the resolver looks for a store at the
+old `/etc/rustmistmcp/tokens.json` location and warns loudly (`tracing::warn!`
+naming both paths) rather than either refusing outright or silently starting
+with an empty store. A configured path that is neither the canonical location
+nor found at all still fails startup — the fallback exists only to bridge the
+one specific rename, not to paper over an arbitrary missing file.
 
 ## New deployments
 
-All new MCP servers (`rustproxmoxmcp`, `rustunifimcp`, and any future vendors) adopt the standard from day one:
+All new MCP servers (`rustproxmoxmcp`, `rustunifimcp`, `rustmistmcp`, and any
+future vendors) adopt the standard from day one:
 
 - Binary name == service name == directory base
 - Config in `/etc/<binary-name>`
@@ -240,3 +268,56 @@ For each repo, the packaging tests must assert:
 5. The installer does not overwrite existing `tokens.json`
 
 See `rustsdcmcp/scripts/verify-packaging.sh` for a reference implementation of these checks.
+
+## Status: all six servers verified compliant (#356)
+
+A 2026-09-07 rebuild of all twelve test rigs across the six servers hit the
+exact class of failure this document was written to prevent, twice —
+`rustproxmoxmcp` and `rustmistmcp` both failed a restart or drop-in restore
+because the configured `tokens.json` path and the file's actual location
+disagreed. [#356](https://github.com/mechubsec/mecmcp/issues/356) tracked
+closing that gap for good. As of this update, every vendor server has been
+verified against the standard in this document:
+
+| Repo | Config | State (`tokens.json`) | Canonical/legacy fallback |
+|---|---|---|---|
+| `rust-junosmcp` | `/etc/jmcp`\* | `/var/lib/jmcp`\* | `resolve_token_path` |
+| `rust-panosmcp` | `/etc/rust-panosmcp` | `/var/lib/rust-panosmcp` | `resolve_token_path` + stale-secret scan |
+| `rustsdcmcp` | `/etc/rustsdcmcp` | `/var/lib/rustsdcmcp` | `resolve_token_path` + stale-secret scan |
+| `rustproxmoxmcp` | `/etc/proxmoxmcp` | `/var/lib/proxmoxmcp` | `resolve_token_path` + stale-secret scan |
+| `rustmistmcp` | `/etc/rustmistmcp` | `/var/lib/rustmistmcp` | `resolve_token_path` + stale-secret scan |
+| `rustunifimcp` | `/etc/unifimcp` | `/var/lib/unifimcp` | none needed — shipped `/var/lib`-only from its first release, never had an `/etc` token store to migrate away from |
+
+\* `rust-junosmcp` also honours the locked-in `jmcp` exception paths; see
+above.
+
+Every server but `rustunifimcp` implements the same `resolve_tokens_with`
+pattern: the configured path is used verbatim and fails if absent, **except**
+when it is byte-exact-equal to the server's own canonical `/var/lib` path, in
+which case an absent canonical file falls back to the legacy `/etc` location
+with a `tracing::warn!` naming both paths. A typo, or a deliberately
+different custom path, never reaches the fallback — it fails startup
+immediately, which is the fail-loud behavior a bad drop-in restore needs
+surfaced at start time rather than discovered mid-incident. Each of the five
+servers with a legacy path to bridge carries unit tests exercising exactly
+this: the fallback firing, a custom path never falling back, and a
+trailing-slash spelling of the canonical path not reaching the fallback either
+(`grep -r canonical_path_falls_back_to_an_existing_legacy_store` in any of
+their `main.rs` files).
+
+No mutable credential or state file remains under `/etc/<svc>` on any of the
+six servers as of this update. Files that do live under `/etc` across the
+fleet (`devices.json`/`sdc.json`/`clusters.json`/`controllers.json`,
+`audit-hmac.key`, `credentials.env`/`secrets.env`, TLS material, `waivers.json`)
+are all either operator-edited or, in the case of `audit-hmac.key`, generated
+once at install time and never rewritten by the server — both fit this
+document's definition of config (immutable across restarts), not state.
+
+**Residual gap, tracked for a follow-up, not blocking #356:** `rustunifimcp`
+already fails loudly on a missing `tokens.json` — `TokenStoreFile::load`
+names the path in its error and there is no silent fallback to fall back
+*to* — but unlike its five siblings it has no dedicated regression test
+pinning that behavior, because it never needed the canonical/legacy resolver
+in the first place. A short test asserting the load error names the
+configured path would close that gap without inventing a migration path this
+server never had.
