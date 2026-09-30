@@ -13,7 +13,7 @@ use crate::RedactError;
 use crate::denylist::is_denylisted_key;
 use crate::shape::looks_like_secret_value;
 use quick_xml::events::attributes::Attribute;
-use quick_xml::events::{BytesStart, BytesText, Event};
+use quick_xml::events::{BytesRef, BytesStart, BytesText, Event};
 use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
 use std::borrow::Cow;
@@ -32,11 +32,31 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
     reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Cursor::new(Vec::new()));
     let mut tag_stack: Vec<Vec<u8>> = Vec::new();
+    // quick-xml chunks element text at every entity/character reference,
+    // reporting `&#x73;ecret` as `Text("")`, `GeneralRef("#x73;")`,
+    // `Text("ecret")` — three events for one node, split wherever the
+    // upstream serializer happened to escape a byte (`&quot;`, `&amp;`,
+    // `&lt;`, any numeric reference). Deciding redaction per event lets a
+    // reference carry secret bytes past the check on either side of it —
+    // `pre-shared-key ascii-text "FAKE"` becomes `&quot;FAKE&quot;` from a
+    // spec-compliant serializer and the literal secret text on either side
+    // of the quotes was never joined with it for the shape/key scan. So
+    // every contiguous run of `Text`/`GeneralRef` events is buffered into
+    // one `String` here and handed to the redaction decision exactly once,
+    // when the run ends.
+    let mut text_run: Option<String> = None;
 
     loop {
         let event = reader
             .read_event()
             .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
+        if !matches!(event, Event::Text(_) | Event::GeneralRef(_)) {
+            flush_text_run(
+                &mut writer,
+                &mut text_run,
+                any_ancestor_denylisted(&tag_stack),
+            )?;
+        }
         match event {
             Event::Eof => {
                 if let Some(unclosed) = tag_stack.last() {
@@ -76,11 +96,24 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
                     .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
             }
             Event::Text(e) => {
-                let ancestor_is_secret = any_ancestor_denylisted(&tag_stack);
-                let redacted = redact_text_bytes(&e, ancestor_is_secret)?;
-                writer
-                    .write_event(Event::Text(redacted))
+                // quick-xml 0.42 stores text as `str`: deref yields the raw,
+                // still-escaped content, same as 0.41's `decode()` for a
+                // `Reader::from_str` source.
+                let raw: &str = &e;
+                let decoded = quick_xml::escape::unescape(raw)
                     .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
+                text_run.get_or_insert_with(String::new).push_str(&decoded);
+            }
+            // quick-xml emits `&amp;`, `&#x73;`, etc. as their own event
+            // rather than folding them into the surrounding `Text` — see the
+            // comment on `text_run` above. Resolve it to the literal
+            // character(s) it represents and fold it into the same buffer as
+            // the text around it, so the redaction decision below sees one
+            // joined string instead of pieces split at the reference.
+            Event::GeneralRef(e) => {
+                text_run
+                    .get_or_insert_with(String::new)
+                    .push_str(&resolve_general_ref(&e)?);
             }
             Event::CData(e) => {
                 let decoded = e.into_inner().into_owned();
@@ -202,28 +235,50 @@ fn redact_attributes<'a>(
     Ok(out)
 }
 
-fn redact_text_bytes<'a>(
-    text: &BytesText<'a>,
+/// Flush a buffered run of `Text`/`GeneralRef` events as a single redaction
+/// decision, writing nothing if the run is empty.
+///
+/// `ancestor_is_secret` must reflect `tag_stack` as it was *during* the
+/// run — callers flush before mutating `tag_stack` for the event that ended
+/// the run, so the stack passed to [`any_ancestor_denylisted`] still
+/// matches.
+fn flush_text_run(
+    writer: &mut Writer<Cursor<Vec<u8>>>,
+    text_run: &mut Option<String>,
     ancestor_is_secret: bool,
-) -> Result<BytesText<'static>, RedactError> {
-    // quick-xml 0.42 stores text as `str`: deref yields the raw, still-escaped
-    // content (no EOL normalization), which is what 0.41's `decode()`
-    // returned for a `Reader::from_str` source.
-    let raw: &str = text;
-    let decoded = quick_xml::escape::unescape(raw)
-        .map_err(|e| RedactError::InvalidXml(e.to_string()))?
-        .into_owned();
-    if ancestor_is_secret || looks_like_secret_value(&decoded) {
-        Ok(
-            BytesText::from_escaped(escape_text(&String::from_utf8_lossy(PLACEHOLDER)))
-                .into_owned(),
-        )
+) -> Result<(), RedactError> {
+    let Some(joined) = text_run.take() else {
+        return Ok(());
+    };
+    let out = if ancestor_is_secret || looks_like_secret_value(&joined) {
+        BytesText::from_escaped(escape_text(&String::from_utf8_lossy(PLACEHOLDER))).into_owned()
     } else {
         // Same reasoning as the CDATA branch above (N5): scan every text
-        // node's body, not only ones that already look like an embedded
+        // run's body, not only ones that already look like an embedded
         // blob.
-        Ok(BytesText::from_escaped(escape_text(&crate::text::redact(&decoded))).into_owned())
+        BytesText::from_escaped(escape_text(&crate::text::redact(&joined))).into_owned()
+    };
+    writer
+        .write_event(Event::Text(out))
+        .map_err(|e| RedactError::InvalidXml(e.to_string()))
+}
+
+/// Resolve a `GeneralRef` (`&#x..;`, `&amp;`, …) to the literal text it
+/// represents, so it can join the same buffer as the surrounding `Text`
+/// events instead of being redacted (or not) as an opaque, uninspected
+/// fragment. Fails closed on an entity this crate cannot resolve rather
+/// than guessing at — or silently dropping — its content.
+fn resolve_general_ref(e: &BytesRef<'_>) -> Result<String, RedactError> {
+    if let Some(ch) = e
+        .resolve_char_ref()
+        .map_err(|err| RedactError::InvalidXml(err.to_string()))?
+    {
+        return Ok(ch.to_string());
     }
+    let name: &str = e;
+    quick_xml::escape::resolve_predefined_entity(name)
+        .map(str::to_string)
+        .ok_or_else(|| RedactError::InvalidXml(format!("unresolved entity reference &{name};")))
 }
 
 /// Escape `<`, `>`, `&`, `'` and `"` — exactly the set quick-xml 0.41's
@@ -407,5 +462,94 @@ another line</output>"#;
             got,
             "<a x=\"v\nw\" y=\"t\tu\" z=\"c\rd\" q=\"&amp;&lt;&gt;&quot;&apos;\"/>"
         );
+    }
+
+    // --- N8: quick-xml reports a character or entity reference (`&#x..;`,
+    // `&amp;`) as its own `GeneralRef` event, separate from the surrounding
+    // `Text` events. Under a denylisted ancestor these must collapse into
+    // the same redaction marker as the text around them, not pass through
+    // unredacted. ---
+
+    #[test]
+    fn n8_partial_ref_secret_is_fully_redacted() {
+        // "s" is written as a character reference, "ecret" as plain text.
+        let xml = "<password>&#x73;ecret</password>";
+        let got = redact(xml).unwrap();
+        assert_eq!(got, "<password>[REDACTED]</password>", "got: {got}");
+    }
+
+    #[test]
+    fn n8_all_ref_secret_is_fully_redacted() {
+        // The whole secret is spelled out as character references.
+        let xml = "<password>&#x73;&#x65;&#x63;&#x72;&#x65;&#x74;</password>";
+        let got = redact(xml).unwrap();
+        assert!(!got.contains('&'), "got: {got}");
+        assert!(got.contains("[REDACTED]"), "got: {got}");
+    }
+
+    #[test]
+    fn n8_named_entity_in_secret_is_redacted() {
+        let xml = "<password>sec&amp;ret</password>";
+        let got = redact(xml).unwrap();
+        assert_eq!(got, "<password>[REDACTED]</password>", "got: {got}");
+    }
+
+    #[test]
+    fn n8_mixed_text_and_ref_secret_collapses_to_one_marker() {
+        let xml = "<password>se&#x63;r&amp;et</password>";
+        let got = redact(xml).unwrap();
+        assert_eq!(got, "<password>[REDACTED]</password>", "got: {got}");
+    }
+
+    #[test]
+    fn n8_ref_outside_denylisted_element_is_untouched() {
+        let xml = "<host>AT&amp;T</host>";
+        let got = redact(xml).unwrap();
+        assert_eq!(got, xml, "got: {got}");
+    }
+
+    #[test]
+    fn n8_denylisted_grandparent_redacts_ref_in_descendant_text() {
+        let xml = "<pre-shared-key><ascii-text>&#x70;&#x73;&#x6b;</ascii-text></pre-shared-key>";
+        let got = redact(xml).unwrap();
+        assert!(!got.contains('&'), "got: {got}");
+        assert!(got.contains("[REDACTED]"), "got: {got}");
+    }
+
+    // --- F1 (MEC-921 review of this PR): a reference inside plain text
+    // (not under a denylisted *element*) must not split the denylisted-key
+    // / shape scan that `text::redact` runs over the joined text node —
+    // any serializer that escapes `"`, `&`, or `<` in text (quick-xml's own
+    // writer among them) would otherwise let the key/value scan see only a
+    // fragment on one side of the reference and miss the secret. ---
+
+    #[test]
+    fn f1_named_entity_quote_does_not_split_keyed_value() {
+        let xml = "<output>security ike policy p1 pre-shared-key ascii-text &quot;FAKEhunter2&quot;</output>";
+        let got = redact(xml).unwrap();
+        assert!(!got.contains("FAKEhunter2"), "got: {got}");
+        assert!(got.contains("[REDACTED]"), "got: {got}");
+    }
+
+    #[test]
+    fn f1_named_entity_amp_does_not_split_keyed_value() {
+        let xml = "<output>set snmp community pub&amp;FAKElic read-only</output>";
+        let got = redact(xml).unwrap();
+        assert!(!got.contains("FAKElic"), "got: {got}");
+    }
+
+    #[test]
+    fn f1_named_entity_lt_does_not_split_keyed_value() {
+        let xml = "<output>password: ab&lt;FAKEcd</output>";
+        let got = redact(xml).unwrap();
+        assert!(!got.contains("FAKEcd"), "got: {got}");
+    }
+
+    #[test]
+    fn f1_named_entity_amp_mid_value_does_not_leak_either_half() {
+        let xml = "<output>user login password=FAKE&amp;tail ok</output>";
+        let got = redact(xml).unwrap();
+        assert!(!got.contains("FAKE"), "got: {got}");
+        assert!(!got.contains("tail"), "got: {got}");
     }
 }
