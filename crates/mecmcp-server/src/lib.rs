@@ -4,7 +4,8 @@
 //!
 //! - **Rendering a result** — [`tool_result`], [`tool_error`], [`bounded_text`].
 //!   A handler's return value is caller-visible and vendor-sized, so it is
-//!   bounded before it leaves.
+//!   bounded before it leaves. [`tool_result`] also redacts it —
+//!   see [`OutputRedaction`].
 //! - **Authorizing a call** — [`authorize_call`] and the rest of
 //!   [`mod@authorize`]. Note the rule stated there: a `None` caller is the
 //!   stdio path and is authorized, so a handler must pass the caller it
@@ -32,6 +33,25 @@
 //! [`truncate_items`] is the list-shaped version of the same idea, for a
 //! handler that would rather hand back the first `N` of `M` entries with an
 //! explicit marker than refuse the whole call.
+//!
+//! ## Redaction runs inside `tool_result`, not beside it
+//!
+//! [`tool_result`] passes every successful value through `mecmcp-redact`
+//! before it is measured against [`ResultLimits`] or handed back to the
+//! caller. Earlier, redaction was something a server had to remember to call
+//! on its own output path; a new tool handler that built its result with
+//! `tool_result` and forgot to redact it first still leaked whatever it
+//! returned. Routing redaction through `tool_result` itself removes that
+//! failure mode — there is no successful [`rmcp::model::CallToolResult`]
+//! `tool_result` can produce without it, short of the one exception below.
+//!
+//! The exception is [`OutputRedaction::SkipForInternalRead`], for a handler
+//! whose result never touched a vendor device or controller — reading this
+//! process's own audit log or policy snapshot, say — where running the
+//! device-secret denylist over the process's own data is pure noise. Choosing
+//! it is an explicit, per-call decision (there is no process-wide flag for
+//! it, unlike `mecmcp_redact::policy`) and it is audited: it emits a
+//! `target: "audit"` event naming the tool and the reason, every time.
 
 pub mod authorize;
 mod xml_json;
@@ -42,6 +62,8 @@ pub use authorize::{
 };
 pub use mecmcp_redact::Untrusted;
 pub use xml_json::{XmlProjectionError, xml_to_json};
+
+use mecmcp_redact::{redact_json_value, redact_text};
 
 use serde::Serialize;
 use std::fmt::Display;
@@ -58,6 +80,36 @@ pub enum ResultFormat {
     /// CLI output, say. `PrettyJson` would hand the caller a quoted, escaped
     /// blob; this hands them the text.
     StringOrPrettyJson,
+}
+
+/// Whether [`tool_result`] passes a successful value through `mecmcp-redact`
+/// before returning it.
+///
+/// There is no `Default` impl on purpose: every call site names its choice,
+/// so a reviewer sees the opt-out in the diff instead of it falling out of an
+/// omitted argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputRedaction {
+    /// Redact the serialized value before returning it. The correct choice
+    /// for anything that carries or might carry vendor/device data — which is
+    /// almost every tool result in this family.
+    Apply,
+    /// Skip redaction because `value` never reached a vendor device or
+    /// controller — an internal read of this process's own state that the
+    /// device-secret denylist has nothing to do with.
+    ///
+    /// Selecting this variant emits a `WARN`-level `target: "audit"` tracing
+    /// event naming `tool` and `reason`, the same way
+    /// `mecmcp_redact::policy::install(DisabledByOperator { .. })` logs an
+    /// operator's process-wide opt-out — so an operator can see, per call,
+    /// every place output left this process unredacted and why.
+    SkipForInternalRead {
+        /// The tool name, so the audit event says which handler chose this.
+        tool: &'static str,
+        /// Why `value` does not need redaction, e.g. "reads this process's
+        /// own audit log entries, not vendor secrets".
+        reason: &'static str,
+    },
 }
 
 /// Hard byte limits applied before a successful MCP result is returned.
@@ -255,18 +307,21 @@ pub fn tool_error_with_untrusted_detail(
 
 /// Convert a domain result into a bounded MCP tool result.
 ///
-/// A failure becomes [`tool_error`]. A success is serialized per `format`, then
+/// A failure becomes [`tool_error`]. A success is serialized per `format`,
+/// redacted per `redaction` (see [`OutputRedaction`] and the crate-level docs
+/// on why that step lives here rather than being left to each caller), then
 /// checked against both limits, and **refused** rather than truncated if it
 /// exceeds either — see the note on limits in the crate documentation.
 ///
 /// # Examples
 /// ```
-/// use mecmcp_server::{ResultFormat, ResultLimits, tool_result};
+/// use mecmcp_server::{OutputRedaction, ResultFormat, ResultLimits, tool_result};
 ///
 /// let over = tool_result::<_, std::convert::Infallible>(
 ///     Ok("0123456789"),
 ///     ResultFormat::StringOrPrettyJson,
 ///     ResultLimits { max_text_bytes: 4, max_json_bytes: 32 },
+///     OutputRedaction::Apply,
 /// );
 /// assert_eq!(over.is_error, Some(true));
 /// ```
@@ -275,6 +330,7 @@ pub fn tool_result<T, E>(
     result: Result<T, E>,
     format: ResultFormat,
     limits: ResultLimits,
+    redaction: OutputRedaction,
 ) -> rmcp::model::CallToolResult
 where
     T: Serialize,
@@ -284,7 +340,16 @@ where
         Ok(value) => value,
         Err(error) => return tool_error(error),
     };
-    let serialized = match serialize_value(&value, format) {
+    if let OutputRedaction::SkipForInternalRead { tool, reason } = redaction {
+        tracing::warn!(
+            target: "audit",
+            event = "tool_output_redaction_skipped",
+            tool = %tool,
+            reason = %reason,
+            "tool output redaction skipped for tool {tool}: {reason}",
+        );
+    }
+    let serialized = match serialize_value(&value, format, redaction) {
         Ok(serialized) => serialized,
         Err(error) => return tool_error(format!("failed to serialize tool result: {error}")),
     };
@@ -316,10 +381,16 @@ struct SerializedValue {
 fn serialize_value<T: Serialize>(
     value: &T,
     format: ResultFormat,
+    redaction: OutputRedaction,
 ) -> Result<SerializedValue, serde_json::Error> {
+    let apply = matches!(redaction, OutputRedaction::Apply);
     match format {
         ResultFormat::PrettyJson => {
-            let text = serde_json::to_string_pretty(value)?;
+            let mut value = serde_json::to_value(value)?;
+            if apply {
+                redact_json_value(&mut value);
+            }
+            let text = serde_json::to_string_pretty(&value)?;
             Ok(SerializedValue {
                 json_bytes: text.len(),
                 text,
@@ -329,13 +400,17 @@ fn serialize_value<T: Serialize>(
             let value = serde_json::to_value(value)?;
             match value {
                 serde_json::Value::String(text) => {
+                    let text = if apply { redact_text(&text) } else { text };
                     // Measured as JSON, returned as text: escaping means the two
                     // sizes genuinely differ, which is why `ResultLimits` has
                     // two fields rather than one.
                     let json_bytes = serde_json::to_string(&text)?.len();
                     Ok(SerializedValue { text, json_bytes })
                 }
-                value => {
+                mut value => {
+                    if apply {
+                        redact_json_value(&mut value);
+                    }
                     let text = serde_json::to_string_pretty(&value)?;
                     Ok(SerializedValue {
                         json_bytes: text.len(),
@@ -404,6 +479,7 @@ mod tests {
                 max_text_bytes: 1024,
                 max_json_bytes: 1024,
             },
+            OutputRedaction::Apply,
         );
         assert_ne!(result.is_error, Some(true));
         assert!(text_of(&result).contains("fw-01"));
@@ -420,6 +496,7 @@ mod tests {
                 max_text_bytes: 4,
                 max_json_bytes: 32,
             },
+            OutputRedaction::Apply,
         );
         assert_eq!(result.is_error, Some(true));
         let text = text_of(&result);
@@ -445,6 +522,7 @@ mod tests {
                 max_text_bytes: 16,
                 max_json_bytes: 16,
             },
+            OutputRedaction::Apply,
         );
         assert_eq!(
             result.is_error,
@@ -470,6 +548,7 @@ mod tests {
             Ok("show version"),
             ResultFormat::StringOrPrettyJson,
             limits,
+            OutputRedaction::Apply,
         );
         assert_eq!(text_of(&raw), "show version");
 
@@ -477,6 +556,7 @@ mod tests {
             Ok("show version"),
             ResultFormat::PrettyJson,
             limits,
+            OutputRedaction::Apply,
         );
         assert_eq!(
             text_of(&quoted),
@@ -494,9 +574,73 @@ mod tests {
                 max_text_bytes: 1024,
                 max_json_bytes: 1024,
             },
+            OutputRedaction::Apply,
         );
         assert_eq!(result.is_error, Some(true));
         assert_eq!(text_of(&result), "device unreachable");
+    }
+
+    /// The whole point of this crate change: a handler that builds its
+    /// result with `tool_result` and never calls `mecmcp-redact` itself still
+    /// gets a redacted value back, because `OutputRedaction::Apply` runs
+    /// unconditionally for `PrettyJson`.
+    #[test]
+    fn tool_result_redacts_a_pretty_json_value_by_default() {
+        let result = tool_result::<_, std::convert::Infallible>(
+            Ok(serde_json::json!({"hostname": "fw-01", "api_key": "FAKEabc123secret"})),
+            ResultFormat::PrettyJson,
+            ResultLimits {
+                max_text_bytes: 1024,
+                max_json_bytes: 1024,
+            },
+            OutputRedaction::Apply,
+        );
+        let text = text_of(&result);
+        assert_ne!(result.is_error, Some(true));
+        assert!(text.contains("fw-01"), "got {text}");
+        assert!(!text.contains("FAKEabc123secret"), "got {text}");
+    }
+
+    /// Same default, for the `StringOrPrettyJson` string path — the shape a
+    /// device CLI dump takes.
+    #[test]
+    fn tool_result_redacts_a_raw_string_value_by_default() {
+        let result = tool_result::<_, std::convert::Infallible>(
+            Ok("hostname fw-01\npassword: hunter2-fake\n"),
+            ResultFormat::StringOrPrettyJson,
+            ResultLimits {
+                max_text_bytes: 1024,
+                max_json_bytes: 1024,
+            },
+            OutputRedaction::Apply,
+        );
+        let text = text_of(&result);
+        assert_ne!(result.is_error, Some(true));
+        assert!(text.contains("fw-01"), "got {text}");
+        assert!(!text.contains("hunter2-fake"), "got {text}");
+    }
+
+    /// `SkipForInternalRead` is the only way to get an unredacted value back
+    /// out of `tool_result`, and it must be opted into per call — nothing
+    /// about `OutputRedaction::Apply` from another call site leaks into this
+    /// one.
+    #[test]
+    fn skip_for_internal_read_returns_the_value_unredacted() {
+        let result = tool_result::<_, std::convert::Infallible>(
+            Ok(serde_json::json!({"api_key": "FAKEabc123secret"})),
+            ResultFormat::PrettyJson,
+            ResultLimits {
+                max_text_bytes: 1024,
+                max_json_bytes: 1024,
+            },
+            OutputRedaction::SkipForInternalRead {
+                tool: "get_audit_log",
+                reason: "reads this process's own audit log entries, not vendor secrets",
+            },
+        );
+        let text = text_of(&result);
+        assert_ne!(result.is_error, Some(true));
+        assert!(text.contains("FAKEabc123secret"), "got {text}");
     }
 
     #[test]
