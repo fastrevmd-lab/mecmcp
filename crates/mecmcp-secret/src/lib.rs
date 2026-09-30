@@ -37,9 +37,16 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 mod auth_readiness;
 mod lifetime;
+pub mod naming;
+pub mod validate;
 
 pub use auth_readiness::AuthFailureTracker;
 pub use lifetime::{CredentialLifetime, CredentialRegistry};
+pub use naming::ServerNaming;
+pub use validate::{
+    CredentialFileFailure, CredentialFileRole, CredentialFileSpec, CredentialValidationError,
+    validate_credential_files,
+};
 
 /// An outbound credential. Zeroized on drop.
 ///
