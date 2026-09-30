@@ -128,6 +128,31 @@ manifest "$tmp/placeholders-scalar.toml" 'placeholders = 5'
 check_err "optional key of the wrong type rejected" 2 "placeholders must be dict" \
   python3 "$READER" "$tmp/placeholders-scalar.toml"
 
+# --- MEC-978: audit_entrypoint follows the same false-sentinel shape as
+# skip_build_env, for the same reason -- `true` is truthy and an empty string
+# is indistinguishable from "unset" once it goes through a shell eval, so both
+# must be rejected rather than silently read as "R7 has nothing to check".
+manifest "$tmp/audit-true.toml" 'audit_entrypoint = true'
+check_err "audit_entrypoint = true rejected" 2 "must name the path" \
+  python3 "$READER" "$tmp/audit-true.toml"
+
+manifest "$tmp/audit-empty.toml" 'audit_entrypoint = ""'
+check_err "audit_entrypoint = \"\" rejected" 2 "is not a value" \
+  python3 "$READER" "$tmp/audit-empty.toml"
+
+manifest "$tmp/audit-abs.toml" 'audit_entrypoint = "/etc/svc/entrypoint.sh"'
+check_err "absolute audit_entrypoint rejected" 2 "not an absolute path" \
+  python3 "$READER" "$tmp/audit-abs.toml"
+
+manifest "$tmp/audit-named.toml" 'audit_entrypoint = "packaging/docker/audit-entrypoint.sh"'
+out="$(python3 "$READER" "$tmp/audit-named.toml")"; check "audit_entrypoint names a path" 0 $?
+grep -q '^CONF_AUDIT_ENTRYPOINT=packaging/docker/audit-entrypoint.sh$' <<<"$out" \
+  || { echo "FAIL - CONF_AUDIT_ENTRYPOINT not emitted for a named path"; fails=$((fails+1)); }
+
+out="$(python3 "$READER" "$tmp/good.toml")"
+grep -q '^CONF_AUDIT_ENTRYPOINT=$' <<<"$out" \
+  || { echo "FAIL - CONF_AUDIT_ENTRYPOINT not emitted empty when audit_entrypoint is absent"; fails=$((fails+1)); }
+
 # --- I4: a newline in a scalar forges a second shell assignment. -----------
 manifest "$tmp/newline-scalar.toml" 'tokens = "/var/lib/svc/tokens.json\nCONF_BINARY=bin/other"'
 check_err "newline in a scalar rejected" 2 "must not contain a newline" \
