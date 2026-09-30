@@ -1392,6 +1392,34 @@ fn check_change_set_write(
         }
     }
 
+    // 4. A two-person approval's approver must not be the owner.
+    //
+    // `approve_change_set` checks this too, but this function is the one door
+    // every write passes through -- including a caller that reaches this
+    // function directly with a hand-built `ChangeSetRecord`, bypassing
+    // `approve_change_set` entirely. Checked unconditionally against `next`,
+    // not gated on `current`, because a `Planned` record with no prior
+    // approval at all can carry a self-approval the moment it is written.
+    if let Some(approver) = next
+        .approval
+        .as_ref()
+        .and_then(|approval| approval.approver.as_ref())
+        && *approver == next.owner
+    {
+        return Err(CoordinatorError::new(
+            "approval",
+            "the change-set owner cannot approve their own plan",
+        ));
+    }
+    if let Some(approver) = next.approver.as_ref()
+        && *approver == next.owner
+    {
+        return Err(CoordinatorError::new(
+            "approver",
+            "the change-set owner cannot approve their own plan",
+        ));
+    }
+
     if !change_set_transition_allowed(current.state, next.state) {
         return Err(CoordinatorError::new(
             "state",
