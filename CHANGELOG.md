@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-09-30
+
 ### Changed
 
 - **docs: close out the filesystem-layout standard across all six vendor
