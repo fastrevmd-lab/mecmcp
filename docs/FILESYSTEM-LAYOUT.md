@@ -61,9 +61,14 @@ The current split puts a server-written file under `/etc`, which is why an atomi
 | `RustJunosMCP` | `rust-junosmcp` | `rust-junosmcp` | `/etc/rust-junosmcp` | `/var/lib/rust-junosmcp` |
 | `rust-panosmcp` | `rust-panosmcp` | `rust-panosmcp` | `/etc/rust-panosmcp` | `/var/lib/rust-panosmcp` |
 | `rustsdcmcp` | `rustsdcmcp` | `rustsdcmcp` | `/etc/rustsdcmcp` | `/var/lib/rustsdcmcp` |
-| `rustproxmoxmcp` | `rustproxmoxmcp` | `rustproxmoxmcp` | `/etc/rustproxmoxmcp` | `/var/lib/rustproxmoxmcp` |
-| `rustunifimcp` | `rustunifimcp` | `rustunifimcp` | `/etc/rustunifimcp` | `/var/lib/rustunifimcp` |
+| `rustproxmoxmcp` | `rust-proxmoxmcp` | `proxmoxmcp` | `/etc/proxmoxmcp`\* | `/var/lib/proxmoxmcp`\* |
+| `rustunifimcp` | `rustunifimcp` | `unifimcp` | `/etc/unifimcp`\* | `/var/lib/unifimcp`\* |
 | `rustmistmcp` | `rustmistmcp` | `rustmistmcp` | `/etc/rustmistmcp` | `/var/lib/rustmistmcp` |
+
+\* `rustproxmoxmcp` and `rustunifimcp` ship with an abbreviated directory/service-user
+base (`proxmoxmcp`, `unifimcp`) that drops the `rust(-)` prefix from the binary name —
+a second, deliberate naming exception alongside `jmcp` below, not a rule violation to
+fix. Every other column (config vs. state split, `tokens.json` placement) still holds.
 
 ## The `jmcp` exception
 
@@ -247,15 +252,21 @@ one specific rename, not to paper over an arbitrary missing file.
 ## New deployments
 
 All new MCP servers (`rustproxmoxmcp`, `rustunifimcp`, `rustmistmcp`, and any
-future vendors) adopt the standard from day one:
+future vendors) adopt the config-vs-state split from day one:
 
-- Binary name == service name == directory base
-- Config in `/etc/<binary-name>`
-- State in `/var/lib/<binary-name>`
-- `tokens.json` in `/var/lib/<binary-name>/tokens.json`
-- Service user `<binary-name>`
+- Config in `/etc/<dir-base>`
+- State in `/var/lib/<dir-base>`
+- `tokens.json` in `/var/lib/<dir-base>/tokens.json`
+- Service user == directory base
 
-No exceptions, no abbreviations.
+`rustmistmcp` also matches binary name == service name == directory base
+exactly. `rustproxmoxmcp` and `rustunifimcp` shipped with the abbreviated
+directory base noted above (`proxmoxmcp`, `unifimcp`) instead of the full
+binary name — accepted as a naming exception, not fixed retroactively, since
+renaming a live service's config/state directories is itself a migration
+with the same operational risk this document exists to avoid. Any future
+vendor should use the full binary name as the directory base unless there is
+a comparable reason not to.
 
 ## Verification
 
@@ -281,29 +292,40 @@ verified against the standard in this document:
 
 | Repo | Config | State (`tokens.json`) | Canonical/legacy fallback |
 |---|---|---|---|
-| `rust-junosmcp` | `/etc/jmcp`\* | `/var/lib/jmcp`\* | `resolve_token_path` |
-| `rust-panosmcp` | `/etc/rust-panosmcp` | `/var/lib/rust-panosmcp` | `resolve_token_path` + stale-secret scan |
-| `rustsdcmcp` | `/etc/rustsdcmcp` | `/var/lib/rustsdcmcp` | `resolve_token_path` + stale-secret scan |
-| `rustproxmoxmcp` | `/etc/proxmoxmcp` | `/var/lib/proxmoxmcp` | `resolve_token_path` + stale-secret scan |
-| `rustmistmcp` | `/etc/rustmistmcp` | `/var/lib/rustmistmcp` | `resolve_token_path` + stale-secret scan |
+| `rust-junosmcp` | `/etc/jmcp`\* | `/var/lib/jmcp`\* | `resolve_tokens_with` |
+| `rust-panosmcp` | `/etc/rust-panosmcp` | `/var/lib/rust-panosmcp` | no resolver — the configured path is used verbatim and fails if absent; the legacy `/etc` store is never read automatically, only warned about if present and not the configured path (`main.rs:92`) + stale-secret scan |
+| `rustsdcmcp` | `/etc/rustsdcmcp` | `/var/lib/rustsdcmcp` | `resolve_tokens_with` + stale-secret scan |
+| `rustproxmoxmcp` | `/etc/proxmoxmcp` | `/var/lib/proxmoxmcp` | `resolve_tokens_with` + stale-secret scan |
+| `rustmistmcp` | `/etc/rustmistmcp` | `/var/lib/rustmistmcp` | `resolve_tokens_with` + stale-secret scan |
 | `rustunifimcp` | `/etc/unifimcp` | `/var/lib/unifimcp` | none needed — shipped `/var/lib`-only from its first release, never had an `/etc` token store to migrate away from |
 
 \* `rust-junosmcp` also honours the locked-in `jmcp` exception paths; see
 above.
 
-Every server but `rustunifimcp` implements the same `resolve_tokens_with`
-pattern: the configured path is used verbatim and fails if absent, **except**
-when it is byte-exact-equal to the server's own canonical `/var/lib` path, in
-which case an absent canonical file falls back to the legacy `/etc` location
-with a `tracing::warn!` naming both paths. A typo, or a deliberately
-different custom path, never reaches the fallback — it fails startup
-immediately, which is the fail-loud behavior a bad drop-in restore needs
-surfaced at start time rather than discovered mid-incident. Each of the five
-servers with a legacy path to bridge carries unit tests exercising exactly
-this: the fallback firing, a custom path never falling back, and a
-trailing-slash spelling of the canonical path not reaching the fallback either
+`rust-junosmcp`, `rustsdcmcp`, `rustproxmoxmcp`, and `rustmistmcp` implement
+the same `resolve_tokens_with` pattern: the configured path is used verbatim
+and fails if absent, **except** when it is byte-exact-equal to the server's
+own canonical `/var/lib` path, in which case an absent canonical file falls
+back to the legacy `/etc` location with a `tracing::warn!` naming both paths.
+A typo, or a deliberately different custom path, never reaches the fallback —
+it fails startup immediately, which is the fail-loud behavior a bad drop-in
+restore needs surfaced at start time rather than discovered mid-incident.
+Each of these four servers carries unit tests exercising exactly this: the
+fallback firing, a custom path never falling back, and a trailing-slash
+spelling of the canonical path not reaching the fallback either
 (`grep -r canonical_path_falls_back_to_an_existing_legacy_store` in any of
 their `main.rs` files).
+
+`rust-panosmcp` does not have this resolver. Its configured `--tokens-file`
+path is loaded as given, with no automatic fallback to the legacy `/etc`
+location; if a legacy store is present at `/etc/rust-panosmcp/tokens.json`
+and is *not* the configured path, startup logs a `tracing::warn!` naming it
+as a stale, un-migrated copy, but never reads from it. An operator restoring
+a PAN-OS rig from an old drop-in that still points at the `/etc` path gets a
+working start (the file is read from wherever it's configured to be), not a
+silent, warned fallback to `/var/lib` the way the other four behave. Bringing
+`rust-panosmcp` in line with the shared resolver is tracked separately, not
+part of this doc update.
 
 No mutable credential or state file remains under `/etc/<svc>` on any of the
 six servers as of this update. Files that do live under `/etc` across the
