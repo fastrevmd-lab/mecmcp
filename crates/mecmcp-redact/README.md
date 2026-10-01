@@ -101,6 +101,31 @@ that field is denylisted, breaking change detection. [`redact_and_digest`] is
 the recommended entry point specifically because it makes "digest first" the
 only order reachable through the API.
 
+## Command-line use
+
+The `cli` feature builds a `mecmcp-redact` binary: the same engine, stdin to
+stdout, for a consumer that cannot link the crate (`mechubbench` is Python).
+
+```sh
+cargo run -p mecmcp-redact --features cli --bin mecmcp-redact -- --format json < body.json
+```
+
+`--format` is `text` (default), `json`, or `xml`. Invalid JSON/XML exits
+non-zero rather than printing the input back unredacted — the same
+fail-closed contract [`redact_json_str`]/[`redact_xml_str`] document. There is
+deliberately no `--profile` flag yet: see the binary's own doc comment
+(`src/bin/mecmcp-redact.rs`) for why.
+
+## Shared test coverage helper
+
+The `test-util` feature exposes [`testing::tools_leaking_secrets`]: given a
+tool-name registry, a set of fixture secrets, and a closure that exercises one
+tool and returns its rendered output, it returns the names of tools whose
+output contained any of those secrets. It generalizes the
+plant-a-secret-per-tool-and-assert-none-leak test every server has built by
+hand, the same way `mecmcp-audit`'s `test-util` feature generalized
+audit-coverage checking.
+
 ## Residual risk — read this before assuming zero egress
 
 This crate reduces what reaches the model. It does not guarantee nothing

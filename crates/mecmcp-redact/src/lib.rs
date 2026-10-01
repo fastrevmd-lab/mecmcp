@@ -66,6 +66,7 @@ pub mod policy;
 pub mod profile;
 pub mod projection;
 pub mod shape;
+pub mod testing;
 mod text;
 pub mod trust;
 mod xml;
