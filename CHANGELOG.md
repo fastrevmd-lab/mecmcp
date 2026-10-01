@@ -29,6 +29,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **mecmcp-server: `OutputRedaction::AlreadyRedacted`, a quiet skip for
+  output a caller redacted itself** (MEC-1168). `SkipForInternalRead` was
+  being reused by a handler whose result *did* come from a vendor device but
+  had already been redacted before reaching `tool_result` — typically to
+  protect a field like a pagination `continuation_token` that
+  `OutputRedaction::Apply`'s unconditional `redact_json_value` would
+  otherwise strip (MEC-440 B1). That reuse made `tool_result` log a `WARN`
+  `tool_output_redaction_skipped` audit event naming the wrong function on
+  every such call, even though the value genuinely was redacted — alert
+  fatigue and an inaccurate audit trail, not a data leak (Low severity,
+  found in review of rustsdcmcp#203 / MEC-1160). `AlreadyRedacted` skips
+  `tool_result`'s own redaction pass exactly as `SkipForInternalRead` does,
+  but emits no audit event, since there is nothing for an operator to be
+  warned about instead at `WARN`. It does carry `tool` and `redacted_by`
+  fields and logs its own `DEBUG`-level `tool_output_redacted_by_caller`
+  event naming both, so an operator can still enumerate every call site that
+  bypassed central redaction for vendor-device data, just without the
+  per-call `WARN` noise (addressed in review, MEC-1181: a silent bypass with
+  no audit trail at all was the wrong tradeoff for data that came from a
+  device). Existing call sites are unaffected; adopting it in place of
+  `SkipForInternalRead` is a separate, per-caller change.
+
 ## [0.25.0] - 2026-09-30
 
 ### Changed
