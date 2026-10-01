@@ -84,14 +84,17 @@ impl Profile {
         }
     }
 
-    /// Reject a key exemption that normalizes to exactly a
-    /// [`crate::denylist::DENYLISTED_KEYS`] term, rather than merely
-    /// containing one as a substring — `"token"` or `"password"` is refused,
-    /// `"continuationtoken"` is fine. Nothing in [`Profile::new`] can check
-    /// this at compile time (the denylist is matched at runtime), so a
-    /// vendor profile's own test suite should call this once and assert
-    /// `Ok(())`, the same way it asserts denylist-completeness over its own
-    /// schema.
+    /// Reject a key exemption that normalizes to exactly a denylisted term —
+    /// one of [`crate::denylist::DENYLISTED_KEYS`] (substring-matched
+    /// elsewhere, but refused here as a whole name: `"token"` or
+    /// `"password"` is refused, `"continuationtoken"` is fine), or one of the
+    /// exact-match-only denylist terms that [`crate::denylist::is_denylisted_key`]
+    /// also checks (`"key"`, and `"keys"` given the right sibling/parent
+    /// context — see [`crate::denylist::is_wep_keys_field`]). Nothing in
+    /// [`Profile::new`] can check this at compile time (the denylist is
+    /// matched at runtime), so a vendor profile's own test suite should call
+    /// this once and assert `Ok(())`, the same way it asserts
+    /// denylist-completeness over its own schema.
     ///
     /// # Errors
     ///
@@ -99,7 +102,10 @@ impl Profile {
     /// denylist term.
     pub fn check_exemptions(&self) -> Result<(), &'static str> {
         for &exemption in self.key_exemptions {
-            if crate::denylist::DENYLISTED_KEYS.contains(&exemption) {
+            if crate::denylist::DENYLISTED_KEYS.contains(&exemption)
+                || crate::denylist::DENYLISTED_EXACT_KEYS.contains(&exemption)
+                || crate::denylist::CONTEXTUALLY_DENYLISTED_EXACT_KEYS.contains(&exemption)
+            {
                 return Err(exemption);
             }
         }
@@ -283,22 +289,26 @@ mod tests {
         assert_eq!(v["continuation_token"]["password"], PLACEHOLDER);
     }
 
-    /// F2 regression: untrusted input cannot forge or erase an exempted
-    /// field by supplying a key that happens to collide with whatever
-    /// internal mechanism exemption used to use. There is no guard/unguard
-    /// round trip left to spoof — exemption is a predicate checked in place
-    /// — but this pins that a key exemption list only ever matches the
-    /// exact names declared, nothing synthesized from input.
+    /// F2 regression, pinned against the exact shape of the fixed defect
+    /// rather than an unrelated sibling key: exemption is now a predicate
+    /// checked in place against the declared name list, so an input key
+    /// cannot be mistaken for anything the implementation itself inserted.
     #[test]
     fn untrusted_input_cannot_forge_an_exempted_key_via_a_sibling() {
+        // Reproduces the exact internal shape the now-removed guard step
+        // used to hide the first exempted key it processed in a document.
+        const OLD_MARKER_INDEX_0: &str = "\u{0}mecmcp-redact-profile-guard\u{0}0";
         let mut v = json!({
-            "a": {"continuation_token": "real", "unrelated": "collide"},
-            "continuation_token": "top-level"
+            "continuation_token": "real-cursor",
+            "nested": { OLD_MARKER_INDEX_0: "forged-by-attacker" },
         });
         redact_json_value_with_profile(&mut v, &TEST_PROFILE);
-        assert_eq!(v["a"]["continuation_token"], "real");
-        assert_eq!(v["a"]["unrelated"], "collide");
-        assert_eq!(v["continuation_token"], "top-level");
+        assert_eq!(v["continuation_token"], "real-cursor");
+        assert!(
+            v["nested"].get("continuation_token").is_none(),
+            "an attacker-supplied key must never be renamed into an exempted field name"
+        );
+        assert_eq!(v["nested"][OLD_MARKER_INDEX_0], "forged-by-attacker");
     }
 
     /// F4: an exemption list must not be able to carve out a whole denylist
@@ -308,6 +318,21 @@ mod tests {
     fn check_exemptions_rejects_an_exact_denylist_term() {
         const BAD: Profile = Profile::new(&[], &["token"]);
         assert_eq!(BAD.check_exemptions(), Err("token"));
+    }
+
+    /// R1: `DENYLISTED_KEYS` is not the only source of denylisted field
+    /// names — `"key"` is denylisted under exact match
+    /// ([`crate::denylist::DENYLISTED_EXACT_KEYS`]), and `"keys"` is
+    /// denylisted given sibling/parent context
+    /// ([`crate::denylist::is_wep_keys_field`]). An exemption list must not
+    /// be able to carve either of those out either.
+    #[test]
+    fn check_exemptions_rejects_the_exact_match_only_denylist_terms() {
+        const BAD_KEY: Profile = Profile::new(&[], &["key"]);
+        assert_eq!(BAD_KEY.check_exemptions(), Err("key"));
+
+        const BAD_KEYS: Profile = Profile::new(&[], &["keys"]);
+        assert_eq!(BAD_KEYS.check_exemptions(), Err("keys"));
     }
 
     #[test]
