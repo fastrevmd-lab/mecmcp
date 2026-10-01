@@ -127,12 +127,25 @@ pub enum OutputRedaction {
     /// fields `Apply` always strips). Re-running redaction here would be a
     /// silent no-op at best and would re-touch an already-protected field at
     /// worst, so `tool_result` trusts the caller's own pass instead of
-    /// repeating it.
+    /// repeating it. That trust is unverified by this crate — the caller's
+    /// own pass must still go through `mecmcp_redact::redact_json_value` (or
+    /// another `mecmcp_redact::policy`-governed path), not a hand-rolled
+    /// denylist, or the two will drift apart.
     ///
-    /// Unlike `SkipForInternalRead`, this emits no audit event: the value
-    /// *was* redacted, just not by this function, so there is nothing for an
-    /// operator to be warned about.
-    AlreadyRedacted,
+    /// Unlike `SkipForInternalRead`, this does not emit a `WARN`-level
+    /// `tool_output_redaction_skipped` event — the value *was* redacted, just
+    /// not by this function, so there is nothing for an operator to be warned
+    /// about. It still emits a `DEBUG`-level `target: "audit"` event naming
+    /// `tool` and `redacted_by`, so an operator can list every call site that
+    /// bypassed central redaction for device data, even though none of them
+    /// need a warning.
+    AlreadyRedacted {
+        /// The tool name, so the audit event says which handler chose this.
+        tool: &'static str,
+        /// What redacted `value` before it reached `tool_result`, e.g.
+        /// "redact_json_value at the call site, to keep continuation_token".
+        redacted_by: &'static str,
+    },
 }
 
 /// Hard byte limits applied before a successful MCP result is returned.
@@ -390,6 +403,15 @@ where
             tool = %tool,
             reason = %reason,
             "tool output redaction skipped for tool {tool}: {reason}",
+        );
+    }
+    if let OutputRedaction::AlreadyRedacted { tool, redacted_by } = redaction {
+        tracing::debug!(
+            target: "audit",
+            event = "tool_output_redacted_by_caller",
+            tool = %tool,
+            redacted_by = %redacted_by,
+            "tool output for {tool} redacted at call site by {redacted_by}",
         );
     }
     let serialized = match serialize_value(&value, format, redaction) {
@@ -804,7 +826,10 @@ mod tests {
                 max_text_bytes: 1024,
                 max_json_bytes: 1024,
             },
-            OutputRedaction::AlreadyRedacted,
+            OutputRedaction::AlreadyRedacted {
+                tool: "list_continuations",
+                redacted_by: "redact_json_value at the call site, to keep continuation_token",
+            },
         );
         let text = text_of(&result);
         assert_ne!(result.is_error, Some(true));
