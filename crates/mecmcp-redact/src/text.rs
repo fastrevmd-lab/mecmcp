@@ -552,7 +552,17 @@ fn userinfo_password_spans(line: &str) -> Vec<(usize, usize)> {
                 }
             }
         }
-        cursor = (authority_start + authority_len.max(1)).min(line.len());
+        // When the authority is empty (`://` immediately followed by `/` or
+        // whitespace), advance past one char rather than a fixed single
+        // byte — `authority_len.max(1)` used to assume ASCII and could land
+        // mid-character on a multi-byte whitespace char (NBSP, em space,
+        // ...), making the next `find("://")` on `line[cursor..]` panic.
+        let step = if authority_len == 0 {
+            rest.chars().next().map_or(1, char::len_utf8)
+        } else {
+            authority_len
+        };
+        cursor = (authority_start + step).min(line.len());
     }
     spans
 }
@@ -1471,5 +1481,36 @@ mod tests {
     fn y5_ideographic_space_before_value_in_forced_fallback_does_not_panic() {
         let got = redact("foo\u{3000}QQw3## SECRET-DATA");
         assert!(!got.contains("QQw3"), "got: {got}");
+    }
+
+    // --- MEC-1226 (Percy review of #463, Finding 1): `userinfo_password_spans`
+    // advanced its cursor past an empty authority with a fixed `+1` byte,
+    // which lands mid-character when the text right after `://` opens with
+    // a multi-byte whitespace char (NBSP, ...). The next `find("://")` on
+    // the truncated slice then panics instead of returning `None`. Reachable
+    // from `redact_text`, `redact_xml_str` and `redact_json_str` alike, with
+    // no `force` or `## SECRET-DATA` marker needed. ---
+
+    #[test]
+    fn y6_nbsp_right_after_scheme_separator_does_not_panic_in_text() {
+        // Nothing here looks like a secret, so the call just needs to
+        // return instead of panicking.
+        let _ = redact("see http://\u{a0}x");
+    }
+
+    #[test]
+    fn y6_nbsp_right_after_scheme_separator_does_not_panic_in_xml() {
+        let _ = crate::redact_xml_str("<a>see http://\u{a0}x</a>").expect("valid xml");
+    }
+
+    #[test]
+    fn y6_nbsp_right_after_scheme_separator_does_not_panic_in_json() {
+        let _ = crate::redact_json_str("{\"m\":\"see http://\u{a0}x\"}").expect("valid json");
+    }
+
+    #[test]
+    fn y6_userinfo_password_after_empty_authority_is_still_redacted() {
+        let got = redact("see http://\u{a0}x then https://admin:QQw4@host/");
+        assert!(!got.contains("QQw4"), "got: {got}");
     }
 }
