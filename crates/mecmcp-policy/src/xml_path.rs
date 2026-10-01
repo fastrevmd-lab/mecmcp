@@ -190,7 +190,22 @@ pub fn blocked_read_paths<A: Copy + PartialEq>(
     deny_action: A,
 ) -> Result<HashSet<String>, XmlPathError> {
     let mut blocked = HashSet::new();
+    // Many documents repeat the same path back-to-back — a run of sibling
+    // elements that share a tag name (as `blocked_read_paths_propagates_
+    // ancestors_promptly_under_many_matches` exercises with 49,000 identical
+    // `leaf-match` siblings) produces the exact same path string on every
+    // call. Skipping a call whose path is bit-identical to the previous
+    // one's avoids redoing the glob match and ancestor-prefix walk for every
+    // repeat: since the path is unchanged, `evaluate` and the `blocked`
+    // inserts it would perform are guaranteed to reach the same outcome the
+    // first occurrence already reached.
+    let mut last_path: Option<Vec<String>> = None;
     walk_elements(xml, |path| {
+        if last_path.as_deref() == Some(path) {
+            return;
+        }
+        last_path = Some(path.to_vec());
+
         let candidate = path_string(path);
         if let Some(rule) = evaluate(rules, &candidate)
             && rule.action == deny_action
