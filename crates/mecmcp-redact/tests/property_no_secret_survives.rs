@@ -94,7 +94,7 @@ fn no_denylisted_exact_key_fixture_secret_survives_any_format() {
             let got = redact(&input, format);
             assert!(
                 !got.contains(&secret),
-                "exact-match key '{key}' (field '{field}') leaked in {}: {got}",
+                "exact-match key '{key}' (field '{field}') leaked in {}",
                 format_name(format)
             );
         }
