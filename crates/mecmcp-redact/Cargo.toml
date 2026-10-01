@@ -11,7 +11,16 @@ authors.workspace      = true
 [lints]
 workspace = true
 
+[[bin]]
+name              = "mecmcp-redact"
+path              = "src/bin/mecmcp-redact.rs"
+required-features = ["cli"]
+
 [dependencies]
+# Only pulled in by the `cli` feature -- a library consumer linking this crate
+# for `redact_text`/`redact_json_str`/etc. must not drag an argument parser
+# into its own binary. See the `cli` feature below.
+clap       = { version = "4", features = ["derive"], optional = true }
 hmac       = { workspace = true }
 quick-xml  = { workspace = true }
 serde_json = { workspace = true }
@@ -22,3 +31,13 @@ tracing    = { workspace = true }
 [dev-dependencies]
 tempfile           = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[features]
+# Exposes the `mecmcp-redact` binary (stdin to stdout, for non-Rust
+# consumers such as mechubbench). Off by default so every existing library
+# consumer's dependency graph is unchanged.
+cli = ["dep:clap"]
+# Exposes `testing::tools_leaking_secrets`, the shared tool-output-redaction
+# coverage helper (mirrors mecmcp-audit's `test-util` -> `testutil.rs`
+# pattern). Dev-dependency only, never a default feature.
+test-util = []

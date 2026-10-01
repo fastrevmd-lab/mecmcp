@@ -31,6 +31,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **mecmcp-redact: `mecmcp-redact` CLI binary and a shared tool-output
+  redaction coverage helper** (MEC-1231). A new `cli` feature exposes a
+  `mecmcp-redact` binary that runs the same `redact_text`/`redact_json_str`/
+  `redact_xml_str` engine every server already links, over stdin/stdout, for
+  non-Rust consumers that cannot depend on the crate directly (`--format
+  text|json|xml`; exits non-zero rather than passing through unparsed input,
+  matching the library's fail-closed contract). A new `test-util` feature
+  exposes `testing::tools_leaking_secrets`, generalizing the
+  hand-rolled-per-server "does any tool's rendered output contain a planted
+  fixture secret" assertion (the same way `mecmcp-audit`'s `test-util`
+  generalized audit-coverage checking) so each server's own coverage test can
+  call one shared function instead of re-deriving it.
+
 - **mecmcp-server: `OutputRedaction::AlreadyRedacted`, a quiet skip for
   output a caller redacted itself** (MEC-1168). `SkipForInternalRead` was
   being reused by a handler whose result *did* come from a vendor device but
