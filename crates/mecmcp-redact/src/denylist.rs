@@ -44,6 +44,12 @@ pub const DENYLISTED_KEYS: &[&str] = &[
     "partnerkey",
     "accountkey",
     "clientkey",
+    // MEC-1245: Junos routing-options `hmac-key` (OSPFv3/IS-IS HMAC
+    // authentication). Not covered by any existing entry — `key` is
+    // exact-match-only (see `DENYLISTED_EXACT_KEYS`'s doc comment) so it
+    // does not catch this as a substring, and no other term here contains
+    // "hmac".
+    "hmackey",
 ];
 
 /// Field names that must match the *whole* normalized key, not a substring.
@@ -208,6 +214,15 @@ mod tests {
                     "expected '{variant}' (variant of spec key '{spec_key}') to be denylisted"
                 );
             }
+        }
+    }
+
+    /// MEC-1245: Junos routing-options `hmac-key` (OSPFv3/IS-IS HMAC
+    /// authentication) was not covered by any existing denylist entry.
+    #[test]
+    fn mec_1245_hmac_key_is_denylisted() {
+        for key in ["hmac-key", "hmac_key", "hmacKey", "HMAC-KEY"] {
+            assert!(is_denylisted_key(key), "'{key}' must be denylisted");
         }
     }
 

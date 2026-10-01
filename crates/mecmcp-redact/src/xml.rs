@@ -28,6 +28,19 @@ const PLACEHOLDER: &[u8] = b"[REDACTED]";
 /// this crate never falls back to returning the input unredacted just
 /// because it could not be understood.
 pub fn redact(input: &str) -> Result<String, RedactError> {
+    redact_with(input, &|_| false)
+}
+
+/// Same as [`redact`], but `extra_exact_elem` names additional element local
+/// names (exact match, namespace-stripped) that are secret-bearing on their
+/// own — used by [`crate::junos`] for element names (`value`) that are too
+/// generic to add to the shared [`crate::denylist`] without over-redacting
+/// every other vendor's XML, but that a vendor-specific profile's own closed
+/// element vocabulary can still treat as unconditionally sensitive.
+pub(crate) fn redact_with(
+    input: &str,
+    extra_exact_elem: &dyn Fn(&str) -> bool,
+) -> Result<String, RedactError> {
     let mut reader = Reader::from_str(input);
     reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Cursor::new(Vec::new()));
@@ -54,7 +67,7 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
             flush_text_run(
                 &mut writer,
                 &mut text_run,
-                any_ancestor_denylisted(&tag_stack),
+                any_ancestor_secret(&tag_stack, extra_exact_elem),
             )?;
         }
         match event {
@@ -69,7 +82,7 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
             }
             Event::Start(e) => {
                 tag_stack.push(local_name(e.name()).to_vec());
-                let rewritten = redact_attributes(&e, &tag_stack)?;
+                let rewritten = redact_attributes(&e, &tag_stack, extra_exact_elem)?;
                 writer
                     .write_event(Event::Start(rewritten))
                     .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
@@ -83,7 +96,7 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
                 // attributes even though the non-empty `<community
                 // name="..."></community>` form does (N4).
                 tag_stack.push(local_name(e.name()));
-                let rewritten = redact_attributes(&e, &tag_stack)?;
+                let rewritten = redact_attributes(&e, &tag_stack, extra_exact_elem)?;
                 tag_stack.pop();
                 writer
                     .write_event(Event::Empty(rewritten))
@@ -117,7 +130,7 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
             }
             Event::CData(e) => {
                 let decoded = e.into_inner().into_owned();
-                let ancestor_is_secret = any_ancestor_denylisted(&tag_stack);
+                let ancestor_is_secret = any_ancestor_secret(&tag_stack, extra_exact_elem);
                 let out = if ancestor_is_secret || looks_like_secret_value(&decoded) {
                     quick_xml::events::BytesCData::new(
                         String::from_utf8_lossy(PLACEHOLDER).into_owned(),
@@ -199,18 +212,21 @@ pub(crate) fn validate(input: &str) -> Result<(), RedactError> {
 /// Whether any element currently open (not just the immediate parent) is a
 /// denylisted key — a Junos SNMP community landing in `<name>` under
 /// `<community>`, or a PSK in `<ascii-text>` under `<pre-shared-key>`, both
-/// have a *grandparent*, not a parent, that names the secret.
-fn any_ancestor_denylisted(tag_stack: &[Vec<u8>]) -> bool {
-    tag_stack
-        .iter()
-        .any(|name| is_denylisted_key(&String::from_utf8_lossy(name)))
+/// have a *grandparent*, not a parent, that names the secret — or matches
+/// `extra_exact_elem` (see [`redact_with`]).
+fn any_ancestor_secret(tag_stack: &[Vec<u8>], extra_exact_elem: &dyn Fn(&str) -> bool) -> bool {
+    tag_stack.iter().any(|name| {
+        let name = String::from_utf8_lossy(name);
+        is_denylisted_key(&name) || extra_exact_elem(&name)
+    })
 }
 
 fn redact_attributes<'a>(
     start: &BytesStart<'a>,
     tag_stack: &[Vec<u8>],
+    extra_exact_elem: &dyn Fn(&str) -> bool,
 ) -> Result<BytesStart<'a>, RedactError> {
-    let ancestor_is_secret = any_ancestor_denylisted(tag_stack);
+    let ancestor_is_secret = any_ancestor_secret(tag_stack, extra_exact_elem);
     let mut out = BytesStart::new(start.name().as_ref().to_owned());
     for attr in start.attributes() {
         let attr = attr.map_err(|e| RedactError::InvalidXml(e.to_string()))?;
@@ -240,7 +256,7 @@ fn redact_attributes<'a>(
 ///
 /// `ancestor_is_secret` must reflect `tag_stack` as it was *during* the
 /// run — callers flush before mutating `tag_stack` for the event that ended
-/// the run, so the stack passed to [`any_ancestor_denylisted`] still
+/// the run, so the stack passed to [`any_ancestor_secret`] still
 /// matches.
 fn flush_text_run(
     writer: &mut Writer<Cursor<Vec<u8>>>,
