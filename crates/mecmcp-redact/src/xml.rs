@@ -10,7 +10,9 @@
 //! instead of emitting a best-effort partial result.
 
 use crate::RedactError;
-use crate::denylist::is_denylisted_key;
+use crate::denylist::{
+    is_bgp_community_field, is_bgp_scope_key, is_container_safe_key, is_denylisted_key,
+};
 use crate::shape::looks_like_secret_value;
 use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesRef, BytesStart, BytesText, Event};
@@ -200,10 +202,33 @@ pub(crate) fn validate(input: &str) -> Result<(), RedactError> {
 /// denylisted key — a Junos SNMP community landing in `<name>` under
 /// `<community>`, or a PSK in `<ascii-text>` under `<pre-shared-key>`, both
 /// have a *grandparent*, not a parent, that names the secret.
+///
+/// Two MEC-537 exceptions to the plain "any ancestor matches" rule:
+///
+/// - A `community` ancestor is skipped when a `bgp` element is also open —
+///   that is a BGP route community (public routing data), not the SNMP
+///   community string sharing the same bare field name. See
+///   [`is_bgp_community_field`].
+/// - A `session` ancestor only counts when it is the *immediate* parent of
+///   the text being decided, not a shallower ancestor — `session` doubles as
+///   a non-secret container for diagnostic fields (`show session info`), and
+///   unlike `pre-shared-key`/`community` there is no single secret payload
+///   nested inside it for the cascade to be finding. See
+///   [`is_container_safe_key`].
 fn any_ancestor_denylisted(tag_stack: &[Vec<u8>]) -> bool {
-    tag_stack
+    let under_bgp = tag_stack
         .iter()
-        .any(|name| is_denylisted_key(&String::from_utf8_lossy(name)))
+        .any(|name| is_bgp_scope_key(&String::from_utf8_lossy(name)));
+    tag_stack.iter().enumerate().any(|(i, name)| {
+        let name = String::from_utf8_lossy(name);
+        if !is_denylisted_key(&name) || is_bgp_community_field(&name, under_bgp) {
+            return false;
+        }
+        if is_container_safe_key(&name) && i + 1 != tag_stack.len() {
+            return false;
+        }
+        true
+    })
 }
 
 fn redact_attributes<'a>(

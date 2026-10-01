@@ -20,7 +20,7 @@ pub const DENYLISTED_KEYS: &[&str] = &[
     "xpassphrase",
     "xsecret",
     "phash",
-    "community",
+    "communitystring",
     "apikey",
     "token",
     "authenticationkey",
@@ -36,7 +36,11 @@ pub const DENYLISTED_KEYS: &[&str] = &[
     "cookie",
     "passwd",
     "pwd",
-    "session",
+    "sessionid",
+    "sessiontoken",
+    "sessionkey",
+    "sessioncookie",
+    "sessionsecret",
     "keystring",
     "messagedigestkey",
     "authkey",
@@ -53,7 +57,21 @@ pub const DENYLISTED_KEYS: &[&str] = &[
 /// named `key0`, ...). But the bare field name `key` alone is exactly the
 /// PAN-OS keygen response shape (`<result><key>` is the API key itself), so it
 /// still needs to be denylisted — just under exact match instead.
-const DENYLISTED_EXACT_KEYS: &[&str] = &["key"];
+///
+/// MEC-537: `session` and `community` moved here from [`DENYLISTED_KEYS`] for
+/// the same reason. As substrings they blanked ordinary PAN-OS operational
+/// output: `show session info`'s `idle-timeout-tcp-session`,
+/// `sessions-active`, and similar diagnostic/config fields all contain
+/// "session" without being session secrets, and BGP route-policy fields like
+/// `community-list`/`match-community`/`add-community` all contain
+/// "community" without being the SNMP community string. The bare words still
+/// need denylisting — a literal `session` field can hold a session
+/// token/cookie, and a literal `community` field is PAN-OS/Junos's SNMP
+/// community string — so they move to exact match rather than dropping out
+/// entirely. Compound spellings that are reliably secret-shaped either way
+/// (`session_id`, `session_token`, `community_string`, ...) stay covered via
+/// the narrower substring entries added alongside this change.
+const DENYLISTED_EXACT_KEYS: &[&str] = &["key", "session", "community"];
 
 /// Whether `key` is a WEP key-material field, identifiable only by the shape
 /// of its enclosing object rather than its own name.
@@ -75,6 +93,47 @@ pub fn is_wep_keys_field(key: &str, parent_key: Option<&str>, sibling_type: Opti
         return true;
     }
     parent_key.is_some_and(|p| normalize(p) == "auth")
+}
+
+/// Whether `key` is the BGP configuration scope that [`is_bgp_community_field`]
+/// looks for among a value's ancestors.
+#[must_use]
+pub fn is_bgp_scope_key(key: &str) -> bool {
+    normalize(key) == "bgp"
+}
+
+/// Whether `key` is a BGP route-community field that must survive despite
+/// normalizing to the exact-match `community` entry.
+///
+/// PAN-OS and Junos both spell a BGP route community (a routing-policy tag
+/// like `65000:100`, public on the wire) with the exact same bare `community`
+/// field an SNMP community *string* (a shared secret) uses — the two are
+/// indistinguishable by field name alone. Both vendors nest every BGP
+/// community reference under a `bgp` element somewhere above it, which SNMP
+/// configuration never is, so a caller walking the tree can tell them apart
+/// by checking whether a `bgp` scope is among the value's ancestors.
+#[must_use]
+pub fn is_bgp_community_field(key: &str, under_bgp_scope: bool) -> bool {
+    under_bgp_scope && normalize(key) == "community"
+}
+
+/// Whether `key` is a denylisted field whose own text can be the secret, but
+/// whose *children* must not be nuked wholesale just because it contains
+/// them.
+///
+/// `session` is the one entry here (MEC-537): a bare `session` field is
+/// sometimes a leaf holding a session token/cookie (secret), and sometimes a
+/// container a vendor op command uses to group non-secret diagnostic fields
+/// (`num-active`, `num-max`, `tcp-timeout`, ...; PAN-OS `show session info`).
+/// Unlike the `pre-shared-key`/`ascii-text` or `snmp`/`community`/`name`
+/// shapes elsewhere in this crate — where the denylisted ancestor's
+/// descendant chain leads straight to the secret value and nothing else —
+/// `session`'s container use has no equivalent single secret payload to find
+/// inside it, so cascading into every leaf the way [`crate::json::redact`]
+/// otherwise does for a denylisted key is the wrong default here.
+#[must_use]
+pub fn is_container_safe_key(key: &str) -> bool {
+    normalize(key) == "session"
 }
 
 /// Lowercase `s` and drop every non-alphanumeric byte, so `pre-shared-key`,
@@ -209,6 +268,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// MEC-537: `session` and `community` match the bare word exactly (a
+    /// session cookie/token, or PAN-OS/Junos's SNMP community string) but not
+    /// as a substring of an unrelated compound field.
+    #[test]
+    fn mec_537_session_and_community_match_exactly_not_as_a_substring() {
+        for key in ["session", "Session", "community", "Community"] {
+            assert!(is_denylisted_key(key), "'{key}' must be denylisted");
+        }
+        for key in [
+            "idle-timeout-tcp-session",
+            "sessions-active",
+            "max-sessions",
+            "session-timeout",
+            "community-list",
+            "match-community",
+            "add-community",
+            "remove-community",
+        ] {
+            assert!(
+                !is_denylisted_key(key),
+                "'{key}' must not match the exact-only 'session'/'community' entries"
+            );
+        }
+    }
+
+    /// MEC-537: compound spellings that are reliably secret-shaped either way
+    /// still match as a substring.
+    #[test]
+    fn mec_537_secret_shaped_session_and_community_compounds_still_match() {
+        for key in [
+            "session_id",
+            "sessionId",
+            "session-token",
+            "session_key",
+            "session_cookie",
+            "jsessionid",
+            "community_string",
+            "communityString",
+            "snmp-community-string",
+        ] {
+            assert!(is_denylisted_key(key), "'{key}' must be denylisted");
+        }
+    }
+
+    #[test]
+    fn mec_537_bgp_community_field_only_matches_under_bgp_scope() {
+        assert!(is_bgp_community_field("community", true));
+        assert!(!is_bgp_community_field("community", false));
+        assert!(!is_bgp_community_field("community-list", true));
+        assert!(is_bgp_scope_key("bgp"));
+        assert!(!is_bgp_scope_key("bgp-peer-group"));
+    }
+
+    #[test]
+    fn mec_537_container_safe_key_is_session_only() {
+        assert!(is_container_safe_key("session"));
+        assert!(!is_container_safe_key("community"));
+        assert!(!is_container_safe_key("secret"));
     }
 
     #[test]

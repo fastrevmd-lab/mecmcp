@@ -7,7 +7,10 @@
 //! nothing to add a new nested shape, at the cost of never being a positive
 //! guarantee the way an allowlist projection is.
 
-use crate::denylist::{is_denylisted_key, is_wep_keys_field};
+use crate::denylist::{
+    is_bgp_community_field, is_bgp_scope_key, is_container_safe_key, is_denylisted_key,
+    is_wep_keys_field,
+};
 use crate::shape::looks_like_secret_value;
 use serde_json::Value;
 
@@ -15,29 +18,47 @@ const PLACEHOLDER: &str = "[REDACTED]";
 
 /// Redact `value` in place.
 pub fn redact(value: &mut Value) {
-    redact_inner(value, None);
+    redact_inner(value, None, false);
 }
 
 /// `parent_key` is the JSON object key `value` was found under, if any — the
 /// only context [`is_wep_keys_field`] needs to tell a WEP `keys` table apart
 /// from an unrelated `keys` field without widening the denylist itself.
-fn redact_inner(value: &mut Value, parent_key: Option<&str>) {
+///
+/// `under_bgp` is whether a `bgp` key sits somewhere above `value` in the
+/// tree — the context [`is_bgp_community_field`] needs to tell a BGP route
+/// community apart from an SNMP community string sharing the same bare
+/// `community` field name (MEC-537).
+fn redact_inner(value: &mut Value, parent_key: Option<&str>, under_bgp: bool) {
     match value {
         Value::Object(map) => {
             let sibling_type = map.get("type").and_then(Value::as_str).map(str::to_owned);
             for (key, v) in map.iter_mut() {
-                if is_denylisted_key(key)
-                    || is_wep_keys_field(key, parent_key, sibling_type.as_deref())
-                {
-                    *v = redact_leaf(v);
+                let is_secret = (is_denylisted_key(key)
+                    || is_wep_keys_field(key, parent_key, sibling_type.as_deref()))
+                    && !is_bgp_community_field(key, under_bgp);
+                let child_under_bgp = under_bgp || is_bgp_scope_key(key);
+                if is_secret {
+                    // MEC-537: a container-safe denylisted key (`session`)
+                    // only forces the placeholder on a scalar value of its
+                    // own; a nested object/array under it is walked normally
+                    // instead of having every leaf nuked, since its children
+                    // are independent diagnostic fields, not pieces of one
+                    // secret payload (see `is_container_safe_key`'s docs).
+                    if is_container_safe_key(key) && matches!(v, Value::Object(_) | Value::Array(_))
+                    {
+                        redact_inner(v, Some(key), child_under_bgp);
+                    } else {
+                        *v = redact_leaf(v);
+                    }
                 } else {
-                    redact_inner(v, Some(key));
+                    redact_inner(v, Some(key), child_under_bgp);
                 }
             }
         }
         Value::Array(items) => {
             for item in items.iter_mut() {
-                redact_inner(item, parent_key);
+                redact_inner(item, parent_key, under_bgp);
             }
         }
         Value::String(s) => {
