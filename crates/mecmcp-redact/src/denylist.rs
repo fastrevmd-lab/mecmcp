@@ -20,6 +20,7 @@ pub const DENYLISTED_KEYS: &[&str] = &[
     "xpassphrase",
     "xsecret",
     "phash",
+    "community",
     "communitystring",
     "apikey",
     "token",
@@ -36,6 +37,7 @@ pub const DENYLISTED_KEYS: &[&str] = &[
     "cookie",
     "passwd",
     "pwd",
+    "session",
     "sessionid",
     "sessiontoken",
     "sessionkey",
@@ -50,6 +52,31 @@ pub const DENYLISTED_KEYS: &[&str] = &[
     "clientkey",
 ];
 
+/// Compound field names that normalize to *containing* [`DENYLISTED_KEYS`]'s
+/// `session` or `community` entries without being secrets, so the substring
+/// match alone would over-redact them.
+///
+/// Exact match, checked before the substring scan: a PAN-OS/Junos diagnostic
+/// or routing-policy field (`idle-timeout-tcp-session`, `sessions-active`,
+/// `community-list`, ...) is a known, closed set of vendor spellings, not a
+/// pattern — unlike the denylist itself, widening this list is the direction
+/// that is *not* safe to be wrong in, so it only grows when a specific
+/// vendor field name is confirmed non-secret (MEC-537 review, F1/F2/F3).
+const SAFE_KEY_EXCEPTIONS: &[&str] = &[
+    "sessions",
+    "sessionsactive",
+    "maxsessions",
+    "sessiontimeout",
+    "idletimeouttcpsession",
+    "communitylist",
+    "matchcommunity",
+    "addcommunity",
+    "removecommunity",
+    "overwritecommunity",
+    "communities",
+    "communitymembers",
+];
+
 /// Field names that must match the *whole* normalized key, not a substring.
 ///
 /// `"key"` is deliberately not in [`DENYLISTED_KEYS`]: as a substring it would
@@ -57,21 +84,7 @@ pub const DENYLISTED_KEYS: &[&str] = &[
 /// named `key0`, ...). But the bare field name `key` alone is exactly the
 /// PAN-OS keygen response shape (`<result><key>` is the API key itself), so it
 /// still needs to be denylisted — just under exact match instead.
-///
-/// MEC-537: `session` and `community` moved here from [`DENYLISTED_KEYS`] for
-/// the same reason. As substrings they blanked ordinary PAN-OS operational
-/// output: `show session info`'s `idle-timeout-tcp-session`,
-/// `sessions-active`, and similar diagnostic/config fields all contain
-/// "session" without being session secrets, and BGP route-policy fields like
-/// `community-list`/`match-community`/`add-community` all contain
-/// "community" without being the SNMP community string. The bare words still
-/// need denylisting — a literal `session` field can hold a session
-/// token/cookie, and a literal `community` field is PAN-OS/Junos's SNMP
-/// community string — so they move to exact match rather than dropping out
-/// entirely. Compound spellings that are reliably secret-shaped either way
-/// (`session_id`, `session_token`, `community_string`, ...) stay covered via
-/// the narrower substring entries added alongside this change.
-const DENYLISTED_EXACT_KEYS: &[&str] = &["key", "session", "community"];
+pub const DENYLISTED_EXACT_KEYS: &[&str] = &["key"];
 
 /// Whether `key` is a WEP key-material field, identifiable only by the shape
 /// of its enclosing object rather than its own name.
@@ -102,8 +115,8 @@ pub fn is_bgp_scope_key(key: &str) -> bool {
     normalize(key) == "bgp"
 }
 
-/// Whether `key` is a BGP route-community field that must survive despite
-/// normalizing to the exact-match `community` entry.
+/// Whether `key` is a BGP route-community field that may survive despite
+/// normalizing to the `community` substring entry.
 ///
 /// PAN-OS and Junos both spell a BGP route community (a routing-policy tag
 /// like `65000:100`, public on the wire) with the exact same bare `community`
@@ -112,28 +125,48 @@ pub fn is_bgp_scope_key(key: &str) -> bool {
 /// community reference under a `bgp` element somewhere above it, which SNMP
 /// configuration never is, so a caller walking the tree can tell them apart
 /// by checking whether a `bgp` scope is among the value's ancestors.
+///
+/// This is necessary but not sufficient: it only tells the caller the *key*
+/// matches the shape. A `bgp` ancestor can itself be a vendor's own
+/// user-chosen map key (a profile, VR, or template literally named `bgp`),
+/// so the key-only check does not prove the field underneath is actually
+/// BGP routing data. Callers must additionally confirm the value with
+/// [`is_bgp_community_tag`] before skipping redaction (MEC-537 review, F4) —
+/// a secret does not parse as community-tag syntax even when it happens to
+/// sit under something named `bgp`.
 #[must_use]
 pub fn is_bgp_community_field(key: &str, under_bgp_scope: bool) -> bool {
     under_bgp_scope && normalize(key) == "community"
 }
 
-/// Whether `key` is a denylisted field whose own text can be the secret, but
-/// whose *children* must not be nuked wholesale just because it contains
-/// them.
+/// Whether `s` looks like BGP community-tag syntax (`65000:100`, a routing
+/// tag; or `65000:100:5`, an extended/large community) or one of BGP's
+/// well-known community names, rather than an arbitrary secret value.
 ///
-/// `session` is the one entry here (MEC-537): a bare `session` field is
-/// sometimes a leaf holding a session token/cookie (secret), and sometimes a
-/// container a vendor op command uses to group non-secret diagnostic fields
-/// (`num-active`, `num-max`, `tcp-timeout`, ...; PAN-OS `show session info`).
-/// Unlike the `pre-shared-key`/`ascii-text` or `snmp`/`community`/`name`
-/// shapes elsewhere in this crate — where the denylisted ancestor's
-/// descendant chain leads straight to the secret value and nothing else —
-/// `session`'s container use has no equivalent single secret payload to find
-/// inside it, so cascading into every leaf the way `json::redact` otherwise
-/// does for a denylisted key is the wrong default here.
+/// Required alongside [`is_bgp_community_field`] before exempting a
+/// `community` field from redaction (MEC-537 review, F4): the key-only check
+/// cannot tell a real BGP routing policy apart from an unrelated value that
+/// merely sits under a `bgp`-named ancestor, so the value itself has to back
+/// up the "this is public routing data" claim. A secret string does not
+/// parse as this shape.
 #[must_use]
-pub fn is_container_safe_key(key: &str) -> bool {
-    normalize(key) == "session"
+pub fn is_bgp_community_tag(s: &str) -> bool {
+    const WELL_KNOWN: &[&str] = &[
+        "no-export",
+        "no-advertise",
+        "no-peer",
+        "no-export-subconfed",
+        "local-as",
+        "internet",
+    ];
+    if WELL_KNOWN.iter().any(|w| s.eq_ignore_ascii_case(w)) {
+        return true;
+    }
+    let parts: Vec<&str> = s.split(':').collect();
+    (parts.len() == 2 || parts.len() == 3)
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Lowercase `s` and drop every non-alphanumeric byte, so `pre-shared-key`,
@@ -155,6 +188,9 @@ fn normalize(s: &str) -> String {
 pub fn is_denylisted_key(key: &str) -> bool {
     let normalized = normalize(key);
     if normalized.is_empty() {
+        return false;
+    }
+    if SAFE_KEY_EXCEPTIONS.iter().any(|term| normalized == *term) {
         return false;
     }
     if DENYLISTED_EXACT_KEYS.iter().any(|term| normalized == *term) {
@@ -270,11 +306,11 @@ mod tests {
         }
     }
 
-    /// MEC-537: `session` and `community` match the bare word exactly (a
-    /// session cookie/token, or PAN-OS/Junos's SNMP community string) but not
-    /// as a substring of an unrelated compound field.
+    /// MEC-537: `session` and `community` match as a substring (a session
+    /// cookie/token, or PAN-OS/Junos's SNMP community string), but the
+    /// specific non-secret compounds on [`SAFE_KEY_EXCEPTIONS`] are exempted.
     #[test]
-    fn mec_537_session_and_community_match_exactly_not_as_a_substring() {
+    fn mec_537_session_and_community_match_as_substrings() {
         for key in ["session", "Session", "community", "Community"] {
             assert!(is_denylisted_key(key), "'{key}' must be denylisted");
         }
@@ -283,6 +319,7 @@ mod tests {
             "sessions-active",
             "max-sessions",
             "session-timeout",
+            "sessions",
             "community-list",
             "match-community",
             "add-community",
@@ -290,13 +327,14 @@ mod tests {
         ] {
             assert!(
                 !is_denylisted_key(key),
-                "'{key}' must not match the exact-only 'session'/'community' entries"
+                "'{key}' must be exempted via SAFE_KEY_EXCEPTIONS"
             );
         }
     }
 
-    /// MEC-537: compound spellings that are reliably secret-shaped either way
-    /// still match as a substring.
+    /// MEC-537 review (F1/F2): compound spellings not on the exceptions
+    /// list — including vendor spellings the review found missing from the
+    /// old exact-match approach — still match as a substring.
     #[test]
     fn mec_537_secret_shaped_session_and_community_compounds_still_match() {
         for key in [
@@ -306,9 +344,26 @@ mod tests {
             "session_key",
             "session_cookie",
             "jsessionid",
+            "auth_session",
+            "user_session",
+            "x-session",
+            "session_data",
+            "session_ticket",
+            "session-hash",
+            "session_value",
             "community_string",
             "communityString",
             "snmp-community-string",
+            "community_name",
+            "communityName",
+            "community-name",
+            "ro_community",
+            "rw-community",
+            "read-community",
+            "trap-community",
+            "snmp_community",
+            "snmpCommunity",
+            "community-key",
         ] {
             assert!(is_denylisted_key(key), "'{key}' must be denylisted");
         }
@@ -323,11 +378,26 @@ mod tests {
         assert!(!is_bgp_scope_key("bgp-peer-group"));
     }
 
+    /// MEC-537 review (F4): the key-only `bgp`-ancestor check is not enough
+    /// on its own — the value itself must look like BGP community-tag
+    /// syntax before the exemption applies.
     #[test]
-    fn mec_537_container_safe_key_is_session_only() {
-        assert!(is_container_safe_key("session"));
-        assert!(!is_container_safe_key("community"));
-        assert!(!is_container_safe_key("secret"));
+    fn mec_537_bgp_community_tag_requires_community_shaped_value() {
+        for tag in [
+            "65000:100",
+            "4294967295:100",
+            "1:2:3",
+            "no-export",
+            "NO-EXPORT",
+        ] {
+            assert!(is_bgp_community_tag(tag), "'{tag}' should look BGP-shaped");
+        }
+        for not_tag in ["QQSecretValue", "", "65000", "65000:", ":100", "a:b"] {
+            assert!(
+                !is_bgp_community_tag(not_tag),
+                "'{not_tag}' should not look BGP-shaped"
+            );
+        }
     }
 
     #[test]

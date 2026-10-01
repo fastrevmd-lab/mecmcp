@@ -53,29 +53,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device). Existing call sites are unaffected; adopting it in place of
   `SkipForInternalRead` is a separate, per-caller change.
 
-- **mecmcp-redact: a PAN-OS profile, and `session`/`community` no longer
-  over-match** (MEC-537, mecmcp#418). The denylist matched `session` and
-  `community` as a substring, so ordinary PAN-OS operational output tripped
-  it: `show session info`'s diagnostic fields
-  (`idle-timeout-tcp-session`, `sessions-active`, ...) and BGP route-policy
-  fields (`community-list`, `match-community`, `add-community`, ...) were
-  blanked outright, even though none of them are secrets. Both move to
-  exact-match instead — a bare `session` can still hold a session
-  token/cookie, and a bare `community` is PAN-OS/Junos's SNMP community
-  string, so neither drops off the denylist, but a compound field merely
-  containing the word no longer matches. The compound spellings that *are*
-  reliably secret-shaped (`session_id`, `session_token`, `community_string`,
-  ...) are covered by new, narrower substring entries. Two further context
-  rules close the gap exact-match alone leaves open: a `community` field is
-  exempted when a `bgp` ancestor is open (PAN-OS/Junos spell a public BGP
-  route community the same way they spell the SNMP secret), and a `session`
-  ancestor only forces redaction of its own direct text, not every leaf
-  nested under it, since unlike `pre-shared-key`/`community` its container
-  use has no single secret payload for the cascade to find. New
-  `tests/panos_profile.rs` fixtures (parallel to MEC-711's Mist fixtures)
-  prove PAN-OS secrets (admin `phash`, a keygen `key`, an IKE pre-shared key,
-  an SNMP community string) are still redacted alongside the two
-  false-positive classes above.
+- **mecmcp-redact: a PAN-OS profile, and narrower exemptions for a handful of
+  non-secret operational fields** (MEC-537, mecmcp#418). Adds PAN-OS fixtures
+  alongside MEC-711's Mist fixtures proving representative PAN-OS secret
+  shapes are redacted, and tightens the `session`/`community` denylist
+  entries so legitimate operational and routing-policy fields that merely
+  contain those words are not blanked, while every secret-shaped variant —
+  reviewed and extended for coverage gaps found in security review — stays
+  redacted.
 
 ## [0.25.0] - 2026-09-30
 

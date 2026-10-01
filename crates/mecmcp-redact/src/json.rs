@@ -8,7 +8,7 @@
 //! guarantee the way an allowlist projection is.
 
 use crate::denylist::{
-    is_bgp_community_field, is_bgp_scope_key, is_container_safe_key, is_denylisted_key,
+    is_bgp_community_field, is_bgp_community_tag, is_bgp_scope_key, is_denylisted_key,
     is_wep_keys_field,
 };
 use crate::shape::looks_like_secret_value;
@@ -19,6 +19,22 @@ const PLACEHOLDER: &str = "[REDACTED]";
 /// Redact `value` in place.
 pub fn redact(value: &mut Value) {
     redact_inner(value, None, false);
+}
+
+/// Whether every string leaf under `value` looks like BGP community-tag
+/// syntax (see [`is_bgp_community_tag`]), so the [`is_bgp_community_field`]
+/// exemption only fires when the value itself backs up the "this is routing
+/// data, not a secret" claim (MEC-537 review, F4). An empty container counts
+/// as not BGP-shaped — no leaves means no evidence either way.
+fn looks_like_bgp_community_value(value: &Value) -> bool {
+    match value {
+        Value::String(s) => is_bgp_community_tag(s),
+        Value::Array(items) => {
+            !items.is_empty() && items.iter().all(looks_like_bgp_community_value)
+        }
+        Value::Object(map) => !map.is_empty() && map.values().all(looks_like_bgp_community_value),
+        Value::Number(_) | Value::Bool(_) | Value::Null => false,
+    }
 }
 
 /// `parent_key` is the JSON object key `value` was found under, if any — the
@@ -34,23 +50,14 @@ fn redact_inner(value: &mut Value, parent_key: Option<&str>, under_bgp: bool) {
         Value::Object(map) => {
             let sibling_type = map.get("type").and_then(Value::as_str).map(str::to_owned);
             for (key, v) in map.iter_mut() {
+                let is_bgp_field =
+                    is_bgp_community_field(key, under_bgp) && looks_like_bgp_community_value(v);
                 let is_secret = (is_denylisted_key(key)
                     || is_wep_keys_field(key, parent_key, sibling_type.as_deref()))
-                    && !is_bgp_community_field(key, under_bgp);
+                    && !is_bgp_field;
                 let child_under_bgp = under_bgp || is_bgp_scope_key(key);
                 if is_secret {
-                    // MEC-537: a container-safe denylisted key (`session`)
-                    // only forces the placeholder on a scalar value of its
-                    // own; a nested object/array under it is walked normally
-                    // instead of having every leaf nuked, since its children
-                    // are independent diagnostic fields, not pieces of one
-                    // secret payload (see `is_container_safe_key`'s docs).
-                    if is_container_safe_key(key) && matches!(v, Value::Object(_) | Value::Array(_))
-                    {
-                        redact_inner(v, Some(key), child_under_bgp);
-                    } else {
-                        *v = redact_leaf(v);
-                    }
+                    *v = redact_leaf(v);
                 } else {
                     redact_inner(v, Some(key), child_under_bgp);
                 }

@@ -11,7 +11,7 @@
 
 use crate::RedactError;
 use crate::denylist::{
-    is_bgp_community_field, is_bgp_scope_key, is_container_safe_key, is_denylisted_key,
+    is_bgp_community_field, is_bgp_community_tag, is_bgp_scope_key, is_denylisted_key,
 };
 use crate::shape::looks_like_secret_value;
 use quick_xml::events::attributes::Attribute;
@@ -53,11 +53,7 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
             .read_event()
             .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
         if !matches!(event, Event::Text(_) | Event::GeneralRef(_)) {
-            flush_text_run(
-                &mut writer,
-                &mut text_run,
-                any_ancestor_denylisted(&tag_stack),
-            )?;
+            flush_text_run(&mut writer, &mut text_run, &tag_stack)?;
         }
         match event {
             Event::Eof => {
@@ -119,7 +115,7 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
             }
             Event::CData(e) => {
                 let decoded = e.into_inner().into_owned();
-                let ancestor_is_secret = any_ancestor_denylisted(&tag_stack);
+                let ancestor_is_secret = any_ancestor_denylisted(&tag_stack, &decoded);
                 let out = if ancestor_is_secret || looks_like_secret_value(&decoded) {
                     quick_xml::events::BytesCData::new(
                         String::from_utf8_lossy(PLACEHOLDER).into_owned(),
@@ -203,28 +199,25 @@ pub(crate) fn validate(input: &str) -> Result<(), RedactError> {
 /// `<community>`, or a PSK in `<ascii-text>` under `<pre-shared-key>`, both
 /// have a *grandparent*, not a parent, that names the secret.
 ///
-/// Two MEC-537 exceptions to the plain "any ancestor matches" rule:
-///
-/// - A `community` ancestor is skipped when a `bgp` element is also open —
-///   that is a BGP route community (public routing data), not the SNMP
-///   community string sharing the same bare field name. See
-///   [`is_bgp_community_field`].
-/// - A `session` ancestor only counts when it is the *immediate* parent of
-///   the text being decided, not a shallower ancestor — `session` doubles as
-///   a non-secret container for diagnostic fields (`show session info`), and
-///   unlike `pre-shared-key`/`community` there is no single secret payload
-///   nested inside it for the cascade to be finding. See
-///   [`is_container_safe_key`].
-fn any_ancestor_denylisted(tag_stack: &[Vec<u8>]) -> bool {
+/// MEC-537 exception: a `community` ancestor is skipped when a `bgp` element
+/// is also open *and* `value` itself looks like BGP community-tag syntax —
+/// that combination is a BGP route community (public routing data), not the
+/// SNMP community string sharing the same bare field name. See
+/// [`is_bgp_community_field`] and [`is_bgp_community_tag`]; the value check
+/// is required because a `bgp` ancestor can itself be a vendor's own
+/// user-chosen element name, not proof the field underneath is routing data
+/// (MEC-537 review, F4).
+fn any_ancestor_denylisted(tag_stack: &[Vec<u8>], value: &str) -> bool {
     let under_bgp = tag_stack
         .iter()
         .any(|name| is_bgp_scope_key(&String::from_utf8_lossy(name)));
-    tag_stack.iter().enumerate().any(|(i, name)| {
+    let bgp_field_survives = under_bgp && is_bgp_community_tag(value);
+    tag_stack.iter().any(|name| {
         let name = String::from_utf8_lossy(name);
-        if !is_denylisted_key(&name) || is_bgp_community_field(&name, under_bgp) {
+        if !is_denylisted_key(&name) {
             return false;
         }
-        if is_container_safe_key(&name) && i + 1 != tag_stack.len() {
+        if is_bgp_community_field(&name, under_bgp) && bgp_field_survives {
             return false;
         }
         true
@@ -235,7 +228,6 @@ fn redact_attributes<'a>(
     start: &BytesStart<'a>,
     tag_stack: &[Vec<u8>],
 ) -> Result<BytesStart<'a>, RedactError> {
-    let ancestor_is_secret = any_ancestor_denylisted(tag_stack);
     let mut out = BytesStart::new(start.name().as_ref().to_owned());
     for attr in start.attributes() {
         let attr = attr.map_err(|e| RedactError::InvalidXml(e.to_string()))?;
@@ -244,6 +236,7 @@ fn redact_attributes<'a>(
             .normalized_value(quick_xml::XmlVersion::Implicit1_0)
             .map_err(|e| RedactError::InvalidXml(e.to_string()))?
             .into_owned();
+        let ancestor_is_secret = any_ancestor_denylisted(tag_stack, &value);
         let redacted_value =
             if ancestor_is_secret || is_denylisted_key(&key) || looks_like_secret_value(&value) {
                 String::from_utf8_lossy(PLACEHOLDER).into_owned()
@@ -263,18 +256,18 @@ fn redact_attributes<'a>(
 /// Flush a buffered run of `Text`/`GeneralRef` events as a single redaction
 /// decision, writing nothing if the run is empty.
 ///
-/// `ancestor_is_secret` must reflect `tag_stack` as it was *during* the
-/// run — callers flush before mutating `tag_stack` for the event that ended
-/// the run, so the stack passed to [`any_ancestor_denylisted`] still
-/// matches.
+/// `tag_stack` must reflect its state as it was *during* the run — callers
+/// flush before mutating `tag_stack` for the event that ended the run, so
+/// the stack passed to [`any_ancestor_denylisted`] still matches.
 fn flush_text_run(
     writer: &mut Writer<Cursor<Vec<u8>>>,
     text_run: &mut Option<String>,
-    ancestor_is_secret: bool,
+    tag_stack: &[Vec<u8>],
 ) -> Result<(), RedactError> {
     let Some(joined) = text_run.take() else {
         return Ok(());
     };
+    let ancestor_is_secret = any_ancestor_denylisted(tag_stack, &joined);
     let out = if ancestor_is_secret || looks_like_secret_value(&joined) {
         BytesText::from_escaped(escape_text(&String::from_utf8_lossy(PLACEHOLDER))).into_owned()
     } else {
