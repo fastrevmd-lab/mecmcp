@@ -79,7 +79,13 @@ pub fn is_wep_keys_field(key: &str, parent_key: Option<&str>, sibling_type: Opti
 
 /// Lowercase `s` and drop every non-alphanumeric byte, so `pre-shared-key`,
 /// `pre_shared_key`, and `preSharedKey` all normalize to `presharedkey`.
-fn normalize(s: &str) -> String {
+///
+/// `pub(crate)` so [`crate::profile`] can match a vendor-declared field name
+/// under the same normalization the denylist itself uses, rather than
+/// maintaining a second, slightly different normalize function the way
+/// rustsdcmcp's pre-migration `redact.rs` did (it stripped only `_`/`-`,
+/// not every non-alphanumeric byte).
+pub(crate) fn normalize(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .flat_map(|c| c.to_lowercase())

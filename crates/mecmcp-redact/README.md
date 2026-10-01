@@ -34,6 +34,20 @@ every vendor server already calls — see [Marking untrusted content](#marking-u
   (`$9$...`), PAN-OS's `-AQ==`-suffixed blobs, `ENC`-prefixed ciphertext, PEM
   blocks, and Junos's `## SECRET-DATA` marker.
 
+## Vendor-specific extensions to the denylist scan
+
+A server occasionally has two kinds of policy the denylist-and-shape scan
+cannot infer from a vendor's schema on its own: a field whose value must be
+withheld as a whole because it is a rendered body (device config, generated
+IPsec config) that can embed a secret in a shape the scan is not guaranteed
+to catch, or a field name that collides with the denylist by substring in
+that vendor's schema but is not a secret (an opaque paging cursor, a logging
+flag — redacting it is a functional or security regression in its own
+right). A server declares a [`Profile`] once and calls
+[`redact_json_value_with_profile`] instead of [`redact_json_value`]; see the
+[`profile`] module docs for the ordering guarantees. This never narrows the
+generic scan — it only adds exceptions and extra withholding on top of it.
+
 ## On by default
 
 [`policy::active()`] defaults to `Enabled`. The only way to change that is

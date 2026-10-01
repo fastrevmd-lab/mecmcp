@@ -31,6 +31,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **mecmcp-redact: `Profile` extension hooks for vendor-specific
+  wholesale-redact and key-exemption rules** (MEC-1244, part of MEC-1231).
+  Two pieces of SDC's local `rustsdcmcp-core/src/redact.rs` are real
+  vendor-specific policy, not generic logic this crate already covers:
+  withholding a field's value wholesale rather than key/value scanning it
+  (SDC-generated IPsec config embeds a PSK inline in a format the generic
+  line scan is not guaranteed to catch), and exempting field names that
+  collide with the denylist by substring but are not secrets in that
+  vendor's schema (paging cursors, logging flags — MEC-440 B1, MEC-973 F1).
+  Both are now generic capabilities any server can declare: a `Profile`
+  carries `wholesale_redact_keys` and `key_exemptions` lists, and
+  `redact_json_value_with_profile` applies them around the existing generic
+  scan without narrowing it. Migrating rustsdcmcp's local implementation
+  onto this is tracked separately, pending design review.
+
 - **mecmcp-server: `OutputRedaction::AlreadyRedacted`, a quiet skip for
   output a caller redacted itself** (MEC-1168). `SkipForInternalRead` was
   being reused by a handler whose result *did* come from a vendor device but

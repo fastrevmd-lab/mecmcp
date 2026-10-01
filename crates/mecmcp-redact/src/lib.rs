@@ -23,6 +23,13 @@
 //!   best-effort net, not a guarantee — see the residual-risk section of the
 //!   crate README.
 //!
+//! A server with vendor-specific exceptions to the denylist-and-shape scan —
+//! a field that must be withheld as a whole rather than key/value scanned,
+//! or a field name that collides with the denylist by substring but is not a
+//! secret in that vendor's schema — declares a [`Profile`] and calls
+//! [`redact_json_value_with_profile`] instead of [`redact_json_value`]. See
+//! the [`profile`] module docs.
+//!
 //! # On by default, and not through a tool argument
 //!
 //! [`policy::active`] defaults to [`policy::RedactionPolicy::Enabled`]. The
@@ -56,6 +63,7 @@ pub mod denylist;
 pub mod digest;
 mod json;
 pub mod policy;
+pub mod profile;
 pub mod projection;
 pub mod shape;
 mod text;
@@ -63,6 +71,7 @@ pub mod trust;
 mod xml;
 
 pub use policy::{RedactionPolicy, active, install};
+pub use profile::Profile;
 pub use trust::Untrusted;
 
 /// A tool-output body's wire format, so [`redact_and_digest`] knows which
@@ -142,6 +151,18 @@ pub fn redact_json_value(value: &mut serde_json::Value) {
         return;
     }
     json::redact(value);
+}
+
+/// Redact a JSON value in place under [`redact_json_value`]'s generic
+/// denylist-and-shape scan, extended by `profile`'s vendor-specific
+/// wholesale-field and key-exemption rules. See the [`profile`] module docs
+/// for why those two rules need a declared profile rather than living in the
+/// generic scan.
+pub fn redact_json_value_with_profile(value: &mut serde_json::Value, profile: &Profile) {
+    if matches!(active(), RedactionPolicy::DisabledByOperator { .. }) {
+        return;
+    }
+    profile::redact_json_value_with_profile(value, profile);
 }
 
 /// Redact an XML document.

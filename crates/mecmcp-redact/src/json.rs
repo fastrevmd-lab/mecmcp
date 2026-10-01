@@ -11,7 +11,7 @@ use crate::denylist::{is_denylisted_key, is_wep_keys_field};
 use crate::shape::looks_like_secret_value;
 use serde_json::Value;
 
-const PLACEHOLDER: &str = "[REDACTED]";
+pub(crate) const PLACEHOLDER: &str = "[REDACTED]";
 
 /// Redact `value` in place.
 pub fn redact(value: &mut Value) {
