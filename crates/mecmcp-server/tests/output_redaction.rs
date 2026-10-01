@@ -73,4 +73,29 @@ fn skip_for_internal_read_emits_an_audit_event_naming_the_tool_and_reason() {
         1,
         "OutputRedaction::Apply must not emit a skip event:\n{captured}"
     );
+
+    // `AlreadyRedacted` is the case this test file exists to add coverage
+    // for (MEC-1168): the value really was redacted, just by the caller
+    // rather than by `tool_result`, so there is nothing here for an operator
+    // to be warned about. It must stay just as quiet as `Apply`, not join
+    // `SkipForInternalRead` in logging a false "skipped" event that names the
+    // wrong function.
+    let _ = tool_result::<_, std::convert::Infallible>(
+        Ok(serde_json::json!({"continuation_token": "page-2"})),
+        ResultFormat::PrettyJson,
+        ResultLimits {
+            max_text_bytes: 1024,
+            max_json_bytes: 1024,
+        },
+        OutputRedaction::AlreadyRedacted,
+    );
+    let captured = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        captured
+            .lines()
+            .filter(|line| line.contains("tool_output_redaction_skipped"))
+            .count(),
+        1,
+        "OutputRedaction::AlreadyRedacted must not emit a skip event:\n{captured}"
+    );
 }

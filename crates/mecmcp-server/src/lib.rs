@@ -45,13 +45,19 @@
 //! failure mode — there is no successful [`rmcp::model::CallToolResult`]
 //! `tool_result` can produce without it, short of the one exception below.
 //!
-//! The exception is [`OutputRedaction::SkipForInternalRead`], for a handler
-//! whose result never touched a vendor device or controller — reading this
-//! process's own audit log or policy snapshot, say — where running the
-//! device-secret denylist over the process's own data is pure noise. Choosing
-//! it is an explicit, per-call decision (there is no process-wide flag for
-//! it, unlike `mecmcp_redact::policy`) and it is audited: it emits a
-//! `target: "audit"` event naming the tool and the reason, every time.
+//! There are two exceptions. [`OutputRedaction::SkipForInternalRead`] is for
+//! a handler whose result never touched a vendor device or controller —
+//! reading this process's own audit log or policy snapshot, say — where
+//! running the device-secret denylist over the process's own data is pure
+//! noise. Choosing it is an explicit, per-call decision (there is no
+//! process-wide flag for it, unlike `mecmcp_redact::policy`) and it is
+//! audited: it emits a `target: "audit"` event naming the tool and the
+//! reason, every time. [`OutputRedaction::AlreadyRedacted`] is for a handler
+//! whose result *did* come from a vendor device but was redacted at the call
+//! site, before reaching `tool_result` — typically because the unconditional
+//! `Apply` pass would strip a field the caller needs to keep, such as a
+//! pagination cursor. It emits no audit event, since the value was in fact
+//! redacted, just not by this function.
 
 pub mod authorize;
 mod xml_json;
@@ -110,6 +116,23 @@ pub enum OutputRedaction {
         /// own audit log entries, not vendor secrets".
         reason: &'static str,
     },
+    /// Skip redaction because `value` already passed through
+    /// `mecmcp-redact` at the call site, before it reached `tool_result`.
+    ///
+    /// This is for a handler whose value **did** come from a vendor device —
+    /// unlike `SkipForInternalRead` — but that redacted it itself first, with
+    /// a targeted pass that protects a field `OutputRedaction::Apply`'s
+    /// unconditional `redact_json_value` would otherwise strip, such as a
+    /// pagination `continuation_token` (see `mecmcp_redact::denylist` for the
+    /// fields `Apply` always strips). Re-running redaction here would be a
+    /// silent no-op at best and would re-touch an already-protected field at
+    /// worst, so `tool_result` trusts the caller's own pass instead of
+    /// repeating it.
+    ///
+    /// Unlike `SkipForInternalRead`, this emits no audit event: the value
+    /// *was* redacted, just not by this function, so there is nothing for an
+    /// operator to be warned about.
+    AlreadyRedacted,
 }
 
 /// Hard byte limits applied before a successful MCP result is returned.
@@ -760,6 +783,35 @@ mod tests {
         let text = text_of(&result);
         assert_ne!(result.is_error, Some(true));
         assert!(text.contains("FAKEabc123secret"), "got {text}");
+    }
+
+    /// `AlreadyRedacted` must not run `redact_json_value` a second time:
+    /// the whole point is that the caller already redacted `value` itself,
+    /// in a pass that kept a field `Apply`'s unconditional redaction would
+    /// have stripped — here standing in for a pagination continuation
+    /// token. A second pass over the same value is a no-op for real
+    /// secrets but would be a correctness bug the moment the caller's
+    /// exemption and this crate's denylist ever disagreed.
+    #[test]
+    fn already_redacted_returns_the_value_untouched() {
+        let result = tool_result::<_, std::convert::Infallible>(
+            Ok(serde_json::json!({
+                "continuation_token": "page-2",
+                "entries": ["already redacted by the caller"],
+            })),
+            ResultFormat::PrettyJson,
+            ResultLimits {
+                max_text_bytes: 1024,
+                max_json_bytes: 1024,
+            },
+            OutputRedaction::AlreadyRedacted,
+        );
+        let text = text_of(&result);
+        assert_ne!(result.is_error, Some(true));
+        assert!(
+            text.contains("page-2"),
+            "a pagination token the caller exempted must survive: got {text}"
+        );
     }
 
     #[test]
