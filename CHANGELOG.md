@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **mecmcp-redact: hardened text redaction against a reachable panic on
+  certain input** (MEC-770). `redact_text` (and the XML/JSON entry points,
+  which share the same core) could panic instead of returning on some
+  device-sourced tool output, which could abort the handling server
+  process. Present in v0.24.0 and v0.24.1. Fixed with a regression test
+  covering the text, XML, and JSON entry points; consumers should upgrade.
+
 ### Added
 
 - **mecmcp-redact: `mecmcp-redact` CLI binary and a shared tool-output
