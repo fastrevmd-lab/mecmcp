@@ -2009,6 +2009,7 @@ dependencies = [
 name = "mecmcp-redact"
 version = "0.25.0"
 dependencies = [
+ "clap",
  "hmac",
  "quick-xml",
  "serde_json",

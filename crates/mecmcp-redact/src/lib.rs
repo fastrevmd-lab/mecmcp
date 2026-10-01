@@ -58,6 +58,7 @@ mod json;
 pub mod policy;
 pub mod projection;
 pub mod shape;
+pub mod testing;
 mod text;
 pub mod trust;
 mod xml;
