@@ -6,11 +6,10 @@
 //! any vendor's schema, the same reason [`crate::projection::FieldAllowlist`]
 //! takes its field list from the caller:
 //!
-//! - **Wholesale fields**: a field whose value is a vendor-specific rendered
-//!   body (device config, generated IPsec config) that can embed a secret in
-//!   a shape the generic line/key scan is not guaranteed to recognize. The
-//!   whole value is withheld as a unit rather than trusted to a best-effort
-//!   scan.
+//! - **Wholesale fields**: a field whose value is a vendor-rendered body that
+//!   can embed a secret in a shape the generic line/key scan is not
+//!   guaranteed to recognize. The whole value is withheld as a unit rather
+//!   than trusted to a best-effort scan.
 //! - **Key exemptions**: a field name that collides with a denylist entry by
 //!   substring in this vendor's schema, but is not a secret (an opaque paging
 //!   cursor, a logging flag). Redacting it is a functional regression (MEC-440
@@ -25,20 +24,14 @@
 //! already catches is still caught — a `Profile` only adds exceptions and
 //! extra withholding, it never narrows the generic scan.
 //!
-//! # Why exemption needs a guard/unguard round trip, not a skip list
+//! # What a key exemption does and does not suppress
 //!
-//! An exempted field cannot simply be skipped during the generic scan: the
-//! scan walks the whole tree by key name, so "skip this key" has to mean
-//! "hide this key's name from the scan for exactly one pass," not "delete
-//! it." The guard step renames each exempted key to an opaque,
-//! counter-suffixed placeholder that cannot itself collide with a denylist
-//! term (a prefix that embedded the original name would still carry whatever
-//! substring made it match in the first place — `continuation_token`
-//! normalizes to a string that still contains `token`), runs the generic
-//! scan, then restores the original names from the recorded order. This is
-//! exactly the technique rustsdcmcp's pre-migration `redact.rs` used
-//! locally; it is generalized here only to the extent of taking its field
-//! lists from the caller.
+//! An exemption only suppresses the key-*name* denylist match for that exact
+//! key. It does not exempt the value: the generic scan still recurses into
+//! it, so a denylisted key nested under an exempted container is still
+//! redacted, and a value that is itself secret-shaped (a PEM block, a
+//! password hash) is still caught by the value-shape scan even though its
+//! key name was exempted.
 
 use serde_json::Value;
 
@@ -59,27 +52,87 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// Build a profile from fixed field-name lists. Each entry is matched
-    /// against a JSON key after normalizing (lowercased, separators
-    /// stripped) — `"site_config"`, `"siteConfig"`, and `"site-config"` are
-    /// one entry, not three.
+    /// Build a profile from fixed field-name lists. Each entry must already
+    /// be normalized — lowercase ASCII letters and digits only, the same
+    /// alphabet a JSON key is normalized into before matching — so
+    /// `"site_config"` is written as `"siteconfig"`, not `"site_config"` or
+    /// `"siteConfig"`. At match time the JSON key is normalized the same
+    /// way, so `"site_config"`, `"siteConfig"`, and `"site-config"` in the
+    /// input all match the one entry `"siteconfig"`.
+    ///
+    /// Because every profile is declared as a `const`, an entry that is
+    /// empty or carries any other byte (an underscore, a hyphen, an
+    /// uppercase letter) is a build-time panic rather than a silently
+    /// unmatchable entry — a field spelled wrong here would otherwise lose
+    /// wholesale withholding or an exemption with no test failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics (at compile time, from `const` evaluation) if any entry in
+    /// either list is empty or contains a byte other than an ASCII lowercase
+    /// letter or digit.
     #[must_use]
     pub const fn new(
         wholesale_redact_keys: &'static [&'static str],
         key_exemptions: &'static [&'static str],
     ) -> Self {
+        check_all_normalized(wholesale_redact_keys);
+        check_all_normalized(key_exemptions);
         Self {
             wholesale_redact_keys,
             key_exemptions,
         }
     }
+
+    /// Reject a key exemption that normalizes to exactly a
+    /// [`crate::denylist::DENYLISTED_KEYS`] term, rather than merely
+    /// containing one as a substring — `"token"` or `"password"` is refused,
+    /// `"continuationtoken"` is fine. Nothing in [`Profile::new`] can check
+    /// this at compile time (the denylist is matched at runtime), so a
+    /// vendor profile's own test suite should call this once and assert
+    /// `Ok(())`, the same way it asserts denylist-completeness over its own
+    /// schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns the offending exemption entry if one exactly matches a
+    /// denylist term.
+    pub fn check_exemptions(&self) -> Result<(), &'static str> {
+        for &exemption in self.key_exemptions {
+            if crate::denylist::DENYLISTED_KEYS.contains(&exemption) {
+                return Err(exemption);
+            }
+        }
+        Ok(())
+    }
 }
 
-/// Prefix used to hide an exempt key from the generic scan for the duration
-/// of that pass. A null byte either side keeps this outside the range of any
-/// normal JSON key a vendor API would plausibly send, so it cannot collide
-/// with a real field even by accident.
-const GUARD_PREFIX: &str = "\u{0}mecmcp-redact-profile-guard\u{0}";
+/// `const fn` panic, so [`Profile::new`] rejects a bad entry at compile time
+/// for every profile, which is always declared as a `const`.
+const fn check_all_normalized(entries: &[&str]) {
+    let mut i = 0;
+    while i < entries.len() {
+        check_normalized(entries[i]);
+        i += 1;
+    }
+}
+
+const fn check_normalized(entry: &str) {
+    let bytes = entry.as_bytes();
+    if bytes.is_empty() {
+        panic!("mecmcp_redact::Profile entry must not be empty");
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !(b.is_ascii_lowercase() || b.is_ascii_digit()) {
+            panic!(
+                "mecmcp_redact::Profile entry must be pre-normalized: lowercase ASCII letters and digits only"
+            );
+        }
+        i += 1;
+    }
+}
 
 /// Redact `value` in place under the generic denylist-and-shape scan, then
 /// apply `profile`'s vendor-specific extensions.
@@ -87,14 +140,12 @@ const GUARD_PREFIX: &str = "\u{0}mecmcp-redact-profile-guard\u{0}";
 /// Order matters and is fixed, not a caller choice: wholesale fields are
 /// withheld *before* the generic scan ever sees them (so the scan cannot
 /// partially rewrite a body this profile says should be withheld as a unit),
-/// and key exemptions are guarded out *before* the generic scan and restored
-/// *after* (so an exempted field's value is never scanned or rewritten at
-/// all, by either pass).
+/// and key exemptions suppress only the key-name denylist match for that
+/// exact key — the generic scan still recurses into an exempted key's value,
+/// so a denylisted descendant or a secret-shaped leaf is still caught.
 pub fn redact_json_value_with_profile(value: &mut Value, profile: &Profile) {
     redact_wholesale_fields(value, profile.wholesale_redact_keys);
-    let guarded = guard_exempt_keys(value, profile.key_exemptions);
-    crate::json::redact(value);
-    unguard_exempt_keys(value, &guarded);
+    crate::json::redact_with_exemptions(value, profile.key_exemptions);
 }
 
 /// Replace every value under a [`Profile::wholesale_redact_keys`] key with
@@ -117,73 +168,6 @@ fn redact_wholesale_fields(value: &mut Value, wholesale_redact_keys: &[&str]) {
         Value::Array(items) => items
             .iter_mut()
             .for_each(|item| redact_wholesale_fields(item, wholesale_redact_keys)),
-        _ => {}
-    }
-}
-
-/// Rename every [`Profile::key_exemptions`] key to an opaque,
-/// counter-suffixed placeholder so the generic scan's substring denylist
-/// match never sees the name it would otherwise match, and record the
-/// original names in assignment order so [`unguard_exempt_keys`] can restore
-/// them exactly.
-#[must_use]
-fn guard_exempt_keys(value: &mut Value, key_exemptions: &[&str]) -> Vec<String> {
-    let mut originals = Vec::new();
-    guard_inner(value, key_exemptions, &mut originals);
-    originals
-}
-
-fn guard_inner(value: &mut Value, key_exemptions: &[&str], originals: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            let keys: Vec<String> = map.keys().cloned().collect();
-            for key in keys {
-                if key_exemptions.contains(&normalize(&key).as_str())
-                    && let Some(v) = map.remove(&key)
-                {
-                    let marker = format!("{GUARD_PREFIX}{}", originals.len());
-                    originals.push(key);
-                    map.insert(marker, v);
-                }
-            }
-            for child in map.values_mut() {
-                guard_inner(child, key_exemptions, originals);
-            }
-        }
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(|item| guard_inner(item, key_exemptions, originals)),
-        _ => {}
-    }
-}
-
-/// Reverse [`guard_exempt_keys`], restoring the original key names from
-/// `originals` by the counter each placeholder carries.
-fn unguard_exempt_keys(value: &mut Value, originals: &[String]) {
-    match value {
-        Value::Object(map) => {
-            let keys: Vec<String> = map.keys().cloned().collect();
-            for key in keys {
-                let Some(index) = key
-                    .strip_prefix(GUARD_PREFIX)
-                    .and_then(|suffix| suffix.parse::<usize>().ok())
-                else {
-                    continue;
-                };
-                let Some(original) = originals.get(index) else {
-                    continue;
-                };
-                if let Some(v) = map.remove(&key) {
-                    map.insert(original.clone(), v);
-                }
-            }
-            for child in map.values_mut() {
-                unguard_exempt_keys(child, originals);
-            }
-        }
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(|item| unguard_exempt_keys(item, originals)),
         _ => {}
     }
 }
@@ -279,18 +263,70 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// Guard markers must never leak into output even when a value happens
-    /// to collide with the guard scheme in some other way (defence in depth
-    /// for the round trip itself, not just the common case).
+    /// F3: exemption only suppresses the key-*name* match. A value that is
+    /// itself secret-shaped under an exempted key must still be caught by
+    /// the value-shape scan.
     #[test]
-    fn guard_markers_never_survive_in_output() {
+    fn exempted_key_with_a_secret_shaped_value_is_still_redacted() {
+        let mut v = json!({"continuation_token": "$6$fakesaltfakehash"});
+        redact_json_value_with_profile(&mut v, &TEST_PROFILE);
+        assert_eq!(v["continuation_token"], PLACEHOLDER);
+    }
+
+    /// F3: a denylisted key nested under an exempted container key must
+    /// still be redacted — exemption does not withhold the whole subtree
+    /// from the scan, only the exempted key's own name match.
+    #[test]
+    fn denylisted_child_under_an_exempted_key_is_still_redacted() {
+        let mut v = json!({"continuation_token": {"password": "hunter2"}});
+        redact_json_value_with_profile(&mut v, &TEST_PROFILE);
+        assert_eq!(v["continuation_token"]["password"], PLACEHOLDER);
+    }
+
+    /// F2 regression: untrusted input cannot forge or erase an exempted
+    /// field by supplying a key that happens to collide with whatever
+    /// internal mechanism exemption used to use. There is no guard/unguard
+    /// round trip left to spoof — exemption is a predicate checked in place
+    /// — but this pins that a key exemption list only ever matches the
+    /// exact names declared, nothing synthesized from input.
+    #[test]
+    fn untrusted_input_cannot_forge_an_exempted_key_via_a_sibling() {
         let mut v = json!({
-            "continuation_token": "a",
-            "continuation_token2": "b",
-            "nextPageToken": "c",
+            "a": {"continuation_token": "real", "unrelated": "collide"},
+            "continuation_token": "top-level"
         });
         redact_json_value_with_profile(&mut v, &TEST_PROFILE);
-        let serialized = serde_json::to_string(&v).unwrap();
-        assert!(!serialized.contains("mecmcp-redact-profile-guard"));
+        assert_eq!(v["a"]["continuation_token"], "real");
+        assert_eq!(v["a"]["unrelated"], "collide");
+        assert_eq!(v["continuation_token"], "top-level");
+    }
+
+    /// F4: an exemption list must not be able to carve out a whole denylist
+    /// term — only a name that merely contains one, like
+    /// `continuationtoken`, is a legitimate exemption.
+    #[test]
+    fn check_exemptions_rejects_an_exact_denylist_term() {
+        const BAD: Profile = Profile::new(&[], &["token"]);
+        assert_eq!(BAD.check_exemptions(), Err("token"));
+    }
+
+    #[test]
+    fn check_exemptions_accepts_a_substring_collision() {
+        assert_eq!(TEST_PROFILE.check_exemptions(), Ok(()));
+    }
+
+    /// F1: an entry that is not already normalized must fail to build
+    /// rather than silently losing wholesale withholding for every spelling
+    /// variant except the one written.
+    #[test]
+    #[should_panic(expected = "pre-normalized")]
+    fn new_panics_on_an_unnormalized_wholesale_entry() {
+        let _ = Profile::new(&["site_config"], &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not be empty")]
+    fn new_panics_on_an_empty_entry() {
+        let _ = Profile::new(&[""], &[]);
     }
 }
