@@ -137,6 +137,7 @@ const REDACT_LOG_KEYS: &[&str] = &[
     "default-chap-secret",
     "local-password",
     "hello-authentication-key",
+    "plain-text-password-value",
     "key",
     "value",
 ];
@@ -147,6 +148,34 @@ const REDACT_LOG_KEYS: &[&str] = &[
 #[allow(clippy::indexing_slicing)] // called with bounds-checked byte offsets
 fn is_word_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+}
+
+/// Byte offset of the end of the identifier word starting at `start` (a run
+/// of [`is_word_char`] bytes). Returns `start` when there is no word there.
+fn word_end(line: &str, start: usize) -> usize {
+    let bytes = line.as_bytes();
+    let mut end = start;
+    // SOUND: all byte indexing is bounds-checked against bytes.len().
+    #[allow(clippy::indexing_slicing)]
+    while end < bytes.len() && is_word_char(bytes[end]) {
+        end += 1;
+    }
+    end
+}
+
+/// Fallback for a compound key not on the closed [`REDACT_LOG_KEYS`] list: a
+/// Junos field whose last hyphen-separated segment is `password`, `secret`,
+/// or `key` (e.g. a future `foo-bar-secret`), or one that ends in the
+/// `-password-value` shape, is treated as sensitive. Kept narrower than
+/// substring matching (which would catch `password` inside `passwordless`)
+/// by anchoring on the final segment, and only consulted in `set` context
+/// (see the caller) so it does not add new prose false positives.
+fn matches_sensitive_key_suffix(word: &str) -> bool {
+    word.ends_with("-password-value")
+        || matches!(
+            word.rsplit('-').next().unwrap_or(word),
+            "password" | "secret" | "key"
+        )
 }
 
 /// Redact a single log line (which may include a trailing `\n`).
@@ -193,17 +222,40 @@ fn redact_log_line(line: &str) -> String {
                     break;
                 }
             }
+            if !matched {
+                let end = word_end(line, idx);
+                let set_context = audit_context || set_statement_precedes(line, idx);
+                // SOUND: `idx`/`end` are char boundaries (`word_end` scans
+                // ASCII `is_word_char` bytes only).
+                #[allow(clippy::string_slice)]
+                if end > idx
+                    && set_context
+                    && matches_sensitive_key_suffix(&line[idx..end])
+                    && let Some((value_start, value_end)) = redactable_value(line, end, set_context)
+                {
+                    #[allow(clippy::string_slice)]
+                    out.push_str(&line[idx..value_start]);
+                    out.push_str("[REDACTED]");
+                    idx = value_end;
+                    matched = true;
+                }
+            }
         }
         // Crypt-hash floor: whatever key (if any) precedes it, a token that
         // looks like a reversible Junos secret (`$9$...` etc. — see
         // `crate::shape::looks_like_secret_value`) never occurs in prose, so
         // it is safe to redact unconditionally at any token boundary. This
         // catches values sitting after a key not on `REDACT_LOG_KEYS` and
-        // bare hash tokens with no preceding key at all.
+        // bare hash tokens with no preceding key at all. The boundary is
+        // "previous byte is not ASCII alphanumeric" rather than a fixed
+        // delimiter set, so structured forms (`k=v`, `k:v`, `(v)`, `,v,`,
+        // `[v]`, or a non-ASCII byte such as U+00A0) still find the start of
+        // the token — a hash value never has an alphanumeric glued directly
+        // in front of it.
         if !matched {
             // SOUND: `idx > 0` guard ensures `idx - 1` is valid.
             #[allow(clippy::indexing_slicing)]
-            let at_token_boundary = idx == 0 || is_token_delimiter(bytes[idx - 1]);
+            let at_token_boundary = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
             if at_token_boundary
                 && let Some((value_start, value_end)) = floor_value_token(line, idx)
             {
@@ -455,12 +507,24 @@ fn value_token(line: &str, pos: usize) -> Option<(usize, usize)> {
 }
 
 /// Whether `byte` delimits a token for the crypt-hash floor scan: whitespace,
-/// `;`, or the angle brackets a captured artefact's embedded XML-ish text can
-/// carry (see [`redact_log_line`]'s floor pass).
+/// the angle brackets a captured artefact's embedded XML-ish text can carry,
+/// and the punctuation that wraps a value in structured log forms (`k=v;`,
+/// `(v)`, `,v,`, `[v]`, `{v}`) (see [`redact_log_line`]'s floor pass).
 fn is_token_delimiter(byte: u8) -> bool {
     matches!(
         byte,
-        b' ' | b'\t' | b'\n' | b'\r' | b';' | b'<' | b'>' | b'"' | b'\''
+        b' ' | b'\t'
+            | b'\n'
+            | b'\r'
+            | b';'
+            | b'<'
+            | b'>'
+            | b'"'
+            | b'\''
+            | b','
+            | b')'
+            | b']'
+            | b'}'
     )
 }
 
@@ -654,9 +718,8 @@ mod tests {
         assert!(!got.contains("leakedBad"), "got: {got}");
     }
 
-    // ── F2: crypt-hash floor in `redact_log_text` — a `$9$...`-shaped value
-    // is redacted whatever key precedes it, or with no preceding key at all,
-    // because a Junos crypt hash never occurs in prose. ────────────────────
+    // ── crypt-hash floor in `redact_log_text`: a `$9$...`-shaped value is
+    // redacted whatever key precedes it, or with no preceding key at all. ──
 
     #[test]
     fn hash_after_a_key_not_on_the_closed_list_is_redacted() {
@@ -698,9 +761,8 @@ mod tests {
         assert!(!got.contains("$9$FAKEbareToken"), "got: {got}"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
     }
 
-    // ── F3: when `redact_xml` cannot parse XML-shaped input, the caller must
-    // refuse the artefact rather than fall back to the line-oriented pass,
-    // which knows nothing about element structure. ─────────────────────────
+    // ── when `redact_xml` cannot parse XML-shaped input, the caller refuses
+    // the artefact instead of falling back to a weaker pass. ───────────────
 
     #[test]
     fn truncated_xml_missing_closing_tags_is_refused() {
@@ -732,7 +794,7 @@ mod tests {
         assert!(redact_log_artefact(bad).is_err());
     }
 
-    // ── F5: a quoted value with an escaped quote is redacted in full, and an
+    // ── a quoted value with an escaped quote is redacted in full, and an
     // unterminated quote does not consume the line terminator. ─────────────
 
     #[test]
@@ -749,5 +811,74 @@ mod tests {
         let got = redact_log_text(input);
         assert_eq!(got.lines().count(), 2, "got: {got}");
         assert!(got.contains("action=login"), "got: {got}");
+    }
+
+    // ── the crypt-hash floor fires at a structured (non-whitespace)
+    // delimiter, not only at whitespace/quote/angle-bracket boundaries. ────
+
+    #[test]
+    fn hash_after_equals_sign_with_no_space_is_redacted() {
+        let got = redact_log_text("foo=$9$FAKEequalsForm"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+        assert!(!got.contains("$9$FAKEequalsForm"), "got: {got}"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+    }
+
+    #[test]
+    fn hash_after_colon_with_no_space_is_redacted() {
+        let got = redact_log_text("key:$9$FAKEcolonForm"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+        assert!(!got.contains("$9$FAKEcolonForm"), "got: {got}"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+    }
+
+    #[test]
+    fn hash_inside_parentheses_is_redacted() {
+        let got = redact_log_text("rollback diff (hash $9$FAKEparenForm)"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+        assert!(!got.contains("$9$FAKEparenForm"), "got: {got}"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+    }
+
+    #[test]
+    fn hash_between_commas_in_a_csv_line_is_redacted() {
+        let got = redact_log_text("field1,$9$FAKEcsvForm,field3"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+        assert!(!got.contains("$9$FAKEcsvForm"), "got: {got}"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+    }
+
+    #[test]
+    fn hash_inside_square_brackets_is_redacted() {
+        let got = redact_log_text("tags=[$9$FAKEbracketForm]"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+        assert!(!got.contains("$9$FAKEbracketForm"), "got: {got}"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+    }
+
+    #[test]
+    fn hash_preceded_by_a_non_breaking_space_is_redacted() {
+        let line = "diagnostic:\u{a0}$9$FAKEnbspForm"; // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+        let got = redact_log_text(line);
+        assert!(!got.contains("$9$FAKEnbspForm"), "got: {got}"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+    }
+
+    // ── compound keys not on the closed `REDACT_LOG_KEYS` list are still
+    // redacted in `set` context when their final segment is sensitive. ─────
+
+    #[test]
+    fn plain_text_password_value_key_is_redacted() {
+        let got = redact_log_text(
+            "set system root-authentication plain-text-password-value FAKEplaintextRoot",
+        );
+        assert!(!got.contains("FAKEplaintextRoot"), "got: {got}");
+    }
+
+    #[test]
+    fn unlisted_compound_key_ending_in_secret_is_redacted_in_set_context() {
+        let got = redact_log_text("set system services oauth client-app-secret FAKEoauthSecret");
+        assert!(!got.contains("FAKEoauthSecret"), "got: {got}");
+    }
+
+    #[test]
+    fn unlisted_compound_key_ending_in_password_value_is_redacted_in_set_context() {
+        let got = redact_log_text("set system login user u1 vault-password-value FAKEvaultValue");
+        assert!(!got.contains("FAKEvaultValue"), "got: {got}");
+    }
+
+    #[test]
+    fn prose_mention_of_a_compound_secret_looking_word_without_set_context_is_untouched() {
+        let line = "Note: the database-password field was rotated by the admin team today";
+        assert_eq!(redact_log_text(line), line);
     }
 }
