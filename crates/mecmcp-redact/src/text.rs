@@ -230,10 +230,8 @@ fn redact_value_span(line: &str, force: bool) -> String {
     // No `=`/`:` — bare `key value` (Junos `set` style). Redact the last
     // whitespace-delimited token when forced, or when it alone looks secret.
     //
-    // `rfind` returns the *start* byte offset of the matched char, which for
-    // a multi-byte whitespace character (NBSP, em space, ...) is not a valid
-    // split point one byte later — `split_at(last_space + 1)` would panic
-    // mid-character. Advance by the char's own UTF-8 width instead.
+    // Advance by whole chars, not raw bytes — a byte offset derived from a
+    // char index must stay on a char boundary or `split_at` panics.
     if let Some((last_space, ws_char)) = line.char_indices().rev().find(|(_, c)| c.is_whitespace())
     {
         let (head, tail) = line.split_at(last_space + ws_char.len_utf8());
@@ -552,11 +550,9 @@ fn userinfo_password_spans(line: &str) -> Vec<(usize, usize)> {
                 }
             }
         }
-        // When the authority is empty (`://` immediately followed by `/` or
-        // whitespace), advance past one char rather than a fixed single
-        // byte — `authority_len.max(1)` used to assume ASCII and could land
-        // mid-character on a multi-byte whitespace char (NBSP, em space,
-        // ...), making the next `find("://")` on `line[cursor..]` panic.
+        // Advance by whole chars, not raw bytes — a fixed one-byte step
+        // assumes ASCII and can land mid-character, making the next `find`
+        // on the advanced slice panic.
         let step = if authority_len == 0 {
             rest.chars().next().map_or(1, char::len_utf8)
         } else {
@@ -1455,61 +1451,46 @@ mod tests {
         assert!(!got.contains("p@QQu1"), "got: {got}");
     }
 
-    // --- MEC-770/MEC-1221: the bare `key value` fallback located its last
-    // whitespace token with `rfind`, which returns the *start* byte offset
-    // of the match. For a multi-byte whitespace character (NBSP, em space,
-    // ideographic space, ...) `offset + 1` lands mid-character, and
-    // `split_at` panics instead of redacting. Force the line through the
-    // unconditional fallback (the `## SECRET-DATA` backstop) with a
-    // multi-byte whitespace character immediately before the value token,
-    // and nothing after it, so the vulnerable split is the only code path
-    // that can locate the value. ---
+    // --- regression tests: a byte-offset advance derived from a char match
+    // must stay on a char boundary, or the next str operation panics. ---
 
     #[test]
-    fn y5_nbsp_before_value_in_forced_fallback_does_not_panic() {
+    fn y5_fallback_nbsp_before_value_does_not_panic() {
         let got = redact("foo\u{a0}QQw1## SECRET-DATA");
         assert!(!got.contains("QQw1"), "got: {got}");
     }
 
     #[test]
-    fn y5_em_space_before_value_in_forced_fallback_does_not_panic() {
+    fn y5_fallback_em_space_before_value_does_not_panic() {
         let got = redact("foo\u{2003}QQw2## SECRET-DATA");
         assert!(!got.contains("QQw2"), "got: {got}");
     }
 
     #[test]
-    fn y5_ideographic_space_before_value_in_forced_fallback_does_not_panic() {
+    fn y5_fallback_ideographic_space_before_value_does_not_panic() {
         let got = redact("foo\u{3000}QQw3## SECRET-DATA");
         assert!(!got.contains("QQw3"), "got: {got}");
     }
 
-    // --- MEC-1226 (Percy review of #463, Finding 1): `userinfo_password_spans`
-    // advanced its cursor past an empty authority with a fixed `+1` byte,
-    // which lands mid-character when the text right after `://` opens with
-    // a multi-byte whitespace char (NBSP, ...). The next `find("://")` on
-    // the truncated slice then panics instead of returning `None`. Reachable
-    // from `redact_text`, `redact_xml_str` and `redact_json_str` alike, with
-    // no `force` or `## SECRET-DATA` marker needed. ---
-
     #[test]
-    fn y6_nbsp_right_after_scheme_separator_does_not_panic_in_text() {
+    fn y6_scheme_cursor_nbsp_does_not_panic_in_text() {
         // Nothing here looks like a secret, so the call just needs to
         // return instead of panicking.
         let _ = redact("see http://\u{a0}x");
     }
 
     #[test]
-    fn y6_nbsp_right_after_scheme_separator_does_not_panic_in_xml() {
+    fn y6_scheme_cursor_nbsp_does_not_panic_in_xml() {
         let _ = crate::redact_xml_str("<a>see http://\u{a0}x</a>").expect("valid xml");
     }
 
     #[test]
-    fn y6_nbsp_right_after_scheme_separator_does_not_panic_in_json() {
+    fn y6_scheme_cursor_nbsp_does_not_panic_in_json() {
         let _ = crate::redact_json_str("{\"m\":\"see http://\u{a0}x\"}").expect("valid json");
     }
 
     #[test]
-    fn y6_userinfo_password_after_empty_authority_is_still_redacted() {
+    fn y6_scheme_cursor_later_userinfo_password_is_still_redacted() {
         let got = redact("see http://\u{a0}x then https://admin:QQw4@host/");
         assert!(!got.contains("QQw4"), "got: {got}");
     }
