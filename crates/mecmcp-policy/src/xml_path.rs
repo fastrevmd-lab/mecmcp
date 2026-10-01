@@ -41,13 +41,13 @@ pub enum XmlPathError {
     /// bytes end up disagreeing about what a read policy should block.
     #[error("input is not well-formed XML, refusing to guess: {0}")]
     InvalidXml(String),
-    /// The input nests elements past [`MAX_DEPTH`].
+    /// The input nests elements past `MAX_DEPTH`.
     #[error("input nests elements past the {MAX_DEPTH}-level limit")]
     TooDeep,
 }
 
 /// One element's ancestor chain, root first, each segment a canonicalized
-/// tag (see [`segment`]).
+/// tag (see `segment`).
 pub type ElementPath = Vec<String>;
 
 /// Render a path as the `/`-joined string [`evaluate`]'s glob rules match
@@ -105,7 +105,7 @@ fn read_attrs(start: &BytesStart<'_>) -> Result<Vec<(String, String)>, XmlPathEr
 ///
 /// Returns [`XmlPathError::InvalidXml`] on malformed XML (an unclosed
 /// element, an unmatched closing tag, an unparsable attribute) and
-/// [`XmlPathError::TooDeep`] past [`MAX_DEPTH`] levels of nesting. Never
+/// [`XmlPathError::TooDeep`] past `MAX_DEPTH` levels of nesting. Never
 /// returns a partial path list on error.
 pub fn element_paths(xml: &str) -> Result<Vec<ElementPath>, XmlPathError> {
     let mut reader = Reader::from_str(xml);
