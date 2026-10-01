@@ -129,8 +129,8 @@ pub fn is_bgp_community_field(key: &str, under_bgp_scope: bool) -> bool {
 /// shapes elsewhere in this crate — where the denylisted ancestor's
 /// descendant chain leads straight to the secret value and nothing else —
 /// `session`'s container use has no equivalent single secret payload to find
-/// inside it, so cascading into every leaf the way [`crate::json::redact`]
-/// otherwise does for a denylisted key is the wrong default here.
+/// inside it, so cascading into every leaf the way `json::redact` otherwise
+/// does for a denylisted key is the wrong default here.
 #[must_use]
 pub fn is_container_safe_key(key: &str) -> bool {
     normalize(key) == "session"
