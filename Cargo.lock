@@ -2000,6 +2000,7 @@ name = "mecmcp-policy"
 version = "0.25.0"
 dependencies = [
  "globset",
+ "quick-xml",
  "serde",
  "thiserror",
 ]
