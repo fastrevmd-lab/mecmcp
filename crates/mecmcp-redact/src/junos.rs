@@ -1,7 +1,7 @@
 //! Junos profile (MEC-1245): two pieces of redaction coverage rustjunosmcp's
 //! `collect_jtac_support_bundle` (`redact=true`, the default) needs that this
-//! crate's vendor-agnostic [`crate::xml`]/[`crate::text`] passes do not
-//! provide on their own.
+//! crate's vendor-agnostic `crate::xml`/`crate::text` passes do not provide
+//! on their own.
 //!
 //! - [`redact_xml`] — the generic XML pass (denylisted element/attribute
 //!   names plus the [`crate::shape`] value-shape catch-all) already covers
@@ -20,7 +20,7 @@
 //! - [`redact_log_text`] — a conservative, `set`-statement-aware line
 //!   redactor for the non-XML support-bundle artefacts (`/var/log/*` files,
 //!   `request support information` tech-support output). This is *not* a
-//!   thin wrapper over [`crate::text::redact`]: that pass is substring-keyed
+//!   thin wrapper over `crate::text::redact`: that pass is substring-keyed
 //!   and intentionally over-redacts (documented, accepted cost for the
 //!   generic multi-vendor case) — it matches `secret` inside `secretary` and
 //!   flags a bare prose mention of a denylisted word with no config-syntax
@@ -93,14 +93,26 @@ pub fn redact_log_text(input: &str) -> String {
 /// plain text under an element name not on the XML pass's locked list (e.g.
 /// directly under `<rpc-reply>` when the expected wrapper element is
 /// absent), so the line-oriented pass is the floor every artefact goes
-/// through regardless of its outer shape. Content that only looks like XML
-/// but that the redactor could not actually walk falls back to the
-/// line-oriented pass alone rather than shipping unredacted.
-#[must_use]
-pub fn redact_log_artefact(input: &str) -> String {
+/// through regardless of its outer shape.
+///
+/// # Errors
+/// Fail-closed: when `input` looks like XML (trimmed, starts with `<`) but
+/// [`redact_xml`] cannot parse it, this returns [`RedactError::InvalidXml`]
+/// instead of falling back to the line-oriented pass alone — that pass knows
+/// nothing about element structure, so it is not a safe stand-in for a
+/// structural redactor that failed. Callers on a fail-closed path must leave
+/// the artefact out of the bundle and record that it did. Only input that
+/// does not look like XML at all takes the line-oriented-only path.
+pub fn redact_log_artefact(input: &str) -> Result<String, RedactError> {
     match redact_xml(input) {
-        Ok(redacted) => redact_log_text(&redacted),
-        Err(_) => redact_log_text(input),
+        Ok(redacted) => Ok(redact_log_text(&redacted)),
+        Err(err) => {
+            if input.trim_start().starts_with('<') {
+                Err(err)
+            } else {
+                Ok(redact_log_text(input))
+            }
+        }
     }
 }
 
@@ -119,6 +131,12 @@ const REDACT_LOG_KEYS: &[&str] = &[
     "authentication-key",
     "authentication-password",
     "privacy-password",
+    "privacy-key",
+    "password",
+    "chap-secret",
+    "default-chap-secret",
+    "local-password",
+    "hello-authentication-key",
     "key",
     "value",
 ];
@@ -173,6 +191,27 @@ fn redact_log_line(line: &str) -> String {
                         matched = true;
                     }
                     break;
+                }
+            }
+        }
+        // Crypt-hash floor: whatever key (if any) precedes it, a token that
+        // looks like a reversible Junos secret (`$9$...` etc. — see
+        // `crate::shape::looks_like_secret_value`) never occurs in prose, so
+        // it is safe to redact unconditionally at any token boundary. This
+        // catches values sitting after a key not on `REDACT_LOG_KEYS` and
+        // bare hash tokens with no preceding key at all.
+        if !matched {
+            // SOUND: `idx > 0` guard ensures `idx - 1` is valid.
+            #[allow(clippy::indexing_slicing)]
+            let at_token_boundary = idx == 0 || is_token_delimiter(bytes[idx - 1]);
+            if at_token_boundary
+                && let Some((value_start, value_end)) = floor_value_token(line, idx)
+            {
+                let inner = token_inner_for_shape_check(line, value_start, value_end);
+                if !inner.is_empty() && looks_like_secret_value(inner) {
+                    out.push_str("[REDACTED]");
+                    idx = value_end;
+                    matched = true;
                 }
             }
         }
@@ -369,18 +408,26 @@ fn value_token(line: &str, pos: usize) -> Option<(usize, usize)> {
     let first = bytes[pos];
     if first == b'"' || first == b'\'' {
         let mut end = pos + 1;
+        // Stop at `\n`: an unterminated quote must not consume the line
+        // terminator and merge with the next line. Skip `\"`/`\'` (escaped
+        // quote) rather than treating it as the closing delimiter, so a
+        // value containing an escaped quote is not truncated mid-value.
         // SOUND: bounds-checked against bytes.len().
         #[allow(clippy::indexing_slicing)]
-        while end < bytes.len() && bytes[end] != first {
-            end += 1;
+        while end < bytes.len() && bytes[end] != first && bytes[end] != b'\n' {
+            if bytes[end] == b'\\' && end + 1 < bytes.len() && bytes[end + 1] == first {
+                end += 2;
+            } else {
+                end += 1;
+            }
         }
         // SOUND: bounds-checked.
         #[allow(clippy::indexing_slicing)]
-        if end < bytes.len() {
+        if end < bytes.len() && bytes[end] == first {
             end += 1; // include the closing quote
         }
-        // `end` is always a char boundary: either `bytes.len()` or one byte
-        // past an ASCII quote (`"` or `'`), both of which are char
+        // `end` is always a char boundary: either `bytes.len()`, a `\n`, or
+        // one byte past an ASCII quote (`"` or `'`), all of which are char
         // boundaries.
         return Some((pos, end));
     }
@@ -404,6 +451,67 @@ fn value_token(line: &str, pos: usize) -> Option<(usize, usize)> {
         None
     } else {
         Some((start, end))
+    }
+}
+
+/// Whether `byte` delimits a token for the crypt-hash floor scan: whitespace,
+/// `;`, or the angle brackets a captured artefact's embedded XML-ish text can
+/// carry (see [`redact_log_line`]'s floor pass).
+fn is_token_delimiter(byte: u8) -> bool {
+    matches!(
+        byte,
+        b' ' | b'\t' | b'\n' | b'\r' | b';' | b'<' | b'>' | b'"' | b'\''
+    )
+}
+
+/// Like [`value_token`], but a bare (unquoted) token also stops at `<`/`>` —
+/// the floor pass runs over artefacts that may embed XML-ish text, where a
+/// hash token can sit directly against a tag delimiter with no whitespace.
+fn floor_value_token(line: &str, pos: usize) -> Option<(usize, usize)> {
+    let bytes = line.as_bytes();
+    if pos >= bytes.len() {
+        return None;
+    }
+    // SOUND: bounds-checked above.
+    #[allow(clippy::indexing_slicing)]
+    let first = bytes[pos];
+    if first == b'"' || first == b'\'' || bytes_start_with(bytes, pos, QUOT_ENTITY) {
+        return value_token(line, pos);
+    }
+    let mut end = pos;
+    // SOUND: all byte indexing is bounds-checked against bytes.len().
+    #[allow(clippy::indexing_slicing)]
+    while end < bytes.len() && !is_token_delimiter(bytes[end]) {
+        end += 1;
+    }
+    if end == pos { None } else { Some((pos, end)) }
+}
+
+/// Strip the surrounding quote (or `&quot;` entity) delimiters from a
+/// `[start, end)` span returned by [`value_token`]/[`floor_value_token`], so
+/// [`looks_like_secret_value`] (which anchors on the value's own leading
+/// byte, e.g. a crypt hash's `$`) sees the value and not its delimiters.
+fn token_inner_for_shape_check(line: &str, start: usize, end: usize) -> &str {
+    let bytes = line.as_bytes();
+    // SOUND: `start`/`end` come from `value_token`/`floor_value_token`, which
+    // guarantee char boundaries.
+    #[allow(clippy::string_slice, clippy::indexing_slicing)]
+    if end > start && (bytes[start] == b'"' || bytes[start] == b'\'') {
+        let close = bytes[start];
+        if end - start >= 2 && bytes[end - 1] == close {
+            &line[start + 1..end - 1]
+        } else {
+            &line[start + 1..end]
+        }
+    } else if bytes_start_with(bytes, start, QUOT_ENTITY) {
+        let qlen = QUOT_ENTITY.len();
+        if end >= start + 2 * qlen && bytes_start_with(bytes, end - qlen, QUOT_ENTITY) {
+            &line[start + qlen..end - qlen]
+        } else {
+            &line[start + qlen..end]
+        }
+    } else {
+        &line[start..end]
     }
 }
 
@@ -535,14 +643,111 @@ mod tests {
     #[test]
     fn cli_text_embedded_in_xml_without_an_output_wrapper_is_scrubbed() {
         let xml = "<rpc-reply>set snmp community leakedXML;\n</rpc-reply>";
-        let got = redact_log_artefact(xml);
+        let got = redact_log_artefact(xml).unwrap();
         assert!(!got.contains("leakedXML"), "got: {got}");
     }
 
     #[test]
-    fn unparseable_xml_still_goes_through_the_log_text_floor() {
-        let bad = "<unclosed>set snmp community leakedBad;";
-        let got = redact_log_artefact(bad);
+    fn non_xml_text_still_goes_through_the_log_text_floor() {
+        let text = "Hostname: srx1\nset snmp community leakedBad;\n";
+        let got = redact_log_artefact(text).unwrap();
         assert!(!got.contains("leakedBad"), "got: {got}");
+    }
+
+    // ── F2: crypt-hash floor in `redact_log_text` — a `$9$...`-shaped value
+    // is redacted whatever key precedes it, or with no preceding key at all,
+    // because a Junos crypt hash never occurs in prose. ────────────────────
+
+    #[test]
+    fn hash_after_a_key_not_on_the_closed_list_is_redacted() {
+        let line = r#"set snmp v3 usm local-engine user u1 privacy-aes128 privacy-key "$9$FAKEaes128priv""#; // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+        let got = redact_log_text(line);
+        assert!(!got.contains("$9$FAKEaes128priv"), "got: {got}"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+    }
+
+    #[test]
+    fn hash_after_a_compound_key_hyphen_joined_to_an_unlisted_word_is_redacted() {
+        let line = r#"set protocols isis interface ge-0/0/0.0 level 2 hello-authentication-key "$9$FAKEisisHello""#; // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+        let got = redact_log_text(line);
+        assert!(!got.contains("$9$FAKEisisHello"), "got: {got}"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+    }
+
+    #[test]
+    fn hash_after_firewall_user_password_is_redacted() {
+        let line = r#"set access profile p1 client c1 firewall-user password "$9$FAKEfwUserPw""#; // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+        let got = redact_log_text(line);
+        assert!(!got.contains("$9$FAKEfwUserPw"), "got: {got}"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+    }
+
+    #[test]
+    fn hash_after_ppp_chap_and_pap_secret_keys_is_redacted() {
+        let chap = r#"set interfaces ge-0/0/0 unit 0 ppp-options chap default-chap-secret "$9$FAKEchapSecret""#; // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+        let got_chap = redact_log_text(chap);
+        assert!(!got_chap.contains("$9$FAKEchapSecret"), "got: {got_chap}"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+
+        let pap =
+            r#"set interfaces ge-0/0/1 unit 0 ppp-options pap local-password "$9$FAKEpapSecret""#; // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+        let got_pap = redact_log_text(pap);
+        assert!(!got_pap.contains("$9$FAKEpapSecret"), "got: {got_pap}"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+    }
+
+    #[test]
+    fn bare_hash_token_with_no_preceding_key_is_redacted() {
+        let line = "unexpected diagnostic dump: $9$FAKEbareToken follows no known key"; // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+        let got = redact_log_text(line);
+        assert!(!got.contains("$9$FAKEbareToken"), "got: {got}"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+    }
+
+    // ── F3: when `redact_xml` cannot parse XML-shaped input, the caller must
+    // refuse the artefact rather than fall back to the line-oriented pass,
+    // which knows nothing about element structure. ─────────────────────────
+
+    #[test]
+    fn truncated_xml_missing_closing_tags_is_refused() {
+        let bad = "<configuration><snmp><community><name>FAKEcommunity</name>"; // gitleaks:allow -- fabricated fixture, not a real community string
+        assert!(redact_log_artefact(bad).is_err());
+    }
+
+    #[test]
+    fn truncated_xml_around_an_encrypted_password_is_refused() {
+        let bad = "<system><root-authentication><encrypted-password>$6$FAKEsalt$FAKEhash</encrypted-password>"; // gitleaks:allow -- fabricated Junos $6$ fixture, not a real hash
+        assert!(redact_log_artefact(bad).is_err());
+    }
+
+    #[test]
+    fn truncated_xml_around_a_pre_shared_key_is_refused() {
+        let bad = "<pre-shared-key><ascii-text>FAKEplainpsk</ascii-text>"; // gitleaks:allow -- fabricated fixture, not a real key
+        assert!(redact_log_artefact(bad).is_err());
+    }
+
+    #[test]
+    fn well_formed_xml_with_an_unresolvable_entity_is_refused() {
+        let bad = "<configuration>&nbsp;<snmp><community><name>FAKEcommunity</name></community></snmp></configuration>"; // gitleaks:allow -- fabricated fixture, not a real community string
+        assert!(redact_log_artefact(bad).is_err());
+    }
+
+    #[test]
+    fn a_bare_unescaped_angle_bracket_in_text_is_refused() {
+        let bad = "<community><name>FAKEcommunity</name></community> < more text"; // gitleaks:allow -- fabricated fixture, not a real community string
+        assert!(redact_log_artefact(bad).is_err());
+    }
+
+    // ── F5: a quoted value with an escaped quote is redacted in full, and an
+    // unterminated quote does not consume the line terminator. ─────────────
+
+    #[test]
+    fn quoted_value_with_an_escaped_quote_is_fully_redacted() {
+        let line = r#"set security ike policy p pre-shared-key ascii-text "ab\"FAKEtail""#; // gitleaks:allow -- fabricated fixture, not a real key
+        let got = redact_log_text(line);
+        assert!(!got.contains("FAKEtail"), "got: {got}");
+        assert!(!got.contains("ab\\\""), "got: {got}");
+    }
+
+    #[test]
+    fn unterminated_quote_does_not_merge_with_the_next_line() {
+        let input = "set security ike policy p pre-shared-key ascii-text \"FAKEunterminated\nnext line user=admin action=login\n";
+        let got = redact_log_text(input);
+        assert_eq!(got.lines().count(), 2, "got: {got}");
+        assert!(got.contains("action=login"), "got: {got}");
     }
 }
