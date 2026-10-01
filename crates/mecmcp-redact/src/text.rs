@@ -229,8 +229,14 @@ fn redact_value_span(line: &str, force: bool) -> String {
     }
     // No `=`/`:` — bare `key value` (Junos `set` style). Redact the last
     // whitespace-delimited token when forced, or when it alone looks secret.
-    if let Some(last_space) = line.rfind(char::is_whitespace) {
-        let (head, tail) = line.split_at(last_space + 1);
+    //
+    // `rfind` returns the *start* byte offset of the matched char, which for
+    // a multi-byte whitespace character (NBSP, em space, ...) is not a valid
+    // split point one byte later — `split_at(last_space + 1)` would panic
+    // mid-character. Advance by the char's own UTF-8 width instead.
+    if let Some((last_space, ws_char)) = line.char_indices().rev().find(|(_, c)| c.is_whitespace())
+    {
+        let (head, tail) = line.split_at(last_space + ws_char.len_utf8());
         let tail_trimmed = tail.trim_end_matches(';');
         let trailing = &tail[tail_trimmed.len()..];
         if !tail_trimmed.is_empty() && (force || looks_like_secret_value(tail_trimmed)) {
@@ -1437,5 +1443,33 @@ mod tests {
         let got = redact("https://admin:p@QQu1@host/");
         assert!(!got.contains("QQu1"), "got: {got}");
         assert!(!got.contains("p@QQu1"), "got: {got}");
+    }
+
+    // --- MEC-770/MEC-1221: the bare `key value` fallback located its last
+    // whitespace token with `rfind`, which returns the *start* byte offset
+    // of the match. For a multi-byte whitespace character (NBSP, em space,
+    // ideographic space, ...) `offset + 1` lands mid-character, and
+    // `split_at` panics instead of redacting. Force the line through the
+    // unconditional fallback (the `## SECRET-DATA` backstop) with a
+    // multi-byte whitespace character immediately before the value token,
+    // and nothing after it, so the vulnerable split is the only code path
+    // that can locate the value. ---
+
+    #[test]
+    fn y5_nbsp_before_value_in_forced_fallback_does_not_panic() {
+        let got = redact("foo\u{a0}QQw1## SECRET-DATA");
+        assert!(!got.contains("QQw1"), "got: {got}");
+    }
+
+    #[test]
+    fn y5_em_space_before_value_in_forced_fallback_does_not_panic() {
+        let got = redact("foo\u{2003}QQw2## SECRET-DATA");
+        assert!(!got.contains("QQw2"), "got: {got}");
+    }
+
+    #[test]
+    fn y5_ideographic_space_before_value_in_forced_fallback_does_not_panic() {
+        let got = redact("foo\u{3000}QQw3## SECRET-DATA");
+        assert!(!got.contains("QQw3"), "got: {got}");
     }
 }
