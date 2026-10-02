@@ -10,7 +10,7 @@
 //! instead of emitting a best-effort partial result.
 
 use crate::RedactError;
-use crate::denylist::is_denylisted_key;
+use crate::denylist::{is_bgp_community_tag, is_bgp_scope_key, is_denylisted_key, normalize};
 use crate::shape::looks_like_secret_value;
 use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesRef, BytesStart, BytesText, Event};
@@ -28,6 +28,26 @@ const PLACEHOLDER: &[u8] = b"[REDACTED]";
 /// this crate never falls back to returning the input unredacted just
 /// because it could not be understood.
 pub fn redact(input: &str) -> Result<String, RedactError> {
+    redact_impl(input, false)
+}
+
+/// The XML counterpart of [`crate::redact_json_value_with_profile`]: redact
+/// `input` the same way [`redact`] does, additionally applying `profile`'s
+/// BGP route-community exemption when it opts in via
+/// [`crate::Profile::with_bgp_route_communities`]. `profile`'s
+/// `wholesale_redact_keys` and `key_exemptions` have no XML equivalent yet
+/// and are not consulted here.
+///
+/// # Errors
+/// Same as [`redact`].
+pub(crate) fn redact_with_profile(
+    input: &str,
+    profile: &crate::Profile,
+) -> Result<String, RedactError> {
+    redact_impl(input, crate::profile::bgp_route_communities(profile))
+}
+
+fn redact_impl(input: &str, bgp_route_communities: bool) -> Result<String, RedactError> {
     let mut reader = Reader::from_str(input);
     reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Cursor::new(Vec::new()));
@@ -54,7 +74,8 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
             flush_text_run(
                 &mut writer,
                 &mut text_run,
-                any_ancestor_denylisted(&tag_stack),
+                &tag_stack,
+                bgp_route_communities,
             )?;
         }
         match event {
@@ -69,7 +90,7 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
             }
             Event::Start(e) => {
                 tag_stack.push(local_name(e.name()).to_vec());
-                let rewritten = redact_attributes(&e, &tag_stack)?;
+                let rewritten = redact_attributes(&e, &tag_stack, bgp_route_communities)?;
                 writer
                     .write_event(Event::Start(rewritten))
                     .map_err(|e| RedactError::InvalidXml(e.to_string()))?;
@@ -83,7 +104,7 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
                 // attributes even though the non-empty `<community
                 // name="..."></community>` form does (N4).
                 tag_stack.push(local_name(e.name()));
-                let rewritten = redact_attributes(&e, &tag_stack)?;
+                let rewritten = redact_attributes(&e, &tag_stack, bgp_route_communities)?;
                 tag_stack.pop();
                 writer
                     .write_event(Event::Empty(rewritten))
@@ -117,7 +138,8 @@ pub fn redact(input: &str) -> Result<String, RedactError> {
             }
             Event::CData(e) => {
                 let decoded = e.into_inner().into_owned();
-                let ancestor_is_secret = any_ancestor_denylisted(&tag_stack);
+                let ancestor_is_secret =
+                    any_ancestor_denylisted(&tag_stack, &decoded, bgp_route_communities);
                 let out = if ancestor_is_secret || looks_like_secret_value(&decoded) {
                     quick_xml::events::BytesCData::new(
                         String::from_utf8_lossy(PLACEHOLDER).into_owned(),
@@ -200,17 +222,71 @@ pub(crate) fn validate(input: &str) -> Result<(), RedactError> {
 /// denylisted key — a Junos SNMP community landing in `<name>` under
 /// `<community>`, or a PSK in `<ascii-text>` under `<pre-shared-key>`, both
 /// have a *grandparent*, not a parent, that names the secret.
-fn any_ancestor_denylisted(tag_stack: &[Vec<u8>]) -> bool {
-    tag_stack
+///
+/// The per-ancestor BGP exemption below agrees with
+/// `json::looks_like_bgp_community_value`'s scope exactly: it checks that a
+/// `bgp` element is strictly above the `community` element, not merely open
+/// anywhere in the stack, and only accepts the `member`/`members` child
+/// shape rather than any child element name.
+///
+/// `bgp_route_communities` gates whether the exemption is consulted at
+/// all — see [`crate::profile::Profile::with_bgp_route_communities`].
+fn any_ancestor_denylisted(
+    tag_stack: &[Vec<u8>],
+    value: &str,
+    bgp_route_communities: bool,
+) -> bool {
+    tag_stack.iter().enumerate().any(|(i, name)| {
+        let name = String::from_utf8_lossy(name);
+        if !is_denylisted_key(&name) {
+            return false;
+        }
+        !(bgp_route_communities && is_bgp_route_community_ancestor(tag_stack, i, value))
+    })
+}
+
+/// Whether the denylisted ancestor at `tag_stack[i]` is a BGP route-community
+/// element exempted from redaction — the XML counterpart of
+/// `json::looks_like_bgp_community_value`'s scope.
+///
+/// Exempt only when all of these hold:
+/// - `tag_stack[i]` is a `community` element (the same bare field name an
+///   SNMP community string uses — see [`is_bgp_community_tag`]'s doc);
+/// - a `bgp` scope element is an ancestor *of that `community` element*
+///   (`tag_stack[..i]`, not the whole stack — a `bgp` element nested *inside*
+///   `community` does not count);
+/// - `value` itself looks like BGP community-tag syntax;
+/// - and `value`'s immediate container is either `<community>` directly
+///   (`i == tag_stack.len() - 1`), or exactly one `<member>`/`<members>`
+///   element nested inside it (`i + 2 == tag_stack.len()`) — any other child
+///   element name under `<community>` is not the known BGP shape and must
+///   still be redacted.
+fn is_bgp_route_community_ancestor(tag_stack: &[Vec<u8>], i: usize, value: &str) -> bool {
+    if normalize(&String::from_utf8_lossy(&tag_stack[i])) != "community" {
+        return false;
+    }
+    let under_bgp = tag_stack[..i]
         .iter()
-        .any(|name| is_denylisted_key(&String::from_utf8_lossy(name)))
+        .any(|name| is_bgp_scope_key(&String::from_utf8_lossy(name)));
+    if !under_bgp || !is_bgp_community_tag(value) {
+        return false;
+    }
+    let len = tag_stack.len();
+    if i == len - 1 {
+        return true;
+    }
+    i + 2 == len
+        && matches!(
+            normalize(&String::from_utf8_lossy(&tag_stack[len - 1])).as_str(),
+            "member" | "members"
+        )
 }
 
 fn redact_attributes<'a>(
     start: &BytesStart<'a>,
     tag_stack: &[Vec<u8>],
+    bgp_route_communities: bool,
 ) -> Result<BytesStart<'a>, RedactError> {
-    let ancestor_is_secret = any_ancestor_denylisted(tag_stack);
     let mut out = BytesStart::new(start.name().as_ref().to_owned());
     for attr in start.attributes() {
         let attr = attr.map_err(|e| RedactError::InvalidXml(e.to_string()))?;
@@ -219,6 +295,7 @@ fn redact_attributes<'a>(
             .normalized_value(quick_xml::XmlVersion::Implicit1_0)
             .map_err(|e| RedactError::InvalidXml(e.to_string()))?
             .into_owned();
+        let ancestor_is_secret = any_ancestor_denylisted(tag_stack, &value, bgp_route_communities);
         let redacted_value =
             if ancestor_is_secret || is_denylisted_key(&key) || looks_like_secret_value(&value) {
                 String::from_utf8_lossy(PLACEHOLDER).into_owned()
@@ -238,18 +315,19 @@ fn redact_attributes<'a>(
 /// Flush a buffered run of `Text`/`GeneralRef` events as a single redaction
 /// decision, writing nothing if the run is empty.
 ///
-/// `ancestor_is_secret` must reflect `tag_stack` as it was *during* the
-/// run — callers flush before mutating `tag_stack` for the event that ended
-/// the run, so the stack passed to [`any_ancestor_denylisted`] still
-/// matches.
+/// `tag_stack` must reflect its state as it was *during* the run — callers
+/// flush before mutating `tag_stack` for the event that ended the run, so
+/// the stack passed to [`any_ancestor_denylisted`] still matches.
 fn flush_text_run(
     writer: &mut Writer<Cursor<Vec<u8>>>,
     text_run: &mut Option<String>,
-    ancestor_is_secret: bool,
+    tag_stack: &[Vec<u8>],
+    bgp_route_communities: bool,
 ) -> Result<(), RedactError> {
     let Some(joined) = text_run.take() else {
         return Ok(());
     };
+    let ancestor_is_secret = any_ancestor_denylisted(tag_stack, &joined, bgp_route_communities);
     let out = if ancestor_is_secret || looks_like_secret_value(&joined) {
         BytesText::from_escaped(escape_text(&String::from_utf8_lossy(PLACEHOLDER))).into_owned()
     } else {
