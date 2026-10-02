@@ -62,6 +62,7 @@
 pub mod denylist;
 pub mod digest;
 mod json;
+pub mod junos;
 pub mod policy;
 pub mod profile;
 pub mod projection;
