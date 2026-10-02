@@ -34,6 +34,20 @@ every vendor server already calls — see [Marking untrusted content](#marking-u
   (`$9$...`), PAN-OS's `-AQ==`-suffixed blobs, `ENC`-prefixed ciphertext, PEM
   blocks, and Junos's `## SECRET-DATA` marker.
 
+## Vendor-specific extensions to the denylist scan
+
+A server occasionally has two kinds of policy the denylist-and-shape scan
+cannot infer from a vendor's schema on its own: a field whose value must be
+withheld as a whole because it is a rendered body (device config, generated
+IPsec config) that can embed a secret in a shape the scan is not guaranteed
+to catch, or a field name that collides with the denylist by substring in
+that vendor's schema but is not a secret (an opaque paging cursor, a logging
+flag — redacting it is a functional or security regression in its own
+right). A server declares a [`Profile`] once and calls
+[`redact_json_value_with_profile`] instead of [`redact_json_value`]; see the
+[`profile`] module docs for the ordering guarantees. This never narrows the
+generic scan — it only adds exceptions and extra withholding on top of it.
+
 ## On by default
 
 [`policy::active()`] defaults to `Enabled`. The only way to change that is
@@ -86,6 +100,31 @@ make two configs that differ only in a rotated secret hash identically once
 that field is denylisted, breaking change detection. [`redact_and_digest`] is
 the recommended entry point specifically because it makes "digest first" the
 only order reachable through the API.
+
+## Command-line use
+
+The `cli` feature builds a `mecmcp-redact` binary: the same engine, stdin to
+stdout, for a consumer that cannot link the crate (`mechubbench` is Python).
+
+```sh
+cargo run -p mecmcp-redact --features cli --bin mecmcp-redact -- --format json < body.json
+```
+
+`--format` is `text` (default), `json`, or `xml`. Invalid JSON/XML exits
+non-zero rather than printing the input back unredacted — the same
+fail-closed contract [`redact_json_str`]/[`redact_xml_str`] document. There is
+deliberately no `--profile` flag yet: see the binary's own doc comment
+(`src/bin/mecmcp-redact.rs`) for why.
+
+## Shared test coverage helper
+
+The `test-util` feature exposes [`testing::tools_leaking_secrets`]: given a
+tool-name registry, a set of fixture secrets, and a closure that exercises one
+tool and returns its rendered output, it returns the names of tools whose
+output contained any of those secrets. It generalizes the
+plant-a-secret-per-tool-and-assert-none-leak test every server has built by
+hand, the same way `mecmcp-audit`'s `test-util` feature generalized
+audit-coverage checking.
 
 ## Residual risk — read this before assuming zero egress
 

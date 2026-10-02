@@ -29,7 +29,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **mecmcp-redact: hardened text redaction against a reachable panic on
+  certain input** (MEC-770). `redact_text` (and the XML/JSON entry points,
+  which share the same core) could panic instead of returning on some
+  device-sourced tool output, which could abort the handling server
+  process. Present in v0.24.0 and v0.24.1. Fixed with a regression test
+  covering the text, XML, and JSON entry points; consumers should upgrade.
+
 ### Added
+
+- **mecmcp-redact: `Profile` extension hooks for vendor-specific
+  wholesale-redact and key-exemption rules** (MEC-1244, part of MEC-1231).
+  Some vendor servers need two kinds of policy this crate's generic scan
+  doesn't cover on its own: withholding a field's value wholesale rather
+  than key/value scanning it, for a vendor-rendered body a best-effort scan
+  isn't guaranteed to cover, and exempting field names that collide with
+  the denylist by substring but are not secrets in that vendor's schema.
+  Both are now generic capabilities any server can declare: a `Profile`
+  carries `wholesale_redact_keys` and `key_exemptions` lists, and
+  `redact_json_value_with_profile` applies them around the existing generic
+  scan without narrowing it. Migrating a server's local implementation onto
+  this is tracked separately, pending design review.
+
+- **mecmcp-redact: `mecmcp-redact` CLI binary and a shared tool-output
+  redaction coverage helper** (MEC-1231). A new `cli` feature exposes a
+  `mecmcp-redact` binary that runs the same `redact_text`/`redact_json_str`/
+  `redact_xml_str` engine every server already links, over stdin/stdout, for
+  non-Rust consumers that cannot depend on the crate directly (`--format
+  text|json|xml`; exits non-zero rather than passing through unparsed input,
+  matching the library's fail-closed contract). A new `test-util` feature
+  exposes `testing::tools_leaking_secrets`, generalizing the
+  hand-rolled-per-server "does any tool's rendered output contain a planted
+  fixture secret" assertion (the same way `mecmcp-audit`'s `test-util`
+  generalized audit-coverage checking) so each server's own coverage test can
+  call one shared function instead of re-deriving it.
 
 - **mecmcp-server: `OutputRedaction::AlreadyRedacted`, a quiet skip for
   output a caller redacted itself** (MEC-1168). `SkipForInternalRead` was
@@ -52,6 +87,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no audit trail at all was the wrong tradeoff for data that came from a
   device). Existing call sites are unaffected; adopting it in place of
   `SkipForInternalRead` is a separate, per-caller change.
+
+- **mecmcp-redact: a PAN-OS `Profile`, and fixtures proving representative
+  PAN-OS secret shapes are redacted.** Adds PAN-OS fixtures alongside
+  MEC-711's Mist fixtures, and a PAN-OS `Profile` whose `key_exemptions` and
+  opt-in BGP route-community exemption let a handful of non-secret
+  operational and routing-policy fields survive for PAN-OS callers
+  specifically, without loosening the default denylist for every other
+  vendor server. Hardens redaction coverage in both the JSON and XML paths.
 
 ## [0.25.0] - 2026-09-30
 

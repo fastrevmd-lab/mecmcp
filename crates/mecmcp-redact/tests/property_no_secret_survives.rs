@@ -16,7 +16,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use mecmcp_redact::denylist::DENYLISTED_KEYS;
+use mecmcp_redact::denylist::{DENYLISTED_EXACT_KEYS, DENYLISTED_KEYS};
 use mecmcp_redact::{redact_json_str, redact_text, redact_xml_str};
 
 #[derive(Clone, Copy)]
@@ -74,6 +74,27 @@ fn no_denylisted_key_fixture_secret_survives_any_format() {
             assert!(
                 !got.contains(&secret),
                 "denylisted key '{key}' (field '{field}') leaked in {}: {got}",
+                format_name(format)
+            );
+        }
+    }
+}
+
+/// F5 (MEC-537 review): the exact-match entries get no coverage from the
+/// substring sweep above, since a key that merely contains one (`keyword`,
+/// `monkey`) must *not* match it. Render each exact entry as the literal,
+/// bare field name instead.
+#[test]
+fn no_denylisted_exact_key_fixture_secret_survives_any_format() {
+    for (i, key) in DENYLISTED_EXACT_KEYS.iter().enumerate() {
+        let field = *key;
+        for &format in FORMATS {
+            let secret = format!("QQZZEXACT{i:04}{}", format_name(format));
+            let input = render(field, &secret, format);
+            let got = redact(&input, format);
+            assert!(
+                !got.contains(&secret),
+                "exact-match key '{key}' (field '{field}') leaked in {}",
                 format_name(format)
             );
         }
