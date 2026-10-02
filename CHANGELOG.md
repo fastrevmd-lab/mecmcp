@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 >
 > Entries from 0.21.0 onward should be written by hand at release time.
 
-## [Unreleased]
+## [0.26.0] - 2026-10-02
 
 ### Security
 
@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device-sourced tool output, which could abort the handling server
   process. Present in v0.24.0 and v0.24.1. Fixed with a regression test
   covering the text, XML, and JSON entry points; consumers should upgrade.
+
+- **mecmcp-policy: hardens read and command policy evaluation against
+  structured-input edge cases** (MEC-419). Policy rules are now evaluated
+  against parsed XML structure rather than raw device output, so a blocked
+  subtree also blocks its descendants and ancestors. Hardens that
+  evaluation to fail closed on inputs identified in security review.
+  Consumers should upgrade.
 
 ### Added
 
@@ -95,6 +102,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operational and routing-policy fields survive for PAN-OS callers
   specifically, without loosening the default denylist for every other
   vendor server. Hardens redaction coverage in both the JSON and XML paths.
+
+- **mecmcp-redact: a Junos redaction profile for support-bundle
+  artefacts** (MEC-1245). Ports `rustjunosmcp`'s support-bundle redaction
+  coverage into a `junos` module: XML redaction extended with a
+  Junos-specific element rule on the shared quick-xml walk, a
+  set-statement-aware line-oriented redactor for non-XML support-bundle
+  text, and a dispatcher that selects the XML vs. text path by the
+  artefact's shape, running the text pass as a floor under both and
+  failing closed when XML-shaped input cannot be parsed. Extends Junos
+  field coverage in the shared, vendor-agnostic denylist.
+  `rustjunosmcp` adopting this as a thin wrapper is a follow-up PR in
+  that repo.
 
 ## [0.25.0] - 2026-09-30
 
