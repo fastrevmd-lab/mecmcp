@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 
 use quick_xml::Reader;
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::{BytesRef, BytesStart, Event};
 use quick_xml::name::QName;
 
 use crate::{CompiledRule, evaluate};
@@ -67,8 +67,27 @@ pub fn path_string(path: &[String]) -> String {
     path.join("/")
 }
 
-fn local_name(name: QName<'_>) -> String {
-    String::from_utf8_lossy(name.local_name().as_ref().as_bytes()).into_owned()
+/// Characters that are either path or glob-pattern metacharacters. None of
+/// these can appear in a well-formed XML `Name` production, so a tag that
+/// contains one is lenient-parser noise (quick-xml accepts it; a conformant
+/// device parser does not): left unrejected, it could either collide with a
+/// genuine multi-segment path once joined with `/`, or change what a glob
+/// rule matches against. Refusing it keeps every segment this module hands
+/// to [`evaluate`] a literal tag name, never pattern syntax.
+const RESERVED_NAME_CHARS: [char; 8] = ['/', '*', '?', '[', ']', '{', '}', '\\'];
+
+fn local_name(name: QName<'_>) -> Result<String, XmlPathError> {
+    let name = String::from_utf8_lossy(name.local_name().as_ref().as_bytes()).into_owned();
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|c| c.is_whitespace() || RESERVED_NAME_CHARS.contains(&c))
+    {
+        return Err(XmlPathError::InvalidXml(format!(
+            "element name {name:?} is not a well-formed XML name"
+        )));
+    }
+    Ok(name)
 }
 
 /// Validate (but discard) an element's attributes: malformed attributes
@@ -126,7 +145,7 @@ fn walk_elements<F: FnMut(&[String])>(xml: &str, mut on_element: F) -> Result<()
                 if element_count > MAX_ELEMENTS {
                     return Err(XmlPathError::TooLarge);
                 }
-                stack.push(local_name(e.name()));
+                stack.push(local_name(e.name())?);
                 on_element(&stack);
             }
             Event::Empty(e) => {
@@ -138,7 +157,7 @@ fn walk_elements<F: FnMut(&[String])>(xml: &str, mut on_element: F) -> Result<()
                 if element_count > MAX_ELEMENTS {
                     return Err(XmlPathError::TooLarge);
                 }
-                stack.push(local_name(e.name()));
+                stack.push(local_name(e.name())?);
                 on_element(&stack);
                 stack.pop();
             }
@@ -147,9 +166,41 @@ fn walk_elements<F: FnMut(&[String])>(xml: &str, mut on_element: F) -> Result<()
                     .pop()
                     .ok_or_else(|| XmlPathError::InvalidXml("unmatched closing tag".to_string()))?;
             }
+            Event::DocType(_) => {
+                return Err(XmlPathError::InvalidXml(
+                    "DOCTYPE is not accepted".to_string(),
+                ));
+            }
+            Event::GeneralRef(bytes_ref) => {
+                reject_non_predefined_ref(&bytes_ref)?;
+            }
             _ => {}
         }
     }
+}
+
+/// Reject any `&entity;` or `&#NNN;` reference except a character reference
+/// or one of the five predefined XML entities (`lt`, `gt`, `amp`, `apos`,
+/// `quot`). A content model where an opaque, unexpanded entity reference can
+/// stand in for arbitrary element structure is exactly the parser
+/// differential this module exists to refuse: this parser sees the
+/// reference as inert text, but a parser that expands general entities (as a
+/// device's XML parser may) could see the entity's replacement text as
+/// additional elements this module never walked.
+fn reject_non_predefined_ref(bytes_ref: &BytesRef<'_>) -> Result<(), XmlPathError> {
+    if bytes_ref
+        .resolve_char_ref()
+        .map_err(|e| XmlPathError::InvalidXml(e.to_string()))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    if quick_xml::escape::resolve_predefined_entity(bytes_ref).is_some() {
+        return Ok(());
+    }
+    Err(XmlPathError::InvalidXml(
+        "entity reference is not accepted".to_string(),
+    ))
 }
 
 /// Parse `xml` and return the path of every element in the document, in
@@ -181,6 +232,14 @@ pub fn element_paths(xml: &str) -> Result<Vec<ElementPath>, XmlPathError> {
 /// for a blocked path's ancestor would return the blocked subtree's content
 /// as part of its own, so the ancestor must be refused as well.
 ///
+/// The same propagation runs in the other direction: every descendant of a
+/// path that matched a deny rule is blocked too, even when the rule's
+/// pattern is a literal path with no wildcard of its own. A rule author who
+/// writes `Deny configuration/system/login` means "this subtree is closed,"
+/// not "this exact element is closed but its children are fair game" — a
+/// read scoped to `configuration/system/login/user/name` must not return
+/// content from inside a subtree the rule denied.
+///
 /// # Errors
 ///
 /// Returns [`XmlPathError`] if `xml` cannot be parsed (malformed XML, too deep, or too many elements).
@@ -190,6 +249,12 @@ pub fn blocked_read_paths<A: Copy + PartialEq>(
     deny_action: A,
 ) -> Result<HashSet<String>, XmlPathError> {
     let mut blocked = HashSet::new();
+    // Every path string that matched a deny rule directly (as opposed to
+    // being swept in because an ancestor or a descendant matched). Document
+    // order visits every ancestor before its descendants, so by the time a
+    // descendant is checked, any ancestor that matched directly is already
+    // in this set.
+    let mut directly_denied: HashSet<String> = HashSet::new();
     // Many documents repeat the same path back-to-back — a run of sibling
     // elements that share a tag name (as `blocked_read_paths_propagates_
     // ancestors_promptly_under_many_matches` exercises with 49,000 identical
@@ -207,24 +272,39 @@ pub fn blocked_read_paths<A: Copy + PartialEq>(
         last_path = Some(path.to_vec());
 
         let candidate = path_string(path);
-        if let Some(rule) = evaluate(rules, &candidate)
-            && rule.action == deny_action
-        {
-            // Build every ancestor prefix by slicing the already-joined
-            // `candidate` string at each segment boundary (no repeated
-            // joins), and walk from the longest prefix down to the
+
+        // Build every prefix by slicing the already-joined `candidate`
+        // string at each segment boundary (no repeated joins).
+        let mut end_offset = 0usize;
+        let mut offsets = Vec::with_capacity(path.len());
+        for (i, segment) in path.iter().enumerate() {
+            if i > 0 {
+                end_offset += 1; // the '/' separator
+            }
+            end_offset += segment.len();
+            offsets.push(end_offset);
+        }
+
+        // True if some proper ancestor prefix of `candidate` already matched
+        // a deny rule directly: this element is inside a subtree a rule
+        // author closed, even though its own path doesn't match the rule's
+        // pattern.
+        let descendant_of_denied = offsets[..offsets.len().saturating_sub(1)]
+            .iter()
+            .any(|&offset| directly_denied.contains(&candidate[..offset]));
+
+        let directly_matches =
+            evaluate(rules, &candidate).is_some_and(|rule| rule.action == deny_action);
+
+        if directly_matches {
+            directly_denied.insert(candidate.clone());
+        }
+
+        if directly_matches || descendant_of_denied {
+            // Walk from the longest prefix (the full candidate) down to the
             // shortest. The moment a prefix is already in `blocked`, every
             // shorter prefix is too — a previous match already propagated
             // all the way to the root — so stop immediately.
-            let mut end_offset = 0usize;
-            let mut offsets = Vec::with_capacity(path.len());
-            for (i, segment) in path.iter().enumerate() {
-                if i > 0 {
-                    end_offset += 1; // the '/' separator
-                }
-                end_offset += segment.len();
-                offsets.push(end_offset);
-            }
             for offset in offsets.into_iter().rev() {
                 if !blocked.insert(candidate[..offset].to_string()) {
                     break;
@@ -236,8 +316,16 @@ pub fn blocked_read_paths<A: Copy + PartialEq>(
 }
 
 /// True if `requested_path` is in the `blocked` set computed by
-/// [`blocked_read_paths`] — either because it matched a deny rule directly,
-/// or because one of its descendants did.
+/// [`blocked_read_paths`] — because it matched a deny rule directly, because
+/// an ancestor of it did (the requested path sits inside a denied subtree),
+/// or because a descendant of it did (the requested path is itself an
+/// ancestor of a denied subtree).
+///
+/// A requested path that is absent from the document the policy was
+/// evaluated against is never reported as blocked by this function: it
+/// reflects what the document's content requires blocking, not whether the
+/// path exists. Callers must still run [`evaluate`] on the requested path
+/// itself to decide whether the request is allowed at all.
 #[must_use]
 pub fn is_read_blocked(blocked: &HashSet<String>, requested_path: &[String]) -> bool {
     blocked.contains(&path_string(requested_path))
@@ -360,20 +448,29 @@ pub fn canonical_command_path(xml_command: &str) -> Result<String, XmlPathError>
                 validate_attrs(&e)?;
                 open(&mut stack, &mut root_seen, &mut element_count)?;
                 stack.push(Frame {
-                    name: local_name(e.name()),
+                    name: local_name(e.name())?,
                     child_count: 0,
                 });
             }
             Event::Empty(e) => {
                 validate_attrs(&e)?;
                 open(&mut stack, &mut root_seen, &mut element_count)?;
-                record_if_leaf(&mut leaf_path, 0, &stack, local_name(e.name()))?;
+                let name = local_name(e.name())?;
+                record_if_leaf(&mut leaf_path, 0, &stack, name)?;
             }
             Event::End(_) => {
                 let frame = stack
                     .pop()
                     .ok_or_else(|| XmlPathError::InvalidXml("unmatched closing tag".to_string()))?;
                 record_if_leaf(&mut leaf_path, frame.child_count, &stack, frame.name)?;
+            }
+            Event::DocType(_) => {
+                return Err(XmlPathError::InvalidXml(
+                    "DOCTYPE is not accepted".to_string(),
+                ));
+            }
+            Event::GeneralRef(bytes_ref) => {
+                reject_non_predefined_ref(&bytes_ref)?;
             }
             _ => {}
         }
@@ -728,5 +825,119 @@ mod tests {
             "propagating ancestors for {} matches took {elapsed:?}, expected early-break on shared prefixes to keep this fast",
             49_000
         );
+    }
+
+    #[test]
+    fn element_paths_rejects_doctype() {
+        // A DOCTYPE with an internal subset can define general entities
+        // whose replacement text a DTD-expanding parser (possibly the
+        // device's own parser) would splice into the document as additional
+        // markup, invisible to this module's element walk. Refuse the whole
+        // document rather than silently ignore the DOCTYPE.
+        let xml = r#"<!DOCTYPE show [<!ENTITY x "<request><restart><system/></restart></request>">]><show>&x;</show>"#;
+        assert_eq!(
+            element_paths(xml),
+            Err(XmlPathError::InvalidXml(
+                "DOCTYPE is not accepted".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn canonical_command_path_rejects_doctype() {
+        let xml = r#"<!DOCTYPE show [<!ENTITY x "<request><restart><system/></restart></request>">]><show>&x;</show>"#;
+        assert_eq!(
+            canonical_command_path(xml),
+            Err(XmlPathError::InvalidXml(
+                "DOCTYPE is not accepted".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn element_paths_rejects_undefined_entity_reference() {
+        // No DOCTYPE at all: an entity reference with nothing defining it is
+        // still opaque to this parser and must not be silently treated as
+        // inert text.
+        let xml = "<show>&undefined;</show>";
+        assert_eq!(
+            element_paths(xml),
+            Err(XmlPathError::InvalidXml(
+                "entity reference is not accepted".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn element_paths_accepts_predefined_entities_and_char_refs() {
+        let xml = "<show>&lt;&gt;&amp;&apos;&quot;&#65;&#x41;</show>";
+        let paths = element_paths(xml).unwrap();
+        assert_eq!(paths, vec![vec!["show".to_string()]]);
+    }
+
+    #[test]
+    fn blocked_read_paths_blocks_descendants_of_a_literally_denied_element() {
+        // The deny rule has no wildcard of its own: it names one exact
+        // element. A rule author who closes a subtree by its exact path
+        // still means the whole subtree, not just that one element.
+        let xml = r#"
+            <configuration>
+                <system>
+                    <login>
+                        <user>
+                            <name>root</name>
+                        </user>
+                    </login>
+                </system>
+            </configuration>
+        "#;
+        let rules = deny_rules(&["configuration/system/login"]);
+        let rule_refs: Vec<_> = rules.iter().collect();
+        let blocked = blocked_read_paths(&rule_refs, xml, TestAction::Deny).unwrap();
+
+        assert!(is_read_blocked(
+            &blocked,
+            &[
+                "configuration".into(),
+                "system".into(),
+                "login".into(),
+                "user".into()
+            ]
+        ));
+        assert!(is_read_blocked(
+            &blocked,
+            &[
+                "configuration".into(),
+                "system".into(),
+                "login".into(),
+                "user".into(),
+                "name".into()
+            ]
+        ));
+
+        // Ancestors of the denied element are still blocked too.
+        assert!(is_read_blocked(&blocked, &["configuration".into()]));
+    }
+
+    #[test]
+    fn local_name_rejects_names_that_collide_with_a_real_multi_segment_path() {
+        // quick-xml is lenient about what counts as a name character: a tag
+        // spelled `show/request` parses as one element whose segment is
+        // `show/request`, which stringifies identically to the real two-
+        // element chain `show` -> `request`. A conformant device parser
+        // rejects this tag outright, so refuse it here instead of letting
+        // one glob-matched string stand in for two different shapes.
+        assert!(matches!(
+            element_paths("<show/request></show/request>"),
+            Err(XmlPathError::InvalidXml(_))
+        ));
+    }
+
+    #[test]
+    fn local_name_rejects_glob_metacharacters() {
+        assert!(matches!(
+            element_paths("<sys*tem/>"),
+            Err(XmlPathError::InvalidXml(_))
+        ));
     }
 }
