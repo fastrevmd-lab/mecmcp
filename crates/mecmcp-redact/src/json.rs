@@ -67,8 +67,8 @@ fn redact_inner(value: &mut Value, parent_key: Option<&str>, under_bgp: bool, ex
                 if exempt.contains(&normalize(key).as_str()) {
                     redact_inner(v, Some(key), child_under_bgp, exempt);
                 } else {
-                    let is_bgp_field = is_bgp_community_field(key, under_bgp)
-                        && looks_like_bgp_community_value(v);
+                    let is_bgp_field =
+                        is_bgp_community_field(key, under_bgp) && looks_like_bgp_community_value(v);
                     let is_secret = (is_denylisted_key(key)
                         || is_wep_keys_field(key, parent_key, sibling_type.as_deref()))
                         && !is_bgp_field;
