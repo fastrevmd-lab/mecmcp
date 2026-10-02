@@ -106,7 +106,7 @@ fn looks_like_xml_shaped(input: &str) -> bool {
 /// Route a captured support-bundle artefact through the appropriate pass.
 ///
 /// The choice of path is made from the artefact's *shape*
-/// ([`looks_like_xml_shaped`]), decided before any parsing is attempted —
+/// (`looks_like_xml_shaped`), decided before any parsing is attempted —
 /// not from whether parsing happens to succeed. Picking the path by parse
 /// outcome is a parser differential: plain `/var/log/*` text that merely
 /// lacks a bare `&` "parses" as XML (an all-text document with no markup)
@@ -125,7 +125,7 @@ fn looks_like_xml_shaped(input: &str) -> bool {
 ///
 /// Non-XML-shaped input never goes through the XML pass (so it is never
 /// XML-escaped or whitespace-normalised — see [`redact_xml`]'s doc comment).
-/// It instead gets [`crate::text::redact`]'s denylisted-key/PEM-block/shape
+/// It instead gets `crate::text::redact`'s denylisted-key/PEM-block/shape
 /// scan as a floor under [`redact_log_text`]: that generic pass is
 /// substring-keyed and case-insensitive where this module's own closed,
 /// whole-word `REDACT_LOG_KEYS` scan is not, and it also handles a `key:
