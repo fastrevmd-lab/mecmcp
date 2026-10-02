@@ -35,13 +35,26 @@ pub(crate) fn redact_with_exemptions(value: &mut Value, exempt: &[&str]) {
 /// exemption only fires when the value itself backs up the "this is routing
 /// data, not a secret" claim (MEC-537 review, F4). An empty container counts
 /// as not BGP-shaped — no leaves means no evidence either way.
+///
+/// For an object, the keys matter too, not just the values (MEC-537 review
+/// follow-up): the PAN-OS-to-JSON shape this exemption targets only ever
+/// nests tag values under a `member`/`members` key, so any other key
+/// (`{"QQkeyleak": "1:2"}`) is treated as not BGP-shaped even if the value
+/// alone would parse as a tag — a key name is exactly where a secret value
+/// could otherwise be smuggled into this exemption.
 fn looks_like_bgp_community_value(value: &Value) -> bool {
     match value {
         Value::String(s) => is_bgp_community_tag(s),
         Value::Array(items) => {
             !items.is_empty() && items.iter().all(looks_like_bgp_community_value)
         }
-        Value::Object(map) => !map.is_empty() && map.values().all(looks_like_bgp_community_value),
+        Value::Object(map) => {
+            !map.is_empty()
+                && map.iter().all(|(k, v)| {
+                    matches!(normalize(k).as_str(), "member" | "members")
+                        && looks_like_bgp_community_value(v)
+                })
+        }
         Value::Number(_) | Value::Bool(_) | Value::Null => false,
     }
 }

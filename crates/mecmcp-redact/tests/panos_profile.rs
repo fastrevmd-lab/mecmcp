@@ -102,6 +102,28 @@ fn panos_bgp_route_community_survives_in_xml() {
     assert!(got.contains("65000:100"), "got: {got}");
 }
 
+/// MEC-1342 review (F2): the BGP community value check walked an object's
+/// *values* for tag syntax but never checked its *keys*, so a value sitting
+/// under a non-`member`/`members` key one level inside the `community`
+/// object was wrongly treated as "BGP-shaped" and skipped — even though the
+/// only shape PAN-OS actually emits nests tag values under `member`.
+#[test]
+fn mec_1342_f2_bgp_community_object_with_non_member_key_is_still_redacted() {
+    let v = serde_json::json!({
+        "bgp": {
+            "community": {
+                "QQkeyleak3": "1:2"
+            }
+        }
+    });
+    let input = v.to_string();
+    let got = redact_json_str(&input).unwrap();
+    assert!(
+        !got.contains("\"1:2\""),
+        "value must be redacted, got: {got}"
+    );
+}
+
 /// Sanity check that the BGP exception is scoped to a `bgp` ancestor: the
 /// same shape outside any BGP context (an SNMP community nested one level,
 /// Junos-style) must still be redacted.

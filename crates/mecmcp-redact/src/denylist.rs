@@ -21,6 +21,7 @@ pub const DENYLISTED_KEYS: &[&str] = &[
     "xsecret",
     "phash",
     "community",
+    "communities",
     "communitystring",
     "apikey",
     "token",
@@ -72,9 +73,6 @@ const SAFE_KEY_EXCEPTIONS: &[&str] = &[
     "matchcommunity",
     "addcommunity",
     "removecommunity",
-    "overwritecommunity",
-    "communities",
-    "communitymembers",
 ];
 
 /// Field names that must match the *whole* normalized key, not a substring.
@@ -134,10 +132,13 @@ pub fn is_bgp_scope_key(key: &str) -> bool {
 /// PAN-OS and Junos both spell a BGP route community (a routing-policy tag
 /// like `65000:100`, public on the wire) with the exact same bare `community`
 /// field an SNMP community *string* (a shared secret) uses — the two are
-/// indistinguishable by field name alone. Both vendors nest every BGP
-/// community reference under a `bgp` element somewhere above it, which SNMP
-/// configuration never is, so a caller walking the tree can tell them apart
-/// by checking whether a `bgp` scope is among the value's ancestors.
+/// indistinguishable by field name alone. PAN-OS nests its BGP route
+/// community under a `bgp` element, which SNMP configuration never is, so a
+/// caller walking the tree can tell them apart by checking whether a `bgp`
+/// scope is among the value's ancestors. Junos instead nests its route
+/// communities under `policy-options`, not `bgp` (MEC-537 review, F3 note),
+/// so this exemption does not fire for them and they stay redacted —
+/// over-redaction, the safe direction to be wrong in, not a leak.
 ///
 /// This is necessary but not sufficient: it only tells the caller the *key*
 /// matches the shape. A `bgp` ancestor can itself be a vendor's own
@@ -383,6 +384,20 @@ mod tests {
             "snmpCommunity",
             "community-key",
         ] {
+            assert!(is_denylisted_key(key), "'{key}' must be denylisted");
+        }
+    }
+
+    /// MEC-1342 review (F1): `communities`, `communitymembers` and
+    /// `overwritecommunity` were exempted via [`SAFE_KEY_EXCEPTIONS`] with no
+    /// vendor evidence and no value-shape check, unlike the bare `community`
+    /// field. All three must be denylisted now that the exemption is gone.
+    /// `communities` in particular does not contain `community` as a
+    /// substring (the plural diverges after `communit`), so it needed its own
+    /// [`DENYLISTED_KEYS`] entry rather than relying on the substring scan.
+    #[test]
+    fn mec_1342_unjustified_community_exceptions_are_denylisted() {
+        for key in ["communities", "communitymembers", "overwritecommunity"] {
             assert!(is_denylisted_key(key), "'{key}' must be denylisted");
         }
     }

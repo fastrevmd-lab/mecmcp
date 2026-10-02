@@ -88,7 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device). Existing call sites are unaffected; adopting it in place of
   `SkipForInternalRead` is a separate, per-caller change.
 
-- **mecmcp-redact: a PAN-OS profile, and narrower exemptions for a handful of
+- **mecmcp-redact: PAN-OS fixtures, and narrower exemptions for a handful of
   non-secret operational fields** (MEC-537, mecmcp#418). Adds PAN-OS fixtures
   alongside MEC-711's Mist fixtures proving representative PAN-OS secret
   shapes are redacted, and narrows a couple of denylist entries so legitimate
