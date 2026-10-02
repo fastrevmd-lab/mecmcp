@@ -7,7 +7,10 @@
 //! nothing to add a new nested shape, at the cost of never being a positive
 //! guarantee the way an allowlist projection is.
 
-use crate::denylist::{is_denylisted_key, is_wep_keys_field, normalize};
+use crate::denylist::{
+    is_bgp_community_field, is_bgp_community_tag, is_bgp_scope_key, is_denylisted_key,
+    is_wep_keys_field, normalize,
+};
 use crate::shape::looks_like_secret_value;
 use serde_json::Value;
 
@@ -15,7 +18,7 @@ pub(crate) const PLACEHOLDER: &str = "[REDACTED]";
 
 /// Redact `value` in place.
 pub fn redact(value: &mut Value) {
-    redact_inner(value, None, &[]);
+    redact_inner(value, None, false, &[], false);
 }
 
 /// Redact `value` in place, except that a key whose normalized form appears
@@ -23,32 +26,104 @@ pub fn redact(value: &mut Value) {
 /// (so a denylisted descendant, or a secret-shaped leaf value, is still
 /// caught), only the key-name match is suppressed. `exempt` entries must
 /// already be normalized (see [`crate::profile::Profile::new`]).
-pub(crate) fn redact_with_exemptions(value: &mut Value, exempt: &[&str]) {
-    redact_inner(value, None, exempt);
+///
+/// `bgp_route_communities` is [`crate::profile::Profile::with_bgp_route_communities`]'s
+/// flag: only when set does a `community` field under a `bgp` scope get the
+/// routing-policy exemption below.
+pub(crate) fn redact_with_exemptions(
+    value: &mut Value,
+    exempt: &[&str],
+    bgp_route_communities: bool,
+) {
+    redact_inner(value, None, false, exempt, bgp_route_communities);
+}
+
+/// Whether every string leaf under `value` looks like BGP community-tag
+/// syntax (see [`is_bgp_community_tag`]), so the [`is_bgp_community_field`]
+/// exemption only fires when the value itself backs up the "this is routing
+/// data, not a secret" claim. An empty container counts as not BGP-shaped —
+/// no leaves means no evidence either way.
+///
+/// For an object, the keys matter too, not just the values: the exemption
+/// only applies to the expected member-key shape, exactly one level deep —
+/// a bare string or array of strings, or an object whose only keys are
+/// `member`/`members` holding a string or array of strings. Nesting any
+/// deeper, or any other key layout, is treated as not BGP-shaped even if
+/// every leaf would otherwise parse as a tag — this caps the match to the
+/// same depth the XML path allows, so the two formats agree on the same
+/// scope.
+fn looks_like_bgp_community_value(value: &Value) -> bool {
+    fn is_tag_or_tags(value: &Value) -> bool {
+        match value {
+            Value::String(s) => is_bgp_community_tag(s),
+            Value::Array(items) => {
+                !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|item| matches!(item, Value::String(s) if is_bgp_community_tag(s)))
+            }
+            _ => false,
+        }
+    }
+    match value {
+        Value::String(_) | Value::Array(_) => is_tag_or_tags(value),
+        Value::Object(map) => {
+            !map.is_empty()
+                && map.iter().all(|(k, v)| {
+                    matches!(normalize(k).as_str(), "member" | "members") && is_tag_or_tags(v)
+                })
+        }
+        Value::Number(_) | Value::Bool(_) | Value::Null => false,
+    }
 }
 
 /// `parent_key` is the JSON object key `value` was found under, if any — the
 /// only context [`is_wep_keys_field`] needs to tell a WEP `keys` table apart
 /// from an unrelated `keys` field without widening the denylist itself.
-fn redact_inner(value: &mut Value, parent_key: Option<&str>, exempt: &[&str]) {
+///
+/// `under_bgp` is whether a `bgp` key sits somewhere above `value` in the
+/// tree — the context [`is_bgp_community_field`] needs to tell a BGP route
+/// community apart from an SNMP community string sharing the same bare
+/// `community` field name.
+///
+/// `exempt` is the same key-name exemption list [`redact_with_exemptions`]
+/// takes — a key whose normalized form appears in it is never treated as
+/// denylisted, but its value is still walked.
+///
+/// `bgp_route_communities` gates the BGP exemption itself — see
+/// [`redact_with_exemptions`].
+fn redact_inner(
+    value: &mut Value,
+    parent_key: Option<&str>,
+    under_bgp: bool,
+    exempt: &[&str],
+    bgp_route_communities: bool,
+) {
     match value {
         Value::Object(map) => {
             let sibling_type = map.get("type").and_then(Value::as_str).map(str::to_owned);
             for (key, v) in map.iter_mut() {
+                let child_under_bgp = under_bgp || is_bgp_scope_key(key);
                 if exempt.contains(&normalize(key).as_str()) {
-                    redact_inner(v, Some(key), exempt);
-                } else if is_denylisted_key(key)
-                    || is_wep_keys_field(key, parent_key, sibling_type.as_deref())
-                {
-                    *v = redact_leaf(v);
+                    redact_inner(v, Some(key), child_under_bgp, exempt, bgp_route_communities);
                 } else {
-                    redact_inner(v, Some(key), exempt);
+                    let is_bgp_field = bgp_route_communities
+                        && is_bgp_community_field(key, under_bgp)
+                        && looks_like_bgp_community_value(v);
+                    let is_secret = (is_denylisted_key(key)
+                        || is_wep_keys_field(key, parent_key, sibling_type.as_deref()))
+                        && !is_bgp_field;
+                    if is_secret {
+                        *v = redact_leaf(v);
+                    } else {
+                        redact_inner(v, Some(key), child_under_bgp, exempt, bgp_route_communities);
+                    }
                 }
             }
         }
         Value::Array(items) => {
             for item in items.iter_mut() {
-                redact_inner(item, parent_key, exempt);
+                redact_inner(item, parent_key, under_bgp, exempt, bgp_route_communities);
             }
         }
         Value::String(s) => {

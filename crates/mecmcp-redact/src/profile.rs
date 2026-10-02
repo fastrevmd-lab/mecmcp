@@ -49,6 +49,7 @@ use crate::json::PLACEHOLDER;
 pub struct Profile {
     wholesale_redact_keys: &'static [&'static str],
     key_exemptions: &'static [&'static str],
+    bgp_route_communities: bool,
 }
 
 impl Profile {
@@ -81,7 +82,24 @@ impl Profile {
         Self {
             wholesale_redact_keys,
             key_exemptions,
+            bgp_route_communities: false,
         }
+    }
+
+    /// Opt this profile into the BGP route-community exemption: a
+    /// `community` field (JSON) or element (XML) directly under a `bgp`
+    /// scope, whose value looks like BGP community-tag syntax rather than an
+    /// arbitrary secret, survives redaction. Off by default, so linking this
+    /// crate never loosens the denylist for a vendor that has not declared
+    /// it needs this exemption. [`crate::redact_json_value_with_profile`]
+    /// reads this flag from the profile it is called with;
+    /// [`crate::redact_xml_str_with_profile`] does the same for the XML
+    /// path. The plain [`crate::redact_json_value`] and
+    /// [`crate::redact_xml_str`] entry points never apply it.
+    #[must_use]
+    pub const fn with_bgp_route_communities(mut self) -> Self {
+        self.bgp_route_communities = true;
+        self
     }
 
     /// Reject a key exemption that normalizes to exactly a denylisted term —
@@ -151,7 +169,19 @@ const fn check_normalized(entry: &str) {
 /// so a denylisted descendant or a secret-shaped leaf is still caught.
 pub fn redact_json_value_with_profile(value: &mut Value, profile: &Profile) {
     redact_wholesale_fields(value, profile.wholesale_redact_keys);
-    crate::json::redact_with_exemptions(value, profile.key_exemptions);
+    crate::json::redact_with_exemptions(
+        value,
+        profile.key_exemptions,
+        profile.bgp_route_communities,
+    );
+}
+
+/// The [`Profile::bgp_route_communities`] flag, read by
+/// [`crate::xml::redact_with_profile`] — the XML path has no equivalent of
+/// `wholesale_redact_keys`/`key_exemptions` yet, so this is the only profile
+/// setting it consults.
+pub(crate) fn bgp_route_communities(profile: &Profile) -> bool {
+    profile.bgp_route_communities
 }
 
 /// Replace every value under a [`Profile::wholesale_redact_keys`] key with

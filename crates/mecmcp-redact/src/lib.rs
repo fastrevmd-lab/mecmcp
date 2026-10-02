@@ -182,6 +182,22 @@ pub fn redact_xml_str(input: &str) -> Result<String, RedactError> {
     xml::redact(input)
 }
 
+/// Redact an XML document under [`redact_xml_str`]'s generic scan, extended
+/// by `profile`'s BGP route-community exemption when it opts in via
+/// [`Profile::with_bgp_route_communities`]. `profile`'s
+/// `wholesale_redact_keys` and `key_exemptions` are JSON-only fields and are
+/// not consulted here — see the [`profile`] module docs.
+///
+/// # Errors
+/// Same as [`redact_xml_str`].
+pub fn redact_xml_str_with_profile(input: &str, profile: &Profile) -> Result<String, RedactError> {
+    if matches!(active(), RedactionPolicy::DisabledByOperator { .. }) {
+        xml::validate(input)?;
+        return Ok(input.to_string());
+    }
+    xml::redact_with_profile(input, profile)
+}
+
 /// The result of [`redact_and_digest`]: the redacted body, and a fingerprint
 /// of the *original* body it was computed from.
 #[derive(Debug, Clone, PartialEq, Eq)]
