@@ -7,37 +7,48 @@
 //! nothing to add a new nested shape, at the cost of never being a positive
 //! guarantee the way an allowlist projection is.
 
-use crate::denylist::{is_denylisted_key, is_wep_keys_field};
+use crate::denylist::{is_denylisted_key, is_wep_keys_field, normalize};
 use crate::shape::looks_like_secret_value;
 use serde_json::Value;
 
-const PLACEHOLDER: &str = "[REDACTED]";
+pub(crate) const PLACEHOLDER: &str = "[REDACTED]";
 
 /// Redact `value` in place.
 pub fn redact(value: &mut Value) {
-    redact_inner(value, None);
+    redact_inner(value, None, &[]);
+}
+
+/// Redact `value` in place, except that a key whose normalized form appears
+/// in `exempt` is never treated as denylisted — its value is still walked
+/// (so a denylisted descendant, or a secret-shaped leaf value, is still
+/// caught), only the key-name match is suppressed. `exempt` entries must
+/// already be normalized (see [`crate::profile::Profile::new`]).
+pub(crate) fn redact_with_exemptions(value: &mut Value, exempt: &[&str]) {
+    redact_inner(value, None, exempt);
 }
 
 /// `parent_key` is the JSON object key `value` was found under, if any — the
 /// only context [`is_wep_keys_field`] needs to tell a WEP `keys` table apart
 /// from an unrelated `keys` field without widening the denylist itself.
-fn redact_inner(value: &mut Value, parent_key: Option<&str>) {
+fn redact_inner(value: &mut Value, parent_key: Option<&str>, exempt: &[&str]) {
     match value {
         Value::Object(map) => {
             let sibling_type = map.get("type").and_then(Value::as_str).map(str::to_owned);
             for (key, v) in map.iter_mut() {
-                if is_denylisted_key(key)
+                if exempt.contains(&normalize(key).as_str()) {
+                    redact_inner(v, Some(key), exempt);
+                } else if is_denylisted_key(key)
                     || is_wep_keys_field(key, parent_key, sibling_type.as_deref())
                 {
                     *v = redact_leaf(v);
                 } else {
-                    redact_inner(v, Some(key));
+                    redact_inner(v, Some(key), exempt);
                 }
             }
         }
         Value::Array(items) => {
             for item in items.iter_mut() {
-                redact_inner(item, parent_key);
+                redact_inner(item, parent_key, exempt);
             }
         }
         Value::String(s) => {

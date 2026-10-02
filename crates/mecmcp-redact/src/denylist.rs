@@ -53,7 +53,18 @@ pub const DENYLISTED_KEYS: &[&str] = &[
 /// named `key0`, ...). But the bare field name `key` alone is exactly the
 /// PAN-OS keygen response shape (`<result><key>` is the API key itself), so it
 /// still needs to be denylisted — just under exact match instead.
-const DENYLISTED_EXACT_KEYS: &[&str] = &["key"];
+///
+/// `pub(crate)` so [`crate::profile::Profile::check_exemptions`] can refuse a
+/// vendor exemption that exactly matches one of these, the same way it
+/// refuses one matching [`DENYLISTED_KEYS`].
+pub(crate) const DENYLISTED_EXACT_KEYS: &[&str] = &["key"];
+
+/// Exact-match field name that is a secret only given additional sibling or
+/// parent context (see [`is_wep_keys_field`]), not by name alone — so it
+/// cannot live in [`DENYLISTED_EXACT_KEYS`] without over-matching every
+/// unrelated `keys` field. A vendor exemption must still not be allowed to
+/// claim this exact name, since in the right context it is secret-bearing.
+pub(crate) const CONTEXTUALLY_DENYLISTED_EXACT_KEYS: &[&str] = &["keys"];
 
 /// Whether `key` is a WEP key-material field, identifiable only by the shape
 /// of its enclosing object rather than its own name.
@@ -79,7 +90,12 @@ pub fn is_wep_keys_field(key: &str, parent_key: Option<&str>, sibling_type: Opti
 
 /// Lowercase `s` and drop every non-alphanumeric byte, so `pre-shared-key`,
 /// `pre_shared_key`, and `preSharedKey` all normalize to `presharedkey`.
-fn normalize(s: &str) -> String {
+///
+/// `pub(crate)` so [`crate::profile`] can match a vendor-declared field name
+/// under the exact same normalization the denylist itself uses, rather than
+/// maintaining a second normalize function that could drift out of sync with
+/// this one.
+pub(crate) fn normalize(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .flat_map(|c| c.to_lowercase())
