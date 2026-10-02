@@ -8,6 +8,8 @@
 
 use globset::{Glob, GlobMatcher};
 
+pub mod xml_path;
+
 /// Origin of a rule, used for tiebreaking equal-specificity matches and for
 /// the human-readable error message on denial.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
