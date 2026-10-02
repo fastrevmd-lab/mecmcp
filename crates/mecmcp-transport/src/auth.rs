@@ -1,5 +1,6 @@
 //! Shared bearer authentication and scope-preflight HTTP boundary.
 
+use crate::approver_assertion::{APPROVER_ASSERTION_HEADER, ApproverAssertionVerifier};
 use crate::preflight::{OptionalPreflight, ScopePreflight, run_preflight};
 use axum::{
     Router,
@@ -240,6 +241,7 @@ pub struct BearerBoundary<G: Grant> {
     authenticator: BearerAuthenticator<G>,
     responses: BearerResponseProfile,
     preflight: OptionalPreflight,
+    approver_assertion: Option<Arc<ApproverAssertionVerifier>>,
 }
 
 impl<G: Grant> Clone for BearerBoundary<G> {
@@ -248,6 +250,7 @@ impl<G: Grant> Clone for BearerBoundary<G> {
             authenticator: self.authenticator.clone(),
             responses: self.responses.clone(),
             preflight: self.preflight.clone(),
+            approver_assertion: self.approver_assertion.clone(),
         }
     }
 }
@@ -281,6 +284,7 @@ impl<G: Grant> BearerBoundary<G> {
             authenticator,
             responses,
             preflight: None,
+            approver_assertion: None,
         }
     }
 
@@ -318,6 +322,18 @@ impl<G: Grant> BearerBoundary<G> {
     #[must_use]
     pub fn with_preflight(mut self, preflight: impl ScopePreflight + 'static) -> Self {
         self.preflight = Some(Arc::new(preflight));
+        self
+    }
+
+    /// Install step-up approver-assertion verification.
+    ///
+    /// Without this, a presented `Mecmcp-Approver-Assertion` header is
+    /// refused with 400 (mecmcp-runtime's `VerifiedApproverArgs`, W5, is the
+    /// only intended way to install this — a server with no issuer
+    /// configured behaves identically to one with no OIDC support at all).
+    #[must_use]
+    pub fn with_approver_assertion(mut self, verifier: Arc<ApproverAssertionVerifier>) -> Self {
+        self.approver_assertion = Some(verifier);
         self
     }
 }
@@ -491,6 +507,7 @@ pub fn apply_bearer_boundary<G: Grant>(
         AuthState {
             authenticator: boundary.authenticator,
             responses: boundary.responses,
+            approver_assertion: boundary.approver_assertion,
         },
         bearer_auth_middleware::<G>,
     ))
@@ -515,6 +532,7 @@ enum PresentationError {
 pub struct AuthState<G: Grant> {
     pub authenticator: BearerAuthenticator<G>,
     pub responses: BearerResponseProfile,
+    pub approver_assertion: Option<Arc<ApproverAssertionVerifier>>,
 }
 
 /// State for the preflight middleware layer.
@@ -554,10 +572,28 @@ pub async fn bearer_auth_middleware<G: Grant>(
             );
         }
     };
-    let Some(caller) = state.authenticator.authenticate(candidate) else {
+    let Some(mut caller) = state.authenticator.authenticate(candidate) else {
         tracing::warn!("auth_failed: no matching token");
         return invalid_token(&state.responses);
     };
+
+    if let Some(header_value) = request.headers().get(APPROVER_ASSERTION_HEADER) {
+        let Some(verifier) = state.approver_assertion.as_ref() else {
+            return approver_assertion_not_configured();
+        };
+        let Ok(assertion) = header_value.to_str() else {
+            tracing::warn!(reason = "malformed_header", "approver_assertion_rejected");
+            return invalid_token(&state.responses);
+        };
+        let now = chrono::Utc::now().timestamp();
+        match verifier.verify_and_bind(assertion, &caller, now).await {
+            Ok(approver) => caller.verified_approver = Some(approver),
+            Err(error) => {
+                tracing::warn!(reason = %error, "approver_assertion_rejected");
+                return invalid_token(&state.responses);
+            }
+        }
+    }
 
     // Insert both the grant-bearing CallerCtx and the grant-neutral
     // AuthenticatedToken so accounting layers can work regardless of G.
@@ -567,6 +603,23 @@ pub async fn bearer_auth_middleware<G: Grant>(
     request.extensions_mut().insert(caller);
 
     next.run(request).await
+}
+
+/// Build a 400 response for a presented approver assertion with no verifier
+/// configured.
+///
+/// Distinct from [`invalid_token`]: the assertion itself was never checked,
+/// so this is a server configuration/request-shape mismatch (RFC 9457
+/// territory), not a credential failure.
+fn approver_assertion_not_configured() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(json!({
+            "error": "approver_assertion_not_configured",
+            "error_description": "this server has no approver-assertion verifier configured",
+        })),
+    )
+        .into_response()
 }
 
 /// Preflight middleware (innermost layer, after accounting and body limit).
@@ -1600,6 +1653,7 @@ mod tests {
             on_behalf_of: None,
             actor_type: ActorType::Human,
             oidc_subject: None,
+            verified_approver: None,
             client_name: None,
             model_id: None,
             session_id: None,
@@ -1656,6 +1710,7 @@ mod tests {
             on_behalf_of: None,
             actor_type: ActorType::Human,
             oidc_subject: None,
+            verified_approver: None,
             client_name: None,
             model_id: None,
             session_id: None,
@@ -1703,6 +1758,7 @@ mod tests {
             on_behalf_of: Some("user@example.com".to_owned()),
             actor_type: ActorType::Agent,
             oidc_subject: None,
+            verified_approver: None,
             client_name: None,
             model_id: None,
             session_id: None,

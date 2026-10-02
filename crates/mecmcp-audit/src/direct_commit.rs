@@ -138,6 +138,7 @@ mod tests {
             on_behalf_of: None,
             actor_type: mecmcp_auth::ActorType::Human,
             oidc_subject: None,
+            verified_approver: None,
             client_name: None,
             model_id: None,
             session_id: None,

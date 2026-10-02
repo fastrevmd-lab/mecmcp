@@ -12,6 +12,7 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
+mecmcp-oidc   = { version = "0.24.1", path = "../mecmcp-oidc" }
 mecmcp-secret = { version = "0.24.1", path = "../mecmcp-secret" }
 arc-swap   = { workspace = true }
 chrono     = { workspace = true }
