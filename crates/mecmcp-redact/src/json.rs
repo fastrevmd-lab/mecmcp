@@ -9,16 +9,25 @@
 
 use crate::denylist::{
     is_bgp_community_field, is_bgp_community_tag, is_bgp_scope_key, is_denylisted_key,
-    is_wep_keys_field,
+    is_wep_keys_field, normalize,
 };
 use crate::shape::looks_like_secret_value;
 use serde_json::Value;
 
-const PLACEHOLDER: &str = "[REDACTED]";
+pub(crate) const PLACEHOLDER: &str = "[REDACTED]";
 
 /// Redact `value` in place.
 pub fn redact(value: &mut Value) {
-    redact_inner(value, None, false);
+    redact_inner(value, None, false, &[]);
+}
+
+/// Redact `value` in place, except that a key whose normalized form appears
+/// in `exempt` is never treated as denylisted — its value is still walked
+/// (so a denylisted descendant, or a secret-shaped leaf value, is still
+/// caught), only the key-name match is suppressed. `exempt` entries must
+/// already be normalized (see [`crate::profile::Profile::new`]).
+pub(crate) fn redact_with_exemptions(value: &mut Value, exempt: &[&str]) {
+    redact_inner(value, None, false, exempt);
 }
 
 /// Whether every string leaf under `value` looks like BGP community-tag
@@ -45,27 +54,35 @@ fn looks_like_bgp_community_value(value: &Value) -> bool {
 /// tree — the context [`is_bgp_community_field`] needs to tell a BGP route
 /// community apart from an SNMP community string sharing the same bare
 /// `community` field name (MEC-537).
-fn redact_inner(value: &mut Value, parent_key: Option<&str>, under_bgp: bool) {
+///
+/// `exempt` is the same key-name exemption list [`redact_with_exemptions`]
+/// takes — a key whose normalized form appears in it is never treated as
+/// denylisted, but its value is still walked.
+fn redact_inner(value: &mut Value, parent_key: Option<&str>, under_bgp: bool, exempt: &[&str]) {
     match value {
         Value::Object(map) => {
             let sibling_type = map.get("type").and_then(Value::as_str).map(str::to_owned);
             for (key, v) in map.iter_mut() {
-                let is_bgp_field =
-                    is_bgp_community_field(key, under_bgp) && looks_like_bgp_community_value(v);
-                let is_secret = (is_denylisted_key(key)
-                    || is_wep_keys_field(key, parent_key, sibling_type.as_deref()))
-                    && !is_bgp_field;
                 let child_under_bgp = under_bgp || is_bgp_scope_key(key);
-                if is_secret {
-                    *v = redact_leaf(v);
+                if exempt.contains(&normalize(key).as_str()) {
+                    redact_inner(v, Some(key), child_under_bgp, exempt);
                 } else {
-                    redact_inner(v, Some(key), child_under_bgp);
+                    let is_bgp_field = is_bgp_community_field(key, under_bgp)
+                        && looks_like_bgp_community_value(v);
+                    let is_secret = (is_denylisted_key(key)
+                        || is_wep_keys_field(key, parent_key, sibling_type.as_deref()))
+                        && !is_bgp_field;
+                    if is_secret {
+                        *v = redact_leaf(v);
+                    } else {
+                        redact_inner(v, Some(key), child_under_bgp, exempt);
+                    }
                 }
             }
         }
         Value::Array(items) => {
             for item in items.iter_mut() {
-                redact_inner(item, parent_key, under_bgp);
+                redact_inner(item, parent_key, under_bgp, exempt);
             }
         }
         Value::String(s) => {
