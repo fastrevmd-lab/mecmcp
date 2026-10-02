@@ -5,18 +5,22 @@
 //!
 //! - [`redact_xml`] — the generic XML pass (denylisted element/attribute
 //!   names plus the [`crate::shape`] value-shape catch-all) already covers
-//!   every name on rustjunosmcp's locked `REDACT_ELEMENT_NAMES` list except
-//!   one: a bare `<value>` element (the NTP `authentication-key` secret,
-//!   `<key><name>1</name><type>md5</type><value>$9$...</value></key>`).
-//!   `value` is deliberately not on [`crate::denylist`] — as a substring or
-//!   exact match it is far too generic a tag name to redact unconditionally
-//!   across every vendor this crate serves — but within Junos's own closed
-//!   NETCONF element vocabulary, treating it as unconditionally
-//!   secret-bearing is the same judgement call rustjunosmcp already made and
-//!   has shipped on for years. [`redact_xml`] is the generic pass plus that
-//!   one Junos-specific addition, not a second XML scanner (parser
-//!   differentials are exactly the risk a second hand-rolled XML walk would
-//!   invite).
+//!   most of rustjunosmcp's locked `REDACT_ELEMENT_NAMES` list. What is left
+//!   over is a handful of element names (e.g. a bare `<value>` element, as in
+//!   the NTP `authentication-key` secret,
+//!   `<key><name>1</name><type>md5</type><value>$9$...</value></key>`) that
+//!   are deliberately not on [`crate::denylist`] — as a substring or exact
+//!   match they are far too generic to redact unconditionally across every
+//!   vendor this crate serves — but within Junos's own closed NETCONF element
+//!   vocabulary, treating them as unconditionally secret-bearing is the same
+//!   judgement call rustjunosmcp already made and has shipped on for years.
+//!   [`is_extra_secret_element`] derives this set from
+//!   [`redact_log_text`]'s own `REDACT_LOG_KEYS` vocabulary rather than
+//!   hand-maintaining a second list, so the XML and text passes cannot drift
+//!   apart on which Junos-specific names are secret-bearing. [`redact_xml`]
+//!   is the generic pass plus that derived set, not a second XML scanner
+//!   (parser differentials are exactly the risk a second hand-rolled XML walk
+//!   would invite).
 //! - [`redact_log_text`] — a conservative, `set`-statement-aware line
 //!   redactor for the non-XML support-bundle artefacts (`/var/log/*` files,
 //!   `request support information` tech-support output). This is *not* a
@@ -40,16 +44,25 @@
 #![deny(clippy::indexing_slicing, clippy::string_slice)]
 
 use crate::RedactError;
+use crate::denylist::is_denylisted_key;
 use crate::policy::{RedactionPolicy, active};
 use crate::shape::looks_like_secret_value;
 use crate::xml;
 
 /// Junos element names whose value is always a secret, independent of its
 /// `crate::denylist`-covered ancestor and of whether the text itself looks
-/// like a crypt hash — see the module docs for why only `value` needs to be
-/// named here (`key` is already denylisted under exact match).
+/// like a crypt hash — see the module docs for why a name like `value` needs
+/// to be named here at all (`key` is already denylisted under exact match).
+///
+/// Derived from [`REDACT_LOG_KEYS`] — the text pass's own closed vocabulary —
+/// rather than kept as a second hand-maintained list: any entry already
+/// covered by [`crate::denylist::is_denylisted_key`] is skipped (it is
+/// already secret-bearing everywhere, not just in Junos XML), and anything
+/// left over is exactly the set of Junos-specific element names the generic
+/// XML pass would otherwise miss. Adding a name to `REDACT_LOG_KEYS` gives it
+/// XML coverage for free; the two lists cannot drift apart.
 fn is_extra_secret_element(local_name: &str) -> bool {
-    local_name == "value"
+    REDACT_LOG_KEYS.contains(&local_name) && !is_denylisted_key(local_name)
 }
 
 /// Redact a Junos NETCONF/XML support-bundle artefact.
@@ -670,6 +683,22 @@ mod tests {
         let xml = "<root><value>leak-value</value></root>";
         let got = redact_xml(xml).unwrap();
         assert!(!got.contains("leak-value"), "got: {got}");
+    }
+
+    #[test]
+    fn xml_pass_covers_every_text_pass_key_not_already_in_the_shared_denylist() {
+        for key in REDACT_LOG_KEYS {
+            if is_denylisted_key(key) {
+                // Already covered by the shared denylist regardless of
+                // vendor; only the Junos-specific leftovers are this
+                // module's job to cover.
+                continue;
+            }
+            let xml = format!("<rpc-reply><{key}>FAKEleak{key}</{key}></rpc-reply>");
+            let got = redact_xml(&xml).unwrap();
+            let leak = format!("FAKEleak{key}");
+            assert!(!got.contains(&leak), "key {key:?} leaked: {got}");
+        }
     }
 
     #[test]
