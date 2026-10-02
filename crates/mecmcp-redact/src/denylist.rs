@@ -51,6 +51,8 @@ pub const DENYLISTED_KEYS: &[&str] = &[
     "partnerkey",
     "accountkey",
     "clientkey",
+    // MEC-1245: extends Junos field coverage in the shared denylist.
+    "hmackey",
 ];
 
 /// Field names that must match the *whole* normalized key, not a substring.
@@ -297,6 +299,14 @@ mod tests {
                     "expected '{variant}' (variant of spec key '{spec_key}') to be denylisted"
                 );
             }
+        }
+    }
+
+    /// MEC-1245: extends Junos field coverage in the shared denylist.
+    #[test]
+    fn mec_1245_junos_routing_auth_keys_denylisted() {
+        for key in ["hmac-key", "hmac_key", "hmacKey", "HMAC-KEY"] {
+            assert!(is_denylisted_key(key), "'{key}' must be denylisted");
         }
     }
 
