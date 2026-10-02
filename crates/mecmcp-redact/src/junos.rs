@@ -2,10 +2,10 @@
 //!
 //! Ported from `rustjunosmcp`'s `rust-junosmcp-srx-core` support-bundle
 //! redactor, which predates this crate. It is kept as a **separate entry
-//! point from [`crate::text::redact`]**, not folded into it, because the two
+//! point from `crate::text::redact`**, not folded into it, because the two
 //! have a deliberately different false-positive posture:
 //!
-//! - [`crate::text::redact`] is intentionally aggressive: once a denylisted
+//! - `crate::text::redact` is intentionally aggressive: once a denylisted
 //!   key token is found anywhere on a line, by design it redacts to the end
 //!   of the line with no further signal required — over-redaction in the
 //!   safe direction, accepted as the cost of a generic best-effort scan.
@@ -26,14 +26,14 @@
 //! previously-shipped behavior instead.
 //!
 //! The redaction marker is `<REDACTED>`, not this crate's usual
-//! `[REDACTED]` (see [`crate::json::PLACEHOLDER`] / `crate::xml::PLACEHOLDER`),
+//! `[REDACTED]` (see `crate::json::PLACEHOLDER` / `crate::xml::PLACEHOLDER`),
 //! to keep `collect_jtac_support_bundle`'s shipped output byte-for-byte
 //! unchanged for callers that already parse or diff it.
 
 #![deny(clippy::indexing_slicing, clippy::string_slice)]
 
 /// Key names whose value is redacted in Junos config/log syntax. Matching is
-/// whole-word (see [`is_word_char`]), not substring — this list is
+/// whole-word (see `is_word_char`), not substring — this list is
 /// deliberately independent of [`crate::denylist::DENYLISTED_KEYS`]'s
 /// substring matching, which would be too permissive for the
 /// signal-gated redaction this module does.
