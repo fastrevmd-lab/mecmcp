@@ -11,7 +11,32 @@
 
 #![allow(clippy::unwrap_used)]
 
-use mecmcp_redact::{redact_json_str, redact_xml_str};
+use mecmcp_redact::{Profile, redact_json_str, redact_xml_str};
+
+/// A representative PAN-OS profile, proving [`Profile::key_exemptions`]
+/// carries the operational/routing-policy field names `main` used to exempt
+/// globally (MEC-537 review, F2): scoped to PAN-OS tool-output callers only,
+/// rather than loosening the denylist for every vendor server that links
+/// this crate.
+const PANOS_PROFILE: Profile = Profile::new(
+    &[],
+    &[
+        "sessions",
+        "sessionsactive",
+        "maxsessions",
+        "sessiontimeout",
+        "idletimeouttcpsession",
+        "communitylist",
+        "matchcommunity",
+        "addcommunity",
+        "removecommunity",
+    ],
+);
+
+#[test]
+fn panos_profile_key_exemptions_do_not_collide_with_the_denylist() {
+    assert_eq!(PANOS_PROFILE.check_exemptions(), Ok(()));
+}
 
 #[test]
 fn panos_admin_phash_is_redacted_but_permissions_survive() {
@@ -46,9 +71,17 @@ fn panos_snmp_community_string_is_redacted() {
 /// JSON (the shape a rustpanosmcp typed-read tool would return), used to be
 /// blanked wholesale because "sessions"/"session" tripped the old
 /// `session`-as-substring denylist entry.
+///
+/// MEC-537 review (F2): the exemption that lets these fields survive is no
+/// longer a global denylist carve-out — it only applies through the PAN-OS
+/// [`Profile`], so this goes through [`mecmcp_redact::redact_json_value_with_profile`]
+/// rather than the generic [`redact_json_str`]. The generic scan (exercised
+/// by `denylist::tests::mec_537_session_and_community_match_as_substrings`)
+/// still redacts these same field names for every caller that has not
+/// declared this exemption.
 #[test]
 fn panos_show_session_info_fields_survive() {
-    let v = serde_json::json!({
+    let mut v = serde_json::json!({
         "sessions": {
             "num-active": 523,
             "num-max": 262144,
@@ -57,13 +90,21 @@ fn panos_show_session_info_fields_survive() {
             "idle-timeout-tcp-session": 3600,
         }
     });
-    let input = v.to_string();
-    let got = redact_json_str(&input).unwrap();
+    mecmcp_redact::redact_json_value_with_profile(&mut v, &PANOS_PROFILE);
+    assert_eq!(v["sessions"]["num-active"], 523);
+    assert_eq!(v["sessions"]["num-max"], 262144);
+    assert_eq!(v["sessions"]["tcp-timeout"], 3600);
+    assert_eq!(v["sessions"]["idle-timeout-tcp-session"], 3600);
+}
+
+/// MEC-537 review (F2): without the PAN-OS profile, the same field names are
+/// not exempted — the generic scan is the default for every other vendor.
+#[test]
+fn panos_show_session_info_fields_are_redacted_without_the_profile() {
+    let v = serde_json::json!({"sessions": {"num-active": 523}});
+    let got = redact_json_str(&v.to_string()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&got).unwrap();
-    assert_eq!(parsed["sessions"]["num-active"], 523);
-    assert_eq!(parsed["sessions"]["num-max"], 262144);
-    assert_eq!(parsed["sessions"]["tcp-timeout"], 3600);
-    assert_eq!(parsed["sessions"]["idle-timeout-tcp-session"], 3600);
+    assert_eq!(parsed["sessions"]["num-active"], "[REDACTED]");
 }
 
 /// mecmcp#418: a BGP export policy's route community (`65000:100`, a routing
@@ -217,4 +258,37 @@ fn mec_537_f4_bgp_ancestor_without_community_shaped_value_is_still_redacted_in_x
     let xml = r#"<bgp><x><community><name>QQbgpXNestedCommunity3</name></community></x></bgp>"#;
     let got = redact_xml_str(xml).unwrap();
     assert!(!got.contains("QQbgpXNestedCommunity3"), "got: {got}");
+}
+
+/// MEC-1370 review (F1): XML twin of
+/// `mec_1342_f2_bgp_community_object_with_non_member_key_is_still_redacted` —
+/// a `community` element's only child other than `member`/`members` is not
+/// the known BGP shape and must still be redacted, even with a genuine `bgp`
+/// ancestor and a community-tag-shaped value.
+#[test]
+fn mec_1370_f1_bgp_community_child_other_than_member_is_still_redacted_in_xml() {
+    let xml = r#"<bgp><community><anything>1234:5678</anything></community></bgp>"#;
+    let got = redact_xml_str(xml).unwrap();
+    assert!(!got.contains("1234:5678"), "got: {got}");
+}
+
+/// MEC-1370 review (F1): a `bgp` element *nested inside* `community` (rather
+/// than an ancestor of it) must not trigger the exemption — only a `bgp`
+/// scope strictly above the `community` element counts, matching JSON's
+/// `looks_like_bgp_community_value` scope exactly, so the two parsers agree
+/// on the same logical document.
+#[test]
+fn mec_1370_f1_bgp_nested_below_community_does_not_exempt_xml() {
+    let xml = r#"<snmp><community><bgp>1234:5678</bgp></community></snmp>"#;
+    let got = redact_xml_str(xml).unwrap();
+    assert!(!got.contains("1234:5678"), "got: {got}");
+}
+
+/// JSON counterpart of the above: a `bgp` key nested inside `community`
+/// (rather than an ancestor of it) must not trigger the exemption either.
+#[test]
+fn mec_1370_f1_bgp_nested_below_community_does_not_exempt_json() {
+    let v = serde_json::json!({"snmp": {"community": {"bgp": "1234:5678"}}});
+    let got = redact_json_str(&v.to_string()).unwrap();
+    assert!(!got.contains("1234:5678"), "got: {got}");
 }

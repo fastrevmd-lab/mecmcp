@@ -10,9 +10,7 @@
 //! instead of emitting a best-effort partial result.
 
 use crate::RedactError;
-use crate::denylist::{
-    is_bgp_community_field, is_bgp_community_tag, is_bgp_scope_key, is_denylisted_key,
-};
+use crate::denylist::{is_bgp_community_tag, is_bgp_scope_key, is_denylisted_key, normalize};
 use crate::shape::looks_like_secret_value;
 use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesRef, BytesStart, BytesText, Event};
@@ -199,29 +197,57 @@ pub(crate) fn validate(input: &str) -> Result<(), RedactError> {
 /// `<community>`, or a PSK in `<ascii-text>` under `<pre-shared-key>`, both
 /// have a *grandparent*, not a parent, that names the secret.
 ///
-/// MEC-537 exception: a `community` ancestor is skipped when a `bgp` element
-/// is also open *and* `value` itself looks like BGP community-tag syntax —
-/// that combination is a BGP route community (public routing data), not the
-/// SNMP community string sharing the same bare field name. See
-/// [`is_bgp_community_field`] and [`is_bgp_community_tag`]; the value check
-/// is required because a `bgp` ancestor can itself be a vendor's own
-/// user-chosen element name, not proof the field underneath is routing data
-/// (MEC-537 review, F4).
+/// MEC-1370 review (F1): the per-ancestor BGP exemption below must agree with
+/// `json::looks_like_bgp_community_value`'s scope exactly, not just check
+/// whether a `bgp` element is open *anywhere* in the stack — that earlier
+/// check could not tell a `bgp` ancestor *above* the `community` element from
+/// one nested *below* it (`<community><bgp>...`), and accepted any child
+/// element name as if it were the `member`/`members` shape.
 fn any_ancestor_denylisted(tag_stack: &[Vec<u8>], value: &str) -> bool {
-    let under_bgp = tag_stack
-        .iter()
-        .any(|name| is_bgp_scope_key(&String::from_utf8_lossy(name)));
-    let bgp_field_survives = under_bgp && is_bgp_community_tag(value);
-    tag_stack.iter().any(|name| {
+    tag_stack.iter().enumerate().any(|(i, name)| {
         let name = String::from_utf8_lossy(name);
         if !is_denylisted_key(&name) {
             return false;
         }
-        if is_bgp_community_field(&name, under_bgp) && bgp_field_survives {
-            return false;
-        }
-        true
+        !is_bgp_route_community_ancestor(tag_stack, i, value)
     })
+}
+
+/// Whether the denylisted ancestor at `tag_stack[i]` is a BGP route-community
+/// element exempted from redaction — the XML counterpart of
+/// `json::looks_like_bgp_community_value`'s scope (MEC-1370 review, F1).
+///
+/// Exempt only when all of these hold:
+/// - `tag_stack[i]` is a `community` element (the same bare field name an
+///   SNMP community string uses — see [`is_bgp_community_tag`]'s doc);
+/// - a `bgp` scope element is an ancestor *of that `community` element*
+///   (`tag_stack[..i]`, not the whole stack — a `bgp` element nested *inside*
+///   `community` does not count);
+/// - `value` itself looks like BGP community-tag syntax;
+/// - and `value`'s immediate container is either `<community>` directly
+///   (`i == tag_stack.len() - 1`), or exactly one `<member>`/`<members>`
+///   element nested inside it (`i + 2 == tag_stack.len()`) — any other child
+///   element name under `<community>` is not the known BGP shape and must
+///   still be redacted.
+fn is_bgp_route_community_ancestor(tag_stack: &[Vec<u8>], i: usize, value: &str) -> bool {
+    if normalize(&String::from_utf8_lossy(&tag_stack[i])) != "community" {
+        return false;
+    }
+    let under_bgp = tag_stack[..i]
+        .iter()
+        .any(|name| is_bgp_scope_key(&String::from_utf8_lossy(name)));
+    if !under_bgp || !is_bgp_community_tag(value) {
+        return false;
+    }
+    let len = tag_stack.len();
+    if i == len - 1 {
+        return true;
+    }
+    i + 2 == len
+        && matches!(
+            normalize(&String::from_utf8_lossy(&tag_stack[len - 1])).as_str(),
+            "member" | "members"
+        )
 }
 
 fn redact_attributes<'a>(

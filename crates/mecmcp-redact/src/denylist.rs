@@ -53,28 +53,6 @@ pub const DENYLISTED_KEYS: &[&str] = &[
     "clientkey",
 ];
 
-/// Compound field names that normalize to *containing* [`DENYLISTED_KEYS`]'s
-/// `session` or `community` entries without being secrets, so the substring
-/// match alone would over-redact them.
-///
-/// Exact match, checked before the substring scan: a PAN-OS/Junos diagnostic
-/// or routing-policy field (`idle-timeout-tcp-session`, `sessions-active`,
-/// `community-list`, ...) is a known, closed set of vendor spellings, not a
-/// pattern — unlike the denylist itself, widening this list is the direction
-/// that is *not* safe to be wrong in, so it only grows when a specific
-/// vendor field name is confirmed non-secret (MEC-537 review, F1/F2/F3).
-const SAFE_KEY_EXCEPTIONS: &[&str] = &[
-    "sessions",
-    "sessionsactive",
-    "maxsessions",
-    "sessiontimeout",
-    "idletimeouttcpsession",
-    "communitylist",
-    "matchcommunity",
-    "addcommunity",
-    "removecommunity",
-];
-
 /// Field names that must match the *whole* normalized key, not a substring.
 ///
 /// `"key"` is deliberately not in [`DENYLISTED_KEYS`]: as a substring it would
@@ -209,9 +187,6 @@ pub fn is_denylisted_key(key: &str) -> bool {
     if normalized.is_empty() {
         return false;
     }
-    if SAFE_KEY_EXCEPTIONS.iter().any(|term| normalized == *term) {
-        return false;
-    }
     if DENYLISTED_EXACT_KEYS.iter().any(|term| normalized == *term) {
         return true;
     }
@@ -325,15 +300,21 @@ mod tests {
         }
     }
 
-    /// MEC-537: `session` and `community` match as a substring (a session
-    /// cookie/token, or PAN-OS/Junos's SNMP community string), but the
-    /// specific non-secret compounds on [`SAFE_KEY_EXCEPTIONS`] are exempted.
+    /// MEC-537 review (F2): `session` and `community` match as a substring (a
+    /// session cookie/token, or PAN-OS/Junos's SNMP community string), and so
+    /// do the PAN-OS operational/routing-policy field names that merely
+    /// contain those words (`idle-timeout-tcp-session`, `community-list`,
+    /// ...). There is no global key-name exemption for them: a vendor server
+    /// that needs one declares a [`crate::profile::Profile`] with those exact
+    /// names as `key_exemptions`, scoped to that vendor's own tool-output
+    /// path, rather than loosening this crate's default for every caller.
     #[test]
     fn mec_537_session_and_community_match_as_substrings() {
-        for key in ["session", "Session", "community", "Community"] {
-            assert!(is_denylisted_key(key), "'{key}' must be denylisted");
-        }
         for key in [
+            "session",
+            "Session",
+            "community",
+            "Community",
             "idle-timeout-tcp-session",
             "sessions-active",
             "max-sessions",
@@ -344,10 +325,7 @@ mod tests {
             "add-community",
             "remove-community",
         ] {
-            assert!(
-                !is_denylisted_key(key),
-                "'{key}' must be exempted via SAFE_KEY_EXCEPTIONS"
-            );
+            assert!(is_denylisted_key(key), "'{key}' must be denylisted");
         }
     }
 
