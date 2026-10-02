@@ -305,14 +305,42 @@ fn is_config_identifier(token: &str) -> bool {
         })
 }
 
+/// Byte offset just past the rightmost whole-word `set` token in `prefix`,
+/// using the same word-boundary rule as [`is_word_char`] rather than
+/// whitespace splitting. A quote, `=`, or other punctuation glued directly
+/// against the word (as in a structured audit line like `cmd="set snmp
+/// community VALUE"`, where whitespace-splitting would merge `cmd="set`
+/// into one token) still counts as a boundary. Returns `None` when `set`
+/// does not occur as a whole word.
+fn rightmost_set_word_end(prefix: &str) -> Option<usize> {
+    let bytes = prefix.as_bytes();
+    let mut found = None;
+    let mut i = 0;
+    // SOUND: all byte indexing is bounds-checked against bytes.len().
+    #[allow(clippy::indexing_slicing)]
+    while i + 3 <= bytes.len() {
+        if &bytes[i..i + 3] == b"set" {
+            let before_ok = i == 0 || !is_word_char(bytes[i - 1]);
+            let after_ok = i + 3 == bytes.len() || !is_word_char(bytes[i + 3]);
+            if before_ok && after_ok {
+                found = Some(i + 3);
+            }
+        }
+        i += 1;
+    }
+    found
+}
+
 /// Decide whether a Junos `set` config statement precedes the key at byte
 /// offset `key_start` on this line. Returns true when a whole-word `set`
-/// token (optionally wrapped in a single leading quote, as when a shell
-/// or syslog line quotes the echoed command) appears earlier on the line
-/// and every whitespace-separated token between that `set` and the key is
-/// a config identifier (not a stopword). This catches both a line that
-/// starts with `set ...` and a `set ...` statement echoed mid-line (e.g. a
-/// `UI_CMDLINE_READ_LINE` syslog: `... load-configuration set snmp
+/// (see [`rightmost_set_word_end`] — this also matches a `set` with a quote
+/// or other punctuation glued directly against it, as when a shell or
+/// syslog line quotes or structurally encodes the echoed command) appears
+/// earlier on the line and every whitespace-separated token between that
+/// `set` and the key is a config identifier (not a stopword) once its own
+/// leading/trailing quote characters are stripped. This catches both a line
+/// that starts with `set ...` and a `set ...` statement echoed mid-line
+/// (e.g. a `UI_CMDLINE_READ_LINE` syslog: `... load-configuration set snmp
 /// community VALUE ...`), while leaving prose like "we set the secret
 /// aside" untouched because the intervening "the" is a stopword.
 fn set_statement_precedes(line: &str, key_start: usize) -> bool {
@@ -320,18 +348,18 @@ fn set_statement_precedes(line: &str, key_start: usize) -> bool {
     // boundary.
     #[allow(clippy::string_slice)]
     let prefix = &line[..key_start];
-    let tokens: Vec<&str> = prefix.split_whitespace().collect();
-    let Some(set_idx) = tokens
-        .iter()
-        .rposition(|&token| token.trim_start_matches(['\'', '"']) == "set")
-    else {
+    let Some(set_end) = rightmost_set_word_end(prefix) else {
         return false;
     };
-    // SOUND: `set_idx` comes from `rposition`, so it is a valid index.
-    #[allow(clippy::indexing_slicing)]
-    tokens[set_idx + 1..]
-        .iter()
-        .all(|&token| is_config_identifier(token) && !SET_CONTEXT_STOPWORDS.contains(&token))
+    // SOUND: `set_end` comes from `rightmost_set_word_end`, which only
+    // returns offsets at or past a `set` match found within `prefix`'s
+    // bounds, so it is a valid char boundary (ASCII word match).
+    #[allow(clippy::string_slice)]
+    let tail = &prefix[set_end..];
+    tail.split_whitespace().all(|token| {
+        let trimmed = token.trim_matches(['\'', '"']);
+        is_config_identifier(trimmed) && !SET_CONTEXT_STOPWORDS.contains(&trimmed)
+    })
 }
 
 /// Format qualifiers that may sit between a sensitive key and its value in
@@ -923,5 +951,13 @@ mod tests {
         let line = "… command 'set system foo-auth-password FAKEb'";
         let got = redact_log_text(line);
         assert!(!got.contains("FAKEb"), "got: {got}");
+    }
+
+    #[test]
+    fn set_token_with_a_quote_glued_directly_to_it_in_a_structured_audit_line_establishes_set_context()
+     {
+        let line = r#"audit: cmd="set snmp community FAKEstructured""#;
+        let got = redact_log_text(line);
+        assert!(!got.contains("FAKEstructured"), "got: {got}");
     }
 }
