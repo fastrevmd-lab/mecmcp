@@ -14,7 +14,7 @@
 //!   vendor this crate serves — but within Junos's own closed NETCONF element
 //!   vocabulary, treating them as unconditionally secret-bearing is the same
 //!   judgement call rustjunosmcp already made and has shipped on for years.
-//!   [`is_extra_secret_element`] derives this set from
+//!   `is_extra_secret_element` derives this set from
 //!   [`redact_log_text`]'s own `REDACT_LOG_KEYS` vocabulary rather than
 //!   hand-maintaining a second list, so the XML and text passes cannot drift
 //!   apart on which Junos-specific names are secret-bearing. [`redact_xml`]
@@ -67,8 +67,9 @@ fn is_extra_secret_element(local_name: &str) -> bool {
 
 /// Redact a Junos NETCONF/XML support-bundle artefact.
 ///
-/// Identical to [`crate::redact_xml_str`] except that a bare `<value>`
-/// element is always treated as secret-bearing (see the module docs).
+/// Identical to [`crate::redact_xml_str`] except that the Junos-specific
+/// extra element set is always treated as secret-bearing (see the module
+/// docs).
 ///
 /// # Errors
 /// Returns [`RedactError::InvalidXml`] when `input` does not parse as
