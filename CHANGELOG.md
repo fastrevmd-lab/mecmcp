@@ -88,6 +88,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device). Existing call sites are unaffected; adopting it in place of
   `SkipForInternalRead` is a separate, per-caller change.
 
+- **mecmcp-redact: a PAN-OS `Profile`, and fixtures proving representative
+  PAN-OS secret shapes are redacted** (MEC-537, mecmcp#418). Adds PAN-OS
+  fixtures alongside MEC-711's Mist fixtures, and a PAN-OS `Profile` whose
+  `key_exemptions` let a handful of non-secret operational and
+  routing-policy fields survive for PAN-OS callers specifically, without
+  loosening the default denylist for every other vendor server. Reviewed
+  and extended for coverage gaps found in security review; XML and JSON
+  now agree on the same BGP route-community exemption scope.
+
 ## [0.25.0] - 2026-09-30
 
 ### Changed
