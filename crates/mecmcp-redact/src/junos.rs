@@ -307,20 +307,24 @@ fn is_config_identifier(token: &str) -> bool {
 
 /// Decide whether a Junos `set` config statement precedes the key at byte
 /// offset `key_start` on this line. Returns true when a whole-word `set`
-/// token appears earlier on the line and every whitespace-separated token
-/// between that `set` and the key is a config identifier (not a stopword).
-/// This catches both a line that starts with `set ...` and a `set ...`
-/// statement echoed mid-line (e.g. a `UI_CMDLINE_READ_LINE` syslog:
-/// `... load-configuration set snmp community VALUE ...`), while leaving
-/// prose like "we set the secret aside" untouched because the intervening
-/// "the" is a stopword.
+/// token (optionally wrapped in a single leading quote, as when a shell
+/// or syslog line quotes the echoed command) appears earlier on the line
+/// and every whitespace-separated token between that `set` and the key is
+/// a config identifier (not a stopword). This catches both a line that
+/// starts with `set ...` and a `set ...` statement echoed mid-line (e.g. a
+/// `UI_CMDLINE_READ_LINE` syslog: `... load-configuration set snmp
+/// community VALUE ...`), while leaving prose like "we set the secret
+/// aside" untouched because the intervening "the" is a stopword.
 fn set_statement_precedes(line: &str, key_start: usize) -> bool {
     // SOUND: `key_start` is `idx` from the caller, which is always a char
     // boundary.
     #[allow(clippy::string_slice)]
     let prefix = &line[..key_start];
     let tokens: Vec<&str> = prefix.split_whitespace().collect();
-    let Some(set_idx) = tokens.iter().rposition(|&token| token == "set") else {
+    let Some(set_idx) = tokens
+        .iter()
+        .rposition(|&token| token.trim_start_matches(['\'', '"']) == "set")
+    else {
         return false;
     };
     // SOUND: `set_idx` comes from `rposition`, so it is a valid index.
@@ -830,7 +834,7 @@ mod tests {
 
     #[test]
     fn hash_inside_parentheses_is_redacted() {
-        let got = redact_log_text("rollback diff (hash $9$FAKEparenForm)"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
+        let got = redact_log_text("rollback diff (hash:$9$FAKEparenForm)"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
         assert!(!got.contains("$9$FAKEparenForm"), "got: {got}"); // gitleaks:allow -- fabricated Junos $9$ fixture, not a real key
     }
 
@@ -880,5 +884,44 @@ mod tests {
     fn prose_mention_of_a_compound_secret_looking_word_without_set_context_is_untouched() {
         let line = "Note: the database-password field was rotated by the admin team today";
         assert_eq!(redact_log_text(line), line);
+    }
+
+    // ── a `set` statement echoed with a quote glued to the token still
+    // establishes set context. ───────────────────────────────────────────
+
+    #[test]
+    fn quoted_set_token_in_a_cmdline_echo_establishes_set_context_for_a_closed_list_key() {
+        let line = "UI_CMDLINE_READ_LINE: User 'u', command 'set snmp community FAKEcomm authorization read-only'";
+        let got = redact_log_text(line);
+        assert!(!got.contains("FAKEcomm"), "got: {got}");
+    }
+
+    #[test]
+    fn quoted_set_token_in_a_cmdline_echo_establishes_set_context_for_a_hyphenated_key() {
+        let line = "… command 'set protocols bgp group g authentication-key FAKEbgp'"; // gitleaks:allow -- fabricated fixture, not a real key
+        let got = redact_log_text(line);
+        assert!(!got.contains("FAKEbgp"), "got: {got}");
+    }
+
+    #[test]
+    fn quoted_set_token_in_a_cmdline_echo_establishes_set_context_for_a_compound_suffix_key() {
+        let line = "… command 'set system root-authentication plain-text-password-value FAKEa'";
+        let got = redact_log_text(line);
+        assert!(!got.contains("FAKEa"), "got: {got}");
+    }
+
+    #[test]
+    fn quoted_set_token_in_a_cmdline_echo_establishes_set_context_for_privacy_key() {
+        let line =
+            "… command 'set snmp v3 usm local-engine user u1 privacy-aes128 privacy-key FAKEc'"; // gitleaks:allow -- fabricated fixture, not a real key
+        let got = redact_log_text(line);
+        assert!(!got.contains("FAKEc"), "got: {got}");
+    }
+
+    #[test]
+    fn quoted_set_token_in_a_cmdline_echo_establishes_set_context_for_an_unlisted_compound_key() {
+        let line = "… command 'set system foo-auth-password FAKEb'";
+        let got = redact_log_text(line);
+        assert!(!got.contains("FAKEb"), "got: {got}");
     }
 }
