@@ -62,6 +62,7 @@
 pub mod denylist;
 pub mod digest;
 mod json;
+pub mod junos;
 pub mod policy;
 pub mod profile;
 pub mod projection;
@@ -164,6 +165,20 @@ pub fn redact_json_value_with_profile(value: &mut serde_json::Value, profile: &P
         return;
     }
     profile::redact_json_value_with_profile(value, profile);
+}
+
+/// Redact a Junos `/var/log/*` or `request support information`-style plain
+/// text artefact using the conservative, `set`-statement-aware matcher in
+/// [`junos`] rather than [`redact_text`]'s generic (and deliberately more
+/// aggressive) scan. See the [`junos`] module docs for why the two are kept
+/// separate. Passes input through unchanged when [`policy::active`] is
+/// [`RedactionPolicy::DisabledByOperator`], same as [`redact_text`].
+#[must_use]
+pub fn redact_junos_log_text(input: &str) -> String {
+    if matches!(active(), RedactionPolicy::DisabledByOperator { .. }) {
+        return input.to_string();
+    }
+    junos::redact_junos_log_text(input)
 }
 
 /// Redact an XML document.
@@ -312,5 +327,12 @@ mod tests {
         let mut v = serde_json::json!({"api_key": "FAKEabc123"});
         redact_json_value(&mut v);
         assert_eq!(v["api_key"], "[REDACTED]");
+    }
+
+    #[test]
+    fn redact_junos_log_text_redacts_a_set_statement() {
+        let out = redact_junos_log_text("set snmp community FAKEcommunity123");
+        assert!(!out.contains("FAKEcommunity123"), "secret leaked: {out}");
+        assert!(out.contains("<REDACTED>"), "marker missing: {out}");
     }
 }

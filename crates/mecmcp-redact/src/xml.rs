@@ -456,6 +456,18 @@ mod tests {
         assert!(!got.contains("QQcommunity1"), "got: {got}");
     }
 
+    /// MEC-1245: a Junos `hmac-key` element with a plain hex value (not
+    /// shaped like a crypt hash) must be redacted by key name. Before
+    /// `"hmackey"` was added to `DENYLISTED_KEYS`, nothing in the generic
+    /// denylist-and-shape scan caught it — `is_crypt_hash` only matches
+    /// `$<id>$...`, so a bare hex HMAC key slipped through.
+    #[test]
+    fn mec1245_hmac_key_element_with_hex_value_is_redacted() {
+        let xml = r#"<routing-options><authentication-key><hmac-key>deadbeefcafe1234</hmac-key></authentication-key></routing-options>"#;
+        let got = redact(xml).unwrap();
+        assert!(!got.contains("deadbeefcafe1234"), "got: {got}");
+    }
+
     #[test]
     fn f4a_denylisted_grandparent_redacts_nested_ascii_text() {
         let xml = r#"<pre-shared-key><ascii-text>QQpsk1</ascii-text></pre-shared-key>"#;

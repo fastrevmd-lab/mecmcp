@@ -26,6 +26,7 @@ pub const DENYLISTED_KEYS: &[&str] = &[
     "apikey",
     "token",
     "authenticationkey",
+    "hmackey",
     "password",
     "sharedkey",
     "sharedsecret",
@@ -219,6 +220,7 @@ mod tests {
                 &["authentication-key", "authentication_key"],
             ),
             ("password", &["password", "adminPassword", "wifi_password"]),
+            ("hmac-key", &["hmac-key", "hmac_key", "hmacKey"]),
         ];
         for (spec_key, variants) in cases {
             for variant in *variants {
