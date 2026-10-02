@@ -40,6 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **mecmcp-redact: `Profile` extension hooks for vendor-specific
+  wholesale-redact and key-exemption rules** (MEC-1244, part of MEC-1231).
+  Some vendor servers need two kinds of policy this crate's generic scan
+  doesn't cover on its own: withholding a field's value wholesale rather
+  than key/value scanning it, for a vendor-rendered body a best-effort scan
+  isn't guaranteed to cover, and exempting field names that collide with
+  the denylist by substring but are not secrets in that vendor's schema.
+  Both are now generic capabilities any server can declare: a `Profile`
+  carries `wholesale_redact_keys` and `key_exemptions` lists, and
+  `redact_json_value_with_profile` applies them around the existing generic
+  scan without narrowing it. Migrating a server's local implementation onto
+  this is tracked separately, pending design review.
+
 - **mecmcp-redact: `mecmcp-redact` CLI binary and a shared tool-output
   redaction coverage helper** (MEC-1231). A new `cli` feature exposes a
   `mecmcp-redact` binary that runs the same `redact_text`/`redact_json_str`/
