@@ -38,14 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process. Present in v0.24.0 and v0.24.1. Fixed with a regression test
   covering the text, XML, and JSON entry points; consumers should upgrade.
 
-- **mecmcp-policy: hardens read and command policy evaluation against
-  structured-input edge cases** (MEC-419). Policy rules are now evaluated
-  against parsed XML structure rather than raw device output, so a blocked
-  subtree also blocks its descendants and ancestors. Hardens that
-  evaluation to fail closed on inputs identified in security review.
-  Consumers should upgrade.
-
 ### Added
+
+- **mecmcp-policy: new opt-in `xml_path` module for hierarchy-aware,
+  fail-closed policy evaluation on parsed XML** (mecmcp#419). Servers must
+  call it to benefit; the existing rule evaluation is unchanged in this
+  release. Adoption in each server is a follow-up.
 
 - **mecmcp-redact: `Profile` extension hooks for vendor-specific
   wholesale-redact and key-exemption rules** (MEC-1244, part of MEC-1231).
