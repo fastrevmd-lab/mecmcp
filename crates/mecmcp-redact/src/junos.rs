@@ -87,32 +87,68 @@ pub fn redact_log_text(input: &str) -> String {
     out
 }
 
+/// True when `input` is shaped like XML: trimmed of leading whitespace, it
+/// starts with `<` followed by an XML name-start character (ASCII letter,
+/// `_`, or `:`), a `?` (`<?xml ...?>` declaration), or a `!` (`<!--`
+/// comment, `<!DOCTYPE`). This is a shape test only, not a parse — it exists
+/// so the dispatcher in [`redact_log_artefact`] can pick the XML-vs-text path
+/// from what the input *looks like* rather than from whether parsing happens
+/// to succeed (see that function's doc comment for why the distinction
+/// matters). A `<` followed by a digit (a syslog PRI prefix, e.g. `<134>`)
+/// or by punctuation deliberately does not count: those are text artefacts
+/// that merely contain an angle bracket, not XML.
+fn looks_like_xml_shaped(input: &str) -> bool {
+    let mut chars = input.trim_start().chars();
+    chars.next() == Some('<')
+        && matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || matches!(c, '_' | ':' | '?' | '!'))
+}
+
 /// Route a captured support-bundle artefact through the appropriate pass.
-/// Well-formed XML is run through [`redact_xml`] and then *always* through
+///
+/// The choice of path is made from the artefact's *shape*
+/// ([`looks_like_xml_shaped`]), decided before any parsing is attempted —
+/// not from whether parsing happens to succeed. Picking the path by parse
+/// outcome is a parser differential: plain `/var/log/*` text that merely
+/// lacks a bare `&` "parses" as XML (an all-text document with no markup)
+/// and would get the weaker, XML-side floor pass instead of the full
+/// [`redact_log_text`] key vocabulary, while a trivial unrelated byte
+/// elsewhere in the same file (a `&` in a URL or a shell `&&`) flips it onto
+/// the other path. The artefact's actual secret content must not depend on
+/// a coincidental byte like that.
+///
+/// XML-shaped input is run through [`redact_xml`] and then *always* through
 /// [`redact_log_text`] as well — a CLI-syntax secret can end up sitting in
 /// plain text under an element name not on the XML pass's locked list (e.g.
 /// directly under `<rpc-reply>` when the expected wrapper element is
-/// absent), so the line-oriented pass is the floor every artefact goes
-/// through regardless of its outer shape.
+/// absent), so the line-oriented pass is the floor every XML artefact goes
+/// through regardless of its inner shape.
+///
+/// Non-XML-shaped input never goes through the XML pass (so it is never
+/// XML-escaped or whitespace-normalised — see [`redact_xml`]'s doc comment).
+/// It instead gets [`crate::text::redact`]'s denylisted-key/PEM-block/shape
+/// scan as a floor under [`redact_log_text`]: that generic pass is
+/// substring-keyed and case-insensitive where this module's own closed,
+/// whole-word `REDACT_LOG_KEYS` scan is not, and it also handles a `key:
+/// value` / JSON `"key": "value"` shape and PEM blocks that
+/// [`redact_log_text`] alone does not recognise. Running both passes
+/// over-redacts prose relative to [`redact_log_text`] alone — an accepted
+/// cost the generic pass already takes everywhere else it is the floor —
+/// but an artefact leaving the user's infrastructure for JTAC must not leak
+/// a secret shape that pass would have caught.
 ///
 /// # Errors
-/// Fail-closed: when `input` looks like XML (trimmed, starts with `<`) but
-/// [`redact_xml`] cannot parse it, this returns [`RedactError::InvalidXml`]
-/// instead of falling back to the line-oriented pass alone — that pass knows
-/// nothing about element structure, so it is not a safe stand-in for a
-/// structural redactor that failed. Callers on a fail-closed path must leave
-/// the artefact out of the bundle and record that it did. Only input that
-/// does not look like XML at all takes the line-oriented-only path.
+/// Fail-closed: when `input` is XML-shaped but [`redact_xml`] cannot parse
+/// it, this returns [`RedactError::InvalidXml`] instead of falling back to
+/// the line-oriented pass alone — that pass knows nothing about element
+/// structure, so it is not a safe stand-in for a structural redactor that
+/// failed. Callers on a fail-closed path must leave the artefact out of the
+/// bundle and record that it did.
 pub fn redact_log_artefact(input: &str) -> Result<String, RedactError> {
-    match redact_xml(input) {
-        Ok(redacted) => Ok(redact_log_text(&redacted)),
-        Err(err) => {
-            if input.trim_start().starts_with('<') {
-                Err(err)
-            } else {
-                Ok(redact_log_text(input))
-            }
-        }
+    if looks_like_xml_shaped(input) {
+        let redacted = redact_xml(input)?;
+        Ok(redact_log_text(&redacted))
+    } else {
+        Ok(redact_log_text(&crate::text::redact(input)))
     }
 }
 
@@ -744,6 +780,71 @@ mod tests {
         let text = "Hostname: srx1\nset snmp community leakedBad;\n";
         let got = redact_log_artefact(text).unwrap();
         assert!(!got.contains("leakedBad"), "got: {got}");
+    }
+
+    // ── review F1 (mecmcp#481): whether a non-XML-shaped artefact gets the
+    // full redaction floor must not depend on a coincidental `&` elsewhere
+    // in the file — these all contain one, and all four would previously
+    // leak once a stray `&` flipped the dispatcher onto `redact_log_text`
+    // alone (which this module's closed, whole-word key list does not
+    // cover in these shapes). ───────────────────────────────────────────
+
+    #[test]
+    fn colon_form_password_with_a_stray_ampersand_elsewhere_is_redacted() {
+        let text = "httpd: login password: FAKEcolonPass && ok";
+        let got = redact_log_artefact(text).unwrap();
+        assert!(!got.contains("FAKEcolonPass"), "got: {got}");
+    }
+
+    #[test]
+    fn json_form_password_with_a_stray_ampersand_elsewhere_is_redacted() {
+        let text = r#"jweb: a & b {"password":"FAKEjsonPass"}"#;
+        let got = redact_log_artefact(text).unwrap();
+        assert!(!got.contains("FAKEjsonPass"), "got: {got}");
+    }
+
+    #[test]
+    fn uppercase_set_statement_with_a_stray_ampersand_elsewhere_is_redacted() {
+        let text = "a & b\nSET SNMP COMMUNITY FAKEUpperCase";
+        let got = redact_log_artefact(text).unwrap();
+        assert!(!got.contains("FAKEUpperCase"), "got: {got}");
+    }
+
+    #[test]
+    fn unqualified_bare_pre_shared_key_with_a_stray_ampersand_elsewhere_is_redacted() {
+        let text = "a & b\npre-shared-key FAKEUnqualifiedPsk";
+        let got = redact_log_artefact(text).unwrap();
+        assert!(!got.contains("FAKEUnqualifiedPsk"), "got: {got}");
+    }
+
+    #[test]
+    fn pem_private_key_block_with_a_stray_ampersand_elsewhere_is_redacted() {
+        let text = "a & b\n-----BEGIN RSA PRIVATE KEY-----\nFAKEbase64PemBody\n-----END RSA PRIVATE KEY-----\n"; // gitleaks:allow -- fabricated PEM fixture, not a real key
+        let got = redact_log_artefact(text).unwrap();
+        assert!(!got.contains("FAKEbase64PemBody"), "got: {got}");
+    }
+
+    // ── review F2 (mecmcp#481): non-XML-shaped text must not be routed
+    // through the XML pass at all, since that pass XML-escapes and
+    // normalises the output — corrupting a support-bundle log file that
+    // happens to parse as all-text XML. ─────────────────────────────────
+
+    #[test]
+    fn non_xml_shaped_text_is_not_xml_escaped_even_when_it_would_parse_as_xml() {
+        let text = r#"user said "hi" it's fine"#;
+        let got = redact_log_artefact(text).unwrap();
+        assert_eq!(got, text, "got: {got}");
+    }
+
+    // ── review F3 (mecmcp#481): a raw syslog line with a PRI prefix
+    // (`<NNN>`) is not XML-shaped and must not be refused by the
+    // fail-closed XML path. ─────────────────────────────────────────────
+
+    #[test]
+    fn syslog_pri_prefixed_line_is_not_refused() {
+        let text = "<134>Oct 2 mgd: set snmp community FAKEsyslogPri";
+        let got = redact_log_artefact(text).unwrap();
+        assert!(!got.contains("FAKEsyslogPri"), "got: {got}");
     }
 
     // ── crypt-hash floor in `redact_log_text`: a `$9$...`-shaped value is
