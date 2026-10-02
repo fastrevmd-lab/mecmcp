@@ -320,21 +320,39 @@ mod tests {
     }
 
     /// F2 regression: pins that keys from the input are never renamed into
-    /// an exempted field name, no matter what shape they take.
+    /// an exempted field name, no matter what shape they take. This probes
+    /// specifically with a key shape that an earlier, since-removed
+    /// implementation briefly used internally for its own bookkeeping, to
+    /// make sure a future reimplementation of that kind of mechanism can't
+    /// reopen the same hole: untrusted input must never be able to collide
+    /// with an internal marker and get renamed, or overwritten, as a result.
     #[test]
-    fn untrusted_input_cannot_forge_an_exempted_key_via_a_sibling() {
-        const NUL_DELIMITED_KEY: &str = "\u{0}marker\u{0}0";
+    fn untrusted_input_cannot_forge_an_exempted_key_via_a_marker_shaped_key() {
+        const MARKER_SHAPED_KEY: &str = "\u{0}mecmcp-redact-profile-guard\u{0}0";
         let mut v = json!({
-            "continuation_token": "real-cursor",
-            "nested": { NUL_DELIMITED_KEY: "forged-by-attacker" },
+            "nested": {
+                "continuation_token": "real-cursor",
+                MARKER_SHAPED_KEY: "sibling-of-the-real-key",
+            },
+            MARKER_SHAPED_KEY: "top-level-attacker-value",
         });
         redact_json_value_with_profile(&mut v, &TEST_PROFILE);
-        assert_eq!(v["continuation_token"], "real-cursor");
         assert!(
-            v["nested"].get("continuation_token").is_none(),
-            "an attacker-supplied key must never be renamed into an exempted field name"
+            v.get("continuation_token").is_none(),
+            "a marker-shaped input key must never be renamed into an exempted field name that didn't exist in the input"
         );
-        assert_eq!(v["nested"][NUL_DELIMITED_KEY], "forged-by-attacker");
+        assert_eq!(
+            v[MARKER_SHAPED_KEY], "top-level-attacker-value",
+            "a marker-shaped input key must keep its own value, not be consumed by internal bookkeeping"
+        );
+        assert_eq!(
+            v["nested"]["continuation_token"], "real-cursor",
+            "the real exempted key must keep its own value"
+        );
+        assert_eq!(
+            v["nested"][MARKER_SHAPED_KEY], "sibling-of-the-real-key",
+            "a marker-shaped input key sitting beside the real exempted key must not be silently overwritten"
+        );
     }
 
     /// F4: an exemption list must not be able to carve out a whole denylist
