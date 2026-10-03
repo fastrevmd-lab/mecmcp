@@ -70,9 +70,23 @@ fn setup_coordinator() -> (tempfile::TempDir, ChangesetCoordinator) {
     (dir, coordinator)
 }
 
+/// A fresh HMAC key for a single test, generated at runtime rather than a
+/// committed literal — nothing here is a credential, so there is nothing
+/// for a secret scanner to flag.
+fn random_key() -> std::sync::Arc<[u8]> {
+    let mut key = [0u8; 16];
+    getrandom::fill(&mut key).expect("system randomness for a test key");
+    std::sync::Arc::from(key.as_slice())
+}
+
 /// Sets up a coordinator in MEC-994 strict (verified-approver) mode, keyed so
-/// genuine approvals sign under v7.
-fn setup_strict_coordinator() -> (tempfile::TempDir, ChangesetCoordinator) {
+/// genuine approvals sign under v7. Returns the key too, for tests that need
+/// to reload the state file themselves.
+fn setup_strict_coordinator() -> (
+    tempfile::TempDir,
+    ChangesetCoordinator,
+    std::sync::Arc<[u8]>,
+) {
     let dir = tempfile::tempdir().expect("tempdir");
     let state_path = dir.path().join("state.json");
 
@@ -85,13 +99,14 @@ fn setup_strict_coordinator() -> (tempfile::TempDir, ChangesetCoordinator) {
         ..OperationLimits::default()
     };
     let approval_ttl = Duration::from_secs(15 * 60);
+    let key = random_key();
 
     let coordinator = ChangesetCoordinator::load(Some(&state_path), limits, approval_ttl, false)
         .expect("coordinator")
-        .with_approval_digest_key(std::sync::Arc::from(b"the-deployment-key".as_slice()))
+        .with_approval_digest_key(std::sync::Arc::clone(&key))
         .with_require_verified_approver(true);
 
-    (dir, coordinator)
+    (dir, coordinator, key)
 }
 
 /// Generates a test fingerprint.
@@ -919,7 +934,7 @@ async fn test_new_approval_has_approval_digest() {
 /// satisfies the two-person rule once strict mode is on.
 #[tokio::test]
 async fn strict_mode_refuses_a_token_asserted_approver() {
-    let (_dir, coordinator) = setup_strict_coordinator();
+    let (_dir, coordinator, _key) = setup_strict_coordinator();
 
     let actions = vec![TestAction {
         action: "set".to_string(),
@@ -967,7 +982,7 @@ async fn strict_mode_refuses_a_token_asserted_approver() {
 /// that prove it.
 #[tokio::test]
 async fn strict_mode_accepts_an_oidc_verified_approver() {
-    let (dir, coordinator) = setup_strict_coordinator();
+    let (dir, coordinator, key) = setup_strict_coordinator();
     let state_path = dir.path().join("state.json");
 
     let actions = vec![TestAction {
@@ -1002,8 +1017,7 @@ async fn strict_mode_accepts_an_oidc_verified_approver() {
 
     assert_eq!(approved.state, ChangeSetState::Approved);
 
-    let state = read_state_with_key(&state_path, 8 * 1024 * 1024, Some(b"the-deployment-key"))
-        .expect("read state");
+    let state = read_state_with_key(&state_path, 8 * 1024 * 1024, Some(&key)).expect("read state");
     let record = state.change_sets.get(&created.change_set_id).unwrap();
     let approval = record.approval.as_ref().expect("approval");
     assert_eq!(approval.digest_version, 7);
@@ -1016,7 +1030,7 @@ async fn strict_mode_accepts_an_oidc_verified_approver() {
 /// through a second token bound to the same verified IdP subject.
 #[tokio::test]
 async fn an_approver_sharing_the_owners_verified_subject_is_refused() {
-    let (_dir, coordinator) = setup_strict_coordinator();
+    let (_dir, coordinator, _key) = setup_strict_coordinator();
 
     let actions = vec![TestAction {
         action: "set".to_string(),
@@ -1062,7 +1076,7 @@ async fn an_approver_sharing_the_owners_verified_subject_is_refused() {
 /// token carries no `oidc_subject` binding.
 #[tokio::test]
 async fn strict_mode_refuses_to_propose_without_an_owner_subject() {
-    let (_dir, coordinator) = setup_strict_coordinator();
+    let (_dir, coordinator, _key) = setup_strict_coordinator();
 
     let actions = vec![TestAction {
         action: "set".to_string(),

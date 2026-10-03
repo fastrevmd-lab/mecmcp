@@ -566,6 +566,15 @@ pub fn validate_principal_for_digest(field_name: &'static str, value: &str) -> R
 mod preview_binding_tests {
     use super::*;
 
+    /// A fresh HMAC key for a single test, generated at runtime rather than
+    /// a committed literal — nothing here is a credential, so there should
+    /// be nothing for a secret scanner to flag.
+    fn random_key() -> [u8; 16] {
+        let mut key = [0u8; 16];
+        getrandom::fill(&mut key).expect("system randomness for a test key");
+        key
+    }
+
     /// The point of v5: the same plan, approver and moment, with a different
     /// preview, must not produce the same signature. Without this the approval
     /// says nothing about the text the approver read.
@@ -720,8 +729,9 @@ mod preview_binding_tests {
     /// as a v7 one.
     #[test]
     fn v6_and_v7_do_not_collide() {
+        let key = random_key();
         let v6 = compute_approval_digest_v6(
-            b"key",
+            &key,
             "cs1",
             "sha256:plan",
             None,
@@ -730,7 +740,7 @@ mod preview_binding_tests {
             1_700_000_000,
         );
         let v7 = compute_approval_digest_v7(
-            b"key",
+            &key,
             "cs1",
             "sha256:plan",
             None,
@@ -749,8 +759,9 @@ mod preview_binding_tests {
     /// disk after signing without the record going tamper-evident.
     #[test]
     fn v7_binds_mechanism_and_oidc_identity() {
+        let key = random_key();
         let base = compute_approval_digest_v7(
-            b"key",
+            &key,
             "cs1",
             "sha256:plan",
             None,
@@ -762,7 +773,7 @@ mod preview_binding_tests {
             None,
         );
         let different_mechanism = compute_approval_digest_v7(
-            b"key",
+            &key,
             "cs1",
             "sha256:plan",
             None,
@@ -774,7 +785,7 @@ mod preview_binding_tests {
             None,
         );
         let different_subject = compute_approval_digest_v7(
-            b"key",
+            &key,
             "cs1",
             "sha256:plan",
             None,
@@ -786,7 +797,7 @@ mod preview_binding_tests {
             None,
         );
         let with_owner_subject = compute_approval_digest_v7(
-            b"key",
+            &key,
             "cs1",
             "sha256:plan",
             None,
@@ -806,8 +817,10 @@ mod preview_binding_tests {
     /// is still what verification depends on, not just the visible fields.
     #[test]
     fn v7_verification_fails_without_the_correct_key() {
+        let real_key = random_key();
+        let forged_key = random_key();
         let digest = compute_approval_digest_v7(
-            b"the-real-key",
+            &real_key,
             "cs1",
             "sha256:plan",
             Some("sha256:preview"),
@@ -819,7 +832,7 @@ mod preview_binding_tests {
             None,
         );
         assert!(verify_approval_digest_v7(
-            b"the-real-key",
+            &real_key,
             "cs1",
             "sha256:plan",
             Some("sha256:preview"),
@@ -832,7 +845,7 @@ mod preview_binding_tests {
             &digest,
         ));
         assert!(!verify_approval_digest_v7(
-            b"a-forged-key",
+            &forged_key,
             "cs1",
             "sha256:plan",
             Some("sha256:preview"),
