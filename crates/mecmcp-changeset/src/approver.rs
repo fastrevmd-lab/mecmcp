@@ -30,7 +30,7 @@ pub enum ApproverIdentity {
     /// cannot name it: Rust gives struct-variant fields the same visibility
     /// as the enum itself, so a `pub` enum cannot restrict `{ principal,
     /// issuer, subject }` fields directly. Wrapping them in
-    /// [`OidcVerifiedFields`], which has no `pub` on its declaration, closes
+    /// `OidcVerifiedFields`, which has no `pub` on its declaration, closes
     /// that gap — a caller outside this crate cannot write
     /// `ApproverIdentity::OidcVerified(..)` with a literal because it cannot
     /// name the payload type. The only way to produce this variant is
