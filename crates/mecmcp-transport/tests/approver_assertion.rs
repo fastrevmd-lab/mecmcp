@@ -153,7 +153,21 @@ fn policy() -> ApproverPolicy {
 /// `oidc_subject` controls whether the bearer token this app authenticates
 /// has a step-up binding at all — `None` exercises `NoSubjectBinding`.
 fn app(key: &TestKey, oidc_subject: Option<OidcSubject>, with_verifier: bool) -> Router {
-    let bound_caller = caller(oidc_subject);
+    app_with_actor(key, oidc_subject, with_verifier, ActorType::Human)
+}
+
+/// Like [`app`], but with control over the bearer token's actor type — an
+/// `agent` token must never bind an approver assertion, regardless of
+/// whether it happens to carry an `oidc_subject` (MEC-994 Percy review F5:
+/// "no transport-level test for an assertion on an agent token").
+fn app_with_actor(
+    key: &TestKey,
+    oidc_subject: Option<OidcSubject>,
+    with_verifier: bool,
+    actor_type: ActorType,
+) -> Router {
+    let mut bound_caller = caller(oidc_subject);
+    bound_caller.actor_type = actor_type;
     let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, move |candidate| {
         (candidate == "secret").then(|| bound_caller.clone())
     });
@@ -379,5 +393,154 @@ async fn the_jwt_never_appears_in_the_tool_result() {
     assert!(
         !body_text.contains(&token),
         "the raw JWT must never reach a tool result"
+    );
+}
+
+/// MEC-994 Percy review F5: the acceptance criteria name four sinks the raw
+/// JWT must never reach — tool result, logs, audit events, and the state
+/// file. [`the_jwt_never_appears_in_the_tool_result`] covers only the first;
+/// this covers the second by capturing everything the middleware emits
+/// (`tracing::warn!` on rejection) for a valid, unrejected call, which is the
+/// path most likely to have the assertion payload closest at hand.
+#[test]
+fn the_jwt_never_appears_in_captured_logs() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let key = generate_test_key(KID);
+    let token = sign_token(&key, &valid_claims("alice", "jti-log-leak-check"), KID);
+    let app = app(&key, Some(bound_subject()), true);
+
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        runtime.block_on(async {
+            let response = app.oneshot(request(Some(&token))).await.expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    });
+
+    assert!(
+        !captured.contains(&token),
+        "the raw JWT must never reach the log output: {captured}"
+    );
+}
+
+/// MEC-994 Percy review F5: "add a tracing-capture test that drives all ten
+/// acceptance cases and asserts ten distinct codes." Every rejection test
+/// above asserts only `401`, which would not notice two different failure
+/// modes collapsing onto the same `reason_code()` — this is the test that
+/// would. Each case builds its own key and app (so a forged-signature case
+/// can legitimately use a *different* key from the one the app verifies
+/// against) and is captured independently, so one case's reason cannot be
+/// mistaken for another's.
+#[test]
+fn every_rejection_reason_is_distinct_and_audited() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let drive = |app: Router, token: &str| -> String {
+        mecmcp_audit::testutil::run_with_capture(|| {
+            runtime.block_on(async {
+                let response = app.oneshot(request(Some(token))).await.expect("response");
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            });
+        })
+    };
+
+    let mut captures = Vec::new();
+
+    // invalid_signature: token signed by a key the verifier does not trust.
+    {
+        let key = generate_test_key(KID);
+        let other = generate_test_key(KID);
+        let token = sign_token(&other, &valid_claims("alice", "jti-r1"), KID);
+        let app = app(&key, Some(bound_subject()), true);
+        captures.push(("invalid_signature", drive(app, &token)));
+    }
+    // wrong_audience
+    {
+        let key = generate_test_key(KID);
+        let mut claims = valid_claims("alice", "jti-r2");
+        claims["aud"] = json!("someone-else");
+        let token = sign_token(&key, &claims, KID);
+        let app = app(&key, Some(bound_subject()), true);
+        captures.push(("wrong_audience", drive(app, &token)));
+    }
+    // wrong_issuer
+    {
+        let key = generate_test_key(KID);
+        let mut claims = valid_claims("alice", "jti-r3");
+        claims["iss"] = json!("https://not-the-configured-idp.example.com");
+        let token = sign_token(&key, &claims, KID);
+        let app = app(&key, Some(bound_subject()), true);
+        captures.push(("wrong_issuer", drive(app, &token)));
+    }
+    // subject_mismatch
+    {
+        let key = generate_test_key(KID);
+        let token = sign_token(&key, &valid_claims("mallory", "jti-r4"), KID);
+        let app = app(&key, Some(bound_subject()), true);
+        captures.push(("subject_mismatch", drive(app, &token)));
+    }
+    // missing_approver_role
+    {
+        let key = generate_test_key(KID);
+        let mut claims = valid_claims("alice", "jti-r5");
+        claims["groups"] = json!(["employee"]);
+        let token = sign_token(&key, &claims, KID);
+        let app = app(&key, Some(bound_subject()), true);
+        captures.push(("missing_approver_role", drive(app, &token)));
+    }
+    // stale
+    {
+        let key = generate_test_key(KID);
+        let mut claims = valid_claims("alice", "jti-r6");
+        claims["iat"] = json!(now() - 301);
+        let token = sign_token(&key, &claims, KID);
+        let app = app(&key, Some(bound_subject()), true);
+        captures.push(("stale", drive(app, &token)));
+    }
+    // issued_in_future
+    {
+        let key = generate_test_key(KID);
+        let mut claims = valid_claims("alice", "jti-r7");
+        claims["iat"] = json!(now() + 3600);
+        let token = sign_token(&key, &claims, KID);
+        let app = app(&key, Some(bound_subject()), true);
+        captures.push(("issued_in_future", drive(app, &token)));
+    }
+    // no_subject_binding: bearer token carries no oidc_subject at all.
+    {
+        let key = generate_test_key(KID);
+        let token = sign_token(&key, &valid_claims("alice", "jti-r8"), KID);
+        let app = app(&key, None, true);
+        captures.push(("no_subject_binding", drive(app, &token)));
+    }
+    // not_human_token: an agent's bearer token can never bind an assertion.
+    {
+        let key = generate_test_key(KID);
+        let token = sign_token(&key, &valid_claims("alice", "jti-r9"), KID);
+        let app = app_with_actor(&key, Some(bound_subject()), true, ActorType::Agent);
+        captures.push(("not_human_token", drive(app, &token)));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for (expected_code, captured) in &captures {
+        let needle = format!("reason=\"{expected_code}\"");
+        assert!(
+            captured.contains(&needle),
+            "case {expected_code:?} did not emit {needle:?}: {captured}"
+        );
+        assert!(
+            seen.insert(*expected_code),
+            "duplicate case name {expected_code:?} in the table itself"
+        );
+    }
+    assert_eq!(
+        seen.len(),
+        captures.len(),
+        "every case above must assert a distinct reason code"
     );
 }
