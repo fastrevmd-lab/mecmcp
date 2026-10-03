@@ -27,9 +27,144 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 >
 > Entries from 0.21.0 onward should be written by hand at release time.
 
-## [Unreleased]
+## [0.26.0] - 2026-10-02
+
+### Security
+
+- **mecmcp-redact: hardened text redaction against a reachable panic on
+  certain input** (MEC-770). `redact_text` (and the XML/JSON entry points,
+  which share the same core) could panic instead of returning on some
+  device-sourced tool output, which could abort the handling server
+  process. Present in v0.24.0 and v0.24.1. Fixed with a regression test
+  covering the text, XML, and JSON entry points; consumers should upgrade.
 
 ### Added
+
+- **mecmcp-policy: new opt-in `xml_path` module for hierarchy-aware,
+  fail-closed policy evaluation on parsed XML** (mecmcp#419). Servers must
+  call it to benefit; the existing rule evaluation is unchanged in this
+  release. Adoption in each server is a follow-up.
+
+- **mecmcp-redact: `Profile` extension hooks for vendor-specific
+  wholesale-redact and key-exemption rules** (MEC-1244, part of MEC-1231).
+  Some vendor servers need two kinds of policy this crate's generic scan
+  doesn't cover on its own: withholding a field's value wholesale rather
+  than key/value scanning it, for a vendor-rendered body a best-effort scan
+  isn't guaranteed to cover, and exempting field names that collide with
+  the denylist by substring but are not secrets in that vendor's schema.
+  Both are now generic capabilities any server can declare: a `Profile`
+  carries `wholesale_redact_keys` and `key_exemptions` lists, and
+  `redact_json_value_with_profile` applies them around the existing generic
+  scan without narrowing it. Migrating a server's local implementation onto
+  this is tracked separately, pending design review.
+
+- **mecmcp-redact: `mecmcp-redact` CLI binary and a shared tool-output
+  redaction coverage helper** (MEC-1231). A new `cli` feature exposes a
+  `mecmcp-redact` binary that runs the same `redact_text`/`redact_json_str`/
+  `redact_xml_str` engine every server already links, over stdin/stdout, for
+  non-Rust consumers that cannot depend on the crate directly (`--format
+  text|json|xml`; exits non-zero rather than passing through unparsed input,
+  matching the library's fail-closed contract). A new `test-util` feature
+  exposes `testing::tools_leaking_secrets`, generalizing the
+  hand-rolled-per-server "does any tool's rendered output contain a planted
+  fixture secret" assertion (the same way `mecmcp-audit`'s `test-util`
+  generalized audit-coverage checking) so each server's own coverage test can
+  call one shared function instead of re-deriving it.
+
+- **mecmcp-server: `OutputRedaction::AlreadyRedacted`, a quiet skip for
+  output a caller redacted itself** (MEC-1168). `SkipForInternalRead` was
+  being reused by a handler whose result *did* come from a vendor device but
+  had already been redacted before reaching `tool_result` — typically to
+  protect a field like a pagination `continuation_token` that
+  `OutputRedaction::Apply`'s unconditional `redact_json_value` would
+  otherwise strip (MEC-440 B1). That reuse made `tool_result` log a `WARN`
+  `tool_output_redaction_skipped` audit event naming the wrong function on
+  every such call, even though the value genuinely was redacted — alert
+  fatigue and an inaccurate audit trail, not a data leak (Low severity,
+  found in review of rustsdcmcp#203 / MEC-1160). `AlreadyRedacted` skips
+  `tool_result`'s own redaction pass exactly as `SkipForInternalRead` does,
+  but emits no audit event, since there is nothing for an operator to be
+  warned about instead at `WARN`. It does carry `tool` and `redacted_by`
+  fields and logs its own `DEBUG`-level `tool_output_redacted_by_caller`
+  event naming both, so an operator can still enumerate every call site that
+  bypassed central redaction for vendor-device data, just without the
+  per-call `WARN` noise (addressed in review, MEC-1181: a silent bypass with
+  no audit trail at all was the wrong tradeoff for data that came from a
+  device). Existing call sites are unaffected; adopting it in place of
+  `SkipForInternalRead` is a separate, per-caller change.
+
+- **mecmcp-redact: a PAN-OS `Profile`, and fixtures proving representative
+  PAN-OS secret shapes are redacted.** Adds PAN-OS fixtures alongside
+  MEC-711's Mist fixtures, and a PAN-OS `Profile` whose `key_exemptions` and
+  opt-in BGP route-community exemption let a handful of non-secret
+  operational and routing-policy fields survive for PAN-OS callers
+  specifically, without loosening the default denylist for every other
+  vendor server. Hardens redaction coverage in both the JSON and XML paths.
+
+- **mecmcp-redact: a Junos redaction profile for support-bundle
+  artefacts** (MEC-1245). Ports `rustjunosmcp`'s support-bundle redaction
+  coverage into a `junos` module: XML redaction extended with a
+  Junos-specific element rule on the shared quick-xml walk, a
+  set-statement-aware line-oriented redactor for non-XML support-bundle
+  text, and a dispatcher that selects the XML vs. text path by the
+  artefact's shape, running the text pass as a floor under both and
+  failing closed when XML-shaped input cannot be parsed. Extends Junos
+  field coverage in the shared, vendor-agnostic denylist.
+  `rustjunosmcp` adopting this as a thin wrapper is a follow-up PR in
+  that repo.
+
+## [0.25.0] - 2026-09-30
+
+### Changed
+
+- **docs: close out the filesystem-layout standard across all six vendor
+  servers** (MEC-988, mecmcp#356, follow-on to #28 and #6).
+  `docs/FILESYSTEM-LAYOUT.md` was missing `rustmistmcp` entirely and still
+  carried `rustsdcmcp` as an open "verify and document" TODO. A 2026-09-07
+  rebuild of all twelve MCP test rigs hit the exact `tokens.json`
+  config-vs-state divergence this document exists to prevent, twice
+  (`rustproxmoxmcp` restarted against a path the file wasn't at;
+  `rustmistmcp`'s token store had moved out from under a restored drop-in).
+  Verified against the code in all six repos rather than assumed:
+  `rustjunosmcp`, `rustsdcmcp`, `rustproxmoxmcp`, and `rustmistmcp` resolve
+  their configured token path against their own canonical `/var/lib/<svc>`
+  location with a byte-exact comparison, fall back to the legacy `/etc`
+  path only when that exact canonical path was configured, and fail
+  startup outright for any other missing path — no silent fallback for a
+  typo or a deliberately different store. `rustpanosmcp` has no such
+  resolver: it loads whatever path is configured and only warns (never
+  reads) if an un-migrated legacy store exists elsewhere. `rustunifimcp`
+  shipped `/var/lib`-only from its first release and never had an `/etc`
+  token store to migrate away from. No mutable credential or state file
+  remains under `/etc/<svc>` on any of the six. `rustproxmoxmcp` and
+  `rustunifimcp` also use an abbreviated directory/service-user base
+  (`proxmoxmcp`, `unifimcp`) rather than the full binary name — a documented
+  naming exception, not a compliance gap. Two residual follow-ups, not
+  fixed here: `rustunifimcp` has no dedicated regression test pinning its
+  already-loud failure on a missing token file, and `rustpanosmcp` could
+  adopt the shared `resolve_tokens_with` resolver the other four share.
+
+### Added
+
+- **mecmcp-secret: shared naming derivation and single-pass credential-file
+  validation** (MEC-987). Two additions that give the six mechub MCP servers
+  a common source of truth instead of six independent decisions:
+  - `naming::ServerNaming::derive` computes `/etc/<short_name>`,
+    `/var/lib/<short_name>`, and the service-user string from one short name,
+    with `naming::known` fixing the short name for each of the six servers
+    today (`jmcp`, `panosmcp`, `sdcmcp`, `proxmoxmcp`, `mistmcp`,
+    `unifimcp`) and documenting the rule a seventh server follows.
+  - `validate::validate_credential_files` checks every credential-adjacent
+    file a server cares about in one pass and returns every offender
+    together, instead of the existing single-file loaders' fail-on-first
+    behaviour. The required mode per file is data
+    (`validate::CredentialFileRole::required_mode`) the loader owns, not a
+    constant duplicated in each repo's setup docs -- `Secret` requires
+    `0600`, `ConfigNoSecret` (files that are operator-authored and hold no
+    secret material, like `rustsdcmcp`'s `sdc.json`) requires `0640`.
+  Consuming servers are unaffected until they opt in: nothing existing
+  changed, resolve_token_path's `/etc` fallback still governs the
+  tokens.json migration path per server.
 
 - **mecmcp-audit: optional OpenTelemetry trace export, and a generic
   HTTPS/JSON forward sink for closed evidence segments** (MEC-459). Two
@@ -95,6 +230,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — mecmcp-server: `tool_result` takes an `OutputRedaction`
+  argument and redacts every successful value by default** (MEC-1020,
+  closes mechubsec/mecmcp#398). Previously this crate only re-exported
+  `Untrusted`, and a handler had to remember to call `mecmcp-redact` on its
+  own output; a new tool that forgot shipped an unredacted value. `tool_result`
+  now redacts `Ok` values unconditionally unless the caller passes
+  `OutputRedaction::SkipForInternalRead { tool, reason }`, a per-call opt-out
+  (there is no `Default` impl and no process-wide flag) that emits a
+  `target: "audit"` `WARN` naming the tool and reason, for data that never
+  touched a device (e.g. this process's own audit log). `tool_error` and
+  `tool_error_with_untrusted_detail` redact their text unconditionally too,
+  with no opt-out — a device error routinely echoes the config line that
+  triggered it, so the error path needs the same default as the success
+  path. Every existing call site in this crate passes `OutputRedaction::Apply`
+  or `Apply`-equivalent behaviour; the six vendor server repos that already
+  call `mecmcp-redact` on their own paths will need their own follow-up to
+  adopt the new argument next time they bump this crate.
+  **Also note:** `ResultFormat::PrettyJson` now serializes through
+  `serde_json::Value` on its way to the redactor, so struct field order in
+  the rendered JSON is alphabetical rather than declaration order; any
+  golden fixture that asserts exact JSON text will need updating.
+
 - **BREAKING — http/openapi: request paths are typed; the raw-URL
   constructor is feature-gated** (MEC-510). `mecmcp-openapi::expand_path` now
   returns `ExpandedPath` instead of `String` — a type with no public
@@ -109,6 +266,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path-templated (OIDC discovery/JWKS); `mecmcp-oidc` enables it. Vendor
   servers should migrate REST calls to `with_base_and_path` and should not
   enable `absolute-url`.
+
+### Security
+
+- **mecmcp-server: a tool's error path could leak a device secret that a
+  new tool's success path was already protected against** (MEC-1020, part
+  of mechubsec/mecmcp#398's review). Before this change, `tool_error` and
+  `tool_error_with_untrusted_detail` passed their text through unredacted,
+  so a Junos commit-check failure or a PAN-OS API error body that quoted
+  the offending config line (a pre-shared key, an SNMP community string)
+  reached the model verbatim, even though the same value in a success
+  result was already redacted by the `Changed` entry above. Both functions
+  now redact unconditionally.
+
+- **mecmcp-server: `tool_error_with_untrusted_detail` could drop its own
+  closing trust-boundary tag** (MEC-1020, review follow-up on
+  mechubsec/mecmcp#458). The function redacted `detail`, rendered it inside
+  `<untrusted-device-content>` markup, then passed the whole tagged string
+  through `tool_error`, which redacted it a second time. `redact_text`'s PEM
+  handling drops every line after an unterminated `-----BEGIN ... -----`
+  header, so device text containing one consumed everything after it,
+  including the closing tag, on the second pass. No secret leaked -- this
+  failed safe on data -- but a client or model that trusts the tag boundary
+  would read an untagged block as unbounded. Each piece is now redacted
+  exactly once before the tag is built.
+
+- **mecmcp-redact: `redact_text` could still drop a closing trust-boundary
+  tag on a real production path** (MEC-1020, review follow-up on
+  mechubsec/mecmcp#458, R2). Fixing the previous entry moved the redundant
+  redaction pass out of `mecmcp-server`, but `mecmcp-changeset` already tags
+  a device error with `Untrusted::render_tagged` *before* the error reaches
+  `tool_error` (`CoordinatorError`'s message carries the tag), so
+  `tool_error`'s single, now-necessary pass over that string still ran into
+  the same unterminated-`BEGIN` case. `text::redact` now recognizes a
+  `</untrusted-device-content id="...">` closing tag as ending an open PEM
+  block even without a matching `END` line -- the tag's body is escaped by
+  `render_tagged`, so a line in this exact shape can only be the wrapper's
+  own closing tag, never forged device text. No secret leaked; this closes
+  the same fail-safe gap for the call sites that tag before returning an
+  error.
 
 ## [0.24.1] - 2026-09-28
 

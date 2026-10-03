@@ -74,6 +74,21 @@ pub fn redact(input: &str) -> String {
             if is_pem_end(trimmed) {
                 in_pem = false;
                 out.push(line.to_string());
+                continue;
+            }
+            // R2 (mecmcp#458 re-review): a closing `</untrusted-device-content
+            // id="...">` tag ends an open PEM body too, even without a
+            // matching END line. Otherwise redacting text that is already
+            // wrapped by `Untrusted::render_tagged` — device text that
+            // contains an unterminated BEGIN line — drops the closing tag
+            // along with the (fake) body, leaving the untrusted block open.
+            // `render_tagged` escapes a forged closing tag inside the body
+            // (`escape_for_tag`), so a literal line in this exact shape can
+            // only be the real tag the wrapper emitted, never device text.
+            if trimmed.starts_with("</untrusted-device-content id=\"") {
+                in_pem = false;
+                out.push(line.to_string());
+                continue;
             }
             // Body lines of an open PEM block are dropped; the single
             // placeholder was already pushed when the block opened.
@@ -214,8 +229,12 @@ fn redact_value_span(line: &str, force: bool) -> String {
     }
     // No `=`/`:` — bare `key value` (Junos `set` style). Redact the last
     // whitespace-delimited token when forced, or when it alone looks secret.
-    if let Some(last_space) = line.rfind(char::is_whitespace) {
-        let (head, tail) = line.split_at(last_space + 1);
+    //
+    // Advance by whole chars, not raw bytes — a byte offset derived from a
+    // char index must stay on a char boundary or `split_at` panics.
+    if let Some((last_space, ws_char)) = line.char_indices().rev().find(|(_, c)| c.is_whitespace())
+    {
+        let (head, tail) = line.split_at(last_space + ws_char.len_utf8());
         let tail_trimmed = tail.trim_end_matches(';');
         let trailing = &tail[tail_trimmed.len()..];
         if !tail_trimmed.is_empty() && (force || looks_like_secret_value(tail_trimmed)) {
@@ -531,7 +550,15 @@ fn userinfo_password_spans(line: &str) -> Vec<(usize, usize)> {
                 }
             }
         }
-        cursor = (authority_start + authority_len.max(1)).min(line.len());
+        // Advance by whole chars, not raw bytes — a fixed one-byte step
+        // assumes ASCII and can land mid-character, making the next `find`
+        // on the advanced slice panic.
+        let step = if authority_len == 0 {
+            rest.chars().next().map_or(1, char::len_utf8)
+        } else {
+            authority_len
+        };
+        cursor = (authority_start + step).min(line.len());
     }
     spans
 }
@@ -648,6 +675,27 @@ mod tests {
         assert!(!got.contains("MoreFakeBase64=="));
         assert!(got.contains("intro line"));
         assert!(got.contains("trailer line"));
+    }
+
+    // R2 (mecmcp#458 re-review): a second redact pass over text already
+    // wrapped by `Untrusted::render_tagged` must not let an unterminated
+    // BEGIN line swallow the closing `</untrusted-device-content id="...">`
+    // tag — the model would then receive an untrusted block with no end.
+    #[test]
+    fn pem_block_stops_at_an_untrusted_content_closing_tag_without_an_end_line() {
+        let block = "<untrusted-device-content id=\"abc123\" source=\"device.stage_error\">\n\
+            This content was returned by a device or controller.\n\
+            error at line 3\n\
+            -----BEGIN RSA PRIVATE KEY-----\n\
+            MIIFAKEBASE64==\n\
+            (truncated)\n\
+            </untrusted-device-content id=\"abc123\">"; // gitleaks:allow -- fabricated base64 body ("FAKE"), not a real key
+        let got = redact(block);
+        assert!(
+            got.contains("</untrusted-device-content id=\"abc123\">"),
+            "closing tag must survive redaction: {got}"
+        );
+        assert!(!got.contains("MIIFAKEBASE64=="), "got: {got}");
     }
 
     #[test]
@@ -1401,5 +1449,49 @@ mod tests {
         let got = redact("https://admin:p@QQu1@host/");
         assert!(!got.contains("QQu1"), "got: {got}");
         assert!(!got.contains("p@QQu1"), "got: {got}");
+    }
+
+    // --- regression tests: a byte-offset advance derived from a char match
+    // must stay on a char boundary, or the next str operation panics. ---
+
+    #[test]
+    fn y5_fallback_nbsp_before_value_does_not_panic() {
+        let got = redact("foo\u{a0}QQw1## SECRET-DATA");
+        assert!(!got.contains("QQw1"), "got: {got}");
+    }
+
+    #[test]
+    fn y5_fallback_em_space_before_value_does_not_panic() {
+        let got = redact("foo\u{2003}QQw2## SECRET-DATA");
+        assert!(!got.contains("QQw2"), "got: {got}");
+    }
+
+    #[test]
+    fn y5_fallback_ideographic_space_before_value_does_not_panic() {
+        let got = redact("foo\u{3000}QQw3## SECRET-DATA");
+        assert!(!got.contains("QQw3"), "got: {got}");
+    }
+
+    #[test]
+    fn y6_scheme_cursor_nbsp_does_not_panic_in_text() {
+        // Nothing here looks like a secret, so the call just needs to
+        // return instead of panicking.
+        let _ = redact("see http://\u{a0}x");
+    }
+
+    #[test]
+    fn y6_scheme_cursor_nbsp_does_not_panic_in_xml() {
+        let _ = crate::redact_xml_str("<a>see http://\u{a0}x</a>").expect("valid xml");
+    }
+
+    #[test]
+    fn y6_scheme_cursor_nbsp_does_not_panic_in_json() {
+        let _ = crate::redact_json_str("{\"m\":\"see http://\u{a0}x\"}").expect("valid json");
+    }
+
+    #[test]
+    fn y6_scheme_cursor_later_userinfo_password_is_still_redacted() {
+        let got = redact("see http://\u{a0}x then https://admin:QQw4@host/");
+        assert!(!got.contains("QQw4"), "got: {got}");
     }
 }

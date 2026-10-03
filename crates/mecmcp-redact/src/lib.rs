@@ -23,6 +23,13 @@
 //!   best-effort net, not a guarantee — see the residual-risk section of the
 //!   crate README.
 //!
+//! A server with vendor-specific exceptions to the denylist-and-shape scan —
+//! a field that must be withheld as a whole rather than key/value scanned,
+//! or a field name that collides with the denylist by substring but is not a
+//! secret in that vendor's schema — declares a [`Profile`] and calls
+//! [`redact_json_value_with_profile`] instead of [`redact_json_value`]. See
+//! the [`profile`] module docs.
+//!
 //! # On by default, and not through a tool argument
 //!
 //! [`policy::active`] defaults to [`policy::RedactionPolicy::Enabled`]. The
@@ -55,14 +62,18 @@
 pub mod denylist;
 pub mod digest;
 mod json;
+pub mod junos;
 pub mod policy;
+pub mod profile;
 pub mod projection;
 pub mod shape;
+pub mod testing;
 mod text;
 pub mod trust;
 mod xml;
 
 pub use policy::{RedactionPolicy, active, install};
+pub use profile::Profile;
 pub use trust::Untrusted;
 
 /// A tool-output body's wire format, so [`redact_and_digest`] knows which
@@ -144,6 +155,18 @@ pub fn redact_json_value(value: &mut serde_json::Value) {
     json::redact(value);
 }
 
+/// Redact a JSON value in place under [`redact_json_value`]'s generic
+/// denylist-and-shape scan, extended by `profile`'s vendor-specific
+/// wholesale-field and key-exemption rules. See the [`profile`] module docs
+/// for why those two rules need a declared profile rather than living in the
+/// generic scan.
+pub fn redact_json_value_with_profile(value: &mut serde_json::Value, profile: &Profile) {
+    if matches!(active(), RedactionPolicy::DisabledByOperator { .. }) {
+        return;
+    }
+    profile::redact_json_value_with_profile(value, profile);
+}
+
 /// Redact an XML document.
 ///
 /// # Errors
@@ -158,6 +181,22 @@ pub fn redact_xml_str(input: &str) -> Result<String, RedactError> {
         return Ok(input.to_string());
     }
     xml::redact(input)
+}
+
+/// Redact an XML document under [`redact_xml_str`]'s generic scan, extended
+/// by `profile`'s BGP route-community exemption when it opts in via
+/// [`Profile::with_bgp_route_communities`]. `profile`'s
+/// `wholesale_redact_keys` and `key_exemptions` are JSON-only fields and are
+/// not consulted here — see the [`profile`] module docs.
+///
+/// # Errors
+/// Same as [`redact_xml_str`].
+pub fn redact_xml_str_with_profile(input: &str, profile: &Profile) -> Result<String, RedactError> {
+    if matches!(active(), RedactionPolicy::DisabledByOperator { .. }) {
+        xml::validate(input)?;
+        return Ok(input.to_string());
+    }
+    xml::redact_with_profile(input, profile)
 }
 
 /// The result of [`redact_and_digest`]: the redacted body, and a fingerprint

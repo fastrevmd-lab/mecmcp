@@ -12,5 +12,6 @@ workspace = true
 
 [dependencies]
 globset   = { workspace = true }
+quick-xml = { workspace = true }
 serde     = { workspace = true }
 thiserror = { workspace = true }

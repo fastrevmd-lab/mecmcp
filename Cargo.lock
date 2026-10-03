@@ -1839,7 +1839,7 @@ checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
 name = "mecmcp-audit"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-auth"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -1892,7 +1892,7 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-changeset"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
  "async-trait",
  "getrandom 0.4.3",
@@ -1918,7 +1918,7 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-device"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
  "async-trait",
  "rustix",
@@ -1934,7 +1934,7 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-http"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
  "mecmcp-openapi",
  "mecmcp-secret",
@@ -1952,7 +1952,7 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-inventory"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
  "mecmcp-secret",
  "serde",
@@ -1965,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-job"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
  "mecmcp-device",
  "thiserror",
@@ -1975,7 +1975,7 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-oidc"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -1991,24 +1991,26 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-openapi"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "mecmcp-policy"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
  "globset",
+ "quick-xml",
  "serde",
  "thiserror",
 ]
 
 [[package]]
 name = "mecmcp-redact"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
+ "clap",
  "hmac",
  "quick-xml",
  "serde_json",
@@ -2021,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-runtime"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2040,7 +2042,7 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-scp"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2059,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-secret"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
  "rustix",
  "tempfile",
@@ -2069,23 +2071,25 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-server"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
  "http",
  "mecmcp-audit",
  "mecmcp-auth",
  "mecmcp-redact",
+ "quick-xml",
  "rmcp",
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
  "tracing-subscriber",
  "uuid",
 ]
 
 [[package]]
 name = "mecmcp-transport"
-version = "0.24.1"
+version = "0.26.0"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -4643,9 +4647,9 @@ dependencies = [
 
 [[package]]
 name = "yoke-derive"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33811428bee40dbceb6d545e95754741d17a6aef9a4849f0fd62e2ba4f412a78"
+checksum = "ec8ebde2db3681e8c9980cc27822030e68752690ddfa9473e739aeb4dbde6d71"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -1,14 +1,19 @@
 //! Vendor-neutral helpers every MCP tool handler in this family needs.
 //!
-//! Two concerns, deliberately kept apart:
+//! Three concerns, deliberately kept apart:
 //!
 //! - **Rendering a result** — [`tool_result`], [`tool_error`], [`bounded_text`].
 //!   A handler's return value is caller-visible and vendor-sized, so it is
-//!   bounded before it leaves.
+//!   bounded before it leaves. [`tool_result`] also redacts it —
+//!   see [`OutputRedaction`].
 //! - **Authorizing a call** — [`authorize_call`] and the rest of
 //!   [`mod@authorize`]. Note the rule stated there: a `None` caller is the
 //!   stdio path and is authorized, so a handler must pass the caller it
 //!   recovered rather than `None` on a lookup miss.
+//! - **Shaping a device response** — [`xml_to_json`] turns device XML into a
+//!   [`serde_json::Value`] tree instead of a string a model has to re-parse
+//!   out of its own escaping. It runs after redaction, not instead of it —
+//!   see its module docs.
 //!
 //! Nothing here knows a vendor's names, paths, headers, models, or statuses.
 //! That is the whole point: three servers were carrying their own copy of this
@@ -28,14 +33,43 @@
 //! [`truncate_items`] is the list-shaped version of the same idea, for a
 //! handler that would rather hand back the first `N` of `M` entries with an
 //! explicit marker than refuse the whole call.
+//!
+//! ## Redaction runs inside `tool_result`, not beside it
+//!
+//! [`tool_result`] passes every successful value through `mecmcp-redact`
+//! before it is measured against [`ResultLimits`] or handed back to the
+//! caller. Earlier, redaction was something a server had to remember to call
+//! on its own output path; a new tool handler that built its result with
+//! `tool_result` and forgot to redact it first still leaked whatever it
+//! returned. Routing redaction through `tool_result` itself removes that
+//! failure mode — there is no successful [`rmcp::model::CallToolResult`]
+//! `tool_result` can produce without it, short of the one exception below.
+//!
+//! There are two exceptions. [`OutputRedaction::SkipForInternalRead`] is for
+//! a handler whose result never touched a vendor device or controller —
+//! reading this process's own audit log or policy snapshot, say — where
+//! running the device-secret denylist over the process's own data is pure
+//! noise. Choosing it is an explicit, per-call decision (there is no
+//! process-wide flag for it, unlike `mecmcp_redact::policy`) and it is
+//! audited: it emits a `target: "audit"` event naming the tool and the
+//! reason, every time. [`OutputRedaction::AlreadyRedacted`] is for a handler
+//! whose result *did* come from a vendor device but was redacted at the call
+//! site, before reaching `tool_result` — typically because the unconditional
+//! `Apply` pass would strip a field the caller needs to keep, such as a
+//! pagination cursor. It emits no audit event, since the value was in fact
+//! redacted, just not by this function.
 
 pub mod authorize;
+mod xml_json;
 
 pub use authorize::{
     AuthorizationError, audit_scope, authorize_call, authorize_target, authorize_tool,
     caller_from_extensions, filter_tools_for_scope,
 };
 pub use mecmcp_redact::Untrusted;
+pub use xml_json::{XmlProjectionError, xml_to_json};
+
+use mecmcp_redact::{redact_json_value, redact_text};
 
 use serde::Serialize;
 use std::fmt::Display;
@@ -52,6 +86,66 @@ pub enum ResultFormat {
     /// CLI output, say. `PrettyJson` would hand the caller a quoted, escaped
     /// blob; this hands them the text.
     StringOrPrettyJson,
+}
+
+/// Whether [`tool_result`] passes a successful value through `mecmcp-redact`
+/// before returning it.
+///
+/// There is no `Default` impl on purpose: every call site names its choice,
+/// so a reviewer sees the opt-out in the diff instead of it falling out of an
+/// omitted argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputRedaction {
+    /// Redact the serialized value before returning it. The correct choice
+    /// for anything that carries or might carry vendor/device data — which is
+    /// almost every tool result in this family.
+    Apply,
+    /// Skip redaction because `value` never reached a vendor device or
+    /// controller — an internal read of this process's own state that the
+    /// device-secret denylist has nothing to do with.
+    ///
+    /// Selecting this variant emits a `WARN`-level `target: "audit"` tracing
+    /// event naming `tool` and `reason`, the same way
+    /// `mecmcp_redact::policy::install(DisabledByOperator { .. })` logs an
+    /// operator's process-wide opt-out — so an operator can see, per call,
+    /// every place output left this process unredacted and why.
+    SkipForInternalRead {
+        /// The tool name, so the audit event says which handler chose this.
+        tool: &'static str,
+        /// Why `value` does not need redaction, e.g. "reads this process's
+        /// own audit log entries, not vendor secrets".
+        reason: &'static str,
+    },
+    /// Skip redaction because `value` already passed through
+    /// `mecmcp-redact` at the call site, before it reached `tool_result`.
+    ///
+    /// This is for a handler whose value **did** come from a vendor device —
+    /// unlike `SkipForInternalRead` — but that redacted it itself first, with
+    /// a targeted pass that protects a field `OutputRedaction::Apply`'s
+    /// unconditional `redact_json_value` would otherwise strip, such as a
+    /// pagination `continuation_token` (see `mecmcp_redact::denylist` for the
+    /// fields `Apply` always strips). Re-running redaction here would be a
+    /// silent no-op at best and would re-touch an already-protected field at
+    /// worst, so `tool_result` trusts the caller's own pass instead of
+    /// repeating it. That trust is unverified by this crate — the caller's
+    /// own pass must still go through `mecmcp_redact::redact_json_value` (or
+    /// another `mecmcp_redact::policy`-governed path), not a hand-rolled
+    /// denylist, or the two will drift apart.
+    ///
+    /// Unlike `SkipForInternalRead`, this does not emit a `WARN`-level
+    /// `tool_output_redaction_skipped` event — the value *was* redacted, just
+    /// not by this function, so there is nothing for an operator to be warned
+    /// about. It still emits a `DEBUG`-level `target: "audit"` event naming
+    /// `tool` and `redacted_by`, so an operator can list every call site that
+    /// bypassed central redaction for device data, even though none of them
+    /// need a warning.
+    AlreadyRedacted {
+        /// The tool name, so the audit event says which handler chose this.
+        tool: &'static str,
+        /// What redacted `value` before it reached `tool_result`, e.g.
+        /// "redact_json_value at the call site, to keep continuation_token".
+        redacted_by: &'static str,
+    },
 }
 
 /// Hard byte limits applied before a successful MCP result is returned.
@@ -193,10 +287,14 @@ pub fn truncate_items<T>(mut items: Vec<T>, max_items: usize) -> TruncatedItems<
 
 /// Build an MCP tool error containing one safe text block.
 ///
-/// The message is whatever `error` renders, so an error type reaching this must
-/// already be safe to show a caller. This crate cannot make an unsafe message
-/// safe; a type that might carry a credential or an internal path should be
-/// redacted at its own boundary, not here.
+/// The message is whatever `error` renders, redacted the same way a
+/// successful [`tool_result`] value is: an error commonly quotes the device's
+/// own words back (a Junos commit-check failure echoes the offending config
+/// line, a PAN-OS API error body echoes the request), so a secret-bearing
+/// line can reach this path exactly as it can reach a success. There is no
+/// opt-out here — [`OutputRedaction::SkipForInternalRead`] only exists for
+/// data that never touched a device, and an error string does not carry that
+/// guarantee.
 ///
 /// The text is **not** bounded. Every caller in this family builds these from
 /// its own short, fixed-shape messages, and silently shortening a diagnostic is
@@ -209,7 +307,20 @@ pub fn truncate_items<T>(mut items: Vec<T>, max_items: usize) -> TruncatedItems<
 /// device's own words stay visibly marked once the model reads them.
 #[must_use]
 pub fn tool_error(error: impl Display) -> rmcp::model::CallToolResult {
-    rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(error.to_string())])
+    error_block(redact_text(&error.to_string()))
+}
+
+/// Build an MCP tool error from text that has already been redacted.
+///
+/// Redacting text a second time is not a no-op: `redact_text`'s PEM handling
+/// keeps a `BEGIN ... PRIVATE KEY` header and drops every line after it until
+/// a matching `END` line, so redacting an already-tagged
+/// [`tool_error_with_untrusted_detail`] block a second time can consume its
+/// closing `</untrusted-device-content>` tag if the device text contains an
+/// unterminated `BEGIN` line. Redact each piece exactly once, then build the
+/// error block directly instead of routing through [`tool_error`] again.
+fn error_block(text: String) -> rmcp::model::CallToolResult {
+    rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(text)])
 }
 
 /// Build an MCP tool error whose detail text came from the device or
@@ -244,23 +355,29 @@ pub fn tool_error_with_untrusted_detail(
     detail: Untrusted<&str>,
     source: &str,
 ) -> rmcp::model::CallToolResult {
-    tool_error(format!("{context}\n{}", detail.render_tagged(source)))
+    let context = redact_text(&context.to_string());
+    let redacted_detail = redact_text(detail.as_inner());
+    let detail = Untrusted::new(redacted_detail.as_str());
+    error_block(format!("{context}\n{}", detail.render_tagged(source)))
 }
 
 /// Convert a domain result into a bounded MCP tool result.
 ///
-/// A failure becomes [`tool_error`]. A success is serialized per `format`, then
+/// A failure becomes [`tool_error`]. A success is serialized per `format`,
+/// redacted per `redaction` (see [`OutputRedaction`] and the crate-level docs
+/// on why that step lives here rather than being left to each caller), then
 /// checked against both limits, and **refused** rather than truncated if it
 /// exceeds either — see the note on limits in the crate documentation.
 ///
 /// # Examples
 /// ```
-/// use mecmcp_server::{ResultFormat, ResultLimits, tool_result};
+/// use mecmcp_server::{OutputRedaction, ResultFormat, ResultLimits, tool_result};
 ///
 /// let over = tool_result::<_, std::convert::Infallible>(
 ///     Ok("0123456789"),
 ///     ResultFormat::StringOrPrettyJson,
 ///     ResultLimits { max_text_bytes: 4, max_json_bytes: 32 },
+///     OutputRedaction::Apply,
 /// );
 /// assert_eq!(over.is_error, Some(true));
 /// ```
@@ -269,6 +386,7 @@ pub fn tool_result<T, E>(
     result: Result<T, E>,
     format: ResultFormat,
     limits: ResultLimits,
+    redaction: OutputRedaction,
 ) -> rmcp::model::CallToolResult
 where
     T: Serialize,
@@ -278,7 +396,25 @@ where
         Ok(value) => value,
         Err(error) => return tool_error(error),
     };
-    let serialized = match serialize_value(&value, format) {
+    if let OutputRedaction::SkipForInternalRead { tool, reason } = redaction {
+        tracing::warn!(
+            target: "audit",
+            event = "tool_output_redaction_skipped",
+            tool = %tool,
+            reason = %reason,
+            "tool output redaction skipped for tool {tool}: {reason}",
+        );
+    }
+    if let OutputRedaction::AlreadyRedacted { tool, redacted_by } = redaction {
+        tracing::debug!(
+            target: "audit",
+            event = "tool_output_redacted_by_caller",
+            tool = %tool,
+            redacted_by = %redacted_by,
+            "tool output for {tool} redacted at call site by {redacted_by}",
+        );
+    }
+    let serialized = match serialize_value(&value, format, redaction) {
         Ok(serialized) => serialized,
         Err(error) => return tool_error(format!("failed to serialize tool result: {error}")),
     };
@@ -310,10 +446,16 @@ struct SerializedValue {
 fn serialize_value<T: Serialize>(
     value: &T,
     format: ResultFormat,
+    redaction: OutputRedaction,
 ) -> Result<SerializedValue, serde_json::Error> {
+    let apply = matches!(redaction, OutputRedaction::Apply);
     match format {
         ResultFormat::PrettyJson => {
-            let text = serde_json::to_string_pretty(value)?;
+            let mut value = serde_json::to_value(value)?;
+            if apply {
+                redact_json_value(&mut value);
+            }
+            let text = serde_json::to_string_pretty(&value)?;
             Ok(SerializedValue {
                 json_bytes: text.len(),
                 text,
@@ -323,13 +465,17 @@ fn serialize_value<T: Serialize>(
             let value = serde_json::to_value(value)?;
             match value {
                 serde_json::Value::String(text) => {
+                    let text = if apply { redact_text(&text) } else { text };
                     // Measured as JSON, returned as text: escaping means the two
                     // sizes genuinely differ, which is why `ResultLimits` has
                     // two fields rather than one.
                     let json_bytes = serde_json::to_string(&text)?.len();
                     Ok(SerializedValue { text, json_bytes })
                 }
-                value => {
+                mut value => {
+                    if apply {
+                        redact_json_value(&mut value);
+                    }
                     let text = serde_json::to_string_pretty(&value)?;
                     Ok(SerializedValue {
                         json_bytes: text.len(),
@@ -360,15 +506,19 @@ mod tests {
     /// alongside this process's own words.
     #[test]
     fn tool_error_with_untrusted_detail_tags_the_device_text() {
+        // Deliberately free of any word `mecmcp-redact` treats as a
+        // denylisted key (e.g. "session") — this test is about tagging,
+        // not redaction, which has its own coverage in
+        // `tool_error_with_untrusted_detail_redacts_the_device_text`.
         let result = tool_error_with_untrusted_detail(
             "staging failed",
-            Untrusted::new("candidate database locked by another session"),
+            Untrusted::new("candidate database locked by another process"),
             "device.stage_error",
         );
         let text = text_of(&result);
         assert_eq!(result.is_error, Some(true));
         assert!(text.contains("staging failed"));
-        assert!(text.contains("candidate database locked by another session"));
+        assert!(text.contains("candidate database locked by another process"));
         assert!(text.contains("<untrusted-device-content id=\""));
         assert!(text.contains("source=\"device.stage_error\""));
         assert!(text.contains("</untrusted-device-content id=\""));
@@ -398,6 +548,7 @@ mod tests {
                 max_text_bytes: 1024,
                 max_json_bytes: 1024,
             },
+            OutputRedaction::Apply,
         );
         assert_ne!(result.is_error, Some(true));
         assert!(text_of(&result).contains("fw-01"));
@@ -414,6 +565,7 @@ mod tests {
                 max_text_bytes: 4,
                 max_json_bytes: 32,
             },
+            OutputRedaction::Apply,
         );
         assert_eq!(result.is_error, Some(true));
         let text = text_of(&result);
@@ -439,6 +591,7 @@ mod tests {
                 max_text_bytes: 16,
                 max_json_bytes: 16,
             },
+            OutputRedaction::Apply,
         );
         assert_eq!(
             result.is_error,
@@ -464,6 +617,7 @@ mod tests {
             Ok("show version"),
             ResultFormat::StringOrPrettyJson,
             limits,
+            OutputRedaction::Apply,
         );
         assert_eq!(text_of(&raw), "show version");
 
@@ -471,6 +625,7 @@ mod tests {
             Ok("show version"),
             ResultFormat::PrettyJson,
             limits,
+            OutputRedaction::Apply,
         );
         assert_eq!(
             text_of(&quoted),
@@ -488,9 +643,200 @@ mod tests {
                 max_text_bytes: 1024,
                 max_json_bytes: 1024,
             },
+            OutputRedaction::Apply,
         );
         assert_eq!(result.is_error, Some(true));
         assert_eq!(text_of(&result), "device unreachable");
+    }
+
+    /// A device error routinely quotes the offending config statement back
+    /// (a Junos commit-check failure, a PAN-OS API error body), so the
+    /// `Err` branch of `tool_result` must redact exactly as its `Ok` branch
+    /// does. Regression for the review finding on #458: this failed before
+    /// `tool_error` redacted its input.
+    #[test]
+    fn tool_result_redacts_a_secret_bearing_error_by_default() {
+        let device_error = "commit failed: set security ike policy p1 pre-shared-key ascii-text \"$9$FAKEhash\"; ## SECRET-DATA\nsnmp community FAKEcomm4"; // gitleaks:allow -- fabricated $9$ hash ("FAKE"), not a real device secret
+        let result = tool_result::<serde_json::Value, _>(
+            Err(device_error),
+            ResultFormat::PrettyJson,
+            ResultLimits {
+                max_text_bytes: 1024,
+                max_json_bytes: 1024,
+            },
+            OutputRedaction::Apply,
+        );
+        let text = text_of(&result);
+        assert_eq!(result.is_error, Some(true));
+        assert!(!text.contains("FAKEhash"), "got {text}");
+        assert!(!text.contains("FAKEcomm4"), "got {text}");
+    }
+
+    /// Same regression as above, for the detail text carried through
+    /// `tool_error_with_untrusted_detail`: a password inside the untrusted
+    /// tag must be redacted, not merely tagged.
+    #[test]
+    fn tool_error_with_untrusted_detail_redacts_the_device_text() {
+        let result = tool_error_with_untrusted_detail(
+            "stage failed",
+            Untrusted::new("error: password FAKEpw5 rejected"),
+            "dev",
+        );
+        let text = text_of(&result);
+        assert_eq!(result.is_error, Some(true));
+        assert!(!text.contains("FAKEpw5"), "got {text}");
+        assert!(text.contains("<untrusted-device-content id=\""));
+    }
+
+    /// Regression for the review finding on #458 (R1): redacting the tagged
+    /// block a second time (once when `tool_error_with_untrusted_detail`
+    /// redacted `detail`, again when it routed the tagged string back through
+    /// `tool_error`) let an unterminated PEM `BEGIN` line in device text
+    /// consume the closing `</untrusted-device-content>` tag, because
+    /// `redact_text`'s PEM handling drops every line after an open `BEGIN`
+    /// until a matching `END` line — including the tag markup appended after
+    /// it. Each piece must be redacted exactly once.
+    #[test]
+    fn tool_error_with_untrusted_detail_closes_its_tag_after_an_unterminated_pem_header() {
+        let result = tool_error_with_untrusted_detail(
+            "staging failed",
+            Untrusted::new(
+                "error at line 3\n-----BEGIN RSA PRIVATE KEY-----\nMIIFAKE\n(truncated)",
+            ), // gitleaks:allow -- fabricated, unterminated PEM header, not a real key
+            "device.stage_error",
+        );
+        let text = text_of(&result);
+        assert!(
+            text.contains("</untrusted-device-content id=\""),
+            "the closing tag must survive redaction: got {text}"
+        );
+    }
+
+    /// Regression for the review finding on #458 (R2): `mecmcp-changeset`
+    /// tags a device error with `Untrusted::render_tagged` *before* it ever
+    /// reaches `tool_error` (`CoordinatorError`'s message already carries the
+    /// tag). `tool_error` then redacts that already-tagged string, which is
+    /// the same "redact after tagging" shape as R1, just reached through a
+    /// real production call site instead of `tool_error_with_untrusted_detail`.
+    /// An unterminated PEM `BEGIN` line in the device text must not consume
+    /// the closing tag here either.
+    #[test]
+    fn tool_result_closes_the_tag_on_an_already_tagged_error_with_an_unterminated_pem_header() {
+        let tagged_device_error = Untrusted::new(
+            "error at line 3\n-----BEGIN RSA PRIVATE KEY-----\nMIIFAKE\n(truncated)",
+        ) // gitleaks:allow -- fabricated, unterminated PEM header, not a real key
+        .render_tagged("device.stage_error");
+        let coordinator_error = format!("staging failed: {tagged_device_error}");
+        let result = tool_result::<serde_json::Value, _>(
+            Err(coordinator_error),
+            ResultFormat::PrettyJson,
+            ResultLimits {
+                max_text_bytes: 4096,
+                max_json_bytes: 4096,
+            },
+            OutputRedaction::Apply,
+        );
+        let text = text_of(&result);
+        assert!(
+            text.contains("</untrusted-device-content id=\""),
+            "the closing tag must survive redaction: got {text}"
+        );
+        assert!(!text.contains("MIIFAKE"), "got {text}");
+    }
+
+    /// The whole point of this crate change: a handler that builds its
+    /// result with `tool_result` and never calls `mecmcp-redact` itself still
+    /// gets a redacted value back, because `OutputRedaction::Apply` runs
+    /// unconditionally for `PrettyJson`.
+    #[test]
+    fn tool_result_redacts_a_pretty_json_value_by_default() {
+        let result = tool_result::<_, std::convert::Infallible>(
+            Ok(serde_json::json!({"hostname": "fw-01", "api_key": "FAKEabc123secret"})),
+            ResultFormat::PrettyJson,
+            ResultLimits {
+                max_text_bytes: 1024,
+                max_json_bytes: 1024,
+            },
+            OutputRedaction::Apply,
+        );
+        let text = text_of(&result);
+        assert_ne!(result.is_error, Some(true));
+        assert!(text.contains("fw-01"), "got {text}");
+        assert!(!text.contains("FAKEabc123secret"), "got {text}");
+    }
+
+    /// Same default, for the `StringOrPrettyJson` string path — the shape a
+    /// device CLI dump takes.
+    #[test]
+    fn tool_result_redacts_a_raw_string_value_by_default() {
+        let result = tool_result::<_, std::convert::Infallible>(
+            Ok("hostname fw-01\npassword: hunter2-fake\n"),
+            ResultFormat::StringOrPrettyJson,
+            ResultLimits {
+                max_text_bytes: 1024,
+                max_json_bytes: 1024,
+            },
+            OutputRedaction::Apply,
+        );
+        let text = text_of(&result);
+        assert_ne!(result.is_error, Some(true));
+        assert!(text.contains("fw-01"), "got {text}");
+        assert!(!text.contains("hunter2-fake"), "got {text}");
+    }
+
+    /// `SkipForInternalRead` is the only way to get an unredacted value back
+    /// out of `tool_result`, and it must be opted into per call — nothing
+    /// about `OutputRedaction::Apply` from another call site leaks into this
+    /// one.
+    #[test]
+    fn skip_for_internal_read_returns_the_value_unredacted() {
+        let result = tool_result::<_, std::convert::Infallible>(
+            Ok(serde_json::json!({"api_key": "FAKEabc123secret"})),
+            ResultFormat::PrettyJson,
+            ResultLimits {
+                max_text_bytes: 1024,
+                max_json_bytes: 1024,
+            },
+            OutputRedaction::SkipForInternalRead {
+                tool: "get_audit_log",
+                reason: "reads this process's own audit log entries, not vendor secrets",
+            },
+        );
+        let text = text_of(&result);
+        assert_ne!(result.is_error, Some(true));
+        assert!(text.contains("FAKEabc123secret"), "got {text}");
+    }
+
+    /// `AlreadyRedacted` must not run `redact_json_value` a second time:
+    /// the whole point is that the caller already redacted `value` itself,
+    /// in a pass that kept a field `Apply`'s unconditional redaction would
+    /// have stripped — here standing in for a pagination continuation
+    /// token. A second pass over the same value is a no-op for real
+    /// secrets but would be a correctness bug the moment the caller's
+    /// exemption and this crate's denylist ever disagreed.
+    #[test]
+    fn already_redacted_returns_the_value_untouched() {
+        let result = tool_result::<_, std::convert::Infallible>(
+            Ok(serde_json::json!({
+                "continuation_token": "page-2",
+                "entries": ["already redacted by the caller"],
+            })),
+            ResultFormat::PrettyJson,
+            ResultLimits {
+                max_text_bytes: 1024,
+                max_json_bytes: 1024,
+            },
+            OutputRedaction::AlreadyRedacted {
+                tool: "list_continuations",
+                redacted_by: "redact_json_value at the call site, to keep continuation_token",
+            },
+        );
+        let text = text_of(&result);
+        assert_ne!(result.is_error, Some(true));
+        assert!(
+            text.contains("page-2"),
+            "a pagination token the caller exempted must survive: got {text}"
+        );
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub const DENYLISTED_KEYS: &[&str] = &[
     "xsecret",
     "phash",
     "community",
+    "communities",
+    "communitystring",
     "apikey",
     "token",
     "authenticationkey",
@@ -37,6 +39,11 @@ pub const DENYLISTED_KEYS: &[&str] = &[
     "passwd",
     "pwd",
     "session",
+    "sessionid",
+    "sessiontoken",
+    "sessionkey",
+    "sessioncookie",
+    "sessionsecret",
     "keystring",
     "messagedigestkey",
     "authkey",
@@ -44,6 +51,8 @@ pub const DENYLISTED_KEYS: &[&str] = &[
     "partnerkey",
     "accountkey",
     "clientkey",
+    // MEC-1245: extends Junos field coverage in the shared denylist.
+    "hmackey",
 ];
 
 /// Field names that must match the *whole* normalized key, not a substring.
@@ -53,7 +62,20 @@ pub const DENYLISTED_KEYS: &[&str] = &[
 /// named `key0`, ...). But the bare field name `key` alone is exactly the
 /// PAN-OS keygen response shape (`<result><key>` is the API key itself), so it
 /// still needs to be denylisted — just under exact match instead.
-const DENYLISTED_EXACT_KEYS: &[&str] = &["key"];
+///
+/// `pub` (not `pub(crate)`) for two independent consumers:
+/// [`crate::profile::Profile::check_exemptions`] refuses a vendor exemption
+/// that exactly matches one of these, the same way it refuses one matching
+/// [`DENYLISTED_KEYS`]; the crate's property test also enumerates this list
+/// directly to assert every exact-match secret field is covered.
+pub const DENYLISTED_EXACT_KEYS: &[&str] = &["key"];
+
+/// Exact-match field name that is a secret only given additional sibling or
+/// parent context (see [`is_wep_keys_field`]), not by name alone — so it
+/// cannot live in [`DENYLISTED_EXACT_KEYS`] without over-matching every
+/// unrelated `keys` field. A vendor exemption must still not be allowed to
+/// claim this exact name, since in the right context it is secret-bearing.
+pub(crate) const CONTEXTUALLY_DENYLISTED_EXACT_KEYS: &[&str] = &["keys"];
 
 /// Whether `key` is a WEP key-material field, identifiable only by the shape
 /// of its enclosing object rather than its own name.
@@ -77,9 +99,78 @@ pub fn is_wep_keys_field(key: &str, parent_key: Option<&str>, sibling_type: Opti
     parent_key.is_some_and(|p| normalize(p) == "auth")
 }
 
+/// Whether `key` is the BGP configuration scope that [`is_bgp_community_field`]
+/// looks for among a value's ancestors.
+#[must_use]
+pub fn is_bgp_scope_key(key: &str) -> bool {
+    normalize(key) == "bgp"
+}
+
+/// Whether `key` is a BGP route-community field that may survive despite
+/// normalizing to the `community` substring entry.
+///
+/// PAN-OS and Junos both spell a BGP route community (a routing-policy tag
+/// like `65000:100`, public on the wire) with the exact same bare `community`
+/// field an SNMP community *string* (a shared secret) uses — the two are
+/// indistinguishable by field name alone. PAN-OS nests its BGP route
+/// community under a `bgp` element, which SNMP configuration never is, so a
+/// caller walking the tree can tell them apart by checking whether a `bgp`
+/// scope is among the value's ancestors. Junos instead nests its route
+/// communities under `policy-options`, not `bgp`, so this exemption does not
+/// fire for them and they stay redacted — over-redaction, the safe direction
+/// to be wrong in, not a leak.
+///
+/// This is necessary but not sufficient: it only tells the caller the *key*
+/// matches the shape. A `bgp` ancestor can itself be a vendor's own
+/// user-chosen map key (a profile, VR, or template literally named `bgp`),
+/// so the key-only check does not prove the field underneath is actually
+/// BGP routing data. Callers must additionally confirm the value with
+/// [`is_bgp_community_tag`] before skipping redaction — a secret does not
+/// parse as community-tag syntax even when it happens to sit under
+/// something named `bgp`.
+#[must_use]
+pub fn is_bgp_community_field(key: &str, under_bgp_scope: bool) -> bool {
+    under_bgp_scope && normalize(key) == "community"
+}
+
+/// Whether `s` looks like BGP community-tag syntax (`65000:100`, a routing
+/// tag; or `65000:100:5`, an extended/large community) or one of BGP's
+/// well-known community names, rather than an arbitrary secret value.
+///
+/// Required alongside [`is_bgp_community_field`] before exempting a
+/// `community` field from redaction: the key-only check cannot tell a real
+/// BGP routing policy apart from an unrelated value that merely sits under a
+/// `bgp`-named ancestor, so the value itself has to back up the "this is
+/// public routing data" claim. A secret string does not parse as this
+/// shape.
+#[must_use]
+pub fn is_bgp_community_tag(s: &str) -> bool {
+    const WELL_KNOWN: &[&str] = &[
+        "no-export",
+        "no-advertise",
+        "no-peer",
+        "no-export-subconfed",
+        "local-as",
+        "internet",
+    ];
+    if WELL_KNOWN.iter().any(|w| s.eq_ignore_ascii_case(w)) {
+        return true;
+    }
+    let parts: Vec<&str> = s.split(':').collect();
+    (parts.len() == 2 || parts.len() == 3)
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Lowercase `s` and drop every non-alphanumeric byte, so `pre-shared-key`,
 /// `pre_shared_key`, and `preSharedKey` all normalize to `presharedkey`.
-fn normalize(s: &str) -> String {
+///
+/// `pub(crate)` so [`crate::profile`] can match a vendor-declared field name
+/// under the exact same normalization the denylist itself uses, rather than
+/// maintaining a second normalize function that could drift out of sync with
+/// this one.
+pub(crate) fn normalize(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .flat_map(|c| c.to_lowercase())
@@ -208,6 +299,119 @@ mod tests {
                     "expected '{variant}' (variant of spec key '{spec_key}') to be denylisted"
                 );
             }
+        }
+    }
+
+    /// MEC-1245: extends Junos field coverage in the shared denylist.
+    #[test]
+    fn mec_1245_junos_routing_auth_keys_denylisted() {
+        for key in ["hmac-key", "hmac_key", "hmacKey", "HMAC-KEY"] {
+            assert!(is_denylisted_key(key), "'{key}' must be denylisted");
+        }
+    }
+
+    /// `session` and `community` match as a substring (a session
+    /// cookie/token, or PAN-OS/Junos's SNMP community string), and so do
+    /// operational/routing-policy field names that merely contain those
+    /// words (`idle-timeout-tcp-session`, `community-list`, ...). There is
+    /// no global key-name exemption for them: a vendor server that needs one
+    /// declares a [`crate::profile::Profile`] with those exact names as
+    /// `key_exemptions`, scoped to that vendor's own tool-output path,
+    /// rather than loosening this crate's default for every caller.
+    #[test]
+    fn mec_537_session_and_community_match_as_substrings() {
+        for key in [
+            "session",
+            "Session",
+            "community",
+            "Community",
+            "idle-timeout-tcp-session",
+            "sessions-active",
+            "max-sessions",
+            "session-timeout",
+            "sessions",
+            "community-list",
+            "match-community",
+            "add-community",
+            "remove-community",
+        ] {
+            assert!(is_denylisted_key(key), "'{key}' must be denylisted");
+        }
+    }
+
+    /// Compound spellings not on the exceptions list still match as a
+    /// substring.
+    #[test]
+    fn mec_537_secret_shaped_session_and_community_compounds_still_match() {
+        for key in [
+            "session_id",
+            "sessionId",
+            "session-token",
+            "session_key",
+            "session_cookie",
+            "jsessionid",
+            "auth_session",
+            "user_session",
+            "x-session",
+            "session_data",
+            "session_ticket",
+            "session-hash",
+            "session_value",
+            "community_string",
+            "communityString",
+            "snmp-community-string",
+            "community_name",
+            "communityName",
+            "community-name",
+            "ro_community",
+            "rw-community",
+            "read-community",
+            "trap-community",
+            "snmp_community",
+            "snmpCommunity",
+            "community-key",
+        ] {
+            assert!(is_denylisted_key(key), "'{key}' must be denylisted");
+        }
+    }
+
+    /// These community-related keys have no vendor evidence to justify an
+    /// exemption and must be denylisted.
+    #[test]
+    fn mec_1342_unjustified_community_exceptions_are_denylisted() {
+        for key in ["communities", "communitymembers", "overwritecommunity"] {
+            assert!(is_denylisted_key(key), "'{key}' must be denylisted");
+        }
+    }
+
+    #[test]
+    fn mec_537_bgp_community_field_only_matches_under_bgp_scope() {
+        assert!(is_bgp_community_field("community", true));
+        assert!(!is_bgp_community_field("community", false));
+        assert!(!is_bgp_community_field("community-list", true));
+        assert!(is_bgp_scope_key("bgp"));
+        assert!(!is_bgp_scope_key("bgp-peer-group"));
+    }
+
+    /// The key-only `bgp`-ancestor check is not enough on its own — the
+    /// value itself must look like BGP community-tag syntax before the
+    /// exemption applies.
+    #[test]
+    fn mec_537_bgp_community_tag_requires_community_shaped_value() {
+        for tag in [
+            "65000:100",
+            "4294967295:100",
+            "1:2:3",
+            "no-export",
+            "NO-EXPORT",
+        ] {
+            assert!(is_bgp_community_tag(tag), "'{tag}' should look BGP-shaped");
+        }
+        for not_tag in ["QQSecretValue", "", "65000", "65000:", ":100", "a:b"] {
+            assert!(
+                !is_bgp_community_tag(not_tag),
+                "'{not_tag}' should not look BGP-shaped"
+            );
         }
     }
 

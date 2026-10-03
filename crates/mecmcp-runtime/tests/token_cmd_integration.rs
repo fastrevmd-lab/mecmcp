@@ -1381,8 +1381,9 @@ fn add_with_both_oidc_flags_stores_the_binding() {
         oidc_subject: Some("alice".to_owned()),
         server_pid: None,
     };
-    let result = run(action, &[], KNOWN_TOOLS);
-    assert!(result.is_ok(), "add failed: {result:?}");
+    if let Err(e) = &run(action, &[], KNOWN_TOOLS) {
+        panic!("add failed: {e}");
+    }
 
     let store_file = TokenStoreFile::<mecmcp_auth::NoGrant>::load(&tokens_file).unwrap();
     let store = store_file.store();
