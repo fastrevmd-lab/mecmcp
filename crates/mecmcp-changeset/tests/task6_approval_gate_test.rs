@@ -13,7 +13,7 @@
 
 use mecmcp_changeset::{
     ApprovalRecord, ApproverIdentity, ChangeSetRecord, ChangeSetState, ChangesetCoordinator,
-    OperationLimits, OwnerSubject, change_set_digest,
+    OperationLimits, OwnerSubject, WaiverKind, change_set_digest,
     persistence::{read_state, read_state_with_key, write_state_for_test},
 };
 use std::path::PathBuf;
@@ -39,10 +39,7 @@ fn oidc_verified_approver(principal: &str, issuer: &str, subject: &str) -> Appro
         change_ref: None,
         request_id: uuid::Uuid::nil(),
         token_verified_fields: mecmcp_audit::TokenVerifiedFields::default(),
-        verified_approver: Some(mecmcp_auth::VerifiedApprover {
-            issuer: issuer.to_owned(),
-            subject: subject.to_owned(),
-        }),
+        verified_approver: Some(mecmcp_auth::VerifiedApprover::for_test(issuer, subject)),
         approver: None,
         change_set_id: None,
     };
@@ -1368,5 +1365,56 @@ async fn strict_mode_refuses_to_approve_when_owner_subject_is_missing() {
             .unwrap_err()
             .to_string()
             .contains("requires the change set to carry an owner_subject")
+    );
+}
+
+/// MEC-994 Percy review F10: an operator waiver (`waive_approval_operator`)
+/// has no verified-identity check of its own, so without this guard an
+/// owner could grant themselves an operator waiver under strict mode and
+/// reach `Approved` with no verified second human at all — exactly the
+/// property strict mode exists to prevent.
+#[tokio::test]
+async fn strict_mode_refuses_an_operator_waiver() {
+    let (dir, coordinator, _key) = setup_strict_coordinator();
+    let _ = &dir;
+
+    let actions = vec![TestAction {
+        action: "set".to_string(),
+        target: "/test/path".to_string(),
+    }];
+    let created = coordinator
+        .create_change_set(
+            "device-a".to_string(),
+            actions,
+            "alice".to_string(),
+            test_fingerprint(),
+            "policy-sig".to_string(),
+            Some(OwnerSubject {
+                issuer: "https://idp.example".to_string(),
+                subject: "alice-sub".to_string(),
+            }),
+        )
+        .await
+        .expect("create");
+
+    let result = coordinator
+        .waive_approval_operator(
+            created.change_set_id.clone(),
+            "device-a".to_string(),
+            "alice".to_string(),
+            created.digest.clone(),
+            WaiverKind::OperatorTool,
+            "authorised exception".to_string(),
+            None,
+            None,
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("refused under strict verified-approver mode")
     );
 }

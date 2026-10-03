@@ -196,10 +196,10 @@ mod tests {
         let attribution = test_attribution(
             "bob",
             mecmcp_audit::ActorType::Human,
-            Some(mecmcp_auth::VerifiedApprover {
-                issuer: "https://idp.example".to_owned(),
-                subject: "bob-sub".to_owned(),
-            }),
+            Some(mecmcp_auth::VerifiedApprover::for_test(
+                "https://idp.example",
+                "bob-sub",
+            )),
         );
         let identity = ApproverIdentity::from_attribution(&attribution);
         assert_eq!(

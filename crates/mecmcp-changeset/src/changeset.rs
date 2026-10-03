@@ -645,6 +645,19 @@ impl ChangesetCoordinator {
             ));
         }
 
+        // An operator waiver is granted in-band by a second principal calling
+        // a tool, with no verified-identity check of its own. Strict mode
+        // exists so a second human, not a second token, approves. Without
+        // this check, the owner can grant themselves an operator waiver and
+        // reach `Approved` with no verified approver at all (MEC-994 Percy
+        // review F10).
+        if self.require_verified_approver() {
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                "approval waiver is refused under strict verified-approver mode",
+            ));
+        }
+
         validate_digest(&expected_digest, "expected_digest")
             .map_err(|e| CoordinatorError::new("expected_digest", e.to_string()))?;
 

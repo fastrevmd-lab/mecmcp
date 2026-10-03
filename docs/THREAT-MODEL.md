@@ -82,7 +82,11 @@ LLM / MCP client ──(1)── mecmcp server ──(2)── network device / 
   `with_require_verified_approver`, surfaced to a CLI as `--require-verified-approver`)
   where the approve call must additionally carry a fresh IdP-issued assertion bound to a
   distinct IdP subject from the proposer's — see trust boundary (5) above — and refuses a
-  lab-mode waiver outright rather than letting it bypass the check. **This is a library
+  lab-mode waiver, an operator waiver, and applying any pre-existing (non-`oidc`) approval
+  outright rather than letting any of them bypass the check. `VerifiedApprover` itself is
+  sealed (`#[non_exhaustive]`, no public constructor): the only way to produce one is
+  `bind_approver` succeeding at the bearer boundary, so a server cannot build one from a
+  tool argument. **This is a library
   capability, not yet a deployed one**: no server in this repository flattens
   `VerifiedApproverArgs` into its CLI or wires a `ChangesetCoordinator` built with it, so
   every server shipped today still has the two-tokens gap this paragraph opened with. That

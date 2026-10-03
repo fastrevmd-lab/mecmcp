@@ -49,12 +49,33 @@ pub struct ApproverPolicy {
 /// no raw claims — the spec requires the JWT itself never be retained past
 /// verification, and widening this type would be the easiest way to violate
 /// that by accident.
+///
+/// `#[non_exhaustive]`, and no public constructor outside this crate: the
+/// only way to produce one is [`bind_approver`] succeeding. A server that
+/// could build this from a tool argument would let a model decide approver
+/// identity, which is exactly the property this type exists to make
+/// unrepresentable (MEC-994 Percy review F9).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VerifiedApprover {
     /// The IdP issuer that signed the verified assertion.
     pub issuer: String,
     /// The IdP's `sub` claim for the approver.
     pub subject: String,
+}
+
+impl VerifiedApprover {
+    /// Test-only constructor, for crates that need a `VerifiedApprover`
+    /// fixture without going through [`bind_approver`]. Gated behind the
+    /// `test-util` feature so it can never ship enabled in a release build.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn for_test(issuer: impl Into<String>, subject: impl Into<String>) -> Self {
+        Self {
+            issuer: issuer.into(),
+            subject: subject.into(),
+        }
+    }
 }
 
 /// Why a presented approver assertion was refused binding to a caller's
