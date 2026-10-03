@@ -111,3 +111,26 @@ pub enum VerificationFailure {
         issuer: String,
     },
 }
+
+impl VerificationFailure {
+    /// A stable, lowercase machine-readable code for this reason, for
+    /// structured audit logging. Separate from the `Display` message, which
+    /// can carry interpolated detail (a key id, an issuer) and is meant for
+    /// humans, not for grouping identical failure classes in a dashboard.
+    #[must_use]
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Malformed(_) => "malformed_jwt",
+            Self::UnknownKeyId(_) => "unknown_key_id",
+            Self::UnsupportedAlgorithm => "unsupported_algorithm",
+            Self::InvalidSignature => "invalid_signature",
+            Self::Expired => "expired",
+            Self::NotYetValid => "not_yet_valid",
+            Self::WrongAudience => "wrong_audience",
+            Self::WrongIssuer => "wrong_issuer",
+            Self::MissingClaim(_) => "missing_claim",
+            Self::MissingIssuedAt => "missing_issued_at",
+            Self::KeysUnavailable { .. } => "keys_unavailable",
+        }
+    }
+}

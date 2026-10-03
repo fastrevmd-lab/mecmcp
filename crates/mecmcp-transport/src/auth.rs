@@ -589,7 +589,11 @@ pub async fn bearer_auth_middleware<G: Grant>(
         match verifier.verify_and_bind(assertion, &caller, now).await {
             Ok(approver) => caller.verified_approver = Some(approver),
             Err(error) => {
-                tracing::warn!(reason = %error, "approver_assertion_rejected");
+                tracing::warn!(
+                    reason = error.reason_code(),
+                    detail = %error,
+                    "approver_assertion_rejected"
+                );
                 return invalid_token(&state.responses);
             }
         }

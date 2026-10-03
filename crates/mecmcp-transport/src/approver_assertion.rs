@@ -133,6 +133,25 @@ pub enum ApproverAssertionError {
     ReplayGuardUnavailable,
 }
 
+impl ApproverAssertionError {
+    /// A stable, lowercase machine-readable code for this reason, for
+    /// structured audit logging. The MEC-994 acceptance criteria require
+    /// every distinct rejection to carry a distinct *audited* reason; the
+    /// `Display` message (used in the 401 body and in `tracing::warn!`) is
+    /// for humans and can repeat text across variants, so this is the stable
+    /// value a log consumer or test should group and assert on instead.
+    #[must_use]
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Verification(inner) => inner.reason_code(),
+            Self::Binding(inner) => inner.reason_code(),
+            Self::MissingJwtId => "missing_jwt_id",
+            Self::ReplayedJti => "replayed_jti",
+            Self::ReplayGuardUnavailable => "replay_guard_unavailable",
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

@@ -291,9 +291,18 @@ pub struct WebApproverArgs {
 
 /// Step-up approver-identity verification switches (MEC-994 W5).
 ///
-/// Flattened into [`Cli`] rather than left standalone like [`WebApproverArgs`]
-/// because `cli_validate::validate` needs to see these together with
-/// `--approval-digest-key-file`, which lives directly on `Cli`.
+/// Standalone, like [`WebApproverArgs`] — **not** flattened into [`Cli`].
+/// Flattening it into the shared `Cli` would put `--require-verified-approver`
+/// on every mecmcp-based server on upgrade, whether or not that server
+/// actually wires a `ChangesetCoordinator` with `with_require_verified_approver`
+/// and an `ApproverIdentity::from_attribution`-derived approver. An operator
+/// who set the flag on a server that does not wire it would get a clean
+/// startup and the old behavior, while `THREAT-MODEL.md` told them otherwise
+/// (MEC-994 Percy review, finding F1). A server opts in explicitly with
+/// `#[command(flatten)]` the same way it opts into `WebApproverArgs`, and
+/// must call [`VerifiedApproverArgs::validate`] itself, since the fields it
+/// cross-checks (`--approval-digest-key-file`, the server's own lab-mode
+/// flag) are not uniform across servers either.
 ///
 /// Absent `--oidc-issuer`, a server behaves identically to one with no OIDC
 /// support at all: no verifier is configured, so a presented
@@ -361,6 +370,71 @@ impl VerifiedApproverArgs {
             require_auth_time: self.approver_require_auth_time,
         })
     }
+
+    /// Cross-check these flags against the two pieces of server-specific
+    /// context this crate cannot see on its own: whether a
+    /// `--approval-digest-key-file` was configured, and whether the
+    /// server's own lab-mode waiver is on.
+    ///
+    /// A server that flattens `VerifiedApproverArgs` must call this (and
+    /// refuse to start on an `Err`) wherever it already validates its own
+    /// CLI, alongside `mecmcp_runtime::cli_validate::validate`.
+    ///
+    /// # Errors
+    /// Returns the specific combination that has no safe interpretation.
+    pub fn validate(
+        &self,
+        digest_key_configured: bool,
+        lab_mode: bool,
+    ) -> Result<(), VerifiedApproverArgsError> {
+        if self.oidc_issuer.is_some() && self.oidc_audience.is_none() {
+            return Err(VerifiedApproverArgsError::IssuerWithoutAudience);
+        }
+        if self.require_verified_approver {
+            if self.oidc_issuer.is_none() {
+                return Err(VerifiedApproverArgsError::RequiresIssuer);
+            }
+            if !digest_key_configured {
+                return Err(VerifiedApproverArgsError::RequiresDigestKey);
+            }
+            if lab_mode {
+                return Err(VerifiedApproverArgsError::IncompatibleWithLabMode);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A `VerifiedApproverArgs` combination with no safe unambiguous
+/// interpretation.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum VerifiedApproverArgsError {
+    /// `--oidc-issuer` was given with no `--oidc-audience`. `OidcConfig`
+    /// requires an audience, so a server building one without this check
+    /// would otherwise have to invent one or silently skip building the
+    /// verifier — either of which is a worse failure than refusing here.
+    #[error("--oidc-issuer requires --oidc-audience")]
+    IssuerWithoutAudience,
+    /// Strict verified-approver mode needs an IdP to verify assertions
+    /// against.
+    #[error("--require-verified-approver requires --oidc-issuer")]
+    RequiresIssuer,
+    /// Strict mode without a keyed approval digest lets the verified-approver
+    /// fields (mechanism/issuer/subject/owner_subject) in a change-set record
+    /// be edited with no detection, which defeats the point of requiring them.
+    #[error(
+        "--require-verified-approver requires --approval-digest-key-file: without a keyed \
+         digest, the verified-approver fields recorded in a change-set are not tamper-evident"
+    )]
+    RequiresDigestKey,
+    /// Lab mode lets an owner waive their own approval outright, which
+    /// bypasses the two-person rule strict mode exists to enforce — the two
+    /// are mutually exclusive, not layered.
+    #[error(
+        "--require-verified-approver is incompatible with lab mode: lab mode lets an owner \
+         waive approval outright, which bypasses the verified-approver gate entirely"
+    )]
+    IncompatibleWithLabMode,
 }
 
 /// SSDF evidence-pipeline switches, defined once and flattened into every
@@ -877,11 +951,6 @@ pub struct Cli {
     /// approval digest (MEC-457).
     #[arg(long)]
     pub approval_digest_key_file: Option<PathBuf>,
-
-    /// Step-up approver-identity verification (MEC-994 W5). Inert unless
-    /// `--oidc-issuer` is given.
-    #[command(flatten)]
-    pub verified_approver: VerifiedApproverArgs,
 }
 
 /// Top-level management commands.
@@ -1385,9 +1454,20 @@ mod composition_tests {
         assert!(args.approver_policy().is_none());
     }
 
+    /// A server opts into `VerifiedApproverArgs` by flattening it alongside
+    /// `Cli`, exactly like `WebApproverArgs` — it is not part of `Cli` itself
+    /// (MEC-994 Percy review F1).
+    #[derive(Debug, Parser)]
+    struct VerifiedApproverTestCli {
+        #[command(flatten)]
+        shared: Cli,
+        #[command(flatten)]
+        verified_approver: VerifiedApproverArgs,
+    }
+
     #[test]
     fn verified_approver_args_no_issuer_means_no_policy_regardless_of_other_flags() {
-        let cli = Cli::parse_from([
+        let cli = VerifiedApproverTestCli::parse_from([
             "test",
             "--approver-role",
             "security-approver",
@@ -1403,7 +1483,7 @@ mod composition_tests {
 
     #[test]
     fn verified_approver_args_build_policy_when_issuer_is_set() {
-        let cli = Cli::parse_from([
+        let cli = VerifiedApproverTestCli::parse_from([
             "test",
             "--oidc-issuer",
             "https://idp.example",
@@ -1430,7 +1510,7 @@ mod composition_tests {
 
     #[test]
     fn verified_approver_args_defaults() {
-        let cli = Cli::parse_from(["test"]);
+        let cli = VerifiedApproverTestCli::parse_from(["test"]);
         assert_eq!(cli.verified_approver.oidc_role_claim, "roles");
         assert_eq!(cli.verified_approver.approver_role, "approver");
         assert_eq!(cli.verified_approver.approver_max_age_secs, 300);
@@ -1444,6 +1524,8 @@ mod composition_tests {
         struct ServerCli {
             #[command(flatten)]
             shared: Cli,
+            #[command(flatten)]
+            verified_approver: VerifiedApproverArgs,
             #[arg(long, default_value_t = 900)]
             approval_timeout_secs: u64,
         }
@@ -1455,21 +1537,89 @@ mod composition_tests {
                 "consumer-mcp",
                 "--oidc-issuer",
                 "https://idp.example",
+                "--oidc-audience",
+                "mecmcp",
                 "--require-verified-approver",
             ],
         )
         .expect("VerifiedApproverArgs must flatten without conflict");
 
         assert_eq!(
-            parsed.cli.shared.verified_approver.oidc_issuer.as_deref(),
+            parsed.cli.verified_approver.oidc_issuer.as_deref(),
             Some("https://idp.example")
         );
+        assert!(parsed.cli.verified_approver.require_verified_approver);
+    }
+
+    #[test]
+    fn verified_approver_args_validate_requires_issuer_for_strict_mode() {
+        let args = VerifiedApproverArgs {
+            require_verified_approver: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            args.validate(true, false),
+            Err(VerifiedApproverArgsError::RequiresIssuer)
+        );
+    }
+
+    #[test]
+    fn verified_approver_args_validate_requires_digest_key_for_strict_mode() {
+        let args = VerifiedApproverArgs {
+            oidc_issuer: Some("https://idp.example".to_owned()),
+            oidc_audience: Some("mecmcp".to_owned()),
+            require_verified_approver: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            args.validate(false, false),
+            Err(VerifiedApproverArgsError::RequiresDigestKey)
+        );
+    }
+
+    #[test]
+    fn verified_approver_args_validate_refuses_lab_mode_in_strict_mode() {
+        let args = VerifiedApproverArgs {
+            oidc_issuer: Some("https://idp.example".to_owned()),
+            oidc_audience: Some("mecmcp".to_owned()),
+            require_verified_approver: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            args.validate(true, true),
+            Err(VerifiedApproverArgsError::IncompatibleWithLabMode)
+        );
+    }
+
+    #[test]
+    fn verified_approver_args_validate_requires_audience_with_issuer() {
+        let args = VerifiedApproverArgs {
+            oidc_issuer: Some("https://idp.example".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            args.validate(true, false),
+            Err(VerifiedApproverArgsError::IssuerWithoutAudience)
+        );
+    }
+
+    #[test]
+    fn verified_approver_args_validate_ok_with_issuer_audience_and_digest_key() {
+        let args = VerifiedApproverArgs {
+            oidc_issuer: Some("https://idp.example".to_owned()),
+            oidc_audience: Some("mecmcp".to_owned()),
+            require_verified_approver: true,
+            ..Default::default()
+        };
+        assert!(args.validate(true, false).is_ok());
+    }
+
+    #[test]
+    fn verified_approver_args_validate_ok_with_no_flags_at_all() {
         assert!(
-            parsed
-                .cli
-                .shared
-                .verified_approver
-                .require_verified_approver
+            VerifiedApproverArgs::default()
+                .validate(false, false)
+                .is_ok()
         );
     }
 }

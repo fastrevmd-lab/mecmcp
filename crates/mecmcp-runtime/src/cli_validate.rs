@@ -65,18 +65,6 @@ pub enum CliRefusal {
         /// Whether key was set.
         key: bool,
     },
-    /// Strict verified-approver mode needs an IdP to verify assertions
-    /// against.
-    #[error("--require-verified-approver requires --oidc-issuer")]
-    VerifiedApproverRequiresIssuer,
-    /// Strict mode without a keyed approval digest lets the verified-approver
-    /// fields (mechanism/issuer/subject/owner_subject) in a change-set record
-    /// be edited with no detection, which defeats the point of requiring them.
-    #[error(
-        "--require-verified-approver requires --approval-digest-key-file: without a keyed \
-         digest, the verified-approver fields recorded in a change-set are not tamper-evident"
-    )]
-    VerifiedApproverRequiresDigestKey,
 }
 
 /// Validate all serve arguments before inventory, secrets, sockets, or TLS load.
@@ -89,17 +77,6 @@ pub enum CliRefusal {
 /// for every consumer, so the weaker check that accepted a listener with no
 /// Origin allowlist is itself an instance of the defect class in mecmcp#273.
 pub fn validate(cli: &Cli) -> Result<(), CliRefusal> {
-    // Verified-approver strict mode is not a transport concept: refuse it
-    // before the stdio early-return below, which otherwise would skip it.
-    if cli.verified_approver.require_verified_approver {
-        if cli.verified_approver.oidc_issuer.is_none() {
-            return Err(CliRefusal::VerifiedApproverRequiresIssuer);
-        }
-        if cli.approval_digest_key_file.is_none() {
-            return Err(CliRefusal::VerifiedApproverRequiresDigestKey);
-        }
-    }
-
     // Stdio needs no transport validation.
     if cli.transport == Transport::Stdio {
         return Ok(());
@@ -542,51 +519,8 @@ mod tests {
         );
     }
 
-    /// MEC-994 W5: strict mode with no issuer configured has nothing to
-    /// verify assertions against.
-    #[test]
-    fn require_verified_approver_without_issuer_is_refused() {
-        let r = validate(&parse(&["--require-verified-approver"]));
-        assert_eq!(r, Err(CliRefusal::VerifiedApproverRequiresIssuer));
-    }
-
-    /// MEC-994 W5: strict mode checked ahead of the stdio early-return, since
-    /// it is not a transport concept.
-    #[test]
-    fn require_verified_approver_refused_even_on_stdio() {
-        let r = validate(&parse(&["-t", "stdio", "--require-verified-approver"]));
-        assert_eq!(r, Err(CliRefusal::VerifiedApproverRequiresIssuer));
-    }
-
-    /// MEC-994 W5: strict mode with an issuer but no keyed approval digest
-    /// would let the new fields it depends on be edited undetected.
-    #[test]
-    fn require_verified_approver_without_digest_key_is_refused() {
-        let r = validate(&parse(&[
-            "--require-verified-approver",
-            "--oidc-issuer",
-            "https://idp.example",
-        ]));
-        assert_eq!(r, Err(CliRefusal::VerifiedApproverRequiresDigestKey));
-    }
-
-    /// MEC-994 W5: issuer and a keyed digest together satisfy strict mode.
-    #[test]
-    fn require_verified_approver_with_issuer_and_digest_key_ok() {
-        let r = validate(&parse(&[
-            "--require-verified-approver",
-            "--oidc-issuer",
-            "https://idp.example",
-            "--approval-digest-key-file",
-            "/tmp/key",
-        ]));
-        assert!(r.is_ok(), "{r:?}");
-    }
-
-    /// MEC-994 W5: no issuer configured at all means no OIDC support, exactly
-    /// like today — this must stay unaffected by the new flags.
-    #[test]
-    fn no_verified_approver_flags_behaves_like_before() {
-        assert!(validate(&parse(&[])).is_ok());
-    }
+    // `--require-verified-approver` and friends (MEC-994 W5) are no longer
+    // flags on the shared `Cli` at all (see `VerifiedApproverArgs`'s doc
+    // comment for why), so their cross-checks live and are tested on
+    // `VerifiedApproverArgs::validate` in `cli.rs`, not here.
 }

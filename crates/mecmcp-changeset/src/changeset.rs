@@ -269,13 +269,44 @@ impl ChangesetCoordinator {
             ));
         }
 
-        if self.require_verified_approver()
-            && !matches!(approver, ApproverIdentity::OidcVerified { .. })
-        {
-            return Err(CoordinatorError::new(
-                "approver",
-                "strict verified-approver mode requires an IdP-verified approver assertion",
-            ));
+        if self.require_verified_approver() {
+            if !matches!(approver, ApproverIdentity::OidcVerified { .. }) {
+                return Err(CoordinatorError::new(
+                    "approver",
+                    "strict verified-approver mode requires an IdP-verified approver assertion",
+                ));
+            }
+            // Strict mode exists to make the verified-approver fields
+            // (mechanism/issuer/subject/owner_subject) tamper-evident via the
+            // keyed v7 digest. Without a key, `approve_change_set` below
+            // falls back to the unkeyed v5 digest, which silently drops
+            // every one of those fields — the acceptance criterion "editing
+            // mechanism/issuer/subject fails the HMAC check" would then not
+            // apply even though strict mode is on (MEC-994 Percy review F3).
+            if self.approval_digest_key().is_none() {
+                return Err(CoordinatorError::new(
+                    "approval_digest_key",
+                    "strict verified-approver mode requires a keyed approval digest \
+                     (--approval-digest-key-file); without one, the verified-approver \
+                     fields recorded in this approval would not be tamper-evident",
+                ));
+            }
+            // A `Planned` record's `owner_subject` is not itself covered by
+            // any digest until this approval signs it in, so a missing value
+            // here could mean the owner's token genuinely had no binding at
+            // propose time, or that the field was stripped from the state
+            // file after the fact (MEC-994 Percy review F4). Strict mode
+            // cannot tell those apart, so it refuses rather than silently
+            // skipping the self-approval check below.
+            if record.owner_subject.is_none() {
+                return Err(CoordinatorError::new(
+                    "owner_subject",
+                    "strict verified-approver mode requires the change set to carry an \
+                     owner_subject; this one has none, which either means it was proposed \
+                     before strict mode was in effect or that owner_subject was stripped \
+                     from the state file after proposal",
+                ));
+            }
         }
 
         // The house rule is two *people*, not two tokens. A verified subject
@@ -466,6 +497,24 @@ impl ChangesetCoordinator {
             return Err(CoordinatorError::new(
                 "change_set_id",
                 "approval waiver requires lab mode to be enabled",
+            ));
+        }
+
+        // Lab mode lets the owner approve their own change set outright —
+        // the opposite of what strict verified-approver mode exists to
+        // enforce. The two are mutually exclusive by construction
+        // (`VerifiedApproverArgs::validate` refuses to start a server with
+        // both), but that is a courtesy pre-check on one CLI shape, not a
+        // guarantee about every coordinator built directly against this
+        // crate's API. Refuse here too, so a lab-mode owner cannot waive
+        // their own approval purely because this check was skipped
+        // elsewhere (MEC-994 Percy review F2).
+        if self.require_verified_approver() {
+            return Err(CoordinatorError::new(
+                "change_set_id",
+                "approval waiver is refused under strict verified-approver mode: lab mode \
+                 lets the owner approve their own change set, which strict mode exists to \
+                 prevent",
             ));
         }
 

@@ -196,6 +196,19 @@ proposer's identity. The approver's existing bearer token is unchanged; the
 JWT is an extra assertion, sent as `Mecmcp-Approver-Assertion`, never as
 `Authorization` and never as a tool argument.
 
+**This is a core-library capability, not yet a feature of any server in this
+repository.** `mecmcp-oidc`, `mecmcp-auth`, `mecmcp-changeset` and
+`mecmcp-transport` all support it, but a server must opt in explicitly — flatten
+`mecmcp_runtime::cli::VerifiedApproverArgs` into its own CLI (it is standalone,
+like `WebApproverArgs`, not part of the shared `Cli`), call its `validate`
+alongside the server's own CLI validation, construct an
+`ApproverAssertionVerifier`, and build every `ApproverIdentity` it passes to
+`approve_change_set`/`create_change_set` via `ApproverIdentity::from_attribution`
+rather than constructing one by hand. `rust-junosmcp` is the planned first
+server to do this (MEC-994 W8); the commands below use it as the running
+example of what that integration will look like, not something it supports
+today.
+
 **1. Register an app in your IdP.** Any OIDC provider that can issue a JWT
 *access* token (not an ID token — the server verifies it as a bearer
 assertion, not an OIDC login flow) works. Note the issuer URL and, if your IdP
@@ -233,7 +246,10 @@ rust-junosmcp --oidc-issuer https://idp.example.com/ \
 `oidc_subject` cannot even propose. Leave it off to roll out the issuer and
 bindings first and watch for rejections before enforcing. The server refuses
 to start if `--require-verified-approver` is set without `--oidc-issuer`,
-without `--approval-digest-key-file`, or together with `--lab-mode`.
+without `--approval-digest-key-file`, or together with `--lab-mode`; and
+refuses to start on `--oidc-issuer` with no `--oidc-audience` regardless of
+`--require-verified-approver`, since `OidcConfig` has no sensible default for
+it.
 
 **5. The approving client presents the header on the approve call** — how it
 obtains that JWT (interactive login, device-code flow, whatever your IdP

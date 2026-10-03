@@ -85,6 +85,12 @@ pub enum BindingFailure {
     /// `now - iat` exceeds `policy.max_age`.
     #[error("the assertion is older than the configured maximum age")]
     Stale,
+    /// `iat` is after `now` (beyond a small clock-skew allowance). This
+    /// needs no attacker: an un-synced IdP clock, or one deliberately set
+    /// ahead, would otherwise pass the staleness check trivially, since
+    /// `now.saturating_sub(iat)` is zero or clamped for any `iat > now`.
+    #[error("the assertion's issued_at claim is in the future")]
+    IssuedInFuture,
     /// `policy.require_auth_time` is set, but the assertion has no
     /// `auth_time` claim.
     #[error("the assertion has no auth_time claim, and one is required")]
@@ -93,6 +99,26 @@ pub enum BindingFailure {
     /// `auth_time`, but `now - auth_time` exceeds `policy.max_age`.
     #[error("the assertion's auth_time is older than the configured maximum age")]
     StaleAuthTime,
+}
+
+impl BindingFailure {
+    /// A stable, lowercase machine-readable code for this reason, for
+    /// structured audit logging. See
+    /// [`mecmcp_oidc::VerificationFailure::reason_code`] for the sibling
+    /// used upstream of this one.
+    #[must_use]
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::NotHumanToken => "not_human_token",
+            Self::NoSubjectBinding => "no_subject_binding",
+            Self::SubjectMismatch => "subject_mismatch",
+            Self::MissingApproverRole => "missing_approver_role",
+            Self::Stale => "stale",
+            Self::IssuedInFuture => "issued_in_future",
+            Self::MissingAuthTime => "missing_auth_time",
+            Self::StaleAuthTime => "stale_auth_time",
+        }
+    }
 }
 
 /// Bind a verified assertion's claims to a caller's token.
@@ -141,6 +167,14 @@ pub fn bind_approver<G: Grant>(
         .any(|role| role == &policy.approver_role)
     {
         return Err(BindingFailure::MissingApproverRole);
+    }
+
+    // Allowance for IdP/server clock skew. Not configurable: this guards
+    // against misconfiguration, not an attacker who controls `iat` (`claims`
+    // is already signature-verified), so there is no policy knob to tune.
+    const FUTURE_SKEW_SECS: i64 = 60;
+    if claims.issued_at > now.saturating_add(FUTURE_SKEW_SECS) {
+        return Err(BindingFailure::IssuedInFuture);
     }
 
     let max_age_secs = i64::try_from(policy.max_age.as_secs()).unwrap_or(i64::MAX);
@@ -296,6 +330,26 @@ mod tests {
         let caller = human_caller(Some(bound()));
         let claims = claims("alice", &["approver"], 1000);
         assert!(bind_approver(&caller, TEST_ISSUER, &claims, &policy(), 1000 + 300).is_ok());
+    }
+
+    #[test]
+    fn an_assertion_issued_in_the_future_is_refused() {
+        let caller = human_caller(Some(bound()));
+        // A misconfigured or ahead-of-skew IdP clock, not an attacker:
+        // without this check, `now.saturating_sub(iat)` would be 0 here and
+        // pass staleness trivially.
+        let claims = claims("alice", &["approver"], 10_000);
+        assert_eq!(
+            bind_approver(&caller, TEST_ISSUER, &claims, &policy(), 1000),
+            Err(BindingFailure::IssuedInFuture)
+        );
+    }
+
+    #[test]
+    fn an_assertion_within_the_clock_skew_allowance_is_accepted() {
+        let caller = human_caller(Some(bound()));
+        let claims = claims("alice", &["approver"], 1060);
+        assert!(bind_approver(&caller, TEST_ISSUER, &claims, &policy(), 1000).is_ok());
     }
 
     #[test]

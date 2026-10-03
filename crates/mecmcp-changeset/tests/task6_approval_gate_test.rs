@@ -26,6 +26,29 @@ struct TestAction {
     target: String,
 }
 
+/// Build an `OidcVerified` approver identity the way a real server would:
+/// through `ApproverIdentity::from_attribution`, never by naming the
+/// variant's (crate-private) payload directly. `ApproverIdentity` is opaque
+/// to this test crate on purpose (MEC-994 F1) — this is the only door.
+fn oidc_verified_approver(principal: &str, issuer: &str, subject: &str) -> ApproverIdentity {
+    let attribution = mecmcp_audit::Attribution {
+        principal: mecmcp_audit::Principal::Token(principal.to_owned()),
+        actor_type: mecmcp_audit::ActorType::Human,
+        agent: None,
+        on_behalf_of: None,
+        change_ref: None,
+        request_id: uuid::Uuid::nil(),
+        token_verified_fields: mecmcp_audit::TokenVerifiedFields::default(),
+        verified_approver: Some(mecmcp_auth::VerifiedApprover {
+            issuer: issuer.to_owned(),
+            subject: subject.to_owned(),
+        }),
+        approver: None,
+        change_set_id: None,
+    };
+    ApproverIdentity::from_attribution(&attribution)
+}
+
 /// Sets up a temporary coordinator with a clean state file.
 fn setup_coordinator() -> (tempfile::TempDir, ChangesetCoordinator) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -971,11 +994,7 @@ async fn strict_mode_accepts_an_oidc_verified_approver() {
         .approve_change_set(
             created.change_set_id.clone(),
             "device-a".to_string(),
-            &ApproverIdentity::OidcVerified {
-                principal: "bob".to_string(),
-                issuer: "https://idp.example".to_string(),
-                subject: "bob-sub".to_string(),
-            },
+            &oidc_verified_approver("bob", "https://idp.example", "bob-sub"),
             created.digest.clone(),
         )
         .await
@@ -1025,11 +1044,7 @@ async fn an_approver_sharing_the_owners_verified_subject_is_refused() {
         .approve_change_set(
             created.change_set_id.clone(),
             "device-a".to_string(),
-            &ApproverIdentity::OidcVerified {
-                principal: "alice-second-token".to_string(),
-                issuer: "https://idp.example".to_string(),
-                subject: "alice-sub".to_string(),
-            },
+            &oidc_verified_approver("alice-second-token", "https://idp.example", "alice-sub"),
             created.digest.clone(),
         )
         .await;
@@ -1130,5 +1145,214 @@ async fn v7_only_fields_on_a_non_v7_record_are_rejected_on_load() {
             .unwrap_err()
             .to_string()
             .contains("only a v7 digest binds")
+    );
+}
+
+/// MEC-994 Percy review F2: strict mode must refuse a lab-mode waiver
+/// outright, not just reject a non-`OidcVerified` approval. Before this fix,
+/// `waive_approval` checked only `lab_mode()`, so a coordinator built with
+/// both `with_require_verified_approver(true)` and lab mode on let the owner
+/// waive their own approval — bypassing strict mode entirely rather than
+/// being gated by it.
+#[tokio::test]
+async fn strict_mode_refuses_a_lab_mode_waiver() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state_path = dir.path().join("state.json");
+    let limits = OperationLimits {
+        max_operations: 1024,
+        max_change_sets: 1024,
+        max_actions_per_set: 64,
+        max_state_bytes: 8 * 1024 * 1024,
+        max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
+    };
+    // lab_mode = true alongside strict mode — the combination
+    // `VerifiedApproverArgs::validate` refuses at CLI startup, but this
+    // coordinator is built directly, bypassing that courtesy pre-check, to
+    // prove the library itself still refuses.
+    let coordinator = ChangesetCoordinator::load(
+        Some(&state_path),
+        limits,
+        Duration::from_secs(15 * 60),
+        true,
+    )
+    .expect("coordinator")
+    .with_approval_digest_key(std::sync::Arc::from(b"the-deployment-key".as_slice()))
+    .with_require_verified_approver(true);
+
+    let actions = vec![TestAction {
+        action: "set".to_string(),
+        target: "/test/path".to_string(),
+    }];
+    let created = coordinator
+        .create_change_set(
+            "device-a".to_string(),
+            actions,
+            "alice".to_string(),
+            test_fingerprint(),
+            "policy-sig".to_string(),
+            Some(OwnerSubject {
+                issuer: "https://idp.example".to_string(),
+                subject: "alice-sub".to_string(),
+            }),
+        )
+        .await
+        .expect("create");
+
+    let result = coordinator
+        .waive_approval(
+            created.change_set_id.clone(),
+            "device-a".to_string(),
+            "alice".to_string(),
+            created.digest.clone(),
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("refused under strict verified-approver mode")
+    );
+}
+
+/// MEC-994 Percy review F3: strict mode without a keyed approval digest must
+/// refuse to approve, not silently fall back to an unkeyed v5 approval that
+/// drops the mechanism/issuer/subject fields strict mode exists to make
+/// tamper-evident.
+#[tokio::test]
+async fn strict_mode_without_a_digest_key_refuses_to_approve() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state_path = dir.path().join("state.json");
+    let limits = OperationLimits {
+        max_operations: 1024,
+        max_change_sets: 1024,
+        max_actions_per_set: 64,
+        max_state_bytes: 8 * 1024 * 1024,
+        max_change_set_bytes: 256 * 1024,
+        ..OperationLimits::default()
+    };
+    // Strict mode, deliberately with no `with_approval_digest_key` call.
+    let coordinator = ChangesetCoordinator::load(
+        Some(&state_path),
+        limits,
+        Duration::from_secs(15 * 60),
+        false,
+    )
+    .expect("coordinator")
+    .with_require_verified_approver(true);
+
+    let actions = vec![TestAction {
+        action: "set".to_string(),
+        target: "/test/path".to_string(),
+    }];
+    let created = coordinator
+        .create_change_set(
+            "device-a".to_string(),
+            actions,
+            "alice".to_string(),
+            test_fingerprint(),
+            "policy-sig".to_string(),
+            Some(OwnerSubject {
+                issuer: "https://idp.example".to_string(),
+                subject: "alice-sub".to_string(),
+            }),
+        )
+        .await
+        .expect("create");
+
+    let result = coordinator
+        .approve_change_set(
+            created.change_set_id.clone(),
+            "device-a".to_string(),
+            &oidc_verified_approver("bob", "https://idp.example", "bob-sub"),
+            created.digest.clone(),
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("requires a keyed approval digest")
+    );
+}
+
+/// MEC-994 Percy review F4: strict mode must refuse to approve a change set
+/// whose `owner_subject` is absent, even though that field is not itself
+/// covered by any digest on a `Planned` record and so could have been
+/// stripped from the state file after proposal rather than genuinely never
+/// set. Without this check, stripping `owner_subject` from a pending change
+/// set would silently disable the self-approval check for it.
+#[tokio::test]
+async fn strict_mode_refuses_to_approve_when_owner_subject_is_missing() {
+    let (dir, coordinator) = setup_strict_coordinator();
+    let state_path = dir.path().join("state.json");
+
+    let actions = vec![TestAction {
+        action: "set".to_string(),
+        target: "/test/path".to_string(),
+    }];
+    let created = coordinator
+        .create_change_set(
+            "device-a".to_string(),
+            actions,
+            "alice".to_string(),
+            test_fingerprint(),
+            "policy-sig".to_string(),
+            Some(OwnerSubject {
+                issuer: "https://idp.example".to_string(),
+                subject: "alice-sub".to_string(),
+            }),
+        )
+        .await
+        .expect("create");
+
+    // Simulate `owner_subject` having been stripped from the state file
+    // after proposal — not reachable through the public API, which is the
+    // point: this field is not itself tamper-evident on a `Planned` record.
+    drop(coordinator);
+    let mut state = read_state(&state_path, 8 * 1024 * 1024).expect("read state");
+    state
+        .change_sets
+        .get_mut(&created.change_set_id)
+        .unwrap()
+        .owner_subject = None;
+    write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
+
+    let coordinator = ChangesetCoordinator::load(
+        Some(&state_path),
+        OperationLimits {
+            max_operations: 1024,
+            max_change_sets: 1024,
+            max_actions_per_set: 64,
+            max_state_bytes: 8 * 1024 * 1024,
+            max_change_set_bytes: 256 * 1024,
+            ..OperationLimits::default()
+        },
+        Duration::from_secs(15 * 60),
+        false,
+    )
+    .expect("coordinator")
+    .with_approval_digest_key(std::sync::Arc::from(b"the-deployment-key".as_slice()))
+    .with_require_verified_approver(true);
+
+    let result = coordinator
+        .approve_change_set(
+            created.change_set_id.clone(),
+            "device-a".to_string(),
+            &oidc_verified_approver("bob", "https://idp.example", "bob-sub"),
+            created.digest.clone(),
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("requires the change set to carry an owner_subject")
     );
 }
