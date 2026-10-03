@@ -17,8 +17,8 @@ workspace = true
 test-util = []
 
 [dependencies]
-mecmcp-oidc   = { version = "0.26.0", path = "../mecmcp-oidc" }
-mecmcp-secret = { version = "0.26.0", path = "../mecmcp-secret" }
+mecmcp-oidc   = { version = "0.26.1", path = "../mecmcp-oidc" }
+mecmcp-secret = { version = "0.26.1", path = "../mecmcp-secret" }
 arc-swap   = { workspace = true }
 chrono     = { workspace = true }
 getrandom  = { workspace = true }
