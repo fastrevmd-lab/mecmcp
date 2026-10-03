@@ -341,6 +341,45 @@ async fn a_stale_assertion_older_than_max_age_is_refused() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// MEC-1511 (deferred from MEC-994 Percy review): a rejected assertion must
+/// reach the `mecmcp-audit` sink, not only `tracing::warn!`. An operator's
+/// audit pipeline watches `target="audit"`, so a rejection that only ever
+/// warned would be invisible to it.
+#[test]
+fn a_rejected_assertion_emits_a_denied_audit_event() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let key = generate_test_key(KID);
+    // Wrong issuer is an arbitrary rejection reason; any case from
+    // `every_rejection_reason_is_distinct_and_audited` would do.
+    let mut claims = valid_claims("alice", "jti-audit-event");
+    claims["iss"] = json!("https://not-the-configured-idp.example.com");
+    let token = sign_token(&key, &claims, KID);
+    let app = app(&key, Some(bound_subject()), true);
+
+    let captured = mecmcp_audit::testutil::run_with_capture(|| {
+        runtime.block_on(async {
+            let response = app.oneshot(request(Some(&token))).await.expect("response");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        });
+    });
+
+    assert!(
+        captured.contains("authorization=denied"),
+        "the audit event must record the rejection as denied: {captured}"
+    );
+    assert!(
+        captured.contains("tool=approver_assertion"),
+        "the audit event must name the approver_assertion tool: {captured}"
+    );
+    assert!(
+        captured.contains("reason=wrong_issuer"),
+        "the audit event must carry the same reason code as the warn log: {captured}"
+    );
+}
+
 #[tokio::test]
 async fn a_bearer_token_with_no_oidc_subject_cannot_bind_an_assertion() {
     let key = generate_test_key(KID);

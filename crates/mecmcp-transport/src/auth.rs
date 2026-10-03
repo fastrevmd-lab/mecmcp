@@ -583,6 +583,7 @@ pub async fn bearer_auth_middleware<G: Grant>(
         };
         let Ok(assertion) = header_value.to_str() else {
             tracing::warn!(reason = "malformed_header", "approver_assertion_rejected");
+            audit_approver_assertion_rejection(&caller, "malformed_header");
             return invalid_token(&state.responses);
         };
         let now = chrono::Utc::now().timestamp();
@@ -594,6 +595,7 @@ pub async fn bearer_auth_middleware<G: Grant>(
                     detail = %error,
                     "approver_assertion_rejected"
                 );
+                audit_approver_assertion_rejection(&caller, error.reason_code());
                 return invalid_token(&state.responses);
             }
         }
@@ -607,6 +609,19 @@ pub async fn bearer_auth_middleware<G: Grant>(
     request.extensions_mut().insert(caller);
 
     next.run(request).await
+}
+
+/// Record a rejected approver assertion as a denied `mecmcp-audit` event.
+///
+/// Before this, a rejection was only visible via `tracing::warn!`, which an
+/// operator's audit pipeline may not be watching (MEC-994 Percy review,
+/// deferred to MEC-1511). `reason` is the same stable [`ApproverAssertionError::reason_code`]
+/// (or `"malformed_header"` for a header that failed UTF-8 decoding before
+/// verification was even attempted) already carried in the `tracing::warn!`
+/// above, so the two never drift apart.
+fn audit_approver_assertion_rejection<G: Grant>(caller: &CallerCtx<G>, reason: &'static str) {
+    let mut scope = AuditScope::from_caller(caller, "approver_assertion", "verify", Vec::new());
+    scope.deny(reason);
 }
 
 /// Build a 400 response for a presented approver assertion with no verifier
