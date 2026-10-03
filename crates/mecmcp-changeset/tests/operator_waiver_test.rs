@@ -246,6 +246,9 @@ fn v3_waiver_round_trip_and_version_dependence() {
             digest: waiver_digest.clone(),
             digest_version: 4,
             waived: Some(waiver_record.clone()),
+            mechanism: None,
+            issuer: None,
+            subject: None,
         }),
         expires_at_unix: approved_at + 900,
         operation_id: None,
@@ -254,6 +257,7 @@ fn v3_waiver_round_trip_and_version_dependence() {
         preview: None,
         task_id: None,
         apply_without_handle: false,
+        owner_subject: None,
     };
 
     let mut state = ChangesetState {
@@ -537,6 +541,7 @@ async fn planned_change_set_harness() -> PlannedChangeSetHarness {
             owner.clone(),
             fingerprint.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .expect("create");
@@ -598,6 +603,9 @@ async fn an_expired_waiver_does_not_authorize_apply() {
         digest: waiver_digest,
         digest_version: 4,
         waived: Some(waiver),
+        mechanism: None,
+        issuer: None,
+        subject: None,
     });
 
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
@@ -700,6 +708,9 @@ async fn lab_mode_disabled_after_waiver_does_not_authorize_apply() {
         digest: waiver_digest,
         digest_version: 4,
         waived: Some(waiver),
+        mechanism: None,
+        issuer: None,
+        subject: None,
     });
 
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
@@ -794,6 +805,9 @@ async fn pre_guard_waiver_expiry_check_fails_without_blocking() {
         digest: waiver_digest,
         digest_version: 4,
         waived: Some(waiver),
+        mechanism: None,
+        issuer: None,
+        subject: None,
     });
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
 
@@ -898,6 +912,9 @@ async fn post_guard_waiver_expiry_check_detects_toctou_rewrite() {
         digest: waiver_digest,
         digest_version: 4,
         waived: Some(waiver.clone()),
+        mechanism: None,
+        issuer: None,
+        subject: None,
     });
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
 
@@ -1000,6 +1017,9 @@ async fn post_guard_waiver_expiry_check_detects_toctou_rewrite() {
         digest: expired_digest,
         digest_version: 4,
         waived: Some(expired_waiver),
+        mechanism: None,
+        issuer: None,
+        subject: None,
     });
     coordinator
         .update_change_set(updated_change_set)
@@ -1063,6 +1083,9 @@ async fn waiver_at_exact_expiry_instant_is_expired() {
         digest: waiver_digest,
         digest_version: 4,
         waived: Some(waiver),
+        mechanism: None,
+        issuer: None,
+        subject: None,
     });
     write_state_for_test(&state_path, &state, 8 * 1024 * 1024).expect("write state");
 

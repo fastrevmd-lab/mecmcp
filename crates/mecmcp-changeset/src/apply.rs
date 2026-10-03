@@ -761,12 +761,16 @@ mod tests {
                 digest: "c".repeat(64),
                 digest_version: 4,
                 waived: Some(waiver),
+                mechanism: None,
+                issuer: None,
+                subject: None,
             }),
             policy_signature: "test".to_owned(),
             targets: vec![],
             preview: None,
             task_id: None,
             apply_without_handle: false,
+            owner_subject: None,
         };
 
         // One second before expiry: still valid

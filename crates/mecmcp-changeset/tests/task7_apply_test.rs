@@ -285,6 +285,7 @@ async fn apply_approved_change_set_succeeds() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -297,9 +298,11 @@ async fn apply_approved_change_set_succeeds() {
         .approve_change_set(
             change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -377,6 +380,7 @@ async fn apply_same_change_set_twice_fails() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -388,9 +392,11 @@ async fn apply_same_change_set_twice_fails() {
         .approve_change_set(
             change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -478,6 +484,7 @@ async fn partial_failure_auto_reverts_and_marks_failed() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -489,9 +496,11 @@ async fn partial_failure_auto_reverts_and_marks_failed() {
         .approve_change_set(
             change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -571,6 +580,7 @@ async fn apply_with_mismatched_digest_fails() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -582,9 +592,11 @@ async fn apply_with_mismatched_digest_fails() {
         .approve_change_set(
             change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -635,6 +647,7 @@ async fn apply_with_mismatched_fingerprint_fails() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -646,9 +659,11 @@ async fn apply_with_mismatched_fingerprint_fails() {
         .approve_change_set(
             change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -704,6 +719,7 @@ async fn apply_unapproved_change_set_fails() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -768,6 +784,7 @@ async fn apply_lab_mode_waived_approval_succeeds() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -841,6 +858,7 @@ async fn apply_with_invalid_endpoint_fails() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -849,9 +867,11 @@ async fn apply_with_invalid_endpoint_fails() {
         .approve_change_set(
             create_output.change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             create_output.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -907,6 +927,7 @@ async fn apply_accepts_a_non_https_vendor_endpoint() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -915,9 +936,11 @@ async fn apply_accepts_a_non_https_vendor_endpoint() {
         .approve_change_set(
             created.change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             created.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -983,6 +1006,7 @@ async fn apply_persists_valid_endpoint_and_reloads() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -991,9 +1015,11 @@ async fn apply_persists_valid_endpoint_and_reloads() {
         .approve_change_set(
             create_output.change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             create_output.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1073,6 +1099,7 @@ async fn apply_after_approval_expired_fails() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -1084,9 +1111,11 @@ async fn apply_after_approval_expired_fails() {
         .approve_change_set(
             change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1283,6 +1312,7 @@ async fn fingerprint_read_failure_with_failed_rollback_marks_indeterminate() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -1291,9 +1321,11 @@ async fn fingerprint_read_failure_with_failed_rollback_marks_indeterminate() {
         .approve_change_set(
             create_output.change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             create_output.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1362,6 +1394,7 @@ async fn finding_1_canonicalize_endpoint_key() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -1370,9 +1403,11 @@ async fn finding_1_canonicalize_endpoint_key() {
         .approve_change_set(
             create_output.change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             create_output.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1431,6 +1466,7 @@ async fn finding_1_reject_malformed_endpoint() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -1439,9 +1475,11 @@ async fn finding_1_reject_malformed_endpoint() {
         .approve_change_set(
             create_output.change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             create_output.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1504,6 +1542,7 @@ async fn finding_2_persist_policy_signature() {
             owner.to_string(),
             initial_fp.clone(),
             policy_sig.to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -1512,9 +1551,11 @@ async fn finding_2_persist_policy_signature() {
         .approve_change_set(
             create_output.change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             create_output.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1588,6 +1629,7 @@ async fn finding_3_persist_config_lock_held() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -1596,9 +1638,11 @@ async fn finding_3_persist_config_lock_held() {
         .approve_change_set(
             create_output.change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             create_output.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1756,6 +1800,7 @@ async fn finding_8_expire_after_guard_wait() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -1767,9 +1812,11 @@ async fn finding_8_expire_after_guard_wait() {
         .approve_change_set(
             change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1844,6 +1891,7 @@ async fn finding_1_serialize_by_device_not_endpoint() {
             owner1.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -1852,9 +1900,11 @@ async fn finding_1_serialize_by_device_not_endpoint() {
         .approve_change_set(
             create_output1.change_set_id.clone(),
             device.clone(),
-            approver1.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver1.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             create_output1.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -1895,6 +1945,7 @@ async fn finding_1_serialize_by_device_not_endpoint() {
             owner2.to_string(),
             after_fp1.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -1903,9 +1954,11 @@ async fn finding_1_serialize_by_device_not_endpoint() {
         .approve_change_set(
             create_output2.change_set_id.clone(),
             device.clone(),
-            approver2.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver2.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             create_output2.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -2093,6 +2146,7 @@ async fn finding_2_cleanup_reservation_on_pre_stage_check_abort() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -2101,9 +2155,11 @@ async fn finding_2_cleanup_reservation_on_pre_stage_check_abort() {
         .approve_change_set(
             create_output.change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             create_output.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -2163,6 +2219,7 @@ async fn finding_2_cleanup_reservation_on_pre_stage_check_abort() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -2171,9 +2228,11 @@ async fn finding_2_cleanup_reservation_on_pre_stage_check_abort() {
         .approve_change_set(
             create_output2.change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             create_output2.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -2234,6 +2293,7 @@ async fn finding_3_recorded_state_reports_actual_persisted_state() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -2242,9 +2302,11 @@ async fn finding_3_recorded_state_reports_actual_persisted_state() {
         .approve_change_set(
             create_output.change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             create_output.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -2421,6 +2483,7 @@ async fn finding_4_reject_legacy_plan_with_empty_policy_signature() {
             owner2.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -2429,9 +2492,11 @@ async fn finding_4_reject_legacy_plan_with_empty_policy_signature() {
         .approve_change_set(
             create_output2.change_set_id.clone(),
             device.clone(),
-            approver2.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver2.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             create_output2.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();
@@ -2487,6 +2552,7 @@ async fn finding_6_accept_case_insensitive_scheme() {
             owner.to_string(),
             initial_fp.clone(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -2495,9 +2561,11 @@ async fn finding_6_accept_case_insensitive_scheme() {
         .approve_change_set(
             create_output.change_set_id.clone(),
             device.clone(),
-            approver.to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: approver.to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             create_output.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .unwrap();

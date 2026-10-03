@@ -77,6 +77,7 @@ async fn create_and_approve(
             "alice".to_string(),
             test_fingerprint(),
             "policy-sig".to_string(),
+            None,
         )
         .await
         .expect("create");
@@ -85,17 +86,19 @@ async fn create_and_approve(
         .approve_change_set(
             created.change_set_id.clone(),
             "device-a".to_string(),
-            "bob".to_string(),
+            &mecmcp_changeset::ApproverIdentity::TokenAsserted {
+                principal: "bob".to_string(),
+                actor_type: mecmcp_audit::ActorType::Human,
+            },
             created.digest.clone(),
-            mecmcp_audit::ActorType::Human,
         )
         .await
         .expect("approve")
 }
 
-/// Approving through a keyed coordinator produces a v6 digest, not v5.
+/// Approving through a keyed coordinator produces a v7 digest, not v5.
 #[tokio::test]
-async fn approving_with_a_key_produces_a_v6_digest() {
+async fn approving_with_a_key_produces_a_v7_digest() {
     let (_dir, state_path, coordinator) =
         setup_keyed_coordinator(Arc::from(b"the-deployment-key".as_slice())).await;
 
@@ -114,8 +117,8 @@ async fn approving_with_a_key_produces_a_v6_digest() {
         .expect("change set");
     let approval = record.approval.as_ref().expect("approval");
     assert_eq!(
-        approval.digest_version, 6,
-        "a configured key must produce a v6 (keyed) digest"
+        approval.digest_version, 7,
+        "a configured key must produce a v7 (keyed) digest"
     );
 }
 
@@ -214,9 +217,9 @@ async fn reloading_a_v6_file_with_the_correct_key_succeeds() {
 /// Percy's review (MEC-457, finding 1): a keyed deployment must not accept an
 /// approval that was forged by downgrading `digest_version` to 5 (or 4, or the
 /// legacy encoding). Those digests are unkeyed — anyone who can write the
-/// state file can recompute them without ever holding the key. Only a v6
+/// state file can recompute them without ever holding the key. Only a v6/v7
 /// digest is bound to the key, so once a key is configured, any approver-
-/// bearing approval that isn't v6 must be rejected outright, not verified
+/// bearing approval that isn't v6/v7 must be rejected outright, not verified
 /// under its own claimed rule.
 #[tokio::test]
 async fn downgrade_to_v5_is_rejected_when_a_key_is_configured() {
@@ -242,6 +245,13 @@ async fn downgrade_to_v5_is_rejected_when_a_key_is_configured() {
         let approval = record.approval.as_mut().expect("approval");
         approval.approver = Some("mallory".to_string());
         approval.digest_version = 5;
+        // A genuine v5 approval never carries these — they are v7-only
+        // (MEC-994). Cleared here so this forgery is caught by the
+        // keyed-version gate this test means to exercise, not by the
+        // separate "v7 fields on a non-v7 record" check.
+        approval.mechanism = None;
+        approval.issuer = None;
+        approval.subject = None;
         approval.digest = mecmcp_changeset::digest::compute_approval_digest_v5(
             &id,
             &plan,
@@ -263,7 +273,7 @@ async fn downgrade_to_v5_is_rejected_when_a_key_is_configured() {
         reloaded
             .unwrap_err()
             .to_string()
-            .contains("requires keyed (v6) approvals")
+            .contains("requires keyed (v6/v7) approvals")
     );
 
     assert!(
