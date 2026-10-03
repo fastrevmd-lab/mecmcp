@@ -1191,7 +1191,7 @@ async fn strict_mode_refuses_a_lab_mode_waiver() {
         true,
     )
     .expect("coordinator")
-    .with_approval_digest_key(std::sync::Arc::from(b"the-deployment-key".as_slice()))
+    .with_approval_digest_key(random_key())
     .with_require_verified_approver(true);
 
     let actions = vec![TestAction {
@@ -1302,7 +1302,7 @@ async fn strict_mode_without_a_digest_key_refuses_to_approve() {
 /// set would silently disable the self-approval check for it.
 #[tokio::test]
 async fn strict_mode_refuses_to_approve_when_owner_subject_is_missing() {
-    let (dir, coordinator) = setup_strict_coordinator();
+    let (dir, coordinator, key) = setup_strict_coordinator();
     let state_path = dir.path().join("state.json");
 
     let actions = vec![TestAction {
@@ -1350,7 +1350,7 @@ async fn strict_mode_refuses_to_approve_when_owner_subject_is_missing() {
         false,
     )
     .expect("coordinator")
-    .with_approval_digest_key(std::sync::Arc::from(b"the-deployment-key".as_slice()))
+    .with_approval_digest_key(std::sync::Arc::clone(&key))
     .with_require_verified_approver(true);
 
     let result = coordinator
