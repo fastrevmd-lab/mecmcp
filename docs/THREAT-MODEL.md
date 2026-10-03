@@ -25,6 +25,10 @@ LLM / MCP client ──(1)── mecmcp server ──(2)── network device / 
                          (3)  │ │ (4)
                               ▼ │
                 SSDF / journald / file      operator: tokens, inventory, flags
+                              │
+                         (5)  │
+                              ▼
+                     IdP (JWKS, step-up assertions)
 ```
 
 1. **Client → server.** Everything the model sends is untrusted, *even with a valid token*.
@@ -36,6 +40,12 @@ LLM / MCP client ──(1)── mecmcp server ──(2)── network device / 
    is off unless configured.
 4. **Operator → server.** The operator is trusted. They set flags, tokens and inventory
    at startup. No MCP call can change the security posture.
+5. **Server → IdP.** Opt-in ([#400](https://github.com/mechubsec/mecmcp/issues/400)): when `--oidc-issuer` is configured, the server
+   fetches JWKS from the IdP to verify step-up approver assertions. No approver JWT, no
+   raw claims and no IdP response ever flow back to the model or into a tool result —
+   verification happens once at the bearer boundary, and only issuer+subject survive it.
+   JWKS unreachable fails closed: approvals are refused, but reads and proposals on
+   existing bearer tokens are unaffected.
 
 ## Threats and mitigations
 
@@ -59,9 +69,16 @@ LLM / MCP client ──(1)── mecmcp server ──(2)── network device / 
 - **Prompt injection is unsolved (T1).** Controls limit *what* a hijacked model can do
   (scopes, two-person approval). They cannot stop it trying. Give read-only
   tokens to any client that reads untrusted text.
-- **"Two-person" means two tokens, not two humans.** One person holding two tokens can
-  approve their own change, and `--lab-mode` waives approval outright. The audit
-  record shows `approval_waiver: "lab-mode"`, but the change is not blocked.
+- **"Two-person" means two tokens, not two humans, unless `--require-verified-approver`
+  is set ([#400](https://github.com/mechubsec/mecmcp/issues/400)).** By default, one person holding two tokens can still approve
+  their own change, and `--lab-mode` waives approval outright (the audit record shows
+  `approval_waiver: "lab-mode"`, but the change is not blocked). With
+  `--require-verified-approver`, the approve call must additionally carry a fresh
+  IdP-issued assertion bound to a distinct IdP subject from the proposer's — see
+  trust boundary (5) above. That assertion only covers *who approved*; it does not
+  scope *what* they may approve beyond the token's existing tool/device scopes, and
+  selector-scoped approver roles (cluster/node/pool/tag/controller/site) are not yet
+  built (tracked separately, see #400).
 - **The host operator is trusted.** Root on the host can read credentials and rewrite
   local audit. Only the off-host SSDF copy survives that.
 - **Hosted model providers see tool output.** Even with T8 fixed, free text such as
@@ -72,7 +89,9 @@ LLM / MCP client ──(1)── mecmcp server ──(2)── network device / 
 
 - Compromise of the managed device itself.
 - The MCP client's own security.
-- OAuth or identity-provider integration.
+- OIDC/OAuth as the MCP bearer credential, session or token exchange, and retiring
+  `actor_type: human` tokens outright — step-up OIDC ([#400](https://github.com/mechubsec/mecmcp/issues/400)) only verifies identity
+  at approval time; the bearer token stays the transport credential.
 - Physical access.
 
 ## Per-server delta

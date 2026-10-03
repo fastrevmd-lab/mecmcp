@@ -186,6 +186,64 @@ reachability rolls itself back.
 `approver: null` with `approval_waiver: "lab-mode"` — it never fabricates an
 approver, so a lab record cannot be mistaken for a reviewed one later.
 
+### Step-up approval: verified human identity ([#400](https://github.com/mechubsec/mecmcp/issues/400))
+
+Without configuration, "two principals" means two *tokens* — one person holding
+both a proposer and an approver token can approve their own change. Step-up
+approval closes that by requiring the approve call to additionally carry a
+fresh JWT from your IdP, bound to a specific token and checked against the
+proposer's identity. The approver's existing bearer token is unchanged; the
+JWT is an extra assertion, sent as `Mecmcp-Approver-Assertion`, never as
+`Authorization` and never as a tool argument.
+
+**1. Register an app in your IdP.** Any OIDC provider that can issue a JWT
+*access* token (not an ID token — the server verifies it as a bearer
+assertion, not an OIDC login flow) works. Note the issuer URL and, if your IdP
+enforces one, the audience (`aud`) the access token is minted for.
+
+**2. Put the approver's role or group in a token claim**, e.g. `roles` or
+`groups`, containing a value you'll designate as the approver role
+(`approver` by default).
+
+**3. Bind each approver's existing token to their IdP subject:**
+
+```bash
+rust-junosmcp token add --tokens-file /etc/jmcp/tokens.json --name alice \
+  --actor-type human --tools approve_change_set --devices '*' \
+  --oidc-issuer https://idp.example.com/ --oidc-subject alice@example.com
+```
+
+The subject is whatever unique, stable identifier your IdP puts in the JWT's
+`sub` claim — not necessarily an email. Only issuer+subject are ever stored;
+never bind a display name.
+
+**4. Start the server with the verifier configured:**
+
+```bash
+rust-junosmcp --oidc-issuer https://idp.example.com/ \
+  --oidc-audience <your-aud> \
+  --oidc-role-claim roles --approver-role approver \
+  --approver-max-age-secs 300 \
+  --approval-digest-key-file /etc/jmcp/approval-digest.key \
+  --require-verified-approver
+```
+
+`--require-verified-approver` is the enforcement switch: with it set, a
+`human` token with no assertion cannot approve, and an owner token with no
+`oidc_subject` cannot even propose. Leave it off to roll out the issuer and
+bindings first and watch for rejections before enforcing. The server refuses
+to start if `--require-verified-approver` is set without `--oidc-issuer`,
+without `--approval-digest-key-file`, or together with `--lab-mode`.
+
+**5. The approving client presents the header on the approve call** — how it
+obtains that JWT (interactive login, device-code flow, whatever your IdP
+supports) is between the approver and their IdP; the server only ever sees
+and verifies the resulting token.
+
+This does not replace scoping: it verifies *who* approved, not *what* they
+may approve beyond their token's existing tool and device scopes. Selector-scoped
+approver roles are a later phase of #400 and are not built yet.
+
 ---
 
 ## 3. Per-server notes
